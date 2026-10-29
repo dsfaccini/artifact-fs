@@ -70,6 +70,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				ucli.BoolFlag{Name: "async", Usage: "return after registration and prepare the repo in the daemon"},
 				ucli.BoolFlag{Name: "prepared-gitdir", Usage: "use an existing git dir for async preparation"},
 				ucli.StringFlag{Name: "git-dir", Usage: "explicit git dir path"},
+				ucli.StringFlag{Name: "blob-cache-dir", Usage: "directory for hydrated blobs; may be shared between repositories"},
 				ucli.StringFlag{Name: "fetch-ref", Usage: "ref to fetch during async preparation"},
 			},
 			Action: withService(ctx, root, stderr, func(c *ucli.Context, svc *daemon.Service) error {
@@ -117,6 +118,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					RemoteRefreshDisabled: strings.EqualFold(refreshValue, "never"),
 					MountRoot:             c.String("mount-root"),
 					GitDir:                c.String("git-dir"),
+					BlobCacheDir:          c.String("blob-cache-dir"),
 					PreparedGitDir:        preparedGitDir,
 					FetchRef:              c.String("fetch-ref"),
 					Enabled:               true,
