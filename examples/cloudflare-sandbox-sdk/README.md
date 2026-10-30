@@ -11,7 +11,7 @@ It includes an authenticated mount API, a status endpoint, and a custom Sandbox
 image. The single bearer token keeps this example focused; it is not a multi-tenant
 authorization design.
 
-You need Docker, Node.js 24, and a Workers Paid plan.
+You need Docker, Node.js 26, and a Workers Paid plan.
 
 ```bash
 cd examples/cloudflare-sandbox-sdk

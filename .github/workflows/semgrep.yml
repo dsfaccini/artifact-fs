@@ -23,8 +23,8 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.local
-          key: semgrep-1.172.0-${{ runner.os }}
+          key: semgrep-1.182.0-${{ runner.os }}
       - if: steps.cache-semgrep.outputs.cache-hit != 'true'
-        run: pip install --user semgrep==1.172.0
+        run: pip install --user semgrep==1.182.0
       - run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: semgrep scan --config=auto
