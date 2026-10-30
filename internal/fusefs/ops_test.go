@@ -367,6 +367,116 @@ func TestRenameBaseDirectoryHydratesAndMovesContents(t *testing.T) {
 	}
 }
 
+func TestRenameRecreatedTrackedFilePreservesSource(t *testing.T) {
+	for _, trackedDestination := range []bool{false, true} {
+		name := "absent destination"
+		if trackedDestination {
+			name = "tracked destination"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			tmp := t.TempDir()
+			cfg := model.RepoConfig{
+				ID:            "repo",
+				OverlayDir:    filepath.Join(tmp, "overlay"),
+				OverlayDBPath: filepath.Join(tmp, "overlay.db"),
+			}
+			ov, err := overlaystore.New(ctx, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = ov.Close() })
+
+			const content = "original tracked content"
+			cachePath := filepath.Join(tmp, "blob")
+			if err := os.WriteFile(cachePath, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			nodes := map[string]model.BaseNode{
+				"README.md": {Path: "README.md", Type: "file", Mode: 0o100644, ObjectOID: "source-oid"},
+			}
+			if trackedDestination {
+				nodes["destination.txt"] = model.BaseNode{Path: "destination.txt", Type: "file", Mode: 0o100644, ObjectOID: "destination-oid"}
+			}
+			children := make([]model.BaseNode, 0, len(nodes))
+			for _, node := range nodes {
+				children = append(children, node)
+			}
+			snapshot := &fakeSnapshot{nodes: nodes, kids: map[string][]model.BaseNode{".": children}}
+			resolver := &Resolver{Snapshot: snapshot, Overlay: ov}
+			resolver.SetGeneration(1)
+			engine := &Engine{Repo: cfg, Resolver: resolver, Overlay: ov, Hydrator: &fakeBatchHydrator{path: cachePath}}
+
+			if err := engine.Rename(ctx, "README.md", "first.md"); err != nil {
+				t.Fatal(err)
+			}
+			if err := engine.Unlink(ctx, "first.md"); err != nil {
+				t.Fatal(err)
+			}
+			if err := engine.Create(ctx, "README.md", 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := engine.Write(ctx, "README.md", 0, []byte(content)); err != nil {
+				t.Fatal(err)
+			}
+
+			created, ok, err := ov.Lookup(ctx, "README.md")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok || created.Kind != model.OverlayKindCreate || created.SourceOID != "" {
+				t.Fatalf("recreated source entry = %+v, exists = %t; want create without source oid", created, ok)
+			}
+			if _, ok, err := snapshot.LookupNode(ctx, resolver.Generation(), "README.md"); err != nil || !ok {
+				t.Fatalf("snapshot source lookup = (%t, %v), want tracked source", ok, err)
+			}
+
+			destination := "second.md"
+			if trackedDestination {
+				destination = "destination.txt"
+			}
+			if err := engine.Rename(ctx, "README.md", destination); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := resolver.ResolvePath("README.md"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("source resolve error = %v, want not exist", err)
+			}
+			entries, err := resolver.ReaddirTyped(ctx, ".")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if entry.Name == "README.md" {
+					t.Fatal("recreated source remains in root directory listing")
+				}
+			}
+			got, err := engine.Read(ctx, destination, 0, len(content))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != content {
+				t.Fatalf("destination content = %q, want %q", got, content)
+			}
+
+			sourceEntry, ok, err := ov.Lookup(ctx, "README.md")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok || sourceEntry.Kind != model.OverlayKindDelete {
+				t.Fatalf("source overlay entry = %+v, exists = %t; want delete", sourceEntry, ok)
+			}
+			destinationEntry, ok, err := ov.Lookup(ctx, destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok || destinationEntry.Kind != model.OverlayKindRename || destinationEntry.SourceOID != "source-oid" {
+				t.Fatalf("destination overlay entry = %+v, exists = %t; want rename from original source", destinationEntry, ok)
+			}
+		})
+	}
+}
+
 func TestRenameBaseDirectoryHydratesBeforeMutatingOverlay(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := model.RepoConfig{

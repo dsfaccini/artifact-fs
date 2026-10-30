@@ -156,15 +156,26 @@ func (e *Engine) Rename(ctx context.Context, oldPath, newPath string) error {
 	}
 	if source.FromOverlay {
 		ov := source.Overlay
-		if dst, ok, err := e.Resolver.Snapshot.LookupNode(ctx, e.Resolver.Generation(), newPath); err != nil {
+		gen := e.Resolver.Generation()
+		dst, dstOK, err := e.Resolver.Snapshot.LookupNode(ctx, gen, newPath)
+		if err != nil {
 			return err
-		} else if ok {
-			if dst.Type == "dir" {
-				return fs.ErrInvalid
+		}
+		if dstOK && dst.Type == "dir" {
+			return fs.ErrInvalid
+		}
+		if ov.Kind == model.OverlayKindCreate {
+			if src, ok, err := e.Resolver.Snapshot.LookupNode(ctx, gen, oldPath); err != nil {
+				return err
+			} else if ok && src.Type == "file" {
+				if err := e.Overlay.RenameAndMarkModifiedFromBase(ctx, oldPath, oldPath, src.ObjectOID, src.Mode); err != nil {
+					return err
+				}
+				return e.Overlay.Rename(ctx, oldPath, newPath)
 			}
-			if ov.Kind == model.OverlayKindCreate || ov.Kind == model.OverlayKindSymlink {
-				return e.Overlay.RenameAndMarkModifiedFromBase(ctx, oldPath, newPath, dst.ObjectOID, dst.Mode)
-			}
+		}
+		if dstOK && (ov.Kind == model.OverlayKindCreate || ov.Kind == model.OverlayKindSymlink) {
+			return e.Overlay.RenameAndMarkModifiedFromBase(ctx, oldPath, newPath, dst.ObjectOID, dst.Mode)
 		}
 		return e.Overlay.Rename(ctx, oldPath, newPath)
 	}
