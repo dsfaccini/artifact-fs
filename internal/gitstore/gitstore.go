@@ -1974,7 +1974,7 @@ func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.
 		return skip()
 	}
 	paths := make([]string, 0)
-	for _, entry := range strings.Split(entries, "\x00") {
+	for entry := range strings.SplitSeq(entries, "\x00") {
 		if entry == "" {
 			continue
 		}
@@ -1997,7 +1997,7 @@ func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.
 	if err != nil {
 		return skip()
 	}
-	for _, entry := range strings.Split(configs, "\x00") {
+	for entry := range strings.SplitSeq(configs, "\x00") {
 		key, _, ok := strings.Cut(entry, "\n")
 		if ok && strings.EqualFold(key, "core.attributesfile") {
 			return false, nil
@@ -2147,7 +2147,7 @@ func verifyGitAttributesPresent(ctx context.Context, repo model.RepoConfig, env 
 	if err != nil {
 		return err
 	}
-	for _, entry := range strings.Split(entries, "\x00") {
+	for entry := range strings.SplitSeq(entries, "\x00") {
 		meta, path, ok := strings.Cut(entry, "\t")
 		if !ok || filepath.Base(path) != ".gitattributes" {
 			continue
