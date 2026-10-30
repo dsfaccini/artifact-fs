@@ -27,7 +27,11 @@ type Engine struct {
 // ensureOverlay promotes a base file to the overlay (hydrate → copy-on-write).
 // No-op if the path already has an overlay entry.
 func (e *Engine) ensureOverlay(ctx context.Context, path string) error {
-	if _, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
+	return e.ensureOverlayWithContexts(ctx, ctx, path)
+}
+
+func (e *Engine) ensureOverlayWithContexts(ctx, metadataCtx context.Context, path string) error {
+	if _, ok, err := e.Overlay.Lookup(metadataCtx, path); err != nil {
 		return err
 	} else if ok {
 		return nil
@@ -42,10 +46,10 @@ func (e *Engine) ensureOverlay(ctx context.Context, path string) error {
 			return hErr
 		}
 		defer src.Close()
-		_, err = e.Overlay.EnsureCopyOnWriteFrom(ctx, e.Repo, path, n.Base, src)
+		_, err = e.Overlay.EnsureCopyOnWriteFrom(metadataCtx, e.Repo, path, n.Base, src)
 		return err
 	}
-	_, err = e.Overlay.EnsureCopyOnWrite(ctx, e.Repo, path, n.Base)
+	_, err = e.Overlay.EnsureCopyOnWrite(metadataCtx, e.Repo, path, n.Base)
 	return err
 }
 
@@ -73,10 +77,14 @@ func (e *Engine) Read(ctx context.Context, path string, off int64, size int) ([]
 }
 
 func (e *Engine) BaseCacheFile(ctx context.Context, path string) (*os.File, int64, bool, error) {
+	return e.baseCacheFile(ctx, ctx, path)
+}
+
+func (e *Engine) baseCacheFile(ctx, metadataCtx context.Context, path string) (*os.File, int64, bool, error) {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
 	path = model.CleanPath(path)
-	if ov, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
+	if ov, ok, err := e.Overlay.Lookup(metadataCtx, path); err != nil {
 		return nil, 0, false, err
 	} else if ok {
 		if ov.IsDeleted() {
@@ -85,7 +93,7 @@ func (e *Engine) BaseCacheFile(ctx context.Context, path string) (*os.File, int6
 		return nil, 0, false, nil
 	}
 	gen := e.Resolver.Generation()
-	n, ok, err := e.Resolver.Snapshot.LookupNode(ctx, gen, path)
+	n, ok, err := e.Resolver.Snapshot.LookupNode(metadataCtx, gen, path)
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -139,6 +147,10 @@ func (e *Engine) Unlink(ctx context.Context, path string) error {
 }
 
 func (e *Engine) Rename(ctx context.Context, oldPath, newPath string) error {
+	return e.rename(ctx, ctx, oldPath, newPath)
+}
+
+func (e *Engine) rename(ctx, metadataCtx context.Context, oldPath, newPath string) error {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
 	oldPath = model.CleanPath(oldPath)
@@ -152,12 +164,12 @@ func (e *Engine) Rename(ctx context.Context, oldPath, newPath string) error {
 		return err
 	}
 	if resolvedNodeType(source) == "dir" {
-		return e.renameDirectory(ctx, oldPath, newPath)
+		return e.renameDirectory(ctx, metadataCtx, oldPath, newPath)
 	}
 	if source.FromOverlay {
 		ov := source.Overlay
 		gen := e.Resolver.Generation()
-		dst, dstOK, err := e.Resolver.Snapshot.LookupNode(ctx, gen, newPath)
+		dst, dstOK, err := e.Resolver.Snapshot.LookupNode(metadataCtx, gen, newPath)
 		if err != nil {
 			return err
 		}
@@ -165,29 +177,29 @@ func (e *Engine) Rename(ctx context.Context, oldPath, newPath string) error {
 			return fs.ErrInvalid
 		}
 		if ov.Kind == model.OverlayKindCreate {
-			if src, ok, err := e.Resolver.Snapshot.LookupNode(ctx, gen, oldPath); err != nil {
+			if src, ok, err := e.Resolver.Snapshot.LookupNode(metadataCtx, gen, oldPath); err != nil {
 				return err
 			} else if ok && src.Type == "file" {
-				if err := e.Overlay.RenameAndMarkModifiedFromBase(ctx, oldPath, oldPath, src.ObjectOID, src.Mode); err != nil {
+				if err := e.Overlay.RenameAndMarkModifiedFromBase(metadataCtx, oldPath, oldPath, src.ObjectOID, src.Mode); err != nil {
 					return err
 				}
-				return e.Overlay.Rename(ctx, oldPath, newPath)
+				return e.Overlay.Rename(metadataCtx, oldPath, newPath)
 			}
 		}
 		if dstOK && (ov.Kind == model.OverlayKindCreate || ov.Kind == model.OverlayKindSymlink) {
-			return e.Overlay.RenameAndMarkModifiedFromBase(ctx, oldPath, newPath, dst.ObjectOID, dst.Mode)
+			return e.Overlay.RenameAndMarkModifiedFromBase(metadataCtx, oldPath, newPath, dst.ObjectOID, dst.Mode)
 		}
-		return e.Overlay.Rename(ctx, oldPath, newPath)
+		return e.Overlay.Rename(metadataCtx, oldPath, newPath)
 	}
-	if dst, ok, err := e.Resolver.Snapshot.LookupNode(ctx, e.Resolver.Generation(), newPath); err != nil {
+	if dst, ok, err := e.Resolver.Snapshot.LookupNode(metadataCtx, e.Resolver.Generation(), newPath); err != nil {
 		return err
 	} else if ok && dst.Type == "dir" {
 		return fs.ErrInvalid
 	}
-	if err := e.ensureOverlay(ctx, oldPath); err != nil {
+	if err := e.ensureOverlayWithContexts(ctx, metadataCtx, oldPath); err != nil {
 		return err
 	}
-	return e.Overlay.Rename(ctx, oldPath, newPath)
+	return e.Overlay.Rename(metadataCtx, oldPath, newPath)
 }
 
 func resolvedNodeType(n ResolvedNode) string {
@@ -197,7 +209,7 @@ func resolvedNodeType(n ResolvedNode) string {
 	return n.Base.Type
 }
 
-func (e *Engine) renameDirectory(ctx context.Context, oldPath, newPath string) error {
+func (e *Engine) renameDirectory(ctx, metadataCtx context.Context, oldPath, newPath string) error {
 	if oldPath == "." || newPath == "." || strings.HasPrefix(newPath, oldPath+"/") {
 		return fs.ErrInvalid
 	}
@@ -205,7 +217,7 @@ func (e *Engine) renameDirectory(ctx context.Context, oldPath, newPath string) e
 		if resolvedNodeType(destination) != "dir" {
 			return fs.ErrInvalid
 		}
-		children, err := e.Resolver.readdirTypedAt(ctx, newPath, e.Resolver.Generation())
+		children, err := e.Resolver.readdirTypedAt(metadataCtx, newPath, e.Resolver.Generation())
 		if err != nil {
 			return err
 		}
@@ -216,15 +228,15 @@ func (e *Engine) renameDirectory(ctx context.Context, oldPath, newPath string) e
 		return err
 	}
 
-	destinationBasePaths, err := e.snapshotTreePaths(ctx, newPath)
+	destinationBasePaths, err := e.snapshotTreePaths(metadataCtx, newPath)
 	if err != nil {
 		return err
 	}
-	sourceBasePaths, err := e.snapshotTreePaths(ctx, oldPath)
+	sourceBasePaths, err := e.snapshotTreePaths(metadataCtx, oldPath)
 	if err != nil {
 		return err
 	}
-	visible, err := e.mergedTree(ctx, oldPath)
+	visible, err := e.mergedTree(metadataCtx, oldPath)
 	if err != nil {
 		return err
 	}
@@ -241,16 +253,16 @@ func (e *Engine) renameDirectory(ctx context.Context, oldPath, newPath string) e
 			continue
 		}
 		if n.node.Base.Type == "dir" {
-			if err := e.Overlay.Mkdir(ctx, n.path, n.node.Base.Mode); err != nil {
+			if err := e.Overlay.Mkdir(metadataCtx, n.path, n.node.Base.Mode); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := e.ensureOverlay(ctx, n.path); err != nil {
+		if err := e.ensureOverlayWithContexts(ctx, metadataCtx, n.path); err != nil {
 			return err
 		}
 	}
-	return e.Overlay.RenameTree(ctx, oldPath, newPath, sourceBasePaths, destinationBasePaths)
+	return e.Overlay.RenameTree(metadataCtx, oldPath, newPath, sourceBasePaths, destinationBasePaths)
 }
 
 type resolvedTreeNode struct {

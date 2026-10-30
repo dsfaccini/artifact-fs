@@ -12,8 +12,350 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
+	overlaystore "github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/jacobsa/fuse/fuseops"
 )
+
+type localOverlayFuseFixture struct {
+	store     *overlaystore.Store
+	resolver  *Resolver
+	engine    *Engine
+	fs        *ArtifactFuse
+	srcInode  fuseops.InodeID
+	nestInode fuseops.InodeID
+	fileInode fuseops.InodeID
+}
+
+func newLocalOverlayFuseFixture(t *testing.T) localOverlayFuseFixture {
+	t.Helper()
+	ctx := context.Background()
+	tmp := t.TempDir()
+	repo := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	store, err := overlaystore.New(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	for _, path := range []string{"src", "src/nested"} {
+		if err := store.Mkdir(ctx, path, 0o755); err != nil {
+			t.Fatalf("Mkdir(%q): %v", path, err)
+		}
+	}
+	if _, err := store.CreateFile(ctx, "src/nested/value.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.WriteFile(ctx, "src/nested/value.txt", 0, []byte("overlay content")); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{}, kids: map[string][]model.BaseNode{}}, Overlay: store}
+	resolver.SetGeneration(1)
+	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: store}
+	fs := NewArtifactFuse(repo, resolver, engine)
+	lookup := func(parent fuseops.InodeID, name string) fuseops.InodeID {
+		op := &fuseops.LookUpInodeOp{Parent: parent, Name: name}
+		if err := fs.LookUpInode(ctx, op); err != nil {
+			t.Fatalf("LookUpInode(%q): %v", name, err)
+		}
+		return op.Entry.Child
+	}
+	srcInode := lookup(fuseops.RootInodeID, "src")
+	nestInode := lookup(srcInode, "nested")
+	fileInode := lookup(nestInode, "value.txt")
+	return localOverlayFuseFixture{
+		store: store, resolver: resolver, engine: engine, fs: fs,
+		srcInode: srcInode, nestInode: nestInode, fileInode: fileInode,
+	}
+}
+
+func TestCanceledContextOpensOverlayFile(t *testing.T) {
+	f := newLocalOverlayFuseFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	open := &fuseops.OpenFileOp{Inode: f.fileInode}
+	if err := f.fs.OpenFile(ctx, open); err != nil {
+		t.Fatalf("OpenFile with canceled request context: %v", err)
+	}
+	if open.Handle == 0 {
+		t.Fatal("OpenFile returned an empty handle")
+	}
+	t.Cleanup(func() { _ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: open.Handle}) })
+	read := &fuseops.ReadFileOp{Handle: open.Handle, Size: 64}
+	if err := f.fs.ReadFile(context.Background(), read); err != nil {
+		t.Fatalf("ReadFile after OpenFile: %v", err)
+	}
+	if got := string(read.Data[0]); got != "overlay content" {
+		t.Fatalf("file handle content = %q, want overlay content", got)
+	}
+}
+
+func TestCanceledContextOpensOverlayDirectory(t *testing.T) {
+	f := newLocalOverlayFuseFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	open := &fuseops.OpenDirOp{Inode: f.nestInode}
+	if err := f.fs.OpenDir(ctx, open); err != nil {
+		t.Fatalf("OpenDir with canceled request context: %v", err)
+	}
+	if open.Handle == 0 {
+		t.Fatal("OpenDir returned an empty handle")
+	}
+	t.Cleanup(func() { _ = f.fs.ReleaseDirHandle(context.Background(), &fuseops.ReleaseDirHandleOp{Handle: open.Handle}) })
+	dir, err := f.fs.dirHandle(open.Handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dir.entries) != 1 || dir.entries[0].Name != "value.txt" {
+		t.Fatalf("directory entries = %+v, want [value.txt]", dir.entries)
+	}
+}
+
+func TestCanceledContextRenamesOverlayDirectory(t *testing.T) {
+	f := newLocalOverlayFuseFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	fileOpen := &fuseops.OpenFileOp{Inode: f.fileInode}
+	if err := f.fs.OpenFile(context.Background(), fileOpen); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: fileOpen.Handle}) })
+	dirOpen := &fuseops.OpenDirOp{Inode: f.nestInode}
+	if err := f.fs.OpenDir(context.Background(), dirOpen); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.fs.ReleaseDirHandle(context.Background(), &fuseops.ReleaseDirHandleOp{Handle: dirOpen.Handle}) })
+	op := &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "src", NewParent: fuseops.RootInodeID, NewName: "dst"}
+	if err := f.fs.Rename(ctx, op); err != nil {
+		t.Fatalf("Rename with canceled request context: %v", err)
+	}
+	if _, err := f.resolver.ResolvePath("src"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("source resolve error = %v, want not exist", err)
+	}
+	if _, err := f.resolver.ResolvePath("dst/nested/value.txt"); err != nil {
+		t.Fatalf("destination resolve: %v", err)
+	}
+	if ref, err := f.fs.requireInode(f.srcInode, syscall.ESTALE); err != nil || ref.Path != "dst" {
+		t.Fatalf("moved source inode = %+v, err = %v", ref, err)
+	}
+	if ref, err := f.fs.requireInode(f.fileInode, syscall.ESTALE); err != nil || ref.Path != "dst/nested/value.txt" {
+		t.Fatalf("moved file inode = %+v, err = %v", ref, err)
+	}
+	fileHandle, err := f.fs.fileHandle(fileOpen.Handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileHandle.mu.Lock()
+	handlePath := fileHandle.path
+	fileHandle.mu.Unlock()
+	if handlePath != "dst/nested/value.txt" {
+		t.Fatalf("moved file handle path = %q", handlePath)
+	}
+	dirHandle, err := f.fs.dirHandle(dirOpen.Handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dirHandle.inode.Path != "dst/nested" {
+		t.Fatalf("moved directory handle path = %q", dirHandle.inode.Path)
+	}
+	read := &fuseops.ReadFileOp{Handle: fileOpen.Handle, Size: 64}
+	if err := f.fs.ReadFile(context.Background(), read); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(read.Data[0]); got != "overlay content" {
+		t.Fatalf("moved file handle content = %q, want overlay content", got)
+	}
+}
+
+type cancelAtRenameTreeOverlay struct {
+	model.OverlayStore
+	cancel context.CancelFunc
+	called bool
+}
+
+func (o *cancelAtRenameTreeOverlay) RenameTree(ctx context.Context, oldPath, newPath string, sourceBasePaths, destinationBasePaths []string) error {
+	o.called = true
+	o.cancel()
+	return o.OverlayStore.RenameTree(ctx, oldPath, newPath, sourceBasePaths, destinationBasePaths)
+}
+
+type failingLookupOverlay struct {
+	model.OverlayStore
+	err error
+}
+
+func (o *failingLookupOverlay) Lookup(context.Context, string) (model.OverlayEntry, bool, error) {
+	return model.OverlayEntry{}, false, o.err
+}
+
+func TestCanceledDuringRenameTreeKeepsNamespaceAndHandlesInSync(t *testing.T) {
+	f := newLocalOverlayFuseFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	overlay := &cancelAtRenameTreeOverlay{OverlayStore: f.store, cancel: cancel}
+	f.resolver.Overlay = overlay
+	f.engine.Overlay = overlay
+	fileOpen := &fuseops.OpenFileOp{Inode: f.fileInode}
+	if err := f.fs.OpenFile(context.Background(), fileOpen); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: fileOpen.Handle}) })
+	dirOpen := &fuseops.OpenDirOp{Inode: f.nestInode}
+	if err := f.fs.OpenDir(context.Background(), dirOpen); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.fs.ReleaseDirHandle(context.Background(), &fuseops.ReleaseDirHandleOp{Handle: dirOpen.Handle}) })
+	op := &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "src", NewParent: fuseops.RootInodeID, NewName: "dst"}
+	if err := f.fs.Rename(ctx, op); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if !overlay.called || !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("RenameTree called=%t, ctx.Err()=%v", overlay.called, ctx.Err())
+	}
+	if _, err := f.resolver.ResolvePath("src"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("source resolve error = %v, want not exist", err)
+	}
+	if _, err := f.resolver.ResolvePath("dst/nested/value.txt"); err != nil {
+		t.Fatalf("destination resolve: %v", err)
+	}
+	if ref, err := f.fs.requireInode(f.srcInode, syscall.ESTALE); err != nil || ref.Path != "dst" {
+		t.Fatalf("source inode = %+v, err = %v", ref, err)
+	}
+	if ref, err := f.fs.requireInode(f.fileInode, syscall.ESTALE); err != nil || ref.Path != "dst/nested/value.txt" {
+		t.Fatalf("file inode = %+v, err = %v", ref, err)
+	}
+	fileHandle, err := f.fs.fileHandle(fileOpen.Handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileHandle.mu.Lock()
+	handlePath := fileHandle.path
+	fileHandle.mu.Unlock()
+	if handlePath != "dst/nested/value.txt" {
+		t.Fatalf("file handle path = %q", handlePath)
+	}
+	dirHandle, err := f.fs.dirHandle(dirOpen.Handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dirHandle.inode.Path != "dst/nested" {
+		t.Fatalf("directory handle path = %q", dirHandle.inode.Path)
+	}
+}
+
+func TestCanceledHydrationInterruptsRenameBeforeMutation(t *testing.T) {
+	tmp := t.TempDir()
+	repo := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	store, err := overlaystore.New(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	base := model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 4}
+	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{base.Path: base}}, Overlay: store}
+	resolver.SetGeneration(1)
+	hydrator := &blockingRenameHydrator{
+		fakeBatchHydrator: &fakeBatchHydrator{},
+		started:           make(chan struct{}),
+		proceed:           make(chan struct{}),
+	}
+	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: store, Hydrator: hydrator}
+	fs := NewArtifactFuse(repo, resolver, engine)
+	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: base.Path}
+	if err := fs.LookUpInode(context.Background(), lookup); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- fs.Rename(ctx, &fuseops.RenameOp{
+			OldParent: fuseops.RootInodeID, OldName: "file.txt",
+			NewParent: fuseops.RootInodeID, NewName: "renamed.txt",
+		})
+	}()
+	<-hydrator.started
+	cancel()
+	if err := <-done; err != syscall.EINTR {
+		t.Fatalf("Rename after canceled hydration = %v, want EINTR", err)
+	}
+	if _, err := resolver.ResolvePath("file.txt"); err != nil {
+		t.Fatalf("source resolve after interrupted rename: %v", err)
+	}
+	if _, err := resolver.ResolvePath("renamed.txt"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("destination resolve after interrupted rename = %v, want not exist", err)
+	}
+	entries, err := store.ListAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("interrupted rename left overlay entries: %+v", entries)
+	}
+	if got := fs.pathToInode["file.txt"]; got != lookup.Entry.Child {
+		t.Fatalf("source inode mapping = %d, want %d", got, lookup.Entry.Child)
+	}
+	if _, ok := fs.pathToInode["renamed.txt"]; ok {
+		t.Fatal("interrupted rename allocated a destination inode mapping")
+	}
+}
+
+func TestCanceledHydrationInterruptsOpenFile(t *testing.T) {
+	tmp := t.TempDir()
+	repo := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	store, err := overlaystore.New(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	base := model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 4}
+	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{base.Path: base}}, Overlay: store}
+	resolver.SetGeneration(1)
+	hydrator := &blockingRenameHydrator{
+		fakeBatchHydrator: &fakeBatchHydrator{},
+		started:           make(chan struct{}),
+		proceed:           make(chan struct{}),
+	}
+	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: store, Hydrator: hydrator}
+	fs := NewArtifactFuse(repo, resolver, engine)
+	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: base.Path}
+	if err := fs.LookUpInode(context.Background(), lookup); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = fs.OpenFile(ctx, &fuseops.OpenFileOp{Inode: lookup.Entry.Child})
+	if err != syscall.EINTR {
+		t.Fatalf("OpenFile after canceled hydration = %v, want EINTR", err)
+	}
+	select {
+	case <-hydrator.started:
+	default:
+		t.Fatal("OpenFile did not reach hydration")
+	}
+	if len(fs.fileHandles) != 0 {
+		t.Fatalf("canceled OpenFile allocated handles: %+v", fs.fileHandles)
+	}
+}
+
+func TestCanceledContextDoesNotHideOverlayStorageFailure(t *testing.T) {
+	f := newLocalOverlayFuseFixture(t)
+	storageErr := errors.New("overlay database unavailable")
+	failing := &failingLookupOverlay{OverlayStore: f.store, err: storageErr}
+	f.resolver.Overlay = failing
+	f.engine.Overlay = failing
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := f.fs.OpenFile(ctx, &fuseops.OpenFileOp{Inode: f.fileInode})
+	if err != syscall.EIO {
+		t.Fatalf("OpenFile storage failure = %v, want EIO", err)
+	}
+}
+
+func TestEngineRenamePreservesCanceledContext(t *testing.T) {
+	f := newLocalOverlayFuseFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := f.engine.Rename(ctx, "src", "dst"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Engine.Rename error = %v, want context.Canceled", err)
+	}
+}
 
 func TestInodeAttrsPreservesSeparateTimes(t *testing.T) {
 	mtime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)

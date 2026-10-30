@@ -611,7 +611,7 @@ func (fs *ArtifactFuse) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) erro
 		return err
 	}
 	// Eagerly load children at open time to avoid races on concurrent ReadDir.
-	entries, gen, commitTime, err := fs.resolver.ReaddirSnapshot(ctx, ref.Path)
+	entries, gen, commitTime, err := fs.resolver.ReaddirSnapshot(context.WithoutCancel(ctx), ref.Path)
 	if err != nil {
 		return syscall.EIO
 	}
@@ -743,7 +743,8 @@ func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) er
 	}
 	fh := &FileHandle{inode: ref, path: ref.Path}
 	if ref.Path != ".git" {
-		if ov, ok, err := fs.engine.Overlay.Lookup(ctx, ref.Path); err != nil {
+		metadataCtx := context.WithoutCancel(ctx)
+		if ov, ok, err := fs.engine.Overlay.Lookup(metadataCtx, ref.Path); err != nil {
 			return syscall.EIO
 		} else if ok && !ov.IsDeleted() {
 			f, err := os.OpenFile(ov.BackingPath, os.O_RDWR, 0)
@@ -756,8 +757,11 @@ func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) er
 			fh.cacheFile = f
 			fh.cacheGeneration = -1
 		} else {
-			f, gen, base, err := fs.engine.BaseCacheFile(ctx, ref.Path)
+			f, gen, base, err := fs.engine.baseCacheFile(ctx, metadataCtx, ref.Path)
 			if err != nil {
+				if isRequestCancellation(ctx, err) {
+					return syscall.EINTR
+				}
 				return syscall.EIO
 			}
 			if base {
@@ -954,6 +958,7 @@ func (fs *ArtifactFuse) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error 
 func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error {
 	fs.handleOps.Lock()
 	defer fs.handleOps.Unlock()
+	metadataCtx := context.WithoutCancel(ctx)
 	oldParent, err := fs.requireInode(op.OldParent, syscall.ENOENT)
 	if err != nil {
 		return err
@@ -985,14 +990,20 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 		}
 	}
 	if sourceType != "dir" {
-		if err := fs.engine.ensureOverlay(ctx, oldPath); err != nil {
+		if err := fs.engine.ensureOverlayWithContexts(ctx, metadataCtx, oldPath); err != nil {
+			if isRequestCancellation(ctx, err) {
+				return syscall.EINTR
+			}
 			return syscall.EIO
 		}
 		if err := fs.pinOpenHandles(oldPath); err != nil {
 			return syscall.EIO
 		}
 		if _, err := fs.resolver.ResolvePath(newPath); err == nil {
-			if err := fs.engine.ensureOverlay(ctx, newPath); err != nil {
+			if err := fs.engine.ensureOverlayWithContexts(ctx, metadataCtx, newPath); err != nil {
+				if isRequestCancellation(ctx, err) {
+					return syscall.EINTR
+				}
 				return syscall.EIO
 			}
 			if err := fs.pinOpenHandles(newPath); err != nil {
@@ -1000,7 +1011,10 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 			}
 		}
 	}
-	if err := fs.engine.Rename(ctx, oldPath, newPath); err != nil {
+	if err := fs.engine.rename(ctx, metadataCtx, oldPath, newPath); err != nil {
+		if isRequestCancellation(ctx, err) {
+			return syscall.EINTR
+		}
 		if errors.Is(err, iofs.ErrInvalid) {
 			return syscall.EINVAL
 		}
@@ -1016,6 +1030,10 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 	fs.detachOpenHandles(newPath)
 	fs.moveOpenHandles(oldPath, newPath)
 	return nil
+}
+
+func isRequestCancellation(ctx context.Context, err error) bool {
+	return ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
 }
 
 func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlinkOp) error {
