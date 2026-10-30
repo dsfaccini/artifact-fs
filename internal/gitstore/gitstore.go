@@ -105,6 +105,7 @@ type gitCommandError struct {
 	cause      error
 	contextErr error
 	retryable  bool // Classified before cause is redacted.
+	exitCode   int
 }
 
 type redactedCause struct {
@@ -1839,6 +1840,138 @@ func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfi
 	return s.ReadTreeHEAD(ctx, repo)
 }
 
+// ConfigureAdoptedWorktree preserves Git's refs, remotes, tracking and index.
+// Filesystem settings belong to the adopted worktree, never its native siblings.
+func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoConfig) error {
+	if strings.TrimSpace(repo.GitDir) == "" || strings.TrimSpace(repo.MountPath) == "" {
+		return errors.New("adoption requires a git dir and mount path")
+	}
+	if _, _, err := s.ResolveHEAD(ctx, repo); err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(repo.GitDir, "index")); err != nil {
+		return fmt.Errorf("adoption requires an initialized index: %w", err)
+	}
+	commonDir, err := runGit(ctx, repo.GitDir, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return err
+	}
+	commonDir, err = filepath.EvalSymlinks(strings.TrimSpace(commonDir))
+	if err != nil {
+		return err
+	}
+	gitDir, err := filepath.Abs(repo.GitDir)
+	if err != nil {
+		return err
+	}
+	gitDir, err = filepath.EvalSymlinks(gitDir)
+	if err != nil {
+		return err
+	}
+	registeredDir, err := filepath.EvalSymlinks(filepath.Join(commonDir, "worktrees"))
+	if err != nil || gitDir == commonDir || filepath.Dir(gitDir) != registeredDir {
+		return errors.New("adoption requires a registered linked worktree git dir")
+	}
+	gitfile, err := os.ReadFile(filepath.Join(gitDir, "gitdir"))
+	if err != nil {
+		return err
+	}
+	registeredGitfile := strings.TrimSpace(string(gitfile))
+	if !filepath.IsAbs(registeredGitfile) {
+		registeredGitfile = filepath.Join(gitDir, registeredGitfile)
+	}
+	registeredMount, err := filepath.EvalSymlinks(filepath.Dir(registeredGitfile))
+	if err != nil {
+		return err
+	}
+	requestedMount, err := filepath.Abs(repo.MountPath)
+	if err != nil {
+		return err
+	}
+	requestedMount, err = filepath.EvalSymlinks(requestedMount)
+	if err != nil {
+		return err
+	}
+	if filepath.Base(registeredGitfile) != ".git" || registeredMount != requestedMount {
+		return errors.New("adopted mount path must match the registered worktree path")
+	}
+	commonConfig := filepath.Join(commonDir, "config")
+	mainConfig := filepath.Join(commonDir, "config.worktree")
+	// Prepare the primary worktree's overrides before enabling the extension.
+	// Keep existing overrides: they already win over the shared config.
+	for _, key := range []string{"core.worktree", "core.bare"} {
+		args := []string{"config", "--file", commonConfig}
+		if key == "core.bare" {
+			args = append(args, "--bool", "--get", key)
+		} else {
+			// Keep path whitespace across runGit's textual output trimming.
+			args = append(args, "--null", "--get-regexp", "^core\\.worktree$")
+		}
+		value, readErr := runGit(ctx, repo.GitDir, args...)
+		if readErr != nil {
+			var exitErr *gitCommandError
+			if errors.As(readErr, &exitErr) && exitErr.exitCode == 1 {
+				continue
+			}
+			return readErr
+		}
+		if key == "core.worktree" {
+			_, path, found := strings.Cut(value, "\n")
+			if !found || !strings.HasSuffix(path, "\x00") {
+				return errors.New("invalid core.worktree config output")
+			}
+			value = strings.TrimSuffix(path, "\x00")
+		} else if value != "true" {
+			continue
+		}
+		if _, readErr := runGit(ctx, repo.GitDir, "config", "--file", mainConfig, "--get", key); readErr != nil {
+			var exitErr *gitCommandError
+			if !errors.As(readErr, &exitErr) || exitErr.exitCode != 1 {
+				return readErr
+			}
+			if _, err := runGit(ctx, repo.GitDir, "config", "--file", mainConfig, key, value); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := runGit(ctx, repo.GitDir, "config", "--file", commonConfig, "extensions.worktreeConfig", "true"); err != nil {
+		return err
+	}
+	for _, key := range []string{"core.worktree", "core.bare"} {
+		if key == "core.bare" {
+			value, err := runGit(ctx, repo.GitDir, "config", "--file", commonConfig, "--bool", "--get", key)
+			if err != nil {
+				var exitErr *gitCommandError
+				if errors.As(err, &exitErr) && exitErr.exitCode == 1 {
+					continue
+				}
+				return err
+			}
+			if strings.TrimSpace(value) != "true" {
+				continue
+			}
+		}
+		if _, err := runGit(ctx, repo.GitDir, "config", "--file", commonConfig, "--unset-all", key); err != nil {
+			var exitErr *gitCommandError
+			if !errors.As(err, &exitErr) || exitErr.exitCode != 5 {
+				return err
+			}
+		}
+	}
+	for _, setting := range [][2]string{
+		{"core.bare", "false"},
+		{"core.worktree", requestedMount},
+		{"core.filemode", "true"},
+		{"core.ignorecase", "false"},
+		{"core.symlinks", "true"},
+	} {
+		if _, err := runGit(ctx, repo.GitDir, "config", "--worktree", setting[0], setting[1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.RepoConfig, stateRoot string) error {
 	if repo.RequiredCommit != "" && strings.TrimSpace(repo.MountPath) != "" {
 		if _, err := os.Stat(repo.MountPath); err != nil {
@@ -1859,6 +1992,13 @@ func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.Repo
 // ConfigureFSMonitorHook installs ArtifactFS's hook without probing the
 // worktree, which may still be gated during startup.
 func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfig, stateRoot string) error {
+	configArgs := []string{"config"}
+	if repo.AdoptGitDir {
+		if err := s.ConfigureAdoptedWorktree(ctx, repo); err != nil {
+			return err
+		}
+		configArgs = append(configArgs, "--worktree")
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -1872,10 +2012,10 @@ func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfi
 	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
 		return err
 	}
-	if _, err := runGit(ctx, repo.GitDir, "config", "core.fsmonitor", hookPath); err != nil {
+	if _, err := runGit(ctx, repo.GitDir, append(configArgs, "core.fsmonitor", hookPath)...); err != nil {
 		return err
 	}
-	if _, err := runGit(ctx, repo.GitDir, "config", "fsmonitor.allowRemote", "true"); err != nil {
+	if _, err := runGit(ctx, repo.GitDir, append(configArgs, "fsmonitor.allowRemote", "true")...); err != nil {
 		return err
 	}
 	// Git adds the fsmonitor extension on the next porcelain index read. The
@@ -2213,7 +2353,11 @@ func runGitWithEnvCapture(ctx context.Context, gitDir string, extraEnv []string,
 	} else if runErr != nil && !(contextErr != nil && strings.EqualFold(strings.TrimSpace(runErr.Error()), "signal: killed")) {
 		cause = errors.New(auth.RedactString(runErr.Error()))
 	}
-	return out, &gitCommandError{cause: cause, contextErr: contextErr, retryable: retryable}
+	exitCode := -1
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	}
+	return out, &gitCommandError{cause: cause, contextErr: contextErr, retryable: retryable, exitCode: exitCode}
 }
 
 func configureCancelableCommand(cmd *exec.Cmd) {

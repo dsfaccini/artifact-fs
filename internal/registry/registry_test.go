@@ -33,6 +33,7 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 		OverlayDBPath:         "/overlay/repo/meta.sqlite",
 		Enabled:               true,
 		PreparedGitDir:        true,
+		AdoptGitDir:           true,
 		FetchRef:              "master",
 		PrepareState:          model.PrepareStatePreparing,
 		RequiredCommit:        "0123456789012345678901234567890123456789",
@@ -50,6 +51,9 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 	got, err := store.GetRepo(ctx, "repo")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !got.AdoptGitDir {
+		t.Fatal("AdoptGitDir = false, want true")
 	}
 	if !got.PreparedGitDir {
 		t.Fatal("PreparedGitDir = false, want true")

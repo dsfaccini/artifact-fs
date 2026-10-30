@@ -68,6 +68,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				ucli.StringFlag{Name: "refresh", Value: "30s", Usage: "remote refresh interval or never"},
 				ucli.StringFlag{Name: "mount-root", Usage: "override mount root"},
 				ucli.BoolFlag{Name: "async", Usage: "return after registration and prepare the repo in the daemon"},
+				ucli.BoolFlag{Name: "adopt-gitdir", Usage: "adopt an initialized linked worktree without fetching or resetting its index"},
 				ucli.BoolFlag{Name: "prepared-gitdir", Usage: "use an existing git dir for async preparation"},
 				ucli.StringFlag{Name: "git-dir", Usage: "explicit git dir path"},
 				ucli.StringFlag{Name: "blob-cache-dir", Usage: "directory for hydrated blobs; may be shared between repositories"},
@@ -85,11 +86,23 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					ref = "refs/heads/" + strings.TrimPrefix(branch, "refs/heads/")
 				}
 				requiredCommit := strings.TrimSpace(c.String("require-commit"))
+				async := c.Bool("async")
+				preparedGitDir := c.Bool("prepared-gitdir")
+				adoptGitDir := c.Bool("adopt-gitdir")
+				if adoptGitDir {
+					for _, flag := range []string{"remote", "ref", "branch", "fetch-ref", "require-commit", "depth", "async", "prepared-gitdir"} {
+						if c.IsSet(flag) {
+							return fmt.Errorf("--adopt-gitdir cannot be combined with --%s", flag)
+						}
+					}
+					if c.IsSet("refresh") && !strings.EqualFold(strings.TrimSpace(c.String("refresh")), "never") {
+						return fmt.Errorf("--adopt-gitdir requires remote refresh to remain disabled")
+					}
+					ref = "HEAD"
+				}
 				if requiredCommit != "" && !c.IsSet("ref") && !c.IsSet("branch") {
 					return fmt.Errorf("--require-commit requires an explicit --ref")
 				}
-				async := c.Bool("async")
-				preparedGitDir := c.Bool("prepared-gitdir")
 				if preparedGitDir && !async {
 					return fmt.Errorf("--prepared-gitdir requires --async")
 				}
@@ -99,10 +112,13 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				if name == "" {
 					return fmt.Errorf("--name is required")
 				}
-				if remote == "" && !preparedGitDir {
+				if remote == "" && !preparedGitDir && !adoptGitDir {
 					return fmt.Errorf("--remote is required")
 				}
 				refreshValue := strings.TrimSpace(c.String("refresh"))
+				if adoptGitDir {
+					refreshValue = "never"
+				}
 				d, err := daemon.ParseRefresh(refreshValue)
 				if err != nil {
 					return err
@@ -120,6 +136,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					GitDir:                c.String("git-dir"),
 					BlobCacheDir:          c.String("blob-cache-dir"),
 					PreparedGitDir:        preparedGitDir,
+					AdoptGitDir:           adoptGitDir,
 					FetchRef:              c.String("fetch-ref"),
 					Enabled:               true,
 				}

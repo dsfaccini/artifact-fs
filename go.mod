@@ -21,3 +21,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )
+
+replace github.com/jacobsa/fuse => github.com/dsfaccini/fuse v0.0.0-20261030184435-ffa139e8f611

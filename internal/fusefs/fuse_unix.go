@@ -9,6 +9,7 @@ import (
 	iofs "io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -33,6 +34,7 @@ type ArtifactFuse struct {
 	repo           model.RepoConfig
 	resolver       *Resolver
 	engine         *Engine
+	fskit          bool
 	gitfileContent []byte // synthesized .git gitfile, computed once
 
 	mu           sync.RWMutex
@@ -58,6 +60,7 @@ type InodeRef struct {
 }
 
 type DirHandle struct {
+	mu         sync.Mutex
 	inode      *InodeRef
 	gen        int64
 	commitTime int64
@@ -103,6 +106,7 @@ func NewArtifactFuse(repo model.RepoConfig, resolver *Resolver, engine *Engine) 
 		repo:           repo,
 		resolver:       resolver,
 		engine:         engine,
+		fskit:          runtime.GOOS == "darwin" && os.Getenv("ARTIFACT_FS_FUSE_BACKEND") == "fskit",
 		gitfileContent: fmt.Appendf(nil, "gitdir: %s\n", repo.GitDir),
 		inodes:         make(map[fuseops.InodeID]*InodeRef),
 		pathToInode:    make(map[string]fuseops.InodeID),
@@ -611,12 +615,9 @@ func (fs *ArtifactFuse) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) erro
 		return err
 	}
 	// Eagerly load children at open time to avoid races on concurrent ReadDir.
-	entries, gen, commitTime, err := fs.resolver.ReaddirSnapshot(context.WithoutCancel(ctx), ref.Path)
+	entries, gen, commitTime, err := fs.readDirSnapshot(ctx, ref)
 	if err != nil {
 		return syscall.EIO
-	}
-	if ref.IsRoot {
-		entries = append([]ReaddirEntry{{Name: ".git", Type: "file", Mode: 0o644, SizeBytes: int64(len(fs.gitfileContent)), SizeState: "known"}}, entries...)
 	}
 
 	dh := &DirHandle{inode: ref, gen: gen, commitTime: commitTime, entries: entries}
@@ -629,10 +630,33 @@ func (fs *ArtifactFuse) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) erro
 	return nil
 }
 
-func (fs *ArtifactFuse) ReadDir(_ context.Context, op *fuseops.ReadDirOp) error {
+func (fs *ArtifactFuse) readDirSnapshot(ctx context.Context, ref *InodeRef) ([]ReaddirEntry, int64, int64, error) {
+	entries, gen, commitTime, err := fs.resolver.ReaddirSnapshot(context.WithoutCancel(ctx), ref.Path)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if ref.IsRoot {
+		entries = append([]ReaddirEntry{{Name: ".git", Type: "file", Mode: 0o644, SizeBytes: int64(len(fs.gitfileContent)), SizeState: "known"}}, entries...)
+	}
+	return entries, gen, commitTime, nil
+}
+
+func (fs *ArtifactFuse) ReadDir(ctx context.Context, op *fuseops.ReadDirOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	dh, err := fs.dirHandle(op.Handle)
 	if err != nil {
 		return err
+	}
+	dh.mu.Lock()
+	defer dh.mu.Unlock()
+	// FSKit keeps a directory handle across separate enumerations.
+	if fs.fskit && op.Offset == 0 {
+		entries, gen, commitTime, err := fs.readDirSnapshot(ctx, dh.inode)
+		if err != nil {
+			return syscall.EIO
+		}
+		dh.entries, dh.gen, dh.commitTime = entries, gen, commitTime
 	}
 
 	offset := int(op.Offset)
@@ -660,6 +684,8 @@ func (fs *ArtifactFuse) ReadDirPlus(_ context.Context, op *fuseops.ReadDirPlusOp
 	if err != nil {
 		return err
 	}
+	dh.mu.Lock()
+	defer dh.mu.Unlock()
 
 	offset := int(op.Offset)
 	for i := offset; i < len(dh.entries); i++ {
@@ -1136,6 +1162,10 @@ func (fs *ArtifactFuse) ListXattr(_ context.Context, _ *fuseops.ListXattrOp) err
 	return syscall.ENOSYS
 }
 func (fs *ArtifactFuse) SetXattr(_ context.Context, _ *fuseops.SetXattrOp) error {
+	if fs.fskit {
+		// ENOSYS enables native AppleDouble fallback files, including ._.venv.
+		return syscall.EPERM
+	}
 	return syscall.ENOSYS
 }
 func (fs *ArtifactFuse) RemoveXattr(_ context.Context, _ *fuseops.RemoveXattrOp) error {

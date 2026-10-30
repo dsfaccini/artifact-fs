@@ -45,6 +45,7 @@ type RepoConfig struct {
 	OverlayDBPath         string
 	Enabled               bool
 	PreparedGitDir        bool
+	AdoptGitDir           bool
 	FetchRef              string
 	PrepareState          string
 	PrepareError          string
@@ -202,6 +203,7 @@ type GitStore interface {
 	ReadTreeHEAD(ctx context.Context, repo RepoConfig) error
 	PrepareFetchedBranch(ctx context.Context, repo RepoConfig, ref string) error
 	ValidatePreparedGitDir(ctx context.Context, repo RepoConfig) error
+	ConfigureAdoptedWorktree(ctx context.Context, repo RepoConfig) error
 }
 
 type SnapshotStore interface {

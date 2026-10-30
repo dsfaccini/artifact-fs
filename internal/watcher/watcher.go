@@ -42,48 +42,84 @@ func (p *Poller) Watch(ctx context.Context, gitDir string, fn func()) {
 }
 
 func (p *Poller) headChanged(headPath string) bool {
-	if p.changed(headPath) {
-		// A HEAD switch selects a different ref path. Prime that ref immediately
-		// so the next branch-tip advance is compared against the new baseline.
-		if refPath, ok := p.headRefPath(headPath); ok {
-			p.primeCurrentRef(refPath)
+	headChanged := p.changed(headPath)
+	ref, ok := p.headRefPath(headPath)
+	if headChanged {
+		if ok {
+			_ = p.currentRefChanged(ref)
 		}
 		return true
 	}
-	refPath, ok := p.headRefPath(headPath)
-	if !ok {
+	return ok && p.currentRefChanged(ref)
+}
+
+type headReference struct {
+	path       string
+	name       string
+	packedPath string
+}
+
+func (p *Poller) currentRefChanged(ref headReference) bool {
+	data, err := os.ReadFile(ref.path)
+	value := strings.TrimSpace(string(data))
+	found := err == nil
+	if err != nil && !os.IsNotExist(err) {
 		return false
 	}
-	return p.currentRefChanged(refPath)
-}
-
-func (p *Poller) primeCurrentRef(refPath string) {
-	_ = p.currentRefChanged(refPath)
-}
-
-func (p *Poller) currentRefChanged(refPath string) bool {
-	if _, err := os.Stat(refPath); err != nil {
-		p.firstSeenChange[refPath] = struct{}{}
-		return false
+	if !found {
+		packed, err := os.ReadFile(ref.packedPath)
+		if err != nil && !os.IsNotExist(err) {
+			return false
+		}
+		for line := range strings.SplitSeq(string(packed), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) == 2 && fields[1] == ref.name {
+				value, found = fields[0], true
+				break
+			}
+		}
 	}
-	return p.changed(refPath)
+	if !found {
+		_, hadValue := p.prev[ref.path]
+		delete(p.prev, ref.path)
+		p.firstSeenChange[ref.path] = struct{}{}
+		return hadValue
+	}
+	previous, seen := p.prev[ref.path]
+	p.prev[ref.path] = value
+	_, changeOnFirstSeen := p.firstSeenChange[ref.path]
+	delete(p.firstSeenChange, ref.path)
+	return (seen && previous != value) || (!seen && changeOnFirstSeen)
 }
 
-func (p *Poller) headRefPath(headPath string) (string, bool) {
+func (p *Poller) headRefPath(headPath string) (headReference, bool) {
 	data, err := os.ReadFile(headPath)
 	if err != nil {
-		return "", false
+		return headReference{}, false
 	}
 	line := strings.TrimSpace(string(data))
 	ref, ok := strings.CutPrefix(line, "ref: ")
 	if !ok {
-		return "", false
+		return headReference{}, false
 	}
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
-		return "", false
+		return headReference{}, false
 	}
-	return filepath.Join(filepath.Dir(headPath), filepath.FromSlash(ref)), true
+	gitDir := filepath.Dir(headPath)
+	// Git keeps these namespaces private; ordinary branch refs and packed-refs
+	// live in the common directory of a linked worktree.
+	if !strings.HasPrefix(ref, "refs/bisect/") && !strings.HasPrefix(ref, "refs/worktree/") && !strings.HasPrefix(ref, "refs/rewritten/") {
+		if common, err := os.ReadFile(filepath.Join(gitDir, "commondir")); err == nil {
+			commonDir := strings.TrimSpace(string(common))
+			if filepath.IsAbs(commonDir) {
+				gitDir = commonDir
+			} else {
+				gitDir = filepath.Join(gitDir, commonDir)
+			}
+		}
+	}
+	return headReference{path: filepath.Join(gitDir, filepath.FromSlash(ref)), name: ref, packedPath: filepath.Join(gitDir, "packed-refs")}, true
 }
 
 func (p *Poller) changed(path string) bool {

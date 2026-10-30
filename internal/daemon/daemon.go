@@ -449,6 +449,7 @@ func samePrepareConfig(a model.RepoConfig, b model.RepoConfig) bool {
 		a.HistoryDepth == b.HistoryDepth &&
 		a.RemoteRefreshDisabled == b.RemoteRefreshDisabled &&
 		a.PreparedGitDir == b.PreparedGitDir &&
+		a.AdoptGitDir == b.AdoptGitDir &&
 		a.FetchRef == b.FetchRef &&
 		a.GitDir == b.GitDir &&
 		a.MetaDBPath == b.MetaDBPath &&
@@ -460,6 +461,17 @@ func samePrepareConfig(a model.RepoConfig, b model.RepoConfig) bool {
 }
 
 func normalizeSourceConfig(cfg *model.RepoConfig) error {
+	if cfg.AdoptGitDir {
+		if strings.TrimSpace(cfg.GitDir) == "" {
+			return errors.New("--adopt-gitdir requires --git-dir")
+		}
+		if cfg.PreparedGitDir || cfg.RemoteURL != "" || cfg.RequiredCommit != "" || cfg.HistoryDepth != 0 || cfg.FetchRef != "" || (cfg.Branch != "" && cfg.Branch != "HEAD") {
+			return errors.New("--adopt-gitdir cannot fetch, select a source ref, or prepare a remote git dir")
+		}
+		cfg.Branch = "HEAD"
+		cfg.RemoteRefreshDisabled = true
+		return nil
+	}
 	cfg.Branch = strings.TrimSpace(cfg.Branch)
 	if cfg.Branch == "" {
 		cfg.Branch = "refs/heads/main"
@@ -505,6 +517,9 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 	if err := model.ValidateRepoName(cfg.Name); err != nil {
 		return err
 	}
+	if cfg.AdoptGitDir && opts.Async {
+		return errors.New("--adopt-gitdir cannot be combined with --async")
+	}
 	if err := normalizeSourceConfig(&cfg); err != nil {
 		return err
 	}
@@ -517,7 +532,18 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 	}
 	explicitGitDir := strings.TrimSpace(cfg.GitDir) != ""
 	s.fillPaths(&cfg)
-	if strings.TrimSpace(cfg.FetchRef) == "" {
+	if cfg.AdoptGitDir {
+		var err error
+		cfg.GitDir, err = filepath.Abs(cfg.GitDir)
+		if err != nil {
+			return err
+		}
+		cfg.MountPath, err = filepath.Abs(cfg.MountPath)
+		if err != nil {
+			return err
+		}
+	}
+	if !cfg.AdoptGitDir && strings.TrimSpace(cfg.FetchRef) == "" {
 		cfg.FetchRef = defaultFetchRef(cfg.Branch)
 	}
 	cfg.ConfigVersion = rand.Text()
@@ -632,6 +658,9 @@ func (s *Service) SetRefresh(ctx context.Context, name string, interval time.Dur
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
 		return err
+	}
+	if cfg.AdoptGitDir && !disabled {
+		return errors.New("remote refresh cannot be enabled for an adopted worktree")
 	}
 	cfg.RefreshInterval = interval
 	cfg.RemoteRefreshDisabled = disabled
@@ -759,7 +788,7 @@ func (s *Service) Prepare(ctx context.Context, name string) error {
 		}
 		return s.persistSyncPrepareSuccess(ctx, cfg)
 	}
-	if strings.TrimSpace(cfg.FetchRef) == "" {
+	if !cfg.AdoptGitDir && strings.TrimSpace(cfg.FetchRef) == "" {
 		cfg.FetchRef = defaultFetchRef(cfg.Branch)
 	}
 	if s.resetRunningPrepareState(cfg) {
@@ -883,6 +912,16 @@ func (s *Service) prepareRepo(ctx context.Context, cfg model.RepoConfig) (retErr
 }
 
 func (s *Service) prepareSource(ctx context.Context, cfg model.RepoConfig) (model.PreparedSource, error) {
+	if cfg.AdoptGitDir {
+		if err := s.git.ConfigureAdoptedWorktree(ctx, cfg); err != nil {
+			return model.PreparedSource{}, err
+		}
+		headOID, headRef, err := s.git.ResolveHEAD(ctx, cfg)
+		if err != nil {
+			return model.PreparedSource{}, err
+		}
+		return model.PreparedSource{Ref: headRef, Commit: headOID}, nil
+	}
 	if cfg.RequiredCommit != "" {
 		return s.git.PrepareSource(ctx, cfg, model.SourceRequirement{
 			Ref:            cfg.Branch,
@@ -990,6 +1029,17 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		snap, headOID, headRef, gen, err = s.ensurePreparedRepo(prepareCtx, cfg, true)
 		if err != nil {
 			return err
+		}
+		if cfg.AdoptGitDir {
+			entries, readErr := os.ReadDir(cfg.MountPath)
+			if readErr != nil || len(entries) != 0 {
+				snap.Close()
+				snap = nil
+				if readErr != nil {
+					return readErr
+				}
+				return errors.New("adopted mountpoint must be empty; native working files are not imported")
+			}
 		}
 		if cfg.RequiredCommit == "" {
 			if err := s.git.EnsureIndexInitialized(prepareCtx, cfg); err != nil {
@@ -1232,7 +1282,7 @@ func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
 
 func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, attempt int64) (retErr error) {
 	s.fillPaths(&cfg)
-	if strings.TrimSpace(cfg.FetchRef) == "" {
+	if !cfg.AdoptGitDir && strings.TrimSpace(cfg.FetchRef) == "" {
 		cfg.FetchRef = defaultFetchRef(cfg.Branch)
 	}
 	started := time.Now()

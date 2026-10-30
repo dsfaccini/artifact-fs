@@ -43,6 +43,29 @@ Or build it directly from the module path:
 go build -o artifact-fs github.com/cloudflare/artifact-fs/cmd/artifact-fs
 ```
 
+### Native macOS FSKit backend in this fork
+
+This fork pins an FSKit-capable `jacobsa/fuse` replacement. Build from this
+checkout with macFUSE 5.5+ installed:
+
+```bash
+CGO_ENABLED=1 \
+CGO_CFLAGS='-F/Library/Filesystems/macfuse.fs/Contents/Frameworks' \
+CGO_LDFLAGS='-F/Library/Filesystems/macfuse.fs/Contents/Frameworks' \
+GOWORK=off go build -tags fskit -o artifact-fs ./cmd/artifact-fs
+```
+
+Enable the `macFUSE` and `macFUSE (local)` file system extensions in System
+Settings, then set `ARTIFACT_FS_FUSE_BACKEND=fskit` for the daemon. This uses
+the user-space filesystem extension and requires no kernel extension. Builds
+without the `fskit` tag retain the existing transport.
+
+FSKit reuses directory handles across enumerations, so this backend refreshes
+entries when enumeration restarts. It rejects extended attributes to prevent
+AppleDouble metadata files; use `cp -X` when copying files with Finder metadata.
+The native mount API has no supported cancellation for a permanently stalled
+system mount service.
+
 Quick start against a public repo:
 
 ```bash
@@ -173,6 +196,49 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
   --git-dir /tmp/workers-sdk.git \
   --fetch-ref main
 ```
+
+## Adopting linked Git worktrees
+
+`--adopt-gitdir` registers an initialized linked worktree without cloning, fetching,
+changing refs or upstream tracking, or replacing its Git index. The GitDir must
+already contain a valid HEAD and index, and its registered worktree path must
+match the mountpoint. Primary GitDirs and relocation are rejected before config
+writes. The mountpoint must be empty: adoption
+uses Git metadata and does not import native working files. This mode preserves normal linked
+worktree discovery, shared objects and refs, and private HEAD/index state:
+
+```bash
+git -C /path/to/base worktree add --no-checkout -b topic /path/to/mounts/topic main
+topic_gitdir=$(git -C /path/to/mounts/topic rev-parse --absolute-git-dir)
+git --git-dir="$topic_gitdir" read-tree HEAD
+git -C /path/to/base worktree lock --reason 'ArtifactFS workspace' /path/to/mounts/topic
+# Save the gitfile outside the mountpoint so the mountpoint is empty.
+mv /path/to/mounts/topic/.git /path/to/topic.gitfile
+
+ARTIFACT_FS_ROOT=/path/to/topic-state artifact-fs add-repo \
+  --name topic --adopt-gitdir --git-dir "$topic_gitdir" \
+  --mount-root /path/to/mounts --blob-cache-dir /path/to/shared-blobs
+ARTIFACT_FS_ROOT=/path/to/topic-state artifact-fs daemon --root /path/to/mounts
+```
+
+Adoption disables remote refresh and rejects acquisition options (`--remote`,
+`--ref`, `--branch`, `--fetch-ref`, `--depth`, `--require-commit`, `--async`, and
+`--prepared-gitdir`). An explicit `--refresh never` is accepted. Local HEAD
+watching remains active, including shared loose and packed branch refs, so
+commits and branch changes reconcile normally. Run ordinary Git fetch/push
+commands when needed; the worktree's original remote configuration is retained.
+
+ArtifactFS enables `extensions.worktreeConfig`, migrating shared `core.worktree`
+and `core.bare=true` settings into the primary worktree's config when necessary.
+Existing primary overrides are retained. It pins the adopted worktree's path,
+filesystem semantics and FSMonitor hook in that worktree's config; native
+siblings retain their settings.
+
+Stop the owning daemon and wait for process exit and actual unmount before
+restoring the saved gitfile, unlocking metadata or removing the worktree.
+`remove-repo` only updates the registry when invoked outside the owning daemon;
+its return alone does not acknowledge that the live mount has stopped. Preserve
+a recovery ref before deleting a branch containing local commits.
 
 ## Verified shallow sources
 
