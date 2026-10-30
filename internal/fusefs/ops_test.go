@@ -2,6 +2,7 @@ package fusefs
 
 import (
 	"context"
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"os"
@@ -367,13 +368,19 @@ func TestRenameBaseDirectoryHydratesAndMovesContents(t *testing.T) {
 	}
 }
 
-func TestRenameRecreatedTrackedFilePreservesSource(t *testing.T) {
-	for _, trackedDestination := range []bool{false, true} {
-		name := "absent destination"
-		if trackedDestination {
-			name = "tracked destination"
-		}
-		t.Run(name, func(t *testing.T) {
+func TestRenameRecreatedTrackedEntryHidesSource(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		sourceType         string
+		sourceMode         uint32
+		trackedDestination bool
+	}{
+		{"file/absent destination", "file", 0o100644, false},
+		{"file/tracked destination", "file", 0o100644, true},
+		{"symlink/absent destination", "symlink", 0o120000, false},
+		{"symlink/tracked destination", "symlink", 0o120000, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			tmp := t.TempDir()
 			cfg := model.RepoConfig{
@@ -393,9 +400,9 @@ func TestRenameRecreatedTrackedFilePreservesSource(t *testing.T) {
 				t.Fatal(err)
 			}
 			nodes := map[string]model.BaseNode{
-				"README.md": {Path: "README.md", Type: "file", Mode: 0o100644, ObjectOID: "source-oid"},
+				"README.md": {Path: "README.md", Type: tc.sourceType, Mode: tc.sourceMode, ObjectOID: "source-oid"},
 			}
-			if trackedDestination {
+			if tc.trackedDestination {
 				nodes["destination.txt"] = model.BaseNode{Path: "destination.txt", Type: "file", Mode: 0o100644, ObjectOID: "destination-oid"}
 			}
 			children := make([]model.BaseNode, 0, len(nodes))
@@ -407,11 +414,17 @@ func TestRenameRecreatedTrackedFilePreservesSource(t *testing.T) {
 			resolver.SetGeneration(1)
 			engine := &Engine{Repo: cfg, Resolver: resolver, Overlay: ov, Hydrator: &fakeBatchHydrator{path: cachePath}}
 
-			if err := engine.Rename(ctx, "README.md", "first.md"); err != nil {
-				t.Fatal(err)
-			}
-			if err := engine.Unlink(ctx, "first.md"); err != nil {
-				t.Fatal(err)
+			if tc.sourceType == "symlink" {
+				if err := engine.Unlink(ctx, "README.md"); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := engine.Rename(ctx, "README.md", "first.md"); err != nil {
+					t.Fatal(err)
+				}
+				if err := engine.Unlink(ctx, "first.md"); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := engine.Create(ctx, "README.md", 0o644); err != nil {
 				t.Fatal(err)
@@ -432,7 +445,7 @@ func TestRenameRecreatedTrackedFilePreservesSource(t *testing.T) {
 			}
 
 			destination := "second.md"
-			if trackedDestination {
+			if tc.trackedDestination {
 				destination = "destination.txt"
 			}
 			if err := engine.Rename(ctx, "README.md", destination); err != nil {
@@ -441,6 +454,15 @@ func TestRenameRecreatedTrackedFilePreservesSource(t *testing.T) {
 
 			if _, err := resolver.ResolvePath("README.md"); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("source resolve error = %v, want not exist", err)
+			}
+			if err := ov.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+				node, ok := snapshot.nodes[path]
+				return node, ok
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := resolver.ResolvePath("README.md"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("source resolve error after reconciliation = %v, want not exist", err)
 			}
 			entries, err := resolver.ReaddirTyped(ctx, ".")
 			if err != nil {
@@ -472,6 +494,29 @@ func TestRenameRecreatedTrackedFilePreservesSource(t *testing.T) {
 			}
 			if !ok || destinationEntry.Kind != model.OverlayKindRename || destinationEntry.SourceOID != "source-oid" {
 				t.Fatalf("destination overlay entry = %+v, exists = %t; want rename from original source", destinationEntry, ok)
+			}
+			if destinationEntry.NodeType() != "file" || destinationEntry.Mode != 0o644 || destinationEntry.SourceMode != tc.sourceMode {
+				t.Fatalf("destination entry = %+v; want regular replacement with original source metadata", destinationEntry)
+			}
+
+			blob := fmt.Sprintf("blob %d\x00%s", len(content), content)
+			committed := model.BaseNode{
+				Path: destination, Type: "file", Mode: 0o100644,
+				ObjectOID: fmt.Sprintf("%x", sha1.Sum([]byte(blob))),
+			}
+			snapshot.nodes = map[string]model.BaseNode{destination: committed}
+			snapshot.kids = map[string][]model.BaseNode{".": {committed}}
+			resolver.SetGeneration(2)
+			if err := ov.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+				node, ok := snapshot.nodes[path]
+				return node, ok
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, path := range []string{"README.md", destination} {
+				if entry, ok, err := ov.Lookup(ctx, path); err != nil || ok {
+					t.Fatalf("overlay after commit at %s = (%+v, %t, %v); want no pending entry", path, entry, ok, err)
+				}
 			}
 		})
 	}

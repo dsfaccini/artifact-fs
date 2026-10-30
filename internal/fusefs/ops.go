@@ -179,7 +179,7 @@ func (e *Engine) rename(ctx, metadataCtx context.Context, oldPath, newPath strin
 		if ov.Kind == model.OverlayKindCreate {
 			if src, ok, err := e.Resolver.Snapshot.LookupNode(metadataCtx, gen, oldPath); err != nil {
 				return err
-			} else if ok && src.Type == "file" {
+			} else if ok && (src.Type == "file" || src.Type == "symlink") {
 				if err := e.Overlay.RenameAndMarkModifiedFromBase(metadataCtx, oldPath, oldPath, src.ObjectOID, src.Mode); err != nil {
 					return err
 				}
