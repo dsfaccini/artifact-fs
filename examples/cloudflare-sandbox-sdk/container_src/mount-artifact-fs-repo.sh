@@ -127,7 +127,7 @@ ensure_daemon() {
   fi
 
   echo "artifact-fs: starting daemon under ${MOUNT_ROOT}"
-  nohup artifact-fs daemon --root "$MOUNT_ROOT" >"$ARTIFACT_FS_DAEMON_LOG" 2>&1 </dev/null &
+  nohup artifact-fs daemon --root "$MOUNT_ROOT" >"$ARTIFACT_FS_DAEMON_LOG" 2>&1 </dev/null 9>&- &
   echo "$!" >"$ARTIFACT_FS_DAEMON_PID_FILE"
 }
 

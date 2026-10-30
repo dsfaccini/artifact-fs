@@ -1,6 +1,5 @@
-import { getSandbox } from '@cloudflare/sandbox';
-
-export { Sandbox } from '@cloudflare/sandbox';
+import { Files, SandboxFileError } from '@cloudflare/sandbox';
+import { DurableObject } from 'cloudflare:workers';
 
 type Env = WorkerBindings & {
   readonly SANDBOX_API_TOKEN?: string;
@@ -36,6 +35,272 @@ const DEFAULT_METADATA_FILE = '/workspace/.artifact-fs-mount';
 const MOUNT_SCRIPT = '/usr/local/bin/mount-artifact-fs-repo';
 const MAX_REQUEST_BODY_BYTES = 16 * 1024;
 const MOUNT_CONFLICT_EXIT_CODE = 42;
+const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000;
+
+type CommandResult = { exitCode: number; stdout: string; stderr: string };
+
+type MountResult =
+  | { conflict: string }
+  | {
+      sandboxId: string;
+      remote: string;
+      branch: string;
+      repoName: string;
+      mountPath: string;
+      bootstrapLog: string;
+      head: string | null;
+      gitStatus: string | null;
+      artifactFsStatus: string;
+    };
+
+type StatusResult =
+  | { missing: true }
+  | { conflict: string }
+  | {
+      sandboxId: string;
+      remote: string;
+      branch: string;
+      repoName: string;
+      mountPath: string;
+      head: string | null;
+      gitStatus: string | null;
+      artifactFsStatus: string;
+    };
+
+export class Sandbox extends DurableObject<Env> {
+  private setup: Promise<void> | null = null;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+
+    const container = ctx.container;
+    if (container?.running) {
+      void ctx.blockConcurrencyWhile(() =>
+        container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS)
+      );
+    }
+  }
+
+  async mount(config: MountConfig): Promise<MountResult> {
+    await this.ensureRunning(config.env);
+
+    const existingMetadata = await this.readMountMetadata();
+    const mountConflict = compareMountMetadata(existingMetadata, config);
+    if (mountConflict) {
+      return { conflict: mountConflict };
+    }
+
+    let bootstrap: CommandResult;
+    try {
+      bootstrap = await this.runCommand(
+        ['timeout', '--kill-after=5s', '120s', MOUNT_SCRIPT],
+        config.env
+      );
+    } catch (error) {
+      await this.destroyAfterFailure();
+      throw error;
+    }
+
+    if (bootstrap.exitCode === MOUNT_CONFLICT_EXIT_CODE) {
+      return {
+        conflict: 'Sandbox is already initialized for a different repo or branch'
+      };
+    }
+
+    if (bootstrap.exitCode !== 0) {
+      const commandError = new SandboxCommandError(
+        'ArtifactFS bootstrap failed',
+        MOUNT_SCRIPT,
+        bootstrap.exitCode
+      );
+      await this.destroyAfterFailure();
+      throw commandError;
+    }
+
+    const repo = await this.collectMountedRepoState(
+      config.repoName,
+      config.mountPath,
+      config.env
+    );
+
+    return {
+      sandboxId: config.sandboxId,
+      remote: config.remote,
+      branch: config.branch,
+      repoName: config.repoName,
+      mountPath: config.mountPath,
+      bootstrapLog: bootstrap.stdout.trim(),
+      ...repo
+    };
+  }
+
+  async status(
+    statusConfig: ReturnType<typeof buildStatusConfig>
+  ): Promise<StatusResult> {
+    await this.ensureRunning(buildCommandEnv());
+    const metadata = await this.readMountMetadata();
+    if (!metadata) {
+      return { missing: true };
+    }
+
+    const mountConflict = compareMountMetadata(metadata, {
+      remote: statusConfig.remote,
+      branch: statusConfig.branch,
+      repoName: metadata.repoName,
+      mountPath: metadata.mountPath
+    });
+    if (mountConflict) {
+      return { conflict: mountConflict };
+    }
+
+    const env = buildCommandEnv(metadata.remote, metadata.branch);
+    const repo = await this.collectMountedRepoState(
+      metadata.repoName,
+      metadata.mountPath,
+      env
+    );
+
+    return {
+      sandboxId: statusConfig.sandboxId,
+      remote: metadata.remote,
+      branch: metadata.branch,
+      repoName: metadata.repoName,
+      mountPath: metadata.mountPath,
+      ...repo
+    };
+  }
+
+  private get container(): Container {
+    const container = this.ctx.container;
+    if (!container) {
+      throw new Error('No container is configured for this Durable Object');
+    }
+    return container;
+  }
+
+  private get files(): Files {
+    return new Files(this.container);
+  }
+
+  private ensureRunning(env: Record<string, string>): Promise<void> {
+    if (this.setup === null || !this.container.running) {
+      this.setup = this.startContainer(env).catch((error: unknown) => {
+        this.setup = null;
+        throw error;
+      });
+    }
+    return this.setup;
+  }
+
+  private async startContainer(env: Record<string, string>): Promise<void> {
+    const container = this.container;
+    if (!container.running) {
+      container.start({
+        image: container.images.artifactfs,
+        instance: 'standard-1',
+        env,
+        enableInternet: true
+      });
+    }
+
+    try {
+      await container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS);
+    } catch (error) {
+      await this.destroyAfterFailure();
+      throw error;
+    }
+  }
+
+  private async destroyAfterFailure(): Promise<void> {
+    try {
+      await this.container.destroy();
+    } catch (destroyError) {
+      console.error('sandbox cleanup failed', destroyError);
+    }
+  }
+
+  private async runCommand(
+    command: string[],
+    env: Record<string, string>
+  ): Promise<CommandResult> {
+    await this.ensureRunning(env);
+    const process = await this.container.exec(command, {
+      cwd: '/workspace',
+      env
+    });
+    const output = await process.output();
+    const decoder = new TextDecoder();
+    return {
+      exitCode: output.exitCode,
+      stdout: decoder.decode(output.stdout),
+      stderr: decoder.decode(output.stderr)
+    };
+  }
+
+  private async readMountMetadata(): Promise<StoredMountMetadata | null> {
+    try {
+      const response = await this.files.readFile(DEFAULT_METADATA_FILE);
+      return parseMetadataFile(await response.text());
+    } catch (error) {
+      if (SandboxFileError.is(error) && error.code === 'ENOENT') {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  private async collectMountedRepoState(
+    repoName: string,
+    mountPath: string,
+    env: Record<string, string>
+  ) {
+    const artifactFsStatus = await this.runChecked(
+      ['artifact-fs', 'status', '--name', repoName],
+      'Could not read ArtifactFS status',
+      env
+    );
+
+    const mounted = /(^|\s)state=mounted(\s|$)/.test(artifactFsStatus.stdout);
+    if (!mounted) {
+      return {
+        head: null,
+        gitStatus: null,
+        artifactFsStatus: artifactFsStatus.stdout.trim()
+      };
+    }
+
+    const [head, gitStatus] = await Promise.all([
+      this.runChecked(
+        ['git', '-C', mountPath, 'rev-parse', 'HEAD'],
+        'Could not read mounted HEAD',
+        env
+      ),
+      this.runChecked(
+        ['git', '-C', mountPath, 'status', '--short', '--branch'],
+        'Could not read mounted git status',
+        env
+      )
+    ]);
+
+    return {
+      head: head.stdout.trim(),
+      gitStatus: gitStatus.stdout.trim(),
+      artifactFsStatus: artifactFsStatus.stdout.trim()
+    };
+  }
+
+  private async runChecked(
+    command: string[],
+    message: string,
+    env: Record<string, string>
+  ): Promise<CommandResult> {
+    const result = await this.runCommand(command, env);
+    if (result.exitCode !== 0) {
+      throw new SandboxCommandError(message, command.join(' '), result.exitCode);
+    }
+    return result;
+  }
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -64,74 +329,12 @@ async function handleMount(request: Request, env: Env): Promise<Response> {
     await authorizeRequest(request, env);
     const body = await parseMountRequest(request);
     const config = buildMountConfig(body.sandboxId, body.remote, body.branch);
-    const sandbox = getSandbox(env.Sandbox, config.sandboxId, {
-      enableDefaultSession: false,
-      normalizeId: true,
-      sleepAfter: '15m',
-      transport: 'rpc'
-    });
-
-    const existingMetadata = await readMountMetadata(sandbox);
-    const mountConflict = compareMountMetadata(existingMetadata, config);
-    if (mountConflict) {
-      return Response.json({ error: mountConflict }, { status: 409 });
+    const sandbox = env.Sandbox.getByName(config.sandboxId);
+    const result = await sandbox.mount(config);
+    if ('conflict' in result) {
+      return Response.json({ error: result.conflict }, { status: 409 });
     }
-
-    // Run the bootstrap script with per-request env so one Worker can mount
-    // different remotes in different sandboxes without rebuilding the image.
-    let bootstrap;
-    try {
-      bootstrap = await sandbox.exec(MOUNT_SCRIPT, {
-        cwd: '/workspace',
-        env: config.env,
-        timeout: 120_000
-      });
-    } catch (error) {
-      // An exec timeout does not guarantee the bootstrap process stopped.
-      try {
-        await sandbox.destroy();
-      } catch (destroyError) {
-        logError('sandbox cleanup failed', destroyError, request);
-      }
-      throw error;
-    }
-
-    if (!bootstrap.success) {
-      if (bootstrap.exitCode === MOUNT_CONFLICT_EXIT_CODE) {
-        throw new UserError(
-          'Sandbox is already initialized for a different repo or branch',
-          409
-        );
-      }
-
-      const commandError = new SandboxCommandError(
-        'ArtifactFS bootstrap failed',
-        MOUNT_SCRIPT,
-        bootstrap.exitCode
-      );
-      try {
-        await sandbox.destroy();
-      } catch (destroyError) {
-        logError('sandbox cleanup failed', destroyError, request);
-      }
-      throw commandError;
-    }
-
-    const repo = await collectMountedRepoState(
-      sandbox,
-      config.repoName,
-      config.mountPath
-    );
-
-    return Response.json({
-      sandboxId: config.sandboxId,
-      remote: config.remote,
-      branch: config.branch,
-      repoName: config.repoName,
-      mountPath: config.mountPath,
-      bootstrapLog: bootstrap.stdout.trim(),
-      ...repo
-    });
+    return Response.json(result);
   } catch (error) {
     return errorResponse(error, request);
   }
@@ -154,15 +357,9 @@ async function handleStatus(request: Request, env: Env): Promise<Response> {
       url.searchParams.get('remote'),
       url.searchParams.get('branch')
     );
-    const sandbox = getSandbox(env.Sandbox, config.sandboxId, {
-      enableDefaultSession: false,
-      normalizeId: true,
-      sleepAfter: '15m',
-      transport: 'rpc'
-    });
-
-    const metadata = await readMountMetadata(sandbox);
-    if (!metadata) {
+    const sandbox = env.Sandbox.getByName(config.sandboxId);
+    const result = await sandbox.status(config);
+    if ('missing' in result) {
       return Response.json(
         {
           error:
@@ -172,30 +369,10 @@ async function handleStatus(request: Request, env: Env): Promise<Response> {
       );
     }
 
-    const mountConflict = compareMountMetadata(metadata, {
-      remote: config.remote,
-      branch: config.branch,
-      repoName: metadata.repoName,
-      mountPath: metadata.mountPath
-    });
-    if (mountConflict) {
-      return Response.json({ error: mountConflict }, { status: 409 });
+    if ('conflict' in result) {
+      return Response.json({ error: result.conflict }, { status: 409 });
     }
-
-    const repo = await collectMountedRepoState(
-      sandbox,
-      metadata.repoName,
-      metadata.mountPath
-    );
-
-    return Response.json({
-      sandboxId: normalizeSandboxId(sandboxId),
-      remote: metadata.remote,
-      branch: metadata.branch,
-      repoName: metadata.repoName,
-      mountPath: metadata.mountPath,
-      ...repo
-    });
+    return Response.json(result);
   } catch (error) {
     return errorResponse(error, request);
   }
@@ -285,13 +462,7 @@ function buildMountConfig(
     branch,
     repoName,
     mountPath,
-    env: {
-      MOUNT_GIT_REMOTE: remote,
-      MOUNT_GIT_BRANCH: branch,
-      ARTIFACT_FS_ROOT: DEFAULT_ARTIFACT_FS_ROOT,
-      MOUNT_ROOT: DEFAULT_MOUNT_ROOT,
-      ARTIFACT_FS_MOUNT_METADATA_FILE: DEFAULT_METADATA_FILE
-    }
+    env: buildCommandEnv(remote, branch)
   };
 }
 
@@ -309,6 +480,19 @@ function buildStatusConfig(
     sandboxId: normalizeRequestedSandboxId(sandboxIdInput),
     remote: remoteInput ? normalizeRemote(remoteInput) : undefined,
     branch
+  };
+}
+
+function buildCommandEnv(
+  remote = DEFAULT_REMOTE,
+  branch = DEFAULT_BRANCH
+): Record<string, string> {
+  return {
+    MOUNT_GIT_REMOTE: remote,
+    MOUNT_GIT_BRANCH: branch,
+    ARTIFACT_FS_ROOT: DEFAULT_ARTIFACT_FS_ROOT,
+    MOUNT_ROOT: DEFAULT_MOUNT_ROOT,
+    ARTIFACT_FS_MOUNT_METADATA_FILE: DEFAULT_METADATA_FILE
   };
 }
 
@@ -419,58 +603,6 @@ function normalizeRequestedSandboxId(value: string): string {
   return normalized;
 }
 
-async function collectMountedRepoState(
-  sandbox: ReturnType<typeof getSandbox>,
-  repoName: string,
-  mountPath: string
-) {
-  const artifactFsStatus = await runChecked(
-    sandbox,
-    `artifact-fs status --name ${shellQuote(repoName)}`,
-    'Could not read ArtifactFS status'
-  );
-
-  const mounted = /(^|\s)state=mounted(\s|$)/.test(artifactFsStatus.stdout);
-  if (!mounted) {
-    return {
-      head: null,
-      gitStatus: null,
-      artifactFsStatus: artifactFsStatus.stdout.trim()
-    };
-  }
-
-  const [head, gitStatus] = await Promise.all([
-    runChecked(
-      sandbox,
-      `git -C ${shellQuote(mountPath)} rev-parse HEAD`,
-      'Could not read mounted HEAD'
-    ),
-    runChecked(
-      sandbox,
-      `git -C ${shellQuote(mountPath)} status --short --branch`,
-      'Could not read mounted git status'
-    )
-  ]);
-
-  return {
-    head: head.stdout.trim(),
-    gitStatus: gitStatus.stdout.trim(),
-    artifactFsStatus: artifactFsStatus.stdout.trim()
-  };
-}
-
-async function readMountMetadata(
-  sandbox: ReturnType<typeof getSandbox>
-): Promise<StoredMountMetadata | null> {
-  const metadata = await sandbox.exists(DEFAULT_METADATA_FILE);
-  if (!metadata.exists) {
-    return null;
-  }
-
-  const file = await sandbox.readFile(DEFAULT_METADATA_FILE);
-  return parseMetadataFile(file.content);
-}
-
 function compareMountMetadata(
   existing: StoredMountMetadata | null,
   requested: {
@@ -563,10 +695,6 @@ function validateBranch(branch: string): void {
   }
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
-}
-
 function helpText(): string {
   return [
     'ArtifactFS + Cloudflare Sandbox SDK example',
@@ -576,19 +704,6 @@ function helpText(): string {
     '',
     'The Docker image includes ArtifactFS and a bootstrap script that mounts the requested repo inside /workspace/mnt/<repo-name>.'
   ].join('\n');
-}
-
-async function runChecked(
-  sandbox: ReturnType<typeof getSandbox>,
-  command: string,
-  message: string,
-  options?: { cwd?: string; env?: Record<string, string>; timeout?: number }
-) {
-  const result = await sandbox.exec(command, options);
-  if (!result.success) {
-    throw new SandboxCommandError(message, command, result.exitCode);
-  }
-  return result;
 }
 
 function errorResponse(error: unknown, request: Request): Response {

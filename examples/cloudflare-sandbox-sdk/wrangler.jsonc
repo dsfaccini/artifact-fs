@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "artifact-fs-sandbox-example",
+  "name": "artifact-fs-sandbox-sdk-v1-example",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-27",
   "compatibility_flags": ["nodejs_compat"],
@@ -17,10 +17,14 @@
   "containers": [
     {
       "class_name": "Sandbox",
-      "image": "./Dockerfile",
-      "image_build_context": "../../",
-      "instance_type": "basic",
-      "max_instances": 10
+      "name": "artifact-fs-sandbox-sdk-v1",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "artifactfs": {
+          "dockerfile": "./Dockerfile",
+          "build_context": "../../"
+        }
+      }
     }
   ],
   "durable_objects": {
