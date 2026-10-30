@@ -77,3 +77,23 @@ func TestFSKitRejectsXattrFallback(t *testing.T) {
 		})
 	}
 }
+
+func TestFSKitGitFileAttributesRemainStable(t *testing.T) {
+	f := newLocalOverlayFuseFixture(t)
+	f.fs.fskit = true
+	ctx := context.Background()
+	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: ".git"}
+	if err := f.fs.LookUpInode(ctx, lookup); err != nil {
+		t.Fatal(err)
+	}
+	if lookup.Entry.Attributes.Mtime.IsZero() {
+		t.Fatal("synthetic Git file has no modification time")
+	}
+	getattr := &fuseops.GetInodeAttributesOp{Inode: lookup.Entry.Child}
+	if err := f.fs.GetInodeAttributes(ctx, getattr); err != nil {
+		t.Fatal(err)
+	}
+	if getattr.Attributes != lookup.Entry.Attributes {
+		t.Fatal("unchanged synthetic Git file attributes changed between lookup and stat")
+	}
+}

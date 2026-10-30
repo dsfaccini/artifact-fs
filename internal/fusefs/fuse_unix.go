@@ -36,6 +36,7 @@ type ArtifactFuse struct {
 	engine         *Engine
 	fskit          bool
 	gitfileContent []byte // synthesized .git gitfile, computed once
+	gitfileTime    time.Time
 
 	mu           sync.RWMutex
 	handleOps    sync.RWMutex
@@ -108,6 +109,7 @@ func NewArtifactFuse(repo model.RepoConfig, resolver *Resolver, engine *Engine) 
 		engine:         engine,
 		fskit:          runtime.GOOS == "darwin" && os.Getenv("ARTIFACT_FS_FUSE_BACKEND") == "fskit",
 		gitfileContent: fmt.Appendf(nil, "gitdir: %s\n", repo.GitDir),
+		gitfileTime:    time.Now(),
 		inodes:         make(map[fuseops.InodeID]*InodeRef),
 		pathToInode:    make(map[string]fuseops.InodeID),
 		nextInodeID:    fuseops.RootInodeID + 1,
@@ -1259,6 +1261,10 @@ func setChildEntryExpiry(entry *fuseops.ChildInodeEntry, ttl time.Duration) {
 
 func (fs *ArtifactFuse) gitFileAttrs() fuseops.InodeAttributes {
 	now := time.Now()
+	if fs.fskit {
+		// Changing timestamps on this immutable file can deadlock concurrent FSKit Git reads.
+		now = fs.gitfileTime
+	}
 	return fuseops.InodeAttributes{
 		Size:  uint64(len(fs.gitfileContent)),
 		Mode:  0o644,
