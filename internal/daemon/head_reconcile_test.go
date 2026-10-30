@@ -306,6 +306,43 @@ func TestHeadReconcileRetriesTransientOverlayFailureWithoutRepublishing(t *testi
 	}
 }
 
+func TestHeadReconcileRestoresPersistedStateWhenHEADReturnsAfterOverlayFailure(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	f.updateMain(f.nextOID)
+	if err := f.rt.overlay.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.signal()
+	f.waitForLog("overlay reconcile failed")
+
+	storedOID, _, storedGen, err := f.rt.snapshot.ReadState(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedOID != f.nextOID || storedGen != f.oldGen+1 {
+		t.Fatalf("snapshot before rollback = %s/%d, want %s/%d", storedOID, storedGen, f.nextOID, f.oldGen+1)
+	}
+	f.waitForHead(f.oldOID, "main", f.oldGen)
+	recovered, err := overlay.New(f.ctx, f.rt.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.updateMain(f.oldOID)
+	f.rt.headMu.Lock()
+	f.rt.overlay = recovered
+	f.rt.resolver.Overlay = recovered
+	f.rt.headMu.Unlock()
+	f.signal()
+	f.waitForHead(f.oldOID, "main", f.oldGen+2)
+
+	cfg := f.rt.cfg
+	cfg.MetaDBPath = filepath.Join(filepath.Dir(cfg.OverlayDir), "snapshot.sqlite")
+	status := f.svc.readPersistedStatus(f.ctx, cfg)
+	if status.CurrentHEADOID != f.oldOID || status.CurrentHEADRef != "main" || status.SnapshotGeneration != f.oldGen+2 {
+		t.Fatalf("persisted status after rollback = %+v", status)
+	}
+}
+
 func TestHeadReconcilePersistsSameOIDRefBeforeUpdatingRuntime(t *testing.T) {
 	f := newHeadReconcileFixture(t)
 	runCmd(t, "git", "-C", f.workDir, "branch", "alias", f.oldOID)
@@ -316,7 +353,7 @@ func TestHeadReconcilePersistsSameOIDRefBeforeUpdatingRuntime(t *testing.T) {
 	}
 
 	f.signal()
-	f.waitForLog("snapshot head_ref update failed")
+	f.waitForLog("snapshot publish failed")
 	f.svc.mu.Lock()
 	gotRef := f.rt.state.CurrentHEADRef
 	f.svc.mu.Unlock()

@@ -1685,8 +1685,10 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 	prevRef := rt.state.CurrentHEADRef
 	prevGen := rt.state.SnapshotGeneration
 	s.mu.Unlock()
-	if oid == prevOID {
-		if ref == prevRef {
+	storedOID, storedRef, gen, stateErr := rt.snapshot.ReadState(ctx)
+	// A failed overlay transition can leave the published snapshot ahead of the active generation.
+	if oid == prevOID && stateErr == nil && storedOID == oid && gen == prevGen {
+		if ref == prevRef && storedRef == ref {
 			return nil
 		}
 		if err := rt.snapshot.UpdateHEADRef(ctx, ref); err != nil {
@@ -1703,7 +1705,6 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 		s.mu.Unlock()
 		return nil
 	}
-	storedOID, storedRef, gen, stateErr := rt.snapshot.ReadState(ctx)
 	if stateErr != nil || storedOID != oid || storedRef != ref || gen == 0 {
 		var phase string
 		gen, phase, err = s.publishSnapshot(ctx, cfg, rt.snapshot, oid, ref)
