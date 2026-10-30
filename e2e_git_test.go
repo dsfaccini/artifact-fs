@@ -127,6 +127,7 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 	t.Cleanup(func() {
 		repo.close(t)
 	})
+	primeE2EMountPolling(t, repo.mountPath)
 	return repo
 }
 
@@ -199,6 +200,7 @@ func (r *mountedE2ERepo) restart(t *testing.T) {
 	r.svc = svc
 	r.cancel = cancel
 	r.errCh = errCh
+	primeE2EMountPolling(t, r.mountPath)
 }
 
 func TestE2EGitCleanState(t *testing.T) {

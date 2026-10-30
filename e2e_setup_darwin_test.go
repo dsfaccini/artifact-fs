@@ -47,3 +47,5 @@ func isMounted(path string) bool {
 	s := string(out)
 	return strings.Contains(s, path) || strings.Contains(s, "/private"+path)
 }
+
+func primeE2EMountPolling(*testing.T, string) {}

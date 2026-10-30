@@ -183,6 +183,7 @@ func TestE2E(t *testing.T) {
 		t.Fatal("FUSE mount did not appear within timeout")
 	}
 	t.Logf("mount active at %s", mountPath)
+	primeE2EMountPolling(t, mountPath)
 
 	// ---- Filesystem read operations ----
 
@@ -1153,6 +1154,7 @@ func TestE2EVerifiedSource(t *testing.T) {
 			stopE2EDaemon(t, firstSvc, firstCancel, firstErrCh, mountPath)
 		}
 	}()
+	primeE2EMountPolling(t, mountPath)
 	if got, want := readFileStr(t, filepath.Join(mountPath, ".git")), "gitdir: "+gitDir+"\n"; got != want {
 		t.Fatalf("mounted .git = %q, want %q", got, want)
 	}
@@ -1241,6 +1243,7 @@ func TestE2EVerifiedSource(t *testing.T) {
 		t.Fatal("verified-source FUSE mount did not reappear after restart")
 	}
 	defer stopE2EDaemon(t, secondSvc, secondCancel, secondErrCh, mountPath)
+	primeE2EMountPolling(t, mountPath)
 
 	assertVerifiedSourceStatus(t, secondSvc, requiredCommit)
 	if head := strings.TrimSpace(gitCmd(t, mountPath, "rev-parse", "HEAD")); head != requiredCommit {

@@ -216,6 +216,7 @@ func runE2EBenchmarkOnce(t *testing.T, repo e2eBenchRepoSpec, iteration int, hyd
 		cancel()
 		t.Fatal("FUSE mount did not appear within timeout")
 	}
+	primeE2EMountPolling(t, mountPath)
 
 	hydrateDur, hydratedBytes, err := hydrateColdObjects(ctx, git, cfg, targets, hydratorWorkers, callerWorkers)
 	if err != nil {
