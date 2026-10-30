@@ -534,6 +534,410 @@ func TestEnsureIndexInitializedCreatesMissingIndex(t *testing.T) {
 	}
 }
 
+func TestBootstrapCleanIndexForFSMonitorMarksSnapshotEntriesWithoutReadingBlobs(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	oid := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	run(t, "git", "-C", repo, "read-tree", "HEAD")
+
+	gitDir := filepath.Join(repo, ".git")
+	indexPath := filepath.Join(gitDir, "index")
+	before, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mode, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hook := filepath.Join(t.TempDir(), "fsmonitor")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "config", "core.fsmonitor", hook)
+	postIndexChange := filepath.Join(gitDir, "hooks", "post-index-change")
+	postIndexChangeCalled := filepath.Join(t.TempDir(), "post-index-change-called")
+	if err := os.WriteFile(postIndexChange, []byte("#!/bin/sh\nprintf called > \"$AFS_POST_INDEX_CHANGE\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AFS_POST_INDEX_CHANGE", postIndexChangeCalled)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	logPath := filepath.Join(bin, "git.log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AFS_GIT_LOG\"\nif [ \"$1\" = cat-file ]; then exit 88; fi\nexec \"$AFS_REAL_GIT\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AFS_GIT_LOG", logPath)
+	t.Setenv("AFS_REAL_GIT", realGit)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: gitDir, MountPath: repo}
+	bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, oid, nil)
+	if err != nil || !bootstrapped {
+		t.Fatalf("BootstrapCleanIndexForFSMonitor = %v, %v; want true, nil", bootstrapped, err)
+	}
+	if got := strings.TrimSpace(runOutput(t, "git", "-C", repo, "ls-files", "-f")); got != "h tracked.txt" {
+		t.Fatalf("fsmonitor-valid entries = %q, want h tracked.txt", got)
+	}
+	after, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(before, after) {
+		t.Fatal("index was not updated")
+	}
+	afterMode, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterMode.Mode().Perm() != mode.Mode().Perm() {
+		t.Fatalf("index permissions = %v, want %v", afterMode.Mode().Perm(), mode.Mode().Perm())
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logged), "cat-file") {
+		t.Fatalf("bootstrap read blob content: %s", logged)
+	}
+	if _, err := os.Stat(postIndexChangeCalled); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("private-index bootstrap invoked post-index-change hook: %v", err)
+	}
+	beforeCanceled, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, oid, func() (bool, error) {
+		return false, context.Canceled
+	}); bootstrapped || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled validation bootstrap = %v, %v; want false, canceled", bootstrapped, err)
+	}
+	if afterCanceled, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(afterCanceled, beforeCanceled) {
+		t.Fatalf("canceled validation changed index: err=%v", err)
+	}
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(cancelCtx, cfg, oid, func() (bool, error) {
+		cancel()
+		return true, nil
+	}); bootstrapped || !errors.Is(err, context.Canceled) {
+		t.Fatalf("context-canceled validation bootstrap = %v, %v; want false, canceled", bootstrapped, err)
+	}
+	cancel()
+	if afterCanceled, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(afterCanceled, beforeCanceled) {
+		t.Fatalf("context-canceled validation changed index: err=%v", err)
+	}
+	if _, err := os.Stat(indexPath + ".lock"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled validation left index lock: %v", err)
+	}
+}
+
+func TestBootstrapCleanIndexForFSMonitorSkipsStagedIndexAndExistingLock(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	oid := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	indexPath := filepath.Join(cfg.GitDir, "index")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("staged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	stagedIndex, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, oid, nil); err != nil || bootstrapped {
+		t.Fatalf("staged bootstrap = %v, %v; want false, nil", bootstrapped, err)
+	}
+	if after, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(after, stagedIndex) {
+		t.Fatalf("staged index changed: err=%v", err)
+	}
+	run(t, "git", "-C", repo, "read-tree", "HEAD")
+	cleanIndex, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := indexPath + ".lock"
+	if err := os.WriteFile(lockPath, []byte("another writer"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, oid, nil); err != nil || bootstrapped {
+		t.Fatalf("locked bootstrap = %v, %v; want false, nil", bootstrapped, err)
+	}
+	if after, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(after, cleanIndex) {
+		t.Fatalf("index changed while locked: err=%v", err)
+	}
+}
+
+func TestBootstrapCleanIndexForFSMonitorSkipsConversionAttributes(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("tracked.txt text\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", ".gitattributes", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	oid := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	run(t, "git", "-C", repo, "read-tree", "HEAD")
+	indexPath := filepath.Join(repo, ".git", "index")
+	before, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, oid, nil); err != nil || bootstrapped {
+		t.Fatalf("conversion attribute bootstrap = %v, %v; want false, nil", bootstrapped, err)
+	}
+	if after, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("conversion attribute changed index: err=%v", err)
+	}
+}
+
+func TestBootstrapCleanIndexForFSMonitorRequiresSnapshotToMatchHEAD(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	staleOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	run(t, "git", "-C", repo, "commit", "--allow-empty", "-m", "advance HEAD")
+	run(t, "git", "-C", repo, "read-tree", "HEAD")
+	indexPath := filepath.Join(repo, ".git", "index")
+	before, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, staleOID, nil); err != nil || bootstrapped {
+		t.Fatalf("stale snapshot bootstrap = %v, %v; want false, nil", bootstrapped, err)
+	}
+	if after, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("stale snapshot changed index: err=%v", err)
+	}
+}
+
+func TestBootstrapCleanIndexForFSMonitorSkipsTrackedEmptyIntentToAdd(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "empty.txt"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "empty.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	head := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	run(t, "git", "-C", repo, "rm", "--cached", "empty.txt")
+	run(t, "git", "-C", repo, "add", "-N", "empty.txt")
+	indexPath := filepath.Join(repo, ".git", "index")
+	before, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); err != nil || bootstrapped {
+		t.Fatalf("tracked-empty ITA bootstrap = %v, %v; want false, nil", bootstrapped, err)
+	}
+	if after, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("tracked-empty ITA index changed: err=%v", err)
+	}
+}
+
+func TestBootstrapCleanIndexForFSMonitorSkipsConfiguredAttributesFile(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "attrs"), []byte("tracked.txt filter=convert\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "config", "filter.convert.clean", "tr a b")
+	run(t, "git", "-C", repo, "add", "attrs", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	run(t, "git", "-C", repo, "config", "core.attributesFile", "attrs")
+	head := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	run(t, "git", "-C", repo, "read-tree", "HEAD")
+	indexPath := filepath.Join(repo, ".git", "index")
+	before, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); err != nil || bootstrapped {
+		t.Fatalf("configured attributes file bootstrap = %v, %v; want false, nil", bootstrapped, err)
+	}
+	if after, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("configured attributes file changed index: err=%v", err)
+	}
+}
+
+func TestBootstrapCleanIndexForFSMonitorSkipsIntentToAddAndUnmergedEntries(t *testing.T) {
+	createRepo := func(t *testing.T) (string, string) {
+		t.Helper()
+		repo := filepath.Join(t.TempDir(), "repo")
+		run(t, "git", "init", "--initial-branch=main", repo)
+		run(t, "git", "-C", repo, "config", "user.name", "test")
+		run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+		if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run(t, "git", "-C", repo, "add", "tracked.txt")
+		run(t, "git", "-C", repo, "commit", "-m", "base")
+		return repo, strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	}
+	t.Run("intent-to-add", func(t *testing.T) {
+		repo, head := createRepo(t)
+		if err := os.WriteFile(filepath.Join(repo, "intent.txt"), []byte("intent\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run(t, "git", "-C", repo, "add", "-N", "intent.txt")
+		indexPath := filepath.Join(repo, ".git", "index")
+		before, err := os.ReadFile(indexPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+		if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); err != nil || bootstrapped {
+			t.Fatalf("intent-to-add bootstrap = %v, %v; want false, nil", bootstrapped, err)
+		}
+		if after, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(after, before) {
+			t.Fatalf("intent-to-add index changed: err=%v", err)
+		}
+	})
+	t.Run("unmerged", func(t *testing.T) {
+		repo, _ := createRepo(t)
+		run(t, "git", "-C", repo, "checkout", "-b", "side")
+		if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("side\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run(t, "git", "-C", repo, "add", "tracked.txt")
+		run(t, "git", "-C", repo, "commit", "-m", "side")
+		run(t, "git", "-C", repo, "checkout", "main")
+		if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("main\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run(t, "git", "-C", repo, "add", "tracked.txt")
+		run(t, "git", "-C", repo, "commit", "-m", "main")
+		merge := exec.Command("git", "-C", repo, "merge", "side")
+		if out, err := merge.CombinedOutput(); err == nil {
+			t.Fatalf("merge unexpectedly succeeded: %s", out)
+		}
+		if strings.TrimSpace(runOutput(t, "git", "-C", repo, "ls-files", "--unmerged")) == "" {
+			t.Fatal("merge did not create unmerged index entries")
+		}
+		head := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+		indexPath := filepath.Join(repo, ".git", "index")
+		before, err := os.ReadFile(indexPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+		if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); err != nil || bootstrapped {
+			t.Fatalf("unmerged bootstrap = %v, %v; want false, nil", bootstrapped, err)
+		}
+		if after, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(after, before) {
+			t.Fatalf("unmerged index changed: err=%v", err)
+		}
+	})
+}
+
+func TestBootstrapCleanIndexForFSMonitorSkipsAlternateIndex(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	head := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	indexPath := filepath.Join(repo, ".git", "index")
+	before, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alternate := filepath.Join(t.TempDir(), "alternate.index")
+	if err := os.WriteFile(alternate, before, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_INDEX_FILE", alternate)
+	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); err != nil || bootstrapped {
+		t.Fatalf("alternate-index bootstrap = %v, %v; want false, nil", bootstrapped, err)
+	}
+	if after, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("default index changed: err=%v", err)
+	}
+	if after, err := os.ReadFile(alternate); err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("alternate index changed: err=%v", err)
+	}
+}
+
+func TestBootstrapCleanIndexForFSMonitorSkipsMissingAttributesBlob(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("*.txt text\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", ".gitattributes", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	head := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	attrOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", ":.gitattributes"))
+	run(t, "git", "-C", repo, "read-tree", "HEAD")
+	indexPath := filepath.Join(repo, ".git", "index")
+	before, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectPath := filepath.Join(repo, ".git", "objects", attrOID[:2], attrOID[2:])
+	if err := os.Remove(objectPath); err != nil {
+		t.Fatal(err)
+	}
+	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); err != nil || bootstrapped {
+		t.Fatalf("missing attributes blob bootstrap = %v, %v; want false, nil", bootstrapped, err)
+	}
+	if after, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("missing attributes blob changed index: err=%v", err)
+	}
+}
+
 func TestEnsureIndexInitializedPreservesAlternateIndex(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "repo")
 	run(t, "git", "init", repo)

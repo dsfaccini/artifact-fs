@@ -1853,6 +1853,12 @@ func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.Repo
 			return err
 		}
 	}
+	return s.ConfigureFSMonitorHook(ctx, repo, stateRoot)
+}
+
+// ConfigureFSMonitorHook installs ArtifactFS's hook without probing the
+// worktree, which may still be gated during startup.
+func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfig, stateRoot string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -1875,6 +1881,184 @@ func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.Repo
 	// Git adds the fsmonitor extension on the next porcelain index read. The
 	// daemon must not write the shared index behind a concurrent Git process.
 	return nil
+}
+
+// BootstrapCleanIndexForFSMonitor marks snapshot paths valid only while the
+// real index is locked and proven to match the immutable snapshot commit.
+func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.RepoConfig, snapshotOID string, validate func() (bool, error)) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if snapshotOID == "" {
+		return false, nil
+	}
+	if _, ok := os.LookupEnv("GIT_INDEX_FILE"); ok {
+		return false, nil
+	}
+	skip := func() (bool, error) {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	indexPath := filepath.Join(repo.GitDir, "index")
+	lockPath := indexPath + ".lock"
+	lock, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	lockOwned := true
+	defer func() {
+		_ = lock.Close()
+		if lockOwned {
+			_ = os.Remove(lockPath)
+		}
+	}()
+
+	info, err := os.Stat(indexPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := lock.Chmod(info.Mode().Perm()); err != nil {
+		return false, err
+	}
+	privateIndex, err := os.CreateTemp(filepath.Dir(indexPath), ".artifact-fs-index-*")
+	if err != nil {
+		return false, err
+	}
+	privatePath := privateIndex.Name()
+	defer os.Remove(privatePath)
+	if err := privateIndex.Chmod(info.Mode().Perm()); err != nil {
+		privateIndex.Close()
+		return false, err
+	}
+	if err := privateIndex.Close(); err != nil {
+		return false, err
+	}
+	if err := copyFile(indexPath, privatePath); err != nil {
+		return false, err
+	}
+	privateWorktree, err := os.MkdirTemp("", "artifact-fs-index-worktree-*")
+	if err != nil {
+		return false, err
+	}
+	defer os.RemoveAll(privateWorktree)
+	privateHooks := filepath.Join(privateWorktree, "hooks")
+	if err := os.Mkdir(privateHooks, 0o700); err != nil {
+		return false, err
+	}
+	env := []string{"GIT_INDEX_FILE=" + privatePath, "GIT_WORK_TREE=" + privateWorktree, "GIT_NO_LAZY_FETCH=1"}
+	run := func(args ...string) (string, error) {
+		return runGitWithEnv(ctx, repo.GitDir, env, args...)
+	}
+	if err := runGitDiscardOutputWithEnv(ctx, repo.GitDir, env, "-c", "core.fsmonitor=false", "ls-files", "--stage", "--", "."); err != nil {
+		return skip()
+	}
+	if out, err := run("-c", "core.fsmonitor=false", "diff-index", "--cached", "--quiet", "--no-renames", "--ita-visible-in-index", snapshotOID, "--"); err != nil || strings.TrimSpace(out) != "" {
+		return skip()
+	}
+	if out, err := run("-c", "core.fsmonitor=false", "diff-index", "--cached", "--quiet", "--no-renames", "--ita-invisible-in-index", snapshotOID, "--"); err != nil || strings.TrimSpace(out) != "" {
+		return skip()
+	}
+	if head, err := run("rev-parse", "--verify", "HEAD"); err != nil || strings.TrimSpace(head) != snapshotOID {
+		return skip()
+	}
+	entries, err := run("-c", "core.fsmonitor=false", "ls-files", "--stage", "-z", "--", ".")
+	if err != nil {
+		return skip()
+	}
+	paths := make([]string, 0)
+	for _, entry := range strings.Split(entries, "\x00") {
+		if entry == "" {
+			continue
+		}
+		meta, path, ok := strings.Cut(entry, "\t")
+		parts := strings.Fields(meta)
+		if !ok || len(parts) != 3 || parts[2] != "0" {
+			return false, nil
+		}
+		if parts[0] != "160000" {
+			paths = append(paths, path)
+		}
+	}
+	if len(paths) == 0 {
+		return false, nil
+	}
+	if out, err := run("config", "--type=bool", "--default=false", "--get", "core.autocrlf"); err != nil || strings.EqualFold(strings.TrimSpace(out), "true") {
+		return skip()
+	}
+	configs, err := run("config", "--null", "--list")
+	if err != nil {
+		return skip()
+	}
+	for _, entry := range strings.Split(configs, "\x00") {
+		key, _, ok := strings.Cut(entry, "\n")
+		if ok && strings.EqualFold(key, "core.attributesfile") {
+			return false, nil
+		}
+	}
+	pathInput := []byte(strings.Join(paths, "\x00") + "\x00")
+	attrs, err := runGitInput(ctx, repo.GitDir, env, pathInput, "-c", "core.fsmonitor=false", "check-attr", "--cached", "--all", "-z", "--stdin")
+	if err != nil {
+		return skip()
+	}
+	attrFields := strings.Split(attrs, "\x00")
+	for i := 1; i+1 < len(attrFields); i += 3 {
+		if attrFields[i] == "crlf" || attrFields[i] == "ident" || attrFields[i] == "filter" || attrFields[i] == "eol" || attrFields[i] == "text" || attrFields[i] == "working-tree-encoding" {
+			return false, nil
+		}
+	}
+	if err := verifyGitAttributesPresent(ctx, repo, env); err != nil {
+		return skip()
+	}
+	if _, err := runGitInput(ctx, repo.GitDir, env, pathInput, "-c", "core.hooksPath="+privateHooks, "update-index", "--fsmonitor", "--fsmonitor-valid", "-z", "--stdin"); err != nil {
+		return skip()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if head, err := run("rev-parse", "--verify", "HEAD"); err != nil || strings.TrimSpace(head) != snapshotOID {
+		return skip()
+	}
+	updated, err := os.ReadFile(privatePath)
+	if err != nil {
+		return false, err
+	}
+	if validate != nil {
+		valid, err := validate()
+		if err != nil {
+			return false, err
+		}
+		if !valid {
+			return false, nil
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if _, err := lock.Write(updated); err != nil {
+		return false, err
+	}
+	if err := lock.Sync(); err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if err := lock.Close(); err != nil {
+		return false, err
+	}
+	if err := os.Rename(lockPath, indexPath); err != nil {
+		return false, err
+	}
+	lockOwned = false
+	return true, nil
 }
 
 func (s *Store) ComputeAheadBehind(ctx context.Context, repo model.RepoConfig) (ahead int, behind int, diverged bool, err error) {
@@ -1913,9 +2097,76 @@ func runGitDiscardOutputWithEnv(ctx context.Context, gitDir string, extraEnv []s
 	return err
 }
 
+func runGitInput(ctx context.Context, gitDir string, extraEnv []string, input []byte, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	configureCancelableCommand(cmd)
+	setGitWorktreeDirectory(cmd, extraEnv)
+	cmd.Env = append(os.Environ(), append([]string{"GIT_DIR=" + gitDir}, extraEnv...)...)
+	cmd.Stdin = bytes.NewReader(input)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", errors.New(auth.RedactString(strings.TrimSpace(stderr.String())))
+	}
+	return stdout.String(), nil
+}
+
+func setGitWorktreeDirectory(cmd *exec.Cmd, extraEnv []string) {
+	for _, entry := range extraEnv {
+		if worktree, ok := strings.CutPrefix(entry, "GIT_WORK_TREE="); ok {
+			cmd.Dir = worktree
+			return
+		}
+	}
+}
+
+func copyFile(from, to string) error {
+	src, err := os.Open(from)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	dst, err := os.OpenFile(to, os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(dst, src)
+	closeErr := dst.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func verifyGitAttributesPresent(ctx context.Context, repo model.RepoConfig, env []string) error {
+	entries, err := runGitWithEnv(ctx, repo.GitDir, env, "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z", "--", ".")
+	if err != nil {
+		return err
+	}
+	for _, entry := range strings.Split(entries, "\x00") {
+		meta, path, ok := strings.Cut(entry, "\t")
+		if !ok || filepath.Base(path) != ".gitattributes" {
+			continue
+		}
+		parts := strings.Fields(meta)
+		if len(parts) != 3 || parts[2] != "0" {
+			return errors.New("unmerged .gitattributes entry")
+		}
+		if err := runGitDiscardOutputWithEnv(ctx, repo.GitDir, env, "cat-file", "-e", parts[1]+"^{blob}"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func runGitWithEnvCapture(ctx context.Context, gitDir string, extraEnv []string, captureOutput bool, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	configureCancelableCommand(cmd)
+	setGitWorktreeDirectory(cmd, extraEnv)
 	env := os.Environ()
 	if gitDir != "" {
 		env = append(env, "GIT_DIR="+gitDir)

@@ -94,6 +94,8 @@ Check the state of a mounted repo with `status`:
 
 Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The daemon prioritizes code and manifests (`package.json`, `go.mod`, `README.md`) over binary files.
 
+When the Git index matches the published snapshot and the overlay is empty, startup marks snapshot entries valid for Git's filesystem monitor before opening the mount. This lets the first `git status` use the daemon's change list instead of reading every tracked blob. ArtifactFS skips this baseline when the index or attributes are uncertain, when `core.attributesFile` is configured, or when staged work or overlay changes exist; Git then performs its normal status scan.
+
 Use `--hydration-concurrency` to control the number of parallel blob-fetch workers (default 4). Each worker maintains a persistent `git cat-file --batch` process, so higher values trade memory for faster bulk hydration:
 
 ```bash
@@ -327,7 +329,7 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 |-------|--------|
 | Git submodules are not initialized | Gitlink paths appear as empty directories so status stays clean |
 | Checkout filters and EOL transforms are not applied to snapshot-only reads | Files use canonical blob bytes until Git writes a transformed overlay |
-| `git status` takes ~7s on large repos (5800+ entries) | Performance -- full tree walk through FUSE |
+| `git status` still scans directories to find untracked files; if the cold baseline is skipped because the index, attributes, or overlay are uncertain, Git also scans tracked content normally | Performance |
 | `git reset` takes ~6.5s for index refresh | Performance -- same root cause as `git status` |
 
 ## Testing

@@ -964,6 +964,7 @@ func (s *Service) ensurePreparedRepo(ctx context.Context, cfg model.RepoConfig, 
 // loop. Called by the daemon's Start for each registered repo.
 func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 	var snap *snapshot.Store
+	var ov *overlay.Store
 	var headOID, headRef string
 	var gen int64
 	prepareCtx, cancel := context.WithTimeout(ctx, s.prepareTimeoutDuration())
@@ -994,24 +995,38 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 				return err
 			}
 		}
-		return nil
+		ov, err = overlay.New(prepareCtx, cfg)
+		if err != nil {
+			snap.Close()
+			snap = nil
+			return err
+		}
+		baseLookup := func(path string) (model.BaseNode, bool, error) {
+			return snap.LookupNode(prepareCtx, gen, path)
+		}
+		if err := ov.ReconcileChecked(prepareCtx, baseLookup); err != nil {
+			ov.Close()
+			ov = nil
+			snap.Close()
+			snap = nil
+			return err
+		}
+		if err := s.bootstrapCleanStatusIndex(prepareCtx, cfg, headOID, gen, snap, ov); err != nil {
+			ov.Close()
+			ov = nil
+			snap.Close()
+			snap = nil
+			return err
+		}
+		return s.startMountedRepo(ctx, cfg, snap, ov, headOID, headRef, gen)
 	})
 	if err != nil {
 		return err
 	}
-	ov, err := overlay.New(ctx, cfg)
-	if err != nil {
-		snap.Close()
-		return err
-	}
-	baseLookup := func(path string) (model.BaseNode, bool, error) {
-		return snap.LookupNode(ctx, gen, path)
-	}
-	if err := ov.ReconcileChecked(ctx, baseLookup); err != nil {
-		ov.Close()
-		snap.Close()
-		return err
-	}
+	return nil
+}
+
+func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, ov *overlay.Store, headOID string, headRef string, gen int64) error {
 	h := hydrator.New(s.git)
 
 	resolver := &fusefs.Resolver{Snapshot: snap, Overlay: ov}
@@ -1505,6 +1520,9 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	if !s.prepareConfigStillCurrent(ctx, cfg) {
 		return registry.ErrRepoChanged
 	}
+	if err := s.bootstrapCleanStatusIndex(ctx, cfg, headOID, gen, rt.snapshot, rt.overlay); err != nil {
+		return err
+	}
 	baseLookup := func(path string) (model.BaseNode, bool, error) {
 		return rt.snapshot.LookupNode(ctx, gen, path)
 	}
@@ -1541,6 +1559,55 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	s.mu.Unlock()
 	rt.gate.MarkReady()
 	s.startRepoBackground(rt)
+	return nil
+}
+
+func (s *Service) bootstrapCleanStatusIndex(ctx context.Context, cfg model.RepoConfig, headOID string, gen int64, snap *snapshot.Store, ov *overlay.Store) error {
+	storedOID, _, storedGen, err := snap.ReadState(ctx)
+	if err != nil {
+		return err
+	}
+	if storedOID != headOID || storedGen != gen {
+		return nil
+	}
+	entries, err := ov.ListAll(ctx)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 0 {
+		return nil
+	}
+	if err := s.git.ConfigureFSMonitorHook(ctx, cfg, s.root); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		s.logger.Warn("git status clean baseline setup skipped", "repo", cfg.Name, "error", err)
+		return nil
+	}
+	bootstrapped, err := s.git.BootstrapCleanIndexForFSMonitor(ctx, cfg, headOID, func() (bool, error) {
+		currentOID, _, currentGen, err := snap.ReadState(ctx)
+		if err != nil {
+			return false, err
+		}
+		if currentOID != headOID || currentGen != gen {
+			return false, nil
+		}
+		currentEntries, err := ov.ListAll(ctx)
+		if err != nil {
+			return false, err
+		}
+		return len(currentEntries) == 0, nil
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		s.logger.Warn("git status clean baseline bootstrap skipped", "repo", cfg.Name, "error", err)
+		return nil
+	}
+	if bootstrapped {
+		s.logger.Debug("git status clean baseline bootstrapped", "repo", cfg.Name)
+	}
 	return nil
 }
 

@@ -224,6 +224,32 @@ func TestE2EGitStatusDetectsSameSizeRewriteAfterMtimeRestore(t *testing.T) {
 	assertGitStatus(t, repo.mountPath, map[string]string{"README.md": " M"})
 }
 
+func TestE2EGitColdStatusDetectsEditBeforeFirstStatus(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+	readmePath := filepath.Join(repo.mountPath, "README.md")
+	st, err := os.Stat(readmePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexedMtime := st.ModTime()
+	updated := []byte(readFileEventually(t, readmePath))
+	if len(updated) == 0 {
+		t.Fatal("README.md is empty")
+	}
+	if updated[0] == 'x' {
+		updated[0] = 'y'
+	} else {
+		updated[0] = 'x'
+	}
+	if err := os.WriteFile(readmePath, updated, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(readmePath, indexedMtime, indexedMtime); err != nil {
+		t.Fatal(err)
+	}
+	assertGitStatus(t, repo.mountPath, map[string]string{"README.md": " M"})
+}
+
 func TestE2EGitStatusPorcelain(t *testing.T) {
 	repo := newMountedE2ERepo(t)
 

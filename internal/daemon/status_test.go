@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
+	"github.com/cloudflare/artifact-fs/internal/snapshot"
 )
 
 func TestVerifiedSourceStatusAndRefreshPolicy(t *testing.T) {
@@ -56,6 +58,85 @@ func TestVerifiedSourceStatusAndRefreshPolicy(t *testing.T) {
 	}
 	if err := svc.FetchNow(ctx, cfg.Name); err == nil || !strings.Contains(err.Error(), "refresh is disabled") {
 		t.Fatalf("FetchNow error = %v, want refresh-disabled rejection", err)
+	}
+}
+
+func TestBootstrapCleanStatusIndexSkipsDeleteOnlyOverlay(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "worktree")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repoPath}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+	runGit("init")
+	runGit("config", "user.name", "test")
+	runGit("config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repoPath, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "tracked.txt")
+	runGit("commit", "-m", "base")
+	headOID := strings.TrimSpace(runGit("rev-parse", "HEAD"))
+	runGit("read-tree", "HEAD")
+	indexPath := filepath.Join(repoPath, ".git", "index")
+	indexBefore, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{ID: "repo", Name: "repo", GitDir: filepath.Join(repoPath, ".git"), MountPath: repoPath}
+	svc.fillPaths(&cfg)
+	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := snap.PublishGeneration(ctx, headOID, "refs/heads/master", []model.BaseNode{
+		{RepoID: cfg.ID, Path: ".", Type: "dir", Mode: 0o755, SizeState: "known"},
+		{RepoID: cfg.ID, Path: "tracked.txt", Type: "file", Mode: 0o644, SizeState: "known"},
+	})
+	if err != nil {
+		snap.Close()
+		t.Fatal(err)
+	}
+	defer snap.Close()
+	ov, err := overlay.New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ov.Close()
+	if err := ov.Remove(ctx, "tracked.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if dirty, err := ov.DirtyCount(ctx); err != nil || dirty != 0 {
+		t.Fatalf("delete-only dirty count = %d, %v; want zero", dirty, err)
+	}
+	entries, err := ov.ListAll(ctx)
+	if err != nil || len(entries) != 1 || entries[0].Kind != model.OverlayKindDelete {
+		t.Fatalf("delete-only overlay entries = %+v, %v", entries, err)
+	}
+	if err := svc.bootstrapCleanStatusIndex(ctx, cfg, headOID, gen, snap, ov); err != nil {
+		t.Fatal(err)
+	}
+	indexAfter, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(indexBefore, indexAfter) {
+		t.Fatal("delete-only overlay allowed clean index bootstrap")
 	}
 }
 
