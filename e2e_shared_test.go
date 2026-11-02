@@ -12,11 +12,17 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/meta"
+	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
 // sharedRestoreTimeout bounds restoring the shared mount between tests. A
 // restore that outlives it is stuck on the mount, which is then wedged.
 const sharedRestoreTimeout = 2 * time.Minute
+
+// kernelCacheExpiry is longer than the 1-second entry and attribute expiry that
+// internal/fusefs gives the kernel. Nothing invalidates those caches when the
+// daemon switches snapshots, so a stat within that second can see the old one.
+const kernelCacheExpiry = 1500 * time.Millisecond
 
 // TestE2ESharedMount runs every e2e test that needs only a mounted repo in its
 // seeded state on one mount, because each mount counts toward the series after
@@ -59,7 +65,10 @@ type sharedE2ERepo struct {
 	remoteGitDir string
 	head         string
 	// headRef is how daemon status names the branch HEAD is on.
-	headRef    string
+	headRef string
+	// generation is the snapshot generation the daemon served when the
+	// mount was last handed to a test.
+	generation int64
 	refs       string
 	remoteRefs string
 	// emptyCommit has an empty tree. While HEAD is on it, the daemon
@@ -90,6 +99,7 @@ func newSharedE2ERepo(t *testing.T) *sharedE2ERepo {
 		t.Fatal(err)
 	}
 	s.headRef = st.CurrentHEADRef
+	s.generation = st.SnapshotGeneration
 	if s.refs, err = listRefs(s.gitDir); err != nil {
 		t.Fatal(err)
 	}
@@ -162,6 +172,11 @@ func (s *sharedE2ERepo) release(t *testing.T) {
 // an index that matches HEAD.
 func (s *sharedE2ERepo) restore() error {
 	mountPath := s.repo.mountPath
+	// A test that moved HEAD may leave a reconcile in flight that daemon
+	// status does not show yet.
+	head, headErr := gitOutput("", "--git-dir", s.gitDir, "rev-parse", "HEAD")
+	ref, refErr := gitOutput("", "--git-dir", s.gitDir, "symbolic-ref", "-q", "HEAD")
+	headMoved := headErr != nil || refErr != nil || head != s.head || ref != "refs/heads/main"
 	for _, dir := range []string{"rebase-merge", "rebase-apply"} {
 		if _, err := os.Stat(filepath.Join(s.gitDir, dir)); err == nil {
 			if _, err := gitOutput(mountPath, "rebase", "--quit"); err != nil {
@@ -187,6 +202,15 @@ func (s *sharedE2ERepo) restore() error {
 	if err := s.discardOverlay(); err != nil {
 		return err
 	}
+	st, err := s.repo.svc.Status(context.Background(), repoName)
+	if err != nil {
+		return err
+	}
+	if headMoved || st.SnapshotGeneration != s.generation {
+		if st, err = s.settle(); err != nil {
+			return err
+		}
+	}
 	// A mixed reset sets the index to HEAD without writing the worktree, and
 	// clears merge and cherry-pick state.
 	if _, err := gitOutput(mountPath, "reset", "-q"); err != nil {
@@ -195,8 +219,37 @@ func (s *sharedE2ERepo) restore() error {
 	if err := s.verify(); err != nil {
 		return err
 	}
+	s.generation = st.SnapshotGeneration
 	s.repo.logs.Reset()
 	return nil
+}
+
+// settle waits until the daemon serves s.head and keeps one snapshot for
+// longer than kernelCacheExpiry, so the kernel holds no entry or attribute
+// from an earlier snapshot. It returns the daemon status at that point.
+func (s *sharedE2ERepo) settle() (model.RepoRuntimeState, error) {
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if err := s.waitForDaemonHEAD(s.head); err != nil {
+			return model.RepoRuntimeState{}, err
+		}
+		before, err := s.repo.svc.Status(context.Background(), repoName)
+		if err != nil {
+			return model.RepoRuntimeState{}, err
+		}
+		time.Sleep(kernelCacheExpiry)
+		after, err := s.repo.svc.Status(context.Background(), repoName)
+		if err != nil {
+			return model.RepoRuntimeState{}, err
+		}
+		if after.CurrentHEADOID == s.head && after.CurrentHEADRef == s.headRef && after.SnapshotGeneration == before.SnapshotGeneration {
+			return after, nil
+		}
+		if time.Now().After(deadline) {
+			return model.RepoRuntimeState{}, fmt.Errorf("daemon did not settle on %s at %s: generation %d became %d, head %s on %s",
+				s.headRef, s.head, before.SnapshotGeneration, after.SnapshotGeneration, after.CurrentHEADOID, after.CurrentHEADRef)
+		}
+	}
 }
 
 // discardOverlay leaves the overlay without entries. Restoring files with Git
