@@ -34,6 +34,16 @@ Repository-specific guidance for `artifact-fs`.
 - The overlay stores deletes as SQLite entries with `kind='delete'`; there is no on-disk whiteout file layer.
 - SQLite is `modernc.org/sqlite` in WAL mode via `internal/meta`.
 
+## Writing tests
+
+- Write a test to catch a regression, never to raise coverage. Do not add coverage targets.
+- Make every regression test fail on the code before the fix. Revert the fix and watch the test fail.
+- Drive behavior through the entry point real callers use, not an internal helper.
+- Use real Git repositories in `t.TempDir()`. Fake the `git` binary only to inject failures a local repository cannot produce, such as HTTP errors.
+- Assert the observable outcome: what `git status` reports, the resolved entry, or the persisted state. A nil error or a log line is not an outcome.
+- Assert a result that only the code path under test produces. `TestBootstrapCleanStatusIndexSkipsDeleteOnlyOverlay` checks only that the index is unchanged, so it passes whichever check skips the bootstrap.
+- Never mount in a package test. Only the root-package e2e tests mount.
+
 ## Validation
 
 - Start with the narrowest relevant test: `go test ./internal/<pkg>` or `go test -run TestName ./internal/<pkg>`.
