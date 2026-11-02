@@ -113,7 +113,7 @@ Check the state of a mounted repo with `status`:
 
 ```bash
 ./artifact-fs status --name workers-sdk
-# repo=workers-sdk state=mounted head=d4c61587... ref=main source_ref=refs/heads/main required_commit=none acquisition=not_required base_commit=d4c61587... remote_refresh=enabled ahead=0 behind=0 diverged=false last_fetch=2026-03-27T12:00:00Z result=ok prepare_error=none hydrated_blobs=42 hydrated_bytes=131072 overlay_dirty=false
+# repo=workers-sdk state=mounted head=d4c61587... ref=main source_ref=refs/heads/main required_commit=none acquisition=not_required base_commit=d4c61587... remote_refresh=enabled ahead=0 behind=0 diverged=false last_fetch=2026-03-27T12:00:00Z result=ok prepare_error=none mount_error=none hydrated_blobs=42 hydrated_bytes=131072 overlay_dirty=false
 ```
 
 | Field | Meaning |
@@ -127,6 +127,7 @@ Check the state of a mounted repo with `status`:
 | `remote_refresh` | Whether daemon and manual remote refreshes are enabled |
 | `ahead` / `behind` / `diverged` | Currently zero/false in one-shot CLI status output |
 | `prepare_error` | Last redacted preparation error, if any |
+| `mount_error` | Last redacted FUSE mount error, if any; a successful mount clears it |
 | `hydrated_blobs` / `hydrated_bytes` | Blob count and bytes present in the local hydration cache |
 | `overlay_dirty` | `true` if the overlay contains created or modified files; delete-only overlays are not counted |
 | `last_fetch` / `result` | `FETCH_HEAD` modification time and `ok` when present; otherwise `never` |

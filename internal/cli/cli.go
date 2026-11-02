@@ -319,11 +319,11 @@ func formatStatusLine(st model.RepoRuntimeState) string {
 	if st.RemoteRefreshDisabled {
 		remoteRefresh = "disabled"
 	}
-	return fmt.Sprintf("repo=%s state=%s head=%s ref=%s source_ref=%s required_commit=%s acquisition=%s base_commit=%s remote_refresh=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s prepare_error=%s hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
+	return fmt.Sprintf("repo=%s state=%s head=%s ref=%s source_ref=%s required_commit=%s acquisition=%s base_commit=%s remote_refresh=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s prepare_error=%s mount_error=%s hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
 		st.RepoID, st.State, st.CurrentHEADOID, st.CurrentHEADRef, st.SourceRef, requiredCommit, acquisition, st.CurrentHEADOID, remoteRefresh,
 		st.AheadCount, st.BehindCount, st.Diverged,
 		formatLastFetchAt(st.LastFetchAt), formatLastFetchResult(st.LastFetchResult),
-		formatPrepareError(st.PrepareError),
+		formatStatusError(st.PrepareError), formatStatusError(st.MountError),
 		st.HydratedBlobCount, st.HydratedBlobBytes, st.DirtyOverlay)
 }
 
@@ -341,7 +341,7 @@ func formatLastFetchResult(result string) string {
 	return result
 }
 
-func formatPrepareError(err string) string {
+func formatStatusError(err string) string {
 	if strings.TrimSpace(err) == "" {
 		return "none"
 	}

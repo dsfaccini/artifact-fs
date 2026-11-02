@@ -5,12 +5,14 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/model"
+	"github.com/cloudflare/artifact-fs/internal/registry"
 )
 
 func TestFormatStatusLineUsesNeverForUnsetFetch(t *testing.T) {
@@ -197,6 +199,33 @@ func TestPrepareCLIReportsQueuedPrepare(t *testing.T) {
 	}
 	if got := stdout.String(); got != "preparing repo\n" {
 		t.Fatalf("stdout = %q, want preparing repo", got)
+	}
+}
+
+func TestStatusCLIPrintsDaemonMountError(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ARTIFACT_FS_ROOT", root)
+	ctx := context.Background()
+	var stdout, stderr bytes.Buffer
+	if code := Run(ctx, []string{"add-repo", "--name", "repo", "--remote", "https://github.com/example/repo.git", "--async"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("add-repo exit = %d, stderr=%q", code, stderr.String())
+	}
+	// The daemon persists mount errors in the registry that status reads.
+	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = reg.UpdateMountError(ctx, "repo", "fskit: extension requires approval")
+	if closeErr := reg.Close(); err != nil || closeErr != nil {
+		t.Fatalf("record mount error: %v, close: %v", err, closeErr)
+	}
+
+	stdout.Reset()
+	if code := Run(ctx, []string{"status", "--name", "repo"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("status exit = %d, stderr=%q", code, stderr.String())
+	}
+	if got := stdout.String(); !strings.Contains(got, " mount_error=fskit:_extension_requires_approval ") {
+		t.Fatalf("status output %q missing mount error", got)
 	}
 }
 
