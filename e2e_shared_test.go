@@ -58,8 +58,10 @@ type sharedE2ERepo struct {
 	// a remote that no test writes to.
 	remoteGitDir string
 	head         string
-	refs         string
-	remoteRefs   string
+	// headRef is how daemon status names the branch HEAD is on.
+	headRef    string
+	refs       string
+	remoteRefs string
 	// emptyCommit has an empty tree. While HEAD is on it, the daemon
 	// reconciles every overlay entry against a base without that path.
 	emptyCommit string
@@ -83,6 +85,11 @@ func newSharedE2ERepo(t *testing.T) *sharedE2ERepo {
 	if s.head, err = gitOutput(repo.mountPath, "rev-parse", "HEAD"); err != nil {
 		t.Fatal(err)
 	}
+	st, err := repo.svc.Status(context.Background(), repoName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.headRef = st.CurrentHEADRef
 	if s.refs, err = listRefs(s.gitDir); err != nil {
 		t.Fatal(err)
 	}
@@ -232,8 +239,8 @@ func (s *sharedE2ERepo) verify() error {
 	if err != nil {
 		return err
 	}
-	if st.State != "mounted" || st.MountError != "" || st.CurrentHEADOID != s.head || st.CurrentHEADRef != "refs/heads/main" || st.DirtyOverlay {
-		return fmt.Errorf("daemon status = %+v, want mounted on refs/heads/main at %s with a clean overlay", st, s.head)
+	if st.State != "mounted" || st.MountError != "" || st.CurrentHEADOID != s.head || st.CurrentHEADRef != s.headRef || st.DirtyOverlay {
+		return fmt.Errorf("daemon status = %+v, want mounted on %s at %s with a clean overlay", st, s.headRef, s.head)
 	}
 	for _, check := range []struct {
 		args []string
@@ -276,12 +283,12 @@ func (s *sharedE2ERepo) verify() error {
 }
 
 func (s *sharedE2ERepo) waitForDaemonHEAD(oid string) error {
-	return pollCondition(15*time.Second, "daemon HEAD on refs/heads/main at "+oid, func() (bool, string) {
+	return pollCondition(15*time.Second, "daemon HEAD on "+s.headRef+" at "+oid, func() (bool, string) {
 		st, err := s.repo.svc.Status(context.Background(), repoName)
 		if err != nil {
 			return false, err.Error()
 		}
-		return st.CurrentHEADOID == oid && st.CurrentHEADRef == "refs/heads/main", fmt.Sprintf("head=%s ref=%s", st.CurrentHEADOID, st.CurrentHEADRef)
+		return st.CurrentHEADOID == oid && st.CurrentHEADRef == s.headRef, fmt.Sprintf("head=%s ref=%s", st.CurrentHEADOID, st.CurrentHEADRef)
 	})
 }
 
