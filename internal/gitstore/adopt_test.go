@@ -1,7 +1,9 @@
 package gitstore
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -106,6 +108,52 @@ func TestAdoptedWorktreeConfigMigration(t *testing.T) {
 			if mode == "existing-primary-override" || mode == "primary-path-whitespace" {
 				if got := strings.TrimSuffix(runOutput(t, "git", "-C", source, "rev-parse", "--show-toplevel"), "\n"); got != source {
 					t.Fatalf("existing primary override changed to %q", got)
+				}
+			}
+		})
+	}
+}
+
+func TestAdoptedWorktreeConfigMigrationFailureKeepsWorktreePaths(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, failingWrite := range []string{"--unset-all core.worktree", "extensions.worktreeConfig true"} {
+		t.Run(failingWrite, func(t *testing.T) {
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			source, worktree, side := filepath.Join(dir, "source"), filepath.Join(dir, "worktree"), filepath.Join(dir, "side")
+			run(t, realGit, "init", "--initial-branch=main", source)
+			if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			run(t, realGit, "-C", source, "add", "README.md")
+			run(t, realGit, "-C", source, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
+			run(t, realGit, "-C", source, "config", "core.worktree", source)
+			run(t, realGit, "-C", source, "worktree", "add", "-b", "topic", worktree)
+			run(t, realGit, "-C", source, "worktree", "add", "-b", "side", side)
+			gitDir := strings.TrimSpace(runOutput(t, realGit, "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
+			// Fail one shared config write, as a held config.lock would.
+			bin := filepath.Join(dir, "bin")
+			if err := os.Mkdir(bin, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			wrapper := fmt.Sprintf("#!/bin/sh\ncase \" $* \" in *\" %s \"*) exit 1 ;; esac\nexec '%s' \"$@\"\n", failingWrite, realGit)
+			if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			store := New(nil)
+			defer store.Close()
+			if err := store.ConfigureAdoptedWorktree(t.Context(), model.RepoConfig{GitDir: gitDir, MountPath: worktree, AdoptGitDir: true}); err == nil {
+				t.Fatal("adoption ignored a failed config write")
+			}
+			for _, checkout := range []string{source, worktree, side} {
+				if got := strings.TrimSpace(runOutput(t, realGit, "-C", checkout, "rev-parse", "--show-toplevel")); got != checkout {
+					t.Fatalf("interrupted migration resolved %s to %q", checkout, got)
 				}
 			}
 		})

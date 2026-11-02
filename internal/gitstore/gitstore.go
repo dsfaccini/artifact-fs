@@ -1906,8 +1906,11 @@ func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoCon
 	}
 	commonConfig := filepath.Join(commonDir, "config")
 	mainConfig := filepath.Join(commonDir, "config.worktree")
-	// Prepare the primary worktree's overrides before enabling the extension.
-	// Keep existing overrides: they already win over the shared config.
+	// Git's migration moves shared core.worktree and core.bare=true into the
+	// primary worktree's config.worktree. Linked worktrees ignore those shared
+	// keys until the extension is enabled, so enabling it last means an
+	// interrupted migration never repoints them. Keep an existing primary
+	// override: it wins once the extension is on, and Git ignores it before.
 	for _, key := range []string{"core.worktree", "core.bare"} {
 		args := []string{"config", "--file", commonConfig}
 		if key == "core.bare" {
@@ -1943,9 +1946,6 @@ func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoCon
 			}
 		}
 	}
-	if _, err := runGit(ctx, repo.GitDir, "config", "--file", commonConfig, "extensions.worktreeConfig", "true"); err != nil {
-		return err
-	}
 	for _, key := range []string{"core.worktree", "core.bare"} {
 		if key == "core.bare" {
 			value, err := runGit(ctx, repo.GitDir, "config", "--file", commonConfig, "--bool", "--get", key)
@@ -1966,6 +1966,9 @@ func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoCon
 				return err
 			}
 		}
+	}
+	if _, err := runGit(ctx, repo.GitDir, "config", "--file", commonConfig, "extensions.worktreeConfig", "true"); err != nil {
+		return err
 	}
 	for _, setting := range [][2]string{
 		{"core.bare", "false"},
