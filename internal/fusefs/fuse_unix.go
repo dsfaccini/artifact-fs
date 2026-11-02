@@ -22,6 +22,8 @@ import (
 
 // MountedFS matches tigrisfs's interface for mount lifecycle.
 type MountedFS interface {
+	// Backend returns the backend that mounted the filesystem: BackendFSKit or BackendKernel.
+	Backend() string
 	Join(ctx context.Context) error
 	Unmount() error
 }
@@ -1194,11 +1196,14 @@ func (fs *ArtifactFuse) RemoveXattr(_ context.Context, _ *fuseops.RemoveXattrOp)
 type mountedFSWrapper struct {
 	*fuse.MountedFileSystem
 	mountPoint string
+	backend    string
 }
 
 func (m *mountedFSWrapper) Unmount() error {
 	return TryUnmount(m.mountPoint)
 }
+
+func (m *mountedFSWrapper) Backend() string { return m.backend }
 
 func MountRepo(repo model.RepoConfig, resolver *Resolver, engine *Engine) (MountedFS, error) {
 	return MountRepoWithGate(repo, resolver, engine, nil)
@@ -1206,20 +1211,72 @@ func MountRepo(repo model.RepoConfig, resolver *Resolver, engine *Engine) (Mount
 
 const backendEnv = "ARTIFACT_FS_FUSE_BACKEND"
 
-// MountBackend returns the transport ARTIFACT_FS_FUSE_BACKEND selects: empty for
-// the platform default, or fskit for macFUSE's FSKit backend.
+// Values of ARTIFACT_FS_FUSE_BACKEND. Only darwin acts on them.
+const (
+	BackendAuto   = "auto"
+	BackendFSKit  = "fskit"
+	BackendKernel = "kernel"
+)
+
+// MountBackend returns the backend ARTIFACT_FS_FUSE_BACKEND selects. Empty selects BackendAuto.
 func MountBackend() (string, error) {
 	switch backend := os.Getenv(backendEnv); backend {
 	case "":
-		return "", nil
-	case "fskit":
-		if !fskitSupported {
-			return "", fmt.Errorf("%s=fskit requires a darwin cgo build with -tags fskit", backendEnv)
-		}
+		return BackendAuto, nil
+	case BackendAuto, BackendFSKit, BackendKernel:
 		return backend, nil
 	default:
-		return "", fmt.Errorf("unsupported %s=%q; leave it empty or set fskit", backendEnv, backend)
+		return "", fmt.Errorf("unsupported %s=%q; use auto, fskit, or kernel", backendEnv, backend)
 	}
+}
+
+// mountWithBackend mounts through the transports backend allows and returns the
+// backend that mounted. mount(true) mounts through FSKit, mount(false) through the
+// kernel transport. BackendAuto falls back to the kernel transport only when FSKit
+// cannot serve any mount here and kextLoaded reports a loaded macFUSE kernel
+// extension, because mounting through an unloaded one prompts macOS to load it.
+func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileSystem, error), kextLoaded func() bool) (*fuse.MountedFileSystem, string, error) {
+	switch backend {
+	case BackendKernel:
+		mfs, err := mount(false)
+		return mfs, BackendKernel, err
+	case BackendFSKit:
+		mfs, err := mount(true)
+		return mfs, BackendFSKit, err
+	}
+	mfs, fskitErr := mount(true)
+	if fskitErr == nil || !fskitUnavailable(fskitErr) {
+		return mfs, BackendFSKit, fskitErr
+	}
+	if !kextLoaded() {
+		return nil, BackendFSKit, fmt.Errorf("%w; no kernel transport fallback because the macFUSE kernel extension is not loaded", fskitErr)
+	}
+	mfs, err := mount(false)
+	if err != nil {
+		return nil, BackendKernel, fmt.Errorf("%w; kernel transport fallback: %w", fskitErr, err)
+	}
+	return mfs, BackendKernel, nil
+}
+
+// fskitUnavailable reports whether err means FSKit cannot serve any mount on this
+// machine. Other FSKit failures may leave a mount behind, so retrying through the
+// kernel transport could mount twice.
+func fskitUnavailable(err error) bool {
+	if errors.Is(err, fuse.ErrFSKitUnavailable) {
+		return true
+	}
+	var mountErr fuse.FSKitMountError
+	if !errors.As(err, &mountErr) {
+		return false
+	}
+	switch mountErr.Result {
+	case fuse.FSKitMountResultUnsupportedOSVersion,
+		fuse.FSKitMountResultHelperToolsInstallationFailed,
+		fuse.FSKitMountResultFileSystemExtensionNotFound,
+		fuse.FSKitMountResultFileSystemExtensionRequiresApproval:
+		return true
+	}
+	return false
 }
 
 func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine, gate *ReadyGate) (MountedFS, error) {
@@ -1228,24 +1285,32 @@ func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine
 		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
 	}
 	fsint := NewArtifactFuse(repo, resolver, engine)
-	fsint.fskit = backend == "fskit"
 	server := fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate))
 
-	mountCfg := &fuse.MountConfig{
+	mountCfg := fuse.MountConfig{
 		FSName:                  "artifact-fs:" + repo.Name,
 		Subtype:                 "artifact-fs",
 		DisableWritebackCaching: true,
 		UseVectoredRead:         true,
 	}
 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.
-	platformMountConfig(mountCfg, backend)
+	platformMountConfig(&mountCfg)
+	mount := func(fskit bool) (*fuse.MountedFileSystem, error) {
+		// The server handles operations as soon as the mount starts.
+		fsint.fskit = fskit
+		cfg := mountCfg
+		if fskit {
+			cfg.Options = map[string]string{"backend": "fskit"}
+		}
+		return fuse.Mount(repo.MountPath, server, &cfg)
+	}
 
-	mfs, err := fuse.Mount(repo.MountPath, server, mountCfg)
+	mfs, mounted, err := platformMount(backend, mount)
 	if err != nil {
 		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
 	}
 
-	return &mountedFSWrapper{MountedFileSystem: mfs, mountPoint: repo.MountPath}, nil
+	return &mountedFSWrapper{MountedFileSystem: mfs, mountPoint: repo.MountPath, backend: mounted}, nil
 }
 
 func TryUnmount(mountPoint string) error {

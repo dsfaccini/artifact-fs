@@ -45,6 +45,7 @@ type delayedUnmountFailure struct {
 	release chan struct{}
 }
 
+func (m *delayedUnmountFailure) Backend() string            { return "fake" }
 func (m *delayedUnmountFailure) Join(context.Context) error { return nil }
 
 func (m *delayedUnmountFailure) Unmount() error {

@@ -12,6 +12,7 @@ require (
 require (
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
 	github.com/dustin/go-humanize v1.1.0 // indirect
+	github.com/ebitengine/purego v0.10.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.1.0 // indirect
@@ -22,4 +23,4 @@ require (
 	modernc.org/memory v1.12.1 // indirect
 )
 
-replace github.com/jacobsa/fuse => github.com/dsfaccini/fuse v0.0.0-20261030184435-ffa139e8f611
+replace github.com/jacobsa/fuse => github.com/dsfaccini/fuse v0.0.0-20261102163808-cb60ed15470d

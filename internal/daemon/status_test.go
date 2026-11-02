@@ -264,6 +264,8 @@ func (m *blockingMountedFS) Join(ctx context.Context) error {
 	}
 }
 
+func (m *blockingMountedFS) Backend() string { return "fake" }
+
 func (m *blockingMountedFS) Unmount() error { return m.unmountErr }
 
 func TestJoinRuntimeMountIsNotCanceledWithWorkers(t *testing.T) {

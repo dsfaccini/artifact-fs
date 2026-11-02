@@ -29,6 +29,8 @@ type fakeMountedFS struct {
 	unmounted   chan struct{}
 }
 
+func (m *fakeMountedFS) Backend() string { return "fake" }
+
 func (m *fakeMountedFS) Join(ctx context.Context) error {
 	select {
 	case <-m.unmounted:

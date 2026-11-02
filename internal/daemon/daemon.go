@@ -1108,7 +1108,7 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 		Hydrator: h,
 	}
 
-	mfs, err := s.mount(cfg, resolver, engine, nil)
+	mfs, err := s.mountFS(cfg, resolver, engine, nil)
 	if err != nil {
 		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
 		mfs = nil
@@ -1136,6 +1136,16 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 	s.startRepoBackground(rt)
 
 	return nil
+}
+
+// mountFS mounts cfg through s.mount and logs which backend serves the mount.
+func (s *Service) mountFS(cfg model.RepoConfig, resolver *fusefs.Resolver, engine *fusefs.Engine, gate *fusefs.ReadyGate) (fusefs.MountedFS, error) {
+	mfs, err := s.mount(cfg, resolver, engine, gate)
+	if err != nil {
+		return nil, err
+	}
+	s.logger.Info("fuse mounted", "repo", cfg.Name, "backend", mfs.Backend())
+	return mfs, nil
 }
 
 func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) error {
@@ -1178,7 +1188,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		Hydrator: h,
 	}
 
-	mfs, err := s.mount(cfg, resolver, engine, gate)
+	mfs, err := s.mountFS(cfg, resolver, engine, gate)
 	if err != nil {
 		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
 		mfs = nil
@@ -2216,7 +2226,7 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 	s.mu.Unlock()
 	defer rt.mounts.Done()
 
-	mfs, err := s.mount(cfg, resolver, engine, gate)
+	mfs, err := s.mountFS(cfg, resolver, engine, gate)
 	s.mu.Lock()
 	if err != nil {
 		mf = s.mountFailures[cfg.ID]
