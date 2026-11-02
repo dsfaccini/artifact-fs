@@ -40,6 +40,7 @@ Repository-specific guidance for `artifact-fs`.
 - For non-trivial code changes, reproduce CI in order: `go build ./cmd/artifact-fs`, `go vet ./...`, then `go test ./...`.
 - Never mount from a unit test. E2E tests own all mounts, so `go test ./...` never mounts.
 - Build only the CLI with `go build ./cmd/artifact-fs`.
+- Enable the pre-commit checks with `git config core.hooksPath .githooks`.
 - Benchmarks are opt-in: `AFS_RUN_BENCH=1 go test -run TestBenchRepos -v`.
 - FUSE e2e tests are opt-in: `AFS_RUN_E2E_TESTS=1 go test -run TestE2E -v .`. They require `/dev/fuse` on Linux.
 - On macOS, e2e tests mount through FSKit by default. Set `ARTIFACT_FS_FUSE_BACKEND=kernel` only to test the macFUSE kernel extension; without a loaded kernel extension those tests skip. A deadlocked FSKit mount cannot be unmounted until reboot.

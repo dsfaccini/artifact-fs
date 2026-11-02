@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Pre-commit checks for staged Go changes. Enable with:
+#
+#   git config core.hooksPath .githooks
+#
+# Always runs gofmt on the staged Go files, go vet on their packages, and a
+# build of the CLI. Then runs unit tests for those packages unless the machine
+# is under load; CI runs every test on push.
+#
+#   AFS_PRECOMMIT_TESTS         auto (default), always, or never.
+#   AFS_PRECOMMIT_LOAD_PER_CPU  1-minute load average per CPU at which auto
+#                               skips tests (default 1).
+set -eo pipefail
+
+# The hook never mounts or benchmarks.
+unset AFS_RUN_E2E_TESTS AFS_RUN_E2E_BENCH AFS_RUN_BENCH
+
+tests_mode=${AFS_PRECOMMIT_TESTS:-auto}
+load_per_cpu=${AFS_PRECOMMIT_LOAD_PER_CPU:-1}
+case $tests_mode in
+auto | always | never) ;;
+*)
+	echo "pre-commit: AFS_PRECOMMIT_TESTS must be auto, always, or never, got '$tests_mode'" >&2
+	exit 1
+	;;
+esac
+case $load_per_cpu in
+'' | . | *[!0-9.]* | *.*.*)
+	echo "pre-commit: AFS_PRECOMMIT_LOAD_PER_CPU must be a number, got '$load_per_cpu'" >&2
+	exit 1
+	;;
+esac
+
+cd "$(git rev-parse --show-toplevel)"
+
+go_files=$(git diff --cached --name-only --diff-filter=ACMRD -- '*.go')
+module_files=$(git diff --cached --name-only --diff-filter=ACMRD -- go.mod go.sum)
+if [ -z "$go_files" ] && [ -z "$module_files" ]; then
+	exit 0
+fi
+
+# Check the staged content, which can differ from the working tree.
+unformatted=""
+while IFS= read -r file; do
+	if [ -n "$file" ] && [ -n "$(git show ":$file" | gofmt -l)" ]; then
+		unformatted="$unformatted  $file"$'\n'
+	fi
+done <<<"$(git diff --cached --name-only --diff-filter=ACMR -- '*.go')"
+if [ -n "$unformatted" ]; then
+	printf 'pre-commit: run gofmt on these staged files:\n%s' "$unformatted" >&2
+	exit 1
+fi
+
+packages=""
+while IFS= read -r file; do
+	[ -n "$file" ] || continue
+	dir=$(dirname "$file")
+	case "/$dir/" in */testdata/*) continue ;; esac
+	if ls "$dir"/*.go >/dev/null 2>&1; then
+		packages="$packages ./$dir"
+	fi
+done <<<"$go_files"
+packages=$(printf '%s\n' $packages | sort -u)
+
+# Tests create their own Git repositories. githooks(5): clear the variables
+# Git exports to hooks so they do not point those repositories at this one.
+unset $(git rev-parse --local-env-vars)
+
+vet_targets=$packages
+if [ -n "$module_files" ]; then
+	vet_targets=./...
+fi
+if [ -n "$vet_targets" ]; then
+	go vet $vet_targets
+fi
+go build -o /dev/null ./cmd/artifact-fs
+
+# The root package holds only the opt-in e2e tests and benchmarks.
+test_targets=$(printf '%s\n' $packages | grep -vx '\./\.' || true)
+if [ -z "$test_targets" ]; then
+	exit 0
+fi
+
+under_load() {
+	local cpus load level
+	cpus=$(getconf _NPROCESSORS_ONLN)
+	if [ -r /proc/loadavg ]; then
+		read -r load _ </proc/loadavg
+	else
+		load=$(sysctl -n vm.loadavg | awk '{ print $2 }')
+	fi
+	if awk -v l="$load" -v c="$cpus" -v t="$load_per_cpu" 'BEGIN { exit !(l >= c * t) }'; then
+		echo "load average $load on $cpus CPUs"
+		return 0
+	fi
+	# macOS reports 1 for normal, 2 for warn, and 4 for critical.
+	level=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || true)
+	if [ -n "$level" ] && [ "$level" -ge 2 ]; then
+		echo "memory pressure level $level"
+		return 0
+	fi
+	if [ -r /proc/meminfo ] &&
+		awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { exit !(t > 0 && a < t / 10) }' /proc/meminfo; then
+		echo "MemAvailable below 10% of MemTotal"
+		return 0
+	fi
+	return 1
+}
+
+case $tests_mode in
+never)
+	echo "pre-commit: skipped unit tests (AFS_PRECOMMIT_TESTS=never); CI runs them on push."
+	exit 0
+	;;
+auto)
+	if reason=$(under_load); then
+		echo "pre-commit: skipped unit tests, machine under load ($reason); CI runs them on push."
+		exit 0
+	fi
+	;;
+esac
+
+go test $test_targets

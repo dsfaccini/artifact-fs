@@ -458,6 +458,8 @@ AI/LLM submissions are welcome, but overall issue/PR quality is ultimately the r
 
 See [AGENTS.md](AGENTS.md) for build commands, architecture details, and conventions. Run `go test ./...` and `go vet ./...` before submitting changes.
 
+Enable the pre-commit checks with `git config core.hooksPath .githooks`. For staged Go changes they run `gofmt`, `go vet`, a CLI build, and the changed packages' unit tests. The hook skips the tests when the machine is under load; set `AFS_PRECOMMIT_TESTS` to `always` or `never` to override, or tune `AFS_PRECOMMIT_LOAD_PER_CPU` (default `1`).
+
 ## Credits
 
 The ArtifactFS FUSE driver takes inspiration from and draws from implementation details in:
