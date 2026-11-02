@@ -630,6 +630,84 @@ func TestRenameReplacedTrackedEntryHidesSource(t *testing.T) {
 	}
 }
 
+func TestRenameChainHidesReplacedTrackedIntermediate(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		unlinkIntermediate bool
+	}{
+		{"unlinked intermediate", true},
+		{"replaced intermediate", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			tmp := t.TempDir()
+			cfg := model.RepoConfig{
+				ID:            "repo",
+				OverlayDir:    filepath.Join(tmp, "overlay"),
+				OverlayDBPath: filepath.Join(tmp, "overlay.db"),
+			}
+			ov, err := overlaystore.New(ctx, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = ov.Close() })
+
+			const content = "first tracked content"
+			cachePath := filepath.Join(tmp, "blob")
+			if err := os.WriteFile(cachePath, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			first := model.BaseNode{Path: "first.txt", Type: "file", Mode: 0o100644, ObjectOID: "first-oid"}
+			intermediate := model.BaseNode{Path: "intermediate.txt", Type: "file", Mode: 0o100644, ObjectOID: "intermediate-oid"}
+			snapshot := &fakeSnapshot{
+				nodes: map[string]model.BaseNode{first.Path: first, intermediate.Path: intermediate},
+				kids:  map[string][]model.BaseNode{".": {first, intermediate}},
+			}
+			resolver := &Resolver{Snapshot: snapshot, Overlay: ov}
+			resolver.SetGeneration(1)
+			engine := &Engine{Repo: cfg, Resolver: resolver, Overlay: ov, Hydrator: &fakeBatchHydrator{path: cachePath}}
+
+			if tc.unlinkIntermediate {
+				if err := engine.Unlink(ctx, intermediate.Path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := engine.Rename(ctx, first.Path, intermediate.Path); err != nil {
+				t.Fatal(err)
+			}
+			if err := engine.Rename(ctx, intermediate.Path, "final.txt"); err != nil {
+				t.Fatal(err)
+			}
+			if err := ov.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+				node, ok := snapshot.nodes[path]
+				return node, ok
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			for _, path := range []string{first.Path, intermediate.Path} {
+				if n, err := resolver.ResolvePath(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("%s after reconciliation = (%+v, %v), want not exist", path, n, err)
+				}
+			}
+			entries, err := resolver.ReaddirTyped(ctx, ".")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 || entries[0].Name != "final.txt" {
+				t.Fatalf("root entries = %+v, want only final.txt", entries)
+			}
+			got, err := engine.Read(ctx, "final.txt", 0, len(content))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != content {
+				t.Fatalf("final content = %q, want %q", got, content)
+			}
+		})
+	}
+}
+
 func TestRenameBaseDirectoryHydratesBeforeMutatingOverlay(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := model.RepoConfig{

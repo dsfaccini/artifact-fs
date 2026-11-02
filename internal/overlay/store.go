@@ -410,7 +410,11 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string, sourceTrack
 	writeSourceWhiteout := true
 	if e.Kind == model.OverlayKindRename && e.TargetPath != "" {
 		newTargetPath = e.TargetPath
-		whiteoutTargetPath = e.TargetPath
+		// Reconcile drops a whiteout that names another path, so only an
+		// untracked intermediate path of a rename chain may name the original.
+		if !sourceTracked {
+			whiteoutTargetPath = e.TargetPath
+		}
 	}
 	mode := e.Mode
 	switch e.Kind {
