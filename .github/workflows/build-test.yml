@@ -35,10 +35,7 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test ./...
-
-      - name: Race test concurrency-sensitive packages
-        run: go test -race ./internal/gitstore ./internal/daemon ./internal/fusefs ./internal/overlay
+        run: go test -race ./...
 
   darwin-build:
     runs-on: ubuntu-latest
