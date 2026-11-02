@@ -202,6 +202,35 @@ func TestPrepareCLIReportsQueuedPrepare(t *testing.T) {
 	}
 }
 
+func TestMountCommandsRefuseAndPointToAlternative(t *testing.T) {
+	for command, wants := range map[string][]string{
+		"unmount": {"remove-repo --name repo", "stop the daemon"},
+		"remount": {"stop the daemon and start it again"},
+	} {
+		t.Run(command, func(t *testing.T) {
+			t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+			ctx := context.Background()
+			var stdout, stderr bytes.Buffer
+			if code := Run(ctx, []string{"add-repo", "--name", "repo", "--remote", "https://github.com/example/repo.git", "--async"}, &stdout, &stderr); code != 0 {
+				t.Fatalf("add-repo exit = %d, stderr=%q", code, stderr.String())
+			}
+			stdout.Reset()
+			stderr.Reset()
+			if code := Run(ctx, []string{command, "--name", "repo"}, &stdout, &stderr); code == 0 {
+				t.Fatalf("%s exit = 0, stdout=%q", command, stdout.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout = %q, want nothing", stdout.String())
+			}
+			for _, want := range wants {
+				if !strings.Contains(stderr.String(), want) {
+					t.Fatalf("stderr = %q, want substring %q", stderr.String(), want)
+				}
+			}
+		})
+	}
+}
+
 func TestStatusCLIPrintsDaemonMountError(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("ARTIFACT_FS_ROOT", root)
