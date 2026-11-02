@@ -18,6 +18,7 @@ import (
 // fails when ARTIFACT_FS_FUSE_BACKEND cannot mount in this build.
 func skipIfNoFUSE(t *testing.T) {
 	t.Helper()
+	skipIfMountWedged(t)
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		t.Skip("skipping: /dev/fuse not available")
 	}

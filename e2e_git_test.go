@@ -134,7 +134,7 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 func (r *mountedE2ERepo) close(t *testing.T) {
 	t.Helper()
 	r.stop(t)
-	removeAllWithRetry(t, r.mountDir)
+	removeE2EMountDir(t, r.mountDir, r.mountPath)
 	removeAllWithRetry(t, r.root)
 }
 
@@ -149,18 +149,10 @@ func (r *mountedE2ERepo) stop(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	shutdownTimer := time.NewTimer(time.Until(deadline))
 	defer shutdownTimer.Stop()
-	closeErrCh := make(chan error, 1)
-	go func() {
-		closeErrCh <- svc.Close()
-	}()
-
-	select {
-	case err := <-closeErrCh:
-		if err != nil {
-			t.Errorf("close daemon: %v", err)
-		}
-	case <-shutdownTimer.C:
-		t.Fatal("Service.Close did not return within 10s")
+	if err := closeE2EService(svc, r.mountPath, time.Until(deadline)); errors.Is(err, errMountWedged) {
+		t.Fatal(err)
+	} else if err != nil {
+		t.Errorf("close daemon: %v", err)
 	}
 	for isMounted(r.mountPath) && time.Now().Before(deadline) {
 		time.Sleep(100 * time.Millisecond)
@@ -252,7 +244,7 @@ func TestE2EGitConcurrentReads(t *testing.T) {
 				t.Fatal(err)
 			}
 		case <-stalled:
-			t.Fatalf("concurrent Git reads stalled; the mount at %s may stay wedged until reboot", repo.mountPath)
+			t.Fatalf("concurrent Git reads stalled: %v", markMountWedged(repo.mountPath))
 		}
 	}
 }

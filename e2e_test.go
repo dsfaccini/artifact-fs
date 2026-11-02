@@ -142,7 +142,7 @@ func TestE2E(t *testing.T) {
 	}
 
 	root := t.TempDir()
-	mountDir := t.TempDir()
+	mountDir := newE2EMountDir(t)
 	mountPath := filepath.Join(mountDir, repoName)
 	if err := os.MkdirAll(mountPath, 0o755); err != nil {
 		t.Fatal(err)
@@ -156,7 +156,11 @@ func TestE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer svc.Close()
+	defer func() {
+		if err := closeE2EService(svc, mountPath, 10*time.Second); err != nil {
+			t.Errorf("close daemon: %v", err)
+		}
+	}()
 	svc.SetMountRoot(mountDir)
 
 	cfg := model.RepoConfig{
@@ -1100,7 +1104,7 @@ func TestE2EVerifiedSource(t *testing.T) {
 	run(t, updateWork, "git", "checkout", "main")
 
 	root := t.TempDir()
-	mountDir := t.TempDir()
+	mountDir := newE2EMountDir(t)
 	mountPath := filepath.Join(mountDir, repoName)
 	cfg := model.RepoConfig{
 		Name:                  repoName,
@@ -1282,7 +1286,9 @@ func assertVerifiedSourceStatus(t *testing.T, svc *daemon.Service, requiredCommi
 func stopE2EDaemon(t *testing.T, svc *daemon.Service, cancel context.CancelFunc, errCh <-chan error, mountPath string) {
 	t.Helper()
 	cancel()
-	if err := svc.Close(); err != nil {
+	if err := closeE2EService(svc, mountPath, 10*time.Second); errors.Is(err, errMountWedged) {
+		t.Fatal(err)
+	} else if err != nil {
 		t.Errorf("close daemon: %v", err)
 	}
 	select {

@@ -18,6 +18,7 @@ import (
 // without these preflights every e2e case waits for its mount timeout.
 func skipIfNoFUSE(t *testing.T) {
 	t.Helper()
+	skipIfMountWedged(t)
 	if _, err := os.Stat("/Library/Filesystems/macfuse.fs"); err != nil {
 		t.Skip("skipping: macFUSE not installed")
 	}
