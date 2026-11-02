@@ -109,10 +109,10 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 	errCh := make(chan error, 1)
 	go func() { errCh <- svc.Start(ctx) }()
 
-	if !waitForMount(t, mountPath, 60*time.Second) {
+	if err := waitForMount(svc, mountPath, 60*time.Second); err != nil {
 		cancel()
 		_ = svc.Close()
-		t.Fatal("FUSE mount did not appear within timeout")
+		t.Fatal(err)
 	}
 
 	repo := &mountedE2ERepo{
@@ -184,10 +184,10 @@ func (r *mountedE2ERepo) restart(t *testing.T) {
 	svc.SetMountRoot(r.mountDir)
 	errCh := make(chan error, 1)
 	go func() { errCh <- svc.Start(ctx) }()
-	if !waitForMount(t, r.mountPath, 60*time.Second) {
+	if err := waitForMount(svc, r.mountPath, 60*time.Second); err != nil {
 		cancel()
 		_ = svc.Close()
-		t.Fatal("FUSE mount did not reappear after restart")
+		t.Fatalf("mount after restart: %v", err)
 	}
 	r.svc = svc
 	r.cancel = cancel

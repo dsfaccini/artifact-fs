@@ -213,10 +213,10 @@ func newAsyncPreparedE2ERepo(t *testing.T, preparedGitDir string, fetchRef strin
 	errCh := make(chan error, 1)
 	go func() { errCh <- svc.Start(ctx) }()
 
-	if !waitForMount(t, mountPath, 60*time.Second) {
+	if err := waitForMount(svc, mountPath, 60*time.Second); err != nil {
 		cancel()
 		_ = svc.Close()
-		t.Fatal("FUSE mount did not appear within timeout")
+		t.Fatal(err)
 	}
 
 	repo := &mountedE2ERepo{

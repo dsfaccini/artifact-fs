@@ -182,9 +182,9 @@ func TestE2E(t *testing.T) {
 	go func() { errCh <- svc.Start(ctx) }()
 
 	// Wait for the FUSE mount to appear
-	if !waitForMount(t, mountPath, 60*time.Second) {
+	if err := waitForMount(svc, mountPath, 60*time.Second); err != nil {
 		cancel()
-		t.Fatal("FUSE mount did not appear within timeout")
+		t.Fatal(err)
 	}
 	t.Logf("mount active at %s", mountPath)
 	primeE2EMountPolling(t, mountPath)
@@ -1147,10 +1147,10 @@ func TestE2EVerifiedSource(t *testing.T) {
 
 	firstErrCh := make(chan error, 1)
 	go func() { firstErrCh <- firstSvc.Start(firstCtx) }()
-	if !waitForMount(t, mountPath, 60*time.Second) {
+	if err := waitForMount(firstSvc, mountPath, 60*time.Second); err != nil {
 		firstCancel()
 		_ = firstSvc.Close()
-		t.Fatal("verified-source FUSE mount did not appear within timeout")
+		t.Fatalf("verified-source mount: %v", err)
 	}
 	firstStopped := false
 	defer func() {
@@ -1241,10 +1241,10 @@ func TestE2EVerifiedSource(t *testing.T) {
 	secondSvc.SetMountRoot(mountDir)
 	secondErrCh := make(chan error, 1)
 	go func() { secondErrCh <- secondSvc.Start(secondCtx) }()
-	if !waitForMount(t, mountPath, 60*time.Second) {
+	if err := waitForMount(secondSvc, mountPath, 60*time.Second); err != nil {
 		secondCancel()
 		_ = secondSvc.Close()
-		t.Fatal("verified-source FUSE mount did not reappear after restart")
+		t.Fatalf("verified-source mount after restart: %v", err)
 	}
 	defer stopE2EDaemon(t, secondSvc, secondCancel, secondErrCh, mountPath)
 	primeE2EMountPolling(t, mountPath)
@@ -1307,16 +1307,32 @@ func stopE2EDaemon(t *testing.T, svc *daemon.Service, cancel context.CancelFunc,
 
 // --- helpers (platform-independent) ---
 
-func waitForMount(t *testing.T, path string, timeout time.Duration) bool {
-	t.Helper()
+// mountErrorGrace is how long waitForMount tolerates a reported mount error.
+// The daemon retries a failed mount at its next registry sync, 3s later, so an
+// error that outlasts that retry is not transient.
+const mountErrorGrace = 10 * time.Second
+
+// waitForMount waits for svc to mount repoName at path. It returns the
+// daemon's mount error once that error outlasts mountErrorGrace.
+func waitForMount(svc *daemon.Service, path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	var failingSince time.Time
 	for time.Now().Before(deadline) {
 		if isMounted(path) {
-			return true
+			return nil
+		}
+		st, err := svc.Status(context.Background(), repoName)
+		switch {
+		case err != nil || st.MountError == "":
+			failingSince = time.Time{}
+		case failingSince.IsZero():
+			failingSince = time.Now()
+		case time.Since(failingSince) >= mountErrorGrace:
+			return fmt.Errorf("FUSE mount failed: %s", st.MountError)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return false
+	return fmt.Errorf("FUSE mount did not appear within %s", timeout)
 }
 
 func lsDir(t *testing.T, dir string) []string {

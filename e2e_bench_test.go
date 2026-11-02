@@ -212,9 +212,9 @@ func runE2EBenchmarkOnce(t *testing.T, repo e2eBenchRepoSpec, iteration int, hyd
 	errCh := make(chan error, 1)
 	go func() { errCh <- svc.Start(ctx) }()
 
-	if !waitForMount(t, mountPath, 60*time.Second) {
+	if err := waitForMount(svc, mountPath, 60*time.Second); err != nil {
 		cancel()
-		t.Fatal("FUSE mount did not appear within timeout")
+		t.Fatal(err)
 	}
 	primeE2EMountPolling(t, mountPath)
 
