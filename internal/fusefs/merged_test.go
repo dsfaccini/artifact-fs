@@ -98,7 +98,7 @@ func (f *fakeOverlay) WriteFile(_ context.Context, _ string, _ int64, data []byt
 func (f *fakeOverlay) SyncFile(_ context.Context, _ string) error          { return nil }
 func (f *fakeOverlay) Truncate(_ context.Context, _ string, _ int64) error { return nil }
 func (f *fakeOverlay) Remove(_ context.Context, _ string) error            { return nil }
-func (f *fakeOverlay) Rename(_ context.Context, oldPath, newPath string) error {
+func (f *fakeOverlay) Rename(_ context.Context, oldPath, newPath string, _ bool) error {
 	oldPath = model.CleanPath(oldPath)
 	newPath = model.CleanPath(newPath)
 	e := f.entries[oldPath]
@@ -107,8 +107,8 @@ func (f *fakeOverlay) Rename(_ context.Context, oldPath, newPath string) error {
 	f.entries[newPath] = e
 	return nil
 }
-func (f *fakeOverlay) RenameAndMarkModifiedFromBase(_ context.Context, oldPath, newPath string, sourceOID string, sourceMode uint32) error {
-	if err := f.Rename(context.Background(), oldPath, newPath); err != nil {
+func (f *fakeOverlay) RenameAndMarkModifiedFromBase(_ context.Context, oldPath, newPath string, sourceOID string, sourceMode uint32, sourceTracked bool) error {
+	if err := f.Rename(context.Background(), oldPath, newPath, sourceTracked); err != nil {
 		return err
 	}
 	e := f.entries[model.CleanPath(newPath)]

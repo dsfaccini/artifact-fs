@@ -244,7 +244,7 @@ func TestRenameBaseSymlinkReconcilesAfterCommit(t *testing.T) {
 	if promoted.Kind != model.OverlayKindSymlink || promoted.TargetPath != target || promoted.SourceOID != oid {
 		t.Fatalf("promoted symlink = %+v", promoted)
 	}
-	if err := s.Rename(ctx, base.Path, "link"); err != nil {
+	if err := s.Rename(ctx, base.Path, "link", true); err != nil {
 		t.Fatal(err)
 	}
 	if source, ok := s.Get(base.Path); !ok || !source.IsDeleted() {
@@ -386,7 +386,7 @@ func TestRenameDBFirst(t *testing.T) {
 		t.Fatal("expected old entry")
 	}
 
-	if err := s.Rename(ctx, "old.txt", "new.txt"); err != nil {
+	if err := s.Rename(ctx, "old.txt", "new.txt", true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -432,7 +432,7 @@ func TestRenameSamePathNoop(t *testing.T) {
 	if _, err := s.CreateFile(ctx, "same.txt", 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rename(ctx, "same.txt", "same.txt"); err != nil {
+	if err := s.Rename(ctx, "same.txt", "same.txt", false); err != nil {
 		t.Fatal(err)
 	}
 	got, ok := s.Get("same.txt")
@@ -453,7 +453,7 @@ func TestRenameThenRecreateSourceUsesDistinctBacking(t *testing.T) {
 	if _, err := s.WriteFile(ctx, "a.txt", 0, []byte("renamed")); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rename(ctx, "a.txt", "b.txt"); err != nil {
+	if err := s.Rename(ctx, "a.txt", "b.txt", false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.CreateFile(ctx, "a.txt", 0o644); err != nil {
@@ -480,7 +480,7 @@ func TestRenameSameMissingPathReturnsNotExist(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
 
-	if err := s.Rename(ctx, "missing.txt", "missing.txt"); !errors.Is(err, os.ErrNotExist) {
+	if err := s.Rename(ctx, "missing.txt", "missing.txt", false); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("err = %v, want os.ErrNotExist", err)
 	}
 }
@@ -495,7 +495,7 @@ func TestRenameCreateRemainsCreateAcrossReconcile(t *testing.T) {
 	if _, err := s.WriteFile(ctx, "tmp.txt", 0, []byte("content")); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rename(ctx, "tmp.txt", "kept.txt"); err != nil {
+	if err := s.Rename(ctx, "tmp.txt", "kept.txt", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -534,7 +534,7 @@ func TestRenamePreservesDirectoryKindAndRepairsMode(t *testing.T) {
 	if err := os.Chmod(src.BackingPath, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rename(ctx, "src", "dst"); err != nil {
+	if err := s.Rename(ctx, "src", "dst", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -577,7 +577,7 @@ func TestRenameMovesNonEmptyOverlayDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.Rename(ctx, "src", "dst"); err != nil {
+	if err := s.Rename(ctx, "src", "dst", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -922,7 +922,7 @@ func TestRenameOverlayDirectoryIgnoresDeletedDescendants(t *testing.T) {
 	if err := s.Remove(ctx, "axb/secret.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rename(ctx, "a_b", "dst"); err != nil {
+	if err := s.Rename(ctx, "a_b", "dst", false); err != nil {
 		t.Fatal(err)
 	}
 	got, ok := s.Get("dst")
@@ -952,7 +952,7 @@ func TestRenameOverlayDirectoryCleansUTF8DeletedDescendants(t *testing.T) {
 	if err := s.Remove(ctx, child); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rename(ctx, dir, "dst"); err != nil {
+	if err := s.Rename(ctx, dir, "dst", false); err != nil {
 		t.Fatal(err)
 	}
 	if e, ok := s.Get(child); ok {
@@ -973,7 +973,7 @@ func TestRenameOverlayDirectoryDoesNotDependOnDestinationBackingPath(t *testing.
 	if err := s.Remove(ctx, "src/a.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rename(ctx, "src", "dst"); err != nil {
+	if err := s.Rename(ctx, "src", "dst", false); err != nil {
 		t.Fatalf("Rename: %v", err)
 	}
 	if _, ok := s.Get("src/a.txt"); ok {
@@ -993,10 +993,10 @@ func TestRenameChainPreservesOriginalSourceForReconcile(t *testing.T) {
 	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "a.txt", base); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rename(ctx, "a.txt", "b.txt"); err != nil {
+	if err := s.Rename(ctx, "a.txt", "b.txt", true); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rename(ctx, "b.txt", "c.txt"); err != nil {
+	if err := s.Rename(ctx, "b.txt", "c.txt", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1036,7 +1036,7 @@ func TestReconcilePreservesDivergentRenameAcrossBaseChange(t *testing.T) {
 	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "a.txt", base); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rename(ctx, "a.txt", "b.txt"); err != nil {
+	if err := s.Rename(ctx, "a.txt", "b.txt", true); err != nil {
 		t.Fatal(err)
 	}
 	if e, ok := s.Get("a.txt"); !ok || !e.IsDeleted() {
@@ -1072,7 +1072,7 @@ func TestReconcileKeepsRenameWhenIdenticalSourceStillExists(t *testing.T) {
 	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "a.txt", base); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rename(ctx, "a.txt", "b.txt"); err != nil {
+	if err := s.Rename(ctx, "a.txt", "b.txt", true); err != nil {
 		t.Fatal(err)
 	}
 	lookup := func(path string) (model.BaseNode, bool) {
@@ -1101,10 +1101,10 @@ func TestReconcilePreservesDivergentChainedRenameAndRemovesIntermediateWhiteout(
 	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "a.txt", base); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rename(ctx, "a.txt", "b.txt"); err != nil {
+	if err := s.Rename(ctx, "a.txt", "b.txt", true); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rename(ctx, "b.txt", "c.txt"); err != nil {
+	if err := s.Rename(ctx, "b.txt", "c.txt", false); err != nil {
 		t.Fatal(err)
 	}
 	if e, ok := s.Get("b.txt"); !ok || !e.IsDeleted() {
@@ -1260,7 +1260,7 @@ func TestRenameRepairsDirectoryModeBeforeCommitting(t *testing.T) {
 	if err := os.Remove(src.BackingPath); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rename(ctx, "src", "dst"); err == nil {
+	if err := s.Rename(ctx, "src", "dst", false); err == nil {
 		t.Fatal("expected backing mode repair failure")
 	}
 	if _, ok := s.Get("src"); !ok {

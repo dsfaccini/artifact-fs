@@ -522,6 +522,114 @@ func TestRenameRecreatedTrackedEntryHidesSource(t *testing.T) {
 	}
 }
 
+func TestRenameReplacedTrackedEntryHidesSource(t *testing.T) {
+	modes := map[string]uint32{"file": 0o100644, "symlink": 0o120000, "dir": 0o040000}
+	for _, tc := range []struct {
+		name               string
+		sourceType         string
+		replacementType    string
+		trackedDestination bool
+	}{
+		{"file replaced by symlink/absent destination", "file", "symlink", false},
+		{"file replaced by symlink/tracked destination", "file", "symlink", true},
+		{"symlink replaced by symlink/absent destination", "symlink", "symlink", false},
+		{"symlink replaced by symlink/tracked destination", "symlink", "symlink", true},
+		{"dir replaced by file/absent destination", "dir", "file", false},
+		{"dir replaced by file/tracked destination", "dir", "file", true},
+		{"dir replaced by symlink/absent destination", "dir", "symlink", false},
+		{"dir replaced by symlink/tracked destination", "dir", "symlink", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			tmp := t.TempDir()
+			cfg := model.RepoConfig{
+				ID:            "repo",
+				OverlayDir:    filepath.Join(tmp, "overlay"),
+				OverlayDBPath: filepath.Join(tmp, "overlay.db"),
+			}
+			ov, err := overlaystore.New(ctx, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = ov.Close() })
+
+			cachePath := filepath.Join(tmp, "blob")
+			if err := os.WriteFile(cachePath, []byte("tracked content"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			source := model.BaseNode{Path: "entry", Type: tc.sourceType, Mode: modes[tc.sourceType], ObjectOID: "source-oid"}
+			nodes := map[string]model.BaseNode{source.Path: source}
+			kids := map[string][]model.BaseNode{".": {source}}
+			if tc.sourceType == "dir" {
+				child := model.BaseNode{Path: "entry/child.txt", Type: "file", Mode: 0o100644, ObjectOID: "child-oid"}
+				nodes[child.Path] = child
+				kids[source.Path] = []model.BaseNode{child}
+			}
+			destination := "moved"
+			if tc.trackedDestination {
+				destination = "destination.txt"
+				tracked := model.BaseNode{Path: destination, Type: "file", Mode: 0o100644, ObjectOID: "destination-oid"}
+				nodes[destination] = tracked
+				kids["."] = append(kids["."], tracked)
+			}
+			snapshot := &fakeSnapshot{nodes: nodes, kids: kids}
+			resolver := &Resolver{Snapshot: snapshot, Overlay: ov}
+			resolver.SetGeneration(1)
+			engine := &Engine{Repo: cfg, Resolver: resolver, Overlay: ov, Hydrator: &fakeBatchHydrator{path: cachePath}}
+
+			if tc.sourceType == "dir" {
+				if err := engine.Unlink(ctx, "entry/child.txt"); err != nil {
+					t.Fatal(err)
+				}
+				if err := engine.Rmdir(ctx, "entry"); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := engine.Unlink(ctx, "entry"); err != nil {
+				t.Fatal(err)
+			}
+			if tc.replacementType == "symlink" {
+				if err := engine.Symlink(ctx, "entry", "elsewhere"); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := engine.Create(ctx, "entry", 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := engine.Rename(ctx, "entry", destination); err != nil {
+				t.Fatal(err)
+			}
+
+			moved, err := resolver.ResolvePath(destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := resolvedNodeType(moved); got != tc.replacementType {
+				t.Fatalf("destination type = %q, want %q", got, tc.replacementType)
+			}
+			if n, err := resolver.ResolvePath("entry"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("source after rename = (%+v, %v), want not exist", n, err)
+			}
+			if err := ov.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+				node, ok := snapshot.nodes[path]
+				return node, ok
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := resolver.ResolvePath("entry"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("source after reconciliation = (%+v, %v), want not exist", n, err)
+			}
+			entries, err := resolver.ReaddirTyped(ctx, ".")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if entry.Name == "entry" {
+					t.Fatal("tracked source reappeared in root directory listing")
+				}
+			}
+		})
+	}
+}
+
 func TestRenameBaseDirectoryHydratesBeforeMutatingOverlay(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := model.RepoConfig{

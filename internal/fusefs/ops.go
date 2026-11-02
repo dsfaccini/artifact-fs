@@ -176,20 +176,20 @@ func (e *Engine) rename(ctx, metadataCtx context.Context, oldPath, newPath strin
 		if dstOK && dst.Type == "dir" {
 			return fs.ErrInvalid
 		}
-		if ov.Kind == model.OverlayKindCreate {
-			if src, ok, err := e.Resolver.Snapshot.LookupNode(metadataCtx, gen, oldPath); err != nil {
+		src, srcOK, err := e.Resolver.Snapshot.LookupNode(metadataCtx, gen, oldPath)
+		if err != nil {
+			return err
+		}
+		if ov.Kind == model.OverlayKindCreate && srcOK && (src.Type == "file" || src.Type == "symlink") {
+			if err := e.Overlay.RenameAndMarkModifiedFromBase(metadataCtx, oldPath, oldPath, src.ObjectOID, src.Mode, true); err != nil {
 				return err
-			} else if ok && (src.Type == "file" || src.Type == "symlink") {
-				if err := e.Overlay.RenameAndMarkModifiedFromBase(metadataCtx, oldPath, oldPath, src.ObjectOID, src.Mode); err != nil {
-					return err
-				}
-				return e.Overlay.Rename(metadataCtx, oldPath, newPath)
 			}
+			return e.Overlay.Rename(metadataCtx, oldPath, newPath, true)
 		}
 		if dstOK && (ov.Kind == model.OverlayKindCreate || ov.Kind == model.OverlayKindSymlink) {
-			return e.Overlay.RenameAndMarkModifiedFromBase(metadataCtx, oldPath, newPath, dst.ObjectOID, dst.Mode)
+			return e.Overlay.RenameAndMarkModifiedFromBase(metadataCtx, oldPath, newPath, dst.ObjectOID, dst.Mode, srcOK)
 		}
-		return e.Overlay.Rename(metadataCtx, oldPath, newPath)
+		return e.Overlay.Rename(metadataCtx, oldPath, newPath, srcOK)
 	}
 	if dst, ok, err := e.Resolver.Snapshot.LookupNode(metadataCtx, e.Resolver.Generation(), newPath); err != nil {
 		return err
@@ -199,7 +199,7 @@ func (e *Engine) rename(ctx, metadataCtx context.Context, oldPath, newPath strin
 	if err := e.ensureOverlayWithContexts(ctx, metadataCtx, oldPath); err != nil {
 		return err
 	}
-	return e.Overlay.Rename(metadataCtx, oldPath, newPath)
+	return e.Overlay.Rename(metadataCtx, oldPath, newPath, true)
 }
 
 func resolvedNodeType(n ResolvedNode) string {

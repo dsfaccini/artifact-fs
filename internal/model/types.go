@@ -224,9 +224,9 @@ type OverlayStore interface {
 	SyncFile(ctx context.Context, path string) error
 	Truncate(ctx context.Context, path string, size int64) error
 	Remove(ctx context.Context, path string) error
-	Rename(ctx context.Context, oldPath, newPath string) error
+	Rename(ctx context.Context, oldPath, newPath string, sourceTracked bool) error
 	RenameTree(ctx context.Context, oldPath, newPath string, sourceBasePaths, destinationBasePaths []string) error
-	RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newPath string, sourceOID string, sourceMode uint32) error
+	RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newPath string, sourceOID string, sourceMode uint32, sourceTracked bool) error
 	Mkdir(ctx context.Context, path string, mode uint32) error
 	SetMode(ctx context.Context, path string, mode uint32) error
 	SetMtime(ctx context.Context, path string, t time.Time) error

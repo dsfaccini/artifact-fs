@@ -380,7 +380,10 @@ func (s *Store) Remove(ctx context.Context, path string) error {
 	return nil
 }
 
-func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
+// Rename moves the overlay entry at oldPath to newPath. sourceTracked reports
+// whether the snapshot has oldPath. A tracked file or symlink source leaves a
+// delete marker so the snapshot entry stays hidden.
+func (s *Store) Rename(ctx context.Context, oldPath, newPath string, sourceTracked bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	oldPath = model.CleanPath(oldPath)
@@ -414,11 +417,11 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	case model.OverlayKindCreate:
 		newKind = e.Kind
 		newTargetPath = ""
-		writeSourceWhiteout = false
+		writeSourceWhiteout = sourceTracked
 	case model.OverlayKindSymlink:
 		newKind = e.Kind
 		newTargetPath = e.TargetPath
-		writeSourceWhiteout = e.SourceOID != ""
+		writeSourceWhiteout = sourceTracked || e.SourceOID != ""
 		newSourceOID = ""
 		newSourceMode = 0
 	}
@@ -627,7 +630,7 @@ func (s *Store) listTreeEntries(ctx context.Context, path string) ([]model.Overl
 	return s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries WHERE path=? OR substr(path, 1, length(?))=? ORDER BY path`, path, prefix, prefix)
 }
 
-func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newPath string, sourceOID string, sourceMode uint32) error {
+func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newPath string, sourceOID string, sourceMode uint32, sourceTracked bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	oldPath = model.CleanPath(oldPath)
@@ -673,7 +676,7 @@ func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newP
 	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path) VALUES(?,?,?,?,?,?,?,?,?,?)`, newPath, newKind, newBacking, e.Mode, e.SizeBytes, e.MtimeUnixNs, now, sourceOID, sourceMode, e.TargetPath); err != nil {
 		return err
 	}
-	if e.Kind == model.OverlayKindSymlink && e.SourceOID != "" {
+	if sourceTracked || (e.Kind == model.OverlayKindSymlink && e.SourceOID != "") {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path) VALUES(?,?,?,?,?,?,?,?,?,?)`, oldPath, model.OverlayKindDelete, "", 0, 0, now, now, "", 0, ""); err != nil {
 			return err
 		}
