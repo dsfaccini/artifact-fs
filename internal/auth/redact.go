@@ -289,7 +289,7 @@ func userinfoLikeBeforePath(candidate string) bool {
 }
 
 func schemeLessUserinfoStart(raw string) int {
-	if i := strings.Index(raw, "://"); i >= 0 && isURLScheme(raw[:i]) {
+	if before, _, ok := strings.Cut(raw, "://"); ok && isURLScheme(before) {
 		return -1
 	}
 	if isSCPStyleRemote(raw) {
