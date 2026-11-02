@@ -4,7 +4,7 @@ Repository-specific guidance for `artifact-fs`.
 
 ## Code review rules
 
-- Flag credentials in Git CLI arguments or unredacted logs. Pass credentials through the environment-based helper in `internal/gitstore/gitstore.go`, and redact log output with `auth.RedactString`.
+- Flag credentials in Git CLI arguments or unredacted logs. Pass credentials through the environment-based helper in `internal/gitstore/credentials.go`, and redact log output with `auth.RedactString`.
 - Flag blob bytes converted to `string`. Keep `BlobToCache` binary-safe by streaming `git cat-file --batch` output to disk.
 - Keep `GIT_NO_LAZY_FETCH=1` on `git cat-file --batch-check` in `batchResolveSizes`. Removing it turns size resolution in blobless clones into network round-trips.
 - Normalize paths only with `model.CleanPath()`. Do not add local wrappers.
