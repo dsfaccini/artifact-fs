@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The mount script runs in a Linux container. macOS ships no flock, so local
+# runs there skip; CI must never skip.
+if ! command -v flock >/dev/null 2>&1; then
+  echo "skip: flock (util-linux) not found; CI runs this test on Linux" >&2
+  [ -z "${CI:-}" ] || exit 1
+  exit 0
+fi
+
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 mount_script=${1:-$script_dir/container_src/mount-artifact-fs-repo.sh}
 tmp_dir=$(mktemp -d)

@@ -14,6 +14,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// wedgedMountRecovery is how Linux clears a stalled mount: a lazy unmount
+// detaches it without waiting for the stuck FUSE requests.
+const wedgedMountRecovery = "clear it with fusermount3 -uz <path>, or umount -l <path> as root"
+
 // skipIfNoFUSE skips the test if the FUSE kernel module is not available, and
 // fails when ARTIFACT_FS_FUSE_BACKEND is invalid.
 func skipIfNoFUSE(t *testing.T) {

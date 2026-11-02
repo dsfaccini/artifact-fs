@@ -43,6 +43,12 @@ jobs:
       - name: Test
         run: go test -race ./...
 
+      - name: Pre-commit hook on Linux
+        run: |
+          printf '\n// pre-commit hook smoke test\n' >> internal/model/types.go
+          git add internal/model/types.go
+          .githooks/pre-commit
+
   darwin-build:
     runs-on: ubuntu-latest
     steps:

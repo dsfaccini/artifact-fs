@@ -13,9 +13,9 @@ import (
 	"time"
 )
 
-// errMountWedged reports a stalled mount. A stalled FSKit mount cannot be
-// unmounted until reboot, and every process that touches it hangs.
-var errMountWedged = errors.New("mount is wedged and needs a reboot to clear")
+// errMountWedged reports a stalled mount. Every process that touches it hangs,
+// and wedgedMountRecovery says how this OS clears it.
+var errMountWedged = errors.New("mount is wedged; " + wedgedMountRecovery)
 
 // wedgedMount holds the first mount path that stalled. Once it is set, e2e
 // tests skip, and cleanup stops unmounting and deleting mount directories.

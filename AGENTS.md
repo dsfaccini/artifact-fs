@@ -51,8 +51,9 @@ Repository-specific guidance for `artifact-fs`.
 - Build only the CLI with `go build ./cmd/artifact-fs`.
 - Enable the pre-commit checks with `git config core.hooksPath .githooks`.
 - Benchmarks are opt-in: `AFS_RUN_BENCH=1 go test -run TestBenchRepos -v`.
-- FUSE e2e tests are opt-in: `AFS_RUN_E2E_TESTS=1 go test -run TestE2E -v .`. They require `/dev/fuse` on Linux.
-- On macOS, e2e tests mount through FSKit by default. Set `ARTIFACT_FS_FUSE_BACKEND=kernel` only to test the macFUSE kernel extension; without a loaded kernel extension those tests skip. A deadlocked FSKit mount cannot be unmounted until reboot.
+- FUSE e2e tests are opt-in. Run them with the same command on macOS and Linux: `AFS_RUN_E2E_TESTS=1 go test -run TestE2E -count=1 -timeout 20m -v .`. Keep `-timeout 20m`: the default 10m can expire mid-suite, and a timeout panic skips every unmount cleanup.
+- On Linux, e2e tests need `/dev/fuse` plus either root or `fusermount3` from the `fuse3` package. Unmount a leftover mount with `fusermount3 -u <path>`, or `fusermount3 -uz <path>` when it hangs.
+- On macOS, e2e tests mount through FSKit by default. Set `ARTIFACT_FS_FUSE_BACKEND=kernel` only to test the macFUSE kernel extension; without a loaded kernel extension those tests skip. Unmount a leftover FSKit mount with `diskutil unmount <path>`. A deadlocked FSKit mount cannot be unmounted until reboot.
 - E2E tests use a local bare repository by default. Set `AFS_E2E_REPO` only when intentionally testing a real remote.
 - E2E benchmark coverage is separate: `AFS_RUN_E2E_BENCH=1 go test -run TestE2EBenchmarkRepos -v .`.
 - Package tests live beside the code. Benchmarks and `e2e*_test.go` live in the root package.

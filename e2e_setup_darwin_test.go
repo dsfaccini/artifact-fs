@@ -12,6 +12,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// wedgedMountRecovery is how macOS clears a stalled mount: nothing unmounts a
+// stalled FSKit mount, including diskutil.
+const wedgedMountRecovery = "only a reboot clears a stalled FSKit mount"
+
 // skipIfNoFUSE skips the test unless ARTIFACT_FS_FUSE_BACKEND selects a transport
 // that can mount here without prompting macOS to load the macFUSE kernel
 // extension, and fails when the variable is invalid. It also skips when the
