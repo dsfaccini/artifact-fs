@@ -504,13 +504,13 @@ func TestE2E(t *testing.T) {
 	}
 }
 
-func TestE2EFilesystemDirectoryMoveWorkflows(t *testing.T) {
-	t.Run("cli_move_preserves_tree_and_open_handles", testE2ECLIDirectoryMove)
-	t.Run("recursive_copy_move_and_replace_empty_destination", testE2ERecursiveCopyMoveAndReplace)
-	t.Run("replace_visible_empty_tracked_destination", testE2EReplaceVisibleEmptyTrackedDirectory)
-	t.Run("replace_deleted_tracked_destination", testE2EReplaceDeletedTrackedDirectory)
-	t.Run("reject_nonempty_destination", testE2ERejectNonemptyDirectoryReplacement)
-	t.Run("native_rename_error_contract", testE2ENativeDirectoryRenameErrors)
+func testE2EFilesystemDirectoryMoveWorkflows(t *testing.T, shared *sharedE2ERepo) {
+	shared.run(t, "cli_move_preserves_tree_and_open_handles", testE2ECLIDirectoryMove)
+	shared.run(t, "recursive_copy_move_and_replace_empty_destination", testE2ERecursiveCopyMoveAndReplace)
+	shared.run(t, "replace_visible_empty_tracked_destination", testE2EReplaceVisibleEmptyTrackedDirectory)
+	shared.run(t, "replace_deleted_tracked_destination", testE2EReplaceDeletedTrackedDirectory)
+	shared.run(t, "reject_nonempty_destination", testE2ERejectNonemptyDirectoryReplacement)
+	shared.run(t, "native_rename_error_contract", testE2ENativeDirectoryRenameErrors)
 }
 
 func TestE2EFilesystemDirectoryRenamePersistsAcrossRestart(t *testing.T) {
@@ -567,8 +567,7 @@ func TestE2EFilesystemDirectoryRenamePersistsAcrossRestart(t *testing.T) {
 	}
 }
 
-func TestE2EFilesystemDirectoryRenameConcurrentAccess(t *testing.T) {
-	repo := newMountedE2ERepo(t)
+func testE2EFilesystemDirectoryRenameConcurrentAccess(t *testing.T, repo *mountedE2ERepo) {
 	left := filepath.Join(repo.mountPath, "concurrent-left")
 	right := filepath.Join(repo.mountPath, "concurrent-right")
 	if err := os.MkdirAll(filepath.Join(left, "nested"), 0o755); err != nil {
@@ -675,8 +674,7 @@ func TestE2EFilesystemDirectoryRenameConcurrentAccess(t *testing.T) {
 	}
 }
 
-func testE2ECLIDirectoryMove(t *testing.T) {
-	repo := newMountedE2ERepo(t)
+func testE2ECLIDirectoryMove(t *testing.T, repo *mountedE2ERepo) {
 	source := filepath.Join(repo.mountPath, "tree")
 	deep := filepath.Join(source, "nested", "deeper")
 	if err := os.MkdirAll(deep, 0o755); err != nil {
@@ -808,8 +806,7 @@ func testE2ECLIDirectoryMove(t *testing.T) {
 	}
 }
 
-func testE2ERecursiveCopyMoveAndReplace(t *testing.T) {
-	repo := newMountedE2ERepo(t)
+func testE2ERecursiveCopyMoveAndReplace(t *testing.T, repo *mountedE2ERepo) {
 	run(t, repo.mountPath, "cp", "-R", "packages/wrangler", "wrangler-copy")
 	copied := filepath.Join(repo.mountPath, "wrangler-copy")
 	if got := readFileStr(t, filepath.Join(copied, "nested", "deep", "config.json")); !strings.Contains(got, "compatibility_date") {
@@ -924,8 +921,7 @@ func assertReplacedDirectoryHandleMatchesNative(t *testing.T, mountedHandle *os.
 	}
 }
 
-func testE2EReplaceVisibleEmptyTrackedDirectory(t *testing.T) {
-	repo := newMountedE2ERepo(t)
+func testE2EReplaceVisibleEmptyTrackedDirectory(t *testing.T, repo *mountedE2ERepo) {
 	destination := filepath.Join(repo.mountPath, "packages", "miniflare")
 	if err := os.Remove(filepath.Join(destination, "package.json")); err != nil {
 		t.Fatal(err)
@@ -963,8 +959,7 @@ func testE2EReplaceVisibleEmptyTrackedDirectory(t *testing.T) {
 	}
 }
 
-func testE2EReplaceDeletedTrackedDirectory(t *testing.T) {
-	repo := newMountedE2ERepo(t)
+func testE2EReplaceDeletedTrackedDirectory(t *testing.T, repo *mountedE2ERepo) {
 	run(t, repo.mountPath, "rm", "-rf", "packages/miniflare")
 	trackedReplacementSource := filepath.Join(repo.mountPath, "tracked-replacement-source")
 	if err := os.Mkdir(trackedReplacementSource, 0o755); err != nil {
@@ -978,8 +973,7 @@ func testE2EReplaceDeletedTrackedDirectory(t *testing.T) {
 	assertPathMissing(t, filepath.Join(repo.mountPath, "packages", "miniflare", "package.json"))
 }
 
-func testE2ERejectNonemptyDirectoryReplacement(t *testing.T) {
-	repo := newMountedE2ERepo(t)
+func testE2ERejectNonemptyDirectoryReplacement(t *testing.T, repo *mountedE2ERepo) {
 	rejectedSource := filepath.Join(repo.mountPath, "rejected-source")
 	rejectedDestination := filepath.Join(repo.mountPath, "rejected-destination")
 	if err := os.MkdirAll(rejectedSource, 0o755); err != nil {
@@ -1005,9 +999,7 @@ func testE2ERejectNonemptyDirectoryReplacement(t *testing.T) {
 	}
 }
 
-func testE2ENativeDirectoryRenameErrors(t *testing.T) {
-	repo := newMountedE2ERepo(t)
-
+func testE2ENativeDirectoryRenameErrors(t *testing.T, repo *mountedE2ERepo) {
 	fileSource := filepath.Join(repo.mountPath, "file-source")
 	directoryDestination := filepath.Join(repo.mountPath, "directory-destination")
 	if err := os.WriteFile(fileSource, []byte("file\n"), 0o644); err != nil {

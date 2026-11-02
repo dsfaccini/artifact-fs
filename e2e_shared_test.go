@@ -44,6 +44,8 @@ func TestE2ESharedMount(t *testing.T) {
 	shared.run(t, "GitResetHardCleanAndStash", testE2EGitResetHardCleanAndStash)
 	shared.run(t, "GitPullFastForward", testE2EGitPullFastForward)
 	shared.run(t, "GitPush", testE2EGitPush)
+	t.Run("FilesystemDirectoryMoveWorkflows", func(t *testing.T) { testE2EFilesystemDirectoryMoveWorkflows(t, shared) })
+	shared.run(t, "FilesystemDirectoryRenameConcurrentAccess", testE2EFilesystemDirectoryRenameConcurrentAccess)
 }
 
 // sharedE2ERepo is a mounted repo that tests take turns on. After each test it
