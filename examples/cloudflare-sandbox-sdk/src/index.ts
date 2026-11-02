@@ -137,7 +137,10 @@ export class Sandbox extends DurableObject<Env> {
   async status(
     statusConfig: ReturnType<typeof buildStatusConfig>
   ): Promise<StatusResult> {
-    await this.ensureRunning(buildCommandEnv());
+    // A container starts on a fresh disk, so a stopped one has no mount to report.
+    if (!this.container.running) {
+      return { missing: true };
+    }
     const metadata = await this.readMountMetadata();
     if (!metadata) {
       return { missing: true };
