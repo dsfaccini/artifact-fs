@@ -10,14 +10,19 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"golang.org/x/sys/unix"
 )
 
-// skipIfNoFUSE skips the test if the FUSE kernel module is not available.
+// skipIfNoFUSE skips the test if the FUSE kernel module is not available, and
+// fails when ARTIFACT_FS_FUSE_BACKEND cannot mount in this build.
 func skipIfNoFUSE(t *testing.T) {
 	t.Helper()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		t.Skip("skipping: /dev/fuse not available")
+	}
+	if _, err := fusefs.MountBackend(); err != nil {
+		t.Fatal(err)
 	}
 }
 
