@@ -1849,6 +1849,15 @@ func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoCon
 	if _, _, err := s.ResolveHEAD(ctx, repo); err != nil {
 		return err
 	}
+	// The HEAD watcher polls loose refs and packed-refs only.
+	if format, err := runGit(ctx, repo.GitDir, "config", "--get", "extensions.refStorage"); err == nil && format != "files" {
+		return fmt.Errorf("adoption requires the files ref storage format, not %s", format)
+	} else if err != nil {
+		var exitErr *gitCommandError
+		if !errors.As(err, &exitErr) || exitErr.exitCode != 1 {
+			return err
+		}
+	}
 	if _, err := os.Stat(filepath.Join(repo.GitDir, "index")); err != nil {
 		return fmt.Errorf("adoption requires an initialized index: %w", err)
 	}

@@ -10,7 +10,7 @@ import (
 )
 
 func TestAdoptedWorktreeConfigMigration(t *testing.T) {
-	for _, mode := range []string{"bare-primary", "existing-primary-override", "missing-index", "primary-gitdir", "wrong-mount-path", "primary-path-whitespace"} {
+	for _, mode := range []string{"bare-primary", "existing-primary-override", "missing-index", "primary-gitdir", "wrong-mount-path", "primary-path-whitespace", "reftable"} {
 		t.Run(mode, func(t *testing.T) {
 			dir, err := filepath.EvalSymlinks(t.TempDir())
 			if err != nil {
@@ -20,7 +20,11 @@ func TestAdoptedWorktreeConfigMigration(t *testing.T) {
 			if mode == "primary-path-whitespace" {
 				source += " "
 			}
-			run(t, "git", "init", "--initial-branch=main", source)
+			initArgs := []string{"init", "--initial-branch=main"}
+			if mode == "reftable" {
+				initArgs = append(initArgs, "--ref-format=reftable")
+			}
+			run(t, "git", append(initArgs, source)...)
 			if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -62,9 +66,12 @@ func TestAdoptedWorktreeConfigMigration(t *testing.T) {
 				}
 			}
 			err = store.ConfigureAdoptedWorktree(t.Context(), cfg)
-			if mode == "primary-gitdir" || mode == "wrong-mount-path" {
+			if mode == "primary-gitdir" || mode == "wrong-mount-path" || mode == "reftable" {
 				if err == nil {
-					t.Fatal("adoption accepted unregistered or relocated Git metadata")
+					t.Fatal("adoption accepted unregistered, relocated or reftable Git metadata")
+				}
+				if mode == "reftable" && !strings.Contains(err.Error(), "reftable") {
+					t.Fatalf("reftable rejection reason: %v", err)
 				}
 				afterConfig, readErr := os.ReadFile(filepath.Join(common, "config"))
 				if readErr != nil || string(beforeConfig) != string(afterConfig) {

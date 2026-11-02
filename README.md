@@ -218,8 +218,8 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
 `--adopt-gitdir` registers an initialized linked worktree without cloning, fetching,
 changing refs or upstream tracking, or replacing its Git index. The GitDir must
 already contain a valid HEAD and index, and its registered worktree path must
-match the mountpoint. Primary GitDirs and relocation are rejected before config
-writes. The mountpoint must be empty: adoption
+match the mountpoint. Primary GitDirs, relocation and reftable ref storage are
+rejected before config writes. The mountpoint must be empty: adoption
 uses Git metadata and does not import native working files. This mode preserves normal linked
 worktree discovery, shared objects and refs, and private HEAD/index state:
 
