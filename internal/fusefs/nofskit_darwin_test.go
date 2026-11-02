@@ -3,43 +3,33 @@
 package fusefs
 
 import (
-	"errors"
-	"slices"
+	"fmt"
 	"testing"
 
 	"github.com/jacobsa/fuse"
 )
 
 func TestPlatformMountWithoutFSKitTagMountsOnlyThroughKernel(t *testing.T) {
-	kextLoaded := macFUSEKextLoaded()
 	for _, test := range []struct {
 		backend     string
+		kextLoaded  bool
 		wantMounts  []bool
 		wantBackend string
 		wantErr     error
 	}{
 		{backend: BackendKernel, wantMounts: []bool{false}, wantBackend: BackendKernel},
-		{backend: BackendFSKit, wantBackend: BackendFSKit, wantErr: errFSKitNotBuilt},
-		{backend: BackendAuto, wantMounts: []bool{false}, wantBackend: BackendKernel},
+		{backend: BackendFSKit, kextLoaded: true, wantBackend: BackendFSKit, wantErr: errFSKitNotBuilt},
+		{backend: BackendAuto, kextLoaded: true, wantMounts: []bool{false}, wantBackend: BackendKernel},
+		{backend: BackendAuto, wantBackend: BackendFSKit, wantErr: errFSKitNotBuilt},
 	} {
-		if test.backend == BackendAuto && !kextLoaded {
-			test.wantMounts, test.wantBackend, test.wantErr = nil, BackendFSKit, errFSKitNotBuilt
-		}
-		t.Run(test.backend, func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s kext loaded %v", test.backend, test.kextLoaded), func(t *testing.T) {
+			setMacFUSEKextLoaded(t, test.kextLoaded)
 			var mounts []bool
 			_, backend, err := platformMount(test.backend, func(fskit bool) (*fuse.MountedFileSystem, error) {
 				mounts = append(mounts, fskit)
 				return nil, nil
 			})
-			if !slices.Equal(mounts, test.wantMounts) {
-				t.Fatalf("mount attempts (true is FSKit) = %v, want %v", mounts, test.wantMounts)
-			}
-			if backend != test.wantBackend {
-				t.Fatalf("backend = %q, want %q", backend, test.wantBackend)
-			}
-			if !errors.Is(err, test.wantErr) {
-				t.Fatalf("error = %v, want %v", err, test.wantErr)
-			}
+			assertMountResult(t, mounts, backend, err, test.wantMounts, test.wantBackend, test.wantErr)
 		})
 	}
 }

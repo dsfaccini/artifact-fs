@@ -150,6 +150,21 @@ func TestMountWithBackendFallsBackOnlyWhenFSKitIsUnavailable(t *testing.T) {
 	}
 }
 
+// assertMountResult checks the mount attempts (true is FSKit), the backend, and
+// the error that a mountWithBackend or platformMount call produced.
+func assertMountResult(t *testing.T, mounts []bool, backend string, err error, wantMounts []bool, wantBackend string, wantErr error) {
+	t.Helper()
+	if !slices.Equal(mounts, wantMounts) {
+		t.Fatalf("mount attempts (true is FSKit) = %v, want %v", mounts, wantMounts)
+	}
+	if backend != wantBackend {
+		t.Fatalf("backend = %q, want %q", backend, wantBackend)
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+}
+
 func TestFSKitRejectsXattrFallback(t *testing.T) {
 	for _, test := range []struct {
 		name  string

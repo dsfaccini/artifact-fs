@@ -9,11 +9,11 @@ Use this skill to operate ArtifactFS as a consumer. Prefer the CLI workflow and 
 
 ## FIRST: Verify Prerequisites
 
-Run from the repo root. If either check fails, STOP and fix the environment first.
+Run from the repo root. If either command fails, STOP and fix the environment first.
 
 ```bash
 test -e /Library/Filesystems/macfuse.fs || test -e /dev/fuse
-test -x ./artifact-fs || go build -tags fskit -o artifact-fs ./cmd/artifact-fs
+go build -tags fskit -o artifact-fs ./cmd/artifact-fs
 ```
 
 ## Critical Rules

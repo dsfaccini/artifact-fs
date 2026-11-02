@@ -37,9 +37,11 @@ Install the CLI from the module:
 go install github.com/cloudflare/artifact-fs/cmd/artifact-fs@latest
 ```
 
-This builds without the FSKit backend below. `go install` with a version
-fetches the upstream module from the Go module proxy and never applies a
-`replace` directive, so the binary uses upstream `jacobsa/fuse`.
+This installs upstream `cloudflare/artifact-fs`, not this fork, so it builds
+without the FSKit backend below. Upstream has no `ARTIFACT_FS_FUSE_BACKEND` and
+mounts on macOS only through the macFUSE kernel extension. This fork cannot be
+installed with `go install …@version`, because such an install refuses a module
+whose `go.mod` has a `replace` directive.
 
 Or build it directly from the module path:
 
@@ -435,18 +437,18 @@ Unit tests:
 go test ./...
 ```
 
-End-to-end tests mount a git repo via FUSE and exercise filesystem + git operations (including commit and overlay reconciliation). They require a FUSE implementation (macFUSE on macOS, `fuse3` on Linux) and are off by default. On macOS they skip when the selected `ARTIFACT_FS_FUSE_BACKEND` transport cannot mount without prompting to load the macFUSE kernel extension. Add `-tags fskit` to run them on FSKit.
+End-to-end tests mount a git repo via FUSE and exercise filesystem + git operations (including commit and overlay reconciliation). They require a FUSE implementation (macFUSE on macOS, `fuse3` on Linux) and are off by default. On macOS they skip when the selected `ARTIFACT_FS_FUSE_BACKEND` transport cannot mount without prompting to load the macFUSE kernel extension. The commands below pass `-tags fskit`, which macOS needs to mount through FSKit and Linux ignores.
 
 By default, e2e tests create a local bare repo -- no network required. Set `AFS_E2E_REPO` to test against a real remote.
 
 ```bash
 # Run e2e tests (uses a local test repo by default)
-AFS_RUN_E2E_TESTS=1 go test -v -run TestE2E -count=1 -timeout 10m .
+AFS_RUN_E2E_TESTS=1 go test -tags fskit -v -run TestE2E -count=1 -timeout 10m .
 
 # Run against a specific remote repo
 AFS_RUN_E2E_TESTS=1 \
   AFS_E2E_REPO=https://github.com/cloudflare/workers-sdk.git \
-  go test -v -run TestE2E -count=1 -timeout 10m .
+  go test -tags fskit -v -run TestE2E -count=1 -timeout 10m .
 ```
 
 ### Environment variables

@@ -48,7 +48,7 @@ Repository-specific guidance for `artifact-fs`.
 ## Validation
 
 - Start with the narrowest relevant test: `go test ./internal/<pkg>` or `go test -run TestName ./internal/<pkg>`.
-- For non-trivial code changes, reproduce CI in order: `go build ./cmd/artifact-fs`, `go vet ./...` with `GOOS=linux`, with `GOOS=darwin`, and with `GOOS=darwin` plus `-tags fskit`, then `go test -race ./...`.
+- For non-trivial code changes, reproduce CI in order: `go build -o /dev/null ./cmd/artifact-fs`, `go vet ./...` with `GOOS=linux`, with `GOOS=darwin`, and with `GOOS=darwin` plus `-tags fskit`, then `go test -race ./...` and `go test -race -tags fskit ./internal/fusefs`.
 - Build only the CLI with `go build -tags fskit ./cmd/artifact-fs`. The `fskit` tag adds the macOS FSKit transport and changes nothing on Linux.
 - Enable the pre-commit checks with `git config core.hooksPath .githooks`.
 - Benchmarks are opt-in: `AFS_RUN_BENCH=1 go test -run TestBenchRepos -v`.
@@ -56,5 +56,5 @@ Repository-specific guidance for `artifact-fs`.
 - On Linux, e2e tests need `/dev/fuse` plus either root or `fusermount3` from the `fuse3` package. Unmount a leftover mount with `fusermount3 -u <path>`, or `fusermount3 -uz <path>` when it hangs.
 - On macOS, e2e tests mount through FSKit. Without `-tags fskit`, they skip unless the macFUSE kernel extension is loaded. Set `ARTIFACT_FS_FUSE_BACKEND=kernel` only to test the macFUSE kernel extension; without a loaded kernel extension those tests skip. Unmount a leftover FSKit mount with `diskutil unmount <path>`. A deadlocked FSKit mount cannot be unmounted until reboot.
 - E2E tests use a local bare repository by default. Set `AFS_E2E_REPO` only when intentionally testing a real remote.
-- E2E benchmark coverage is separate: `AFS_RUN_E2E_BENCH=1 go test -run TestE2EBenchmarkRepos -v .`.
+- E2E benchmark coverage is separate: `AFS_RUN_E2E_BENCH=1 go test -tags fskit -run TestE2EBenchmarkRepos -v .`.
 - Package tests live beside the code. Benchmarks and `e2e*_test.go` live in the root package.

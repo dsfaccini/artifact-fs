@@ -43,6 +43,10 @@ jobs:
       - name: Test
         run: go test -race ./...
 
+      # The fuse replacement defines its FSKit error types on every OS, so Linux runs their classification tests.
+      - name: Test with the fskit tag
+        run: go test -race -tags fskit ./internal/fusefs
+
       - name: Pre-commit hook on Linux
         run: |
           printf '\n// pre-commit hook smoke test\n' >> internal/model/types.go
@@ -87,6 +91,11 @@ jobs:
         run: |
           go mod edit -dropreplace=github.com/jacobsa/fuse
           go mod tidy
+          replace=$(go list -m -f '{{.Replace}}' github.com/jacobsa/fuse)
+          if [ "$replace" != "<nil>" ]; then
+            echo "github.com/jacobsa/fuse is still replaced by $replace" >&2
+            exit 1
+          fi
 
       - name: Build and vet on Linux and macOS
         run: |
