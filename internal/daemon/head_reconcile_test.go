@@ -15,9 +15,11 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
+	"github.com/cloudflare/artifact-fs/internal/hydrator"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
+	"github.com/jacobsa/fuse/fuseops"
 )
 
 type headReconcileFixture struct {
@@ -461,4 +463,63 @@ func TestHeadReconcileResumesAfterUnmountFailure(t *testing.T) {
 		t.Fatal("expected unmount failure")
 	}
 	f.waitForHead(f.nextOID, "main", f.oldGen+1)
+}
+
+func TestHeadReconcileServesReadsMatchingReportedSize(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	repo := f.rt.cfg
+	repo.BlobCacheDir = t.TempDir()
+	h := hydrator.New(f.svc.git)
+	h.Start(1, repo)
+	t.Cleanup(h.Stop)
+	fs := fusefs.NewArtifactFuse(repo, f.rt.resolver, &fusefs.Engine{Resolver: f.rt.resolver, Repo: repo, Overlay: f.rt.overlay, Hydrator: h})
+	open := func(inode fuseops.InodeID) fuseops.HandleID {
+		t.Helper()
+		op := &fuseops.OpenFileOp{Inode: inode}
+		if err := fs.OpenFile(f.ctx, op); err != nil {
+			t.Fatalf("OpenFile: %v", err)
+		}
+		t.Cleanup(func() {
+			_ = fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: op.Handle})
+		})
+		return op.Handle
+	}
+	read := func(inode fuseops.InodeID, handle fuseops.HandleID) string {
+		t.Helper()
+		op := &fuseops.ReadFileOp{Inode: inode, Handle: handle, Size: 64}
+		if err := fs.ReadFile(f.ctx, op); err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		return string(bytes.Join(op.Data, nil))
+	}
+
+	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "README.md"}
+	if err := fs.LookUpInode(f.ctx, lookup); err != nil {
+		t.Fatalf("LookUpInode: %v", err)
+	}
+	inode := lookup.Entry.Child
+	openedBefore := open(inode)
+	f.updateMain(f.nextOID)
+	f.signal()
+	f.waitForHead(f.nextOID, "main", f.oldGen+1)
+
+	reported := lookup.Entry.Attributes.Size
+	if got := read(inode, openedBefore); got != "old\n" || uint64(len(got)) != reported {
+		t.Errorf("read through handle opened before HEAD moved = %q, want the old content the lookup sized at %d bytes", got, reported)
+	}
+	if got := read(inode, open(inode)); got != "old\n" || uint64(len(got)) != reported {
+		t.Errorf("read through handle opened after HEAD moved = %q, want the old content the lookup sized at %d bytes", got, reported)
+	}
+
+	getattr := &fuseops.GetInodeAttributesOp{Inode: inode}
+	if err := fs.GetInodeAttributes(f.ctx, getattr); err != nil {
+		t.Fatalf("GetInodeAttributes: %v", err)
+	}
+	reported = getattr.Attributes.Size
+	if got := read(inode, openedBefore); got != "next\n" || uint64(len(got)) != reported {
+		t.Errorf("read through handle opened before getattr = %q, want the new content getattr sized at %d bytes", got, reported)
+	}
+	if got := read(inode, open(inode)); got != "next\n" || uint64(len(got)) != reported {
+		t.Errorf("read through handle opened after getattr = %q, want the new content getattr sized at %d bytes", got, reported)
+	}
 }

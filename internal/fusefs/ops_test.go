@@ -200,11 +200,11 @@ func TestFileHandleCachesHydratedBaseFile(t *testing.T) {
 	fh := &FileHandle{path: "file.txt"}
 	defer fh.closeCachedFile()
 
-	first, err := fh.read(context.Background(), engine, 0, 4)
+	first, err := fh.read(context.Background(), engine, 0, 0, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := fh.read(context.Background(), engine, 4, 3)
+	second, err := fh.read(context.Background(), engine, 0, 4, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,12 +240,12 @@ func TestFileHandleRehydratesAfterGenerationChange(t *testing.T) {
 	fh := &FileHandle{path: "file.txt"}
 	defer fh.closeCachedFile()
 
-	first, err := fh.read(context.Background(), engine, 0, 3)
+	first, err := fh.read(context.Background(), engine, 0, 0, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resolver.SetGeneration(2)
-	second, err := fh.read(context.Background(), engine, 0, 3)
+	second, err := fh.read(context.Background(), engine, 0, 0, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 	fs.fileHandles[1] = fh
 	defer fh.closeCachedFile()
 
-	first, err := fh.read(context.Background(), engine, 0, 3)
+	first, err := fh.read(context.Background(), engine, 0, 0, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 	}()
 
 	<-overlay.beforeCopy
-	overlapped, err := fh.read(context.Background(), engine, 0, 3)
+	overlapped, err := fh.read(context.Background(), engine, 0, 0, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +309,7 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	after, err := fh.read(context.Background(), engine, 0, 3)
+	after, err := fh.read(context.Background(), engine, 0, 0, 3)
 	if err != nil {
 		t.Fatal(err)
 	}

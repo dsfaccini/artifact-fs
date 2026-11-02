@@ -76,11 +76,13 @@ func (e *Engine) Read(ctx context.Context, path string, off int64, size int) ([]
 	return readFileChunkFrom(f, off, size)
 }
 
-func (e *Engine) BaseCacheFile(ctx context.Context, path string) (*os.File, int64, bool, error) {
-	return e.baseCacheFile(ctx, ctx, path)
+// BaseCacheFile opens the base content of path at generation gen, or at the
+// current generation when gen is 0, and returns the generation it opened.
+func (e *Engine) BaseCacheFile(ctx context.Context, path string, gen int64) (*os.File, int64, bool, error) {
+	return e.baseCacheFile(ctx, ctx, path, gen)
 }
 
-func (e *Engine) baseCacheFile(ctx, metadataCtx context.Context, path string) (*os.File, int64, bool, error) {
+func (e *Engine) baseCacheFile(ctx, metadataCtx context.Context, path string, gen int64) (*os.File, int64, bool, error) {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
 	path = model.CleanPath(path)
@@ -92,8 +94,16 @@ func (e *Engine) baseCacheFile(ctx, metadataCtx context.Context, path string) (*
 		}
 		return nil, 0, false, nil
 	}
-	gen := e.Resolver.Generation()
+	current := e.Resolver.Generation()
+	if gen == 0 {
+		gen = current
+	}
 	n, ok, err := e.Resolver.Snapshot.LookupNode(metadataCtx, gen, path)
+	if err == nil && !ok && gen != current {
+		// HEAD reconciliation pruned gen.
+		gen = current
+		n, ok, err = e.Resolver.Snapshot.LookupNode(metadataCtx, gen, path)
+	}
 	if err != nil {
 		return nil, 0, false, err
 	}

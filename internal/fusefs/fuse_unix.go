@@ -50,10 +50,14 @@ type ArtifactFuse struct {
 }
 
 type InodeRef struct {
-	ID      fuseops.InodeID
-	Path    string
-	Type    string // file, dir, symlink
-	Mode    uint32
+	ID   fuseops.InodeID
+	Path string
+	Type string // file, dir, symlink
+	Mode uint32
+	// Gen is the snapshot generation of the base attributes last reported for
+	// this inode, or 0 when the kernel's view came from the overlay. Base reads
+	// serve Gen so their length matches the size the kernel holds after a HEAD
+	// change, until a new reply reports the current generation.
 	Gen     int64
 	Refcnt  int64
 	IsRoot  bool
@@ -128,6 +132,7 @@ func (fs *ArtifactFuse) allocInode(path, typ string, mode uint32, gen int64) *In
 	if id, ok := fs.pathToInode[path]; ok {
 		if ref, ok := fs.inodes[id]; ok {
 			ref.Refcnt++
+			ref.Gen = gen
 			return ref
 		}
 	}
@@ -149,6 +154,23 @@ func (fs *ArtifactFuse) requireInode(id fuseops.InodeID, missing error) (*InodeR
 	snapshot := *ref
 	fs.mu.RUnlock()
 	return &snapshot, nil
+}
+
+func (fs *ArtifactFuse) inodeGeneration(id fuseops.InodeID) int64 {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	if ref := fs.inodes[id]; ref != nil {
+		return ref.Gen
+	}
+	return 0
+}
+
+func (fs *ArtifactFuse) setInodeGeneration(id fuseops.InodeID, gen int64) {
+	fs.mu.Lock()
+	if ref := fs.inodes[id]; ref != nil {
+		ref.Gen = gen
+	}
+	fs.mu.Unlock()
 }
 
 func (fs *ArtifactFuse) dropInodeLookup(id fuseops.InodeID) {
@@ -200,6 +222,7 @@ func (fs *ArtifactFuse) moveInodePath(oldPath, newPath string) {
 	for _, move := range moves {
 		if ref := fs.inodes[move.id]; ref != nil {
 			ref.Path = move.newPath
+			ref.Gen = 0
 			fs.pathToInode[move.newPath] = move.id
 		}
 	}
@@ -336,7 +359,9 @@ func (fs *ArtifactFuse) moveOpenHandles(oldPath, newPath string) {
 	}
 }
 
-func (fh *FileHandle) read(ctx context.Context, engine *Engine, off int64, size int) ([]byte, error) {
+// read serves the overlay when it holds the path, and otherwise the base content
+// of generation gen, or of the current generation when gen is 0.
+func (fh *FileHandle) read(ctx context.Context, engine *Engine, gen int64, off int64, size int) ([]byte, error) {
 	fh.mu.Lock()
 	path := fh.path
 	if fh.detached && fh.cacheFile != nil {
@@ -344,9 +369,11 @@ func (fh *FileHandle) read(ctx context.Context, engine *Engine, off int64, size 
 		return readFileChunkFrom(fh.cacheFile, off, size)
 	}
 	fh.mu.Unlock()
-	currentGen := engine.Resolver.Generation()
+	if gen == 0 {
+		gen = engine.Resolver.Generation()
+	}
 	fh.mu.Lock()
-	if fh.cacheFile != nil && (fh.cacheGeneration == -1 || fh.cacheGeneration == currentGen) {
+	if fh.cacheFile != nil && (fh.cacheGeneration == -1 || fh.cacheGeneration == gen) {
 		defer fh.mu.Unlock()
 		return readFileChunkFrom(fh.cacheFile, off, size)
 	}
@@ -362,7 +389,7 @@ func (fh *FileHandle) read(ctx context.Context, engine *Engine, off int64, size 
 	seq := fh.invalidateSeq
 	fh.mu.Unlock()
 
-	f, gen, ok, err := engine.BaseCacheFile(ctx, path)
+	f, gen, ok, err := engine.BaseCacheFile(ctx, path, gen)
 	if err != nil {
 		return nil, err
 	}
@@ -370,7 +397,7 @@ func (fh *FileHandle) read(ctx context.Context, engine *Engine, off int64, size 
 		return engine.Read(ctx, path, off, size)
 	}
 	fh.mu.Lock()
-	if fh.invalidateSeq != seq || gen != engine.Resolver.Generation() {
+	if fh.invalidateSeq != seq {
 		fh.mu.Unlock()
 		_ = f.Close()
 		return engine.Read(ctx, path, off, size)
@@ -452,7 +479,7 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 		return nil
 	}
 
-	mode, size, typ, mtime, ctime, err := fs.resolveAttrs(ctx, childPath)
+	mode, size, typ, mtime, ctime, gen, err := fs.resolveAttrs(ctx, childPath)
 	if err != nil {
 		if errors.Is(err, iofs.ErrNotExist) {
 			return syscall.ENOENT
@@ -461,7 +488,7 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 	}
 
 	fs.mu.Lock()
-	ref := fs.allocInode(childPath, typ, mode, fs.resolver.Generation())
+	ref := fs.allocInode(childPath, typ, mode, gen)
 	fs.mu.Unlock()
 
 	op.Entry.Child = ref.ID
@@ -497,28 +524,31 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 		return nil
 	}
 
-	mode, size, typ, mtime, ctime, err := fs.resolveAttrs(ctx, ref.Path)
+	mode, size, typ, mtime, ctime, gen, err := fs.resolveAttrs(ctx, ref.Path)
 	if err != nil {
 		if errors.Is(err, iofs.ErrNotExist) {
 			return syscall.ENOENT
 		}
 		return syscall.EIO
 	}
+	fs.setInodeGeneration(op.Inode, gen)
 	op.Attributes = inodeAttrs(mode, uint64(size), typ, mtime, ctime)
 	op.AttributesExpiration = attrExpiry(time.Second)
 	return nil
 }
 
-func (fs *ArtifactFuse) resolveAttrs(ctx context.Context, path string) (mode uint32, size int64, nodeType string, mtime time.Time, ctime time.Time, err error) {
+// resolveAttrs returns the attributes of path and the snapshot generation they
+// came from, or generation 0 when they came from the overlay.
+func (fs *ArtifactFuse) resolveAttrs(ctx context.Context, path string) (mode uint32, size int64, nodeType string, mtime time.Time, ctime time.Time, gen int64, err error) {
 	n, generation, commitTime, err := fs.resolver.ResolvePathState(path)
 	if err != nil {
-		return 0, 0, "", time.Time{}, time.Time{}, err
+		return 0, 0, "", time.Time{}, time.Time{}, 0, err
 	}
 	if n.FromOverlay {
 		typ := n.Overlay.NodeType()
 		mt := time.Unix(0, n.Overlay.MtimeUnixNs)
 		ct := time.Unix(0, n.Overlay.CtimeUnixNs)
-		return n.Overlay.Mode, n.Overlay.SizeBytes, typ, mt, ct, nil
+		return n.Overlay.Mode, n.Overlay.SizeBytes, typ, mt, ct, 0, nil
 	}
 
 	mode = normalizeMode(n.Base.Mode, n.Base.Type)
@@ -526,13 +556,13 @@ func (fs *ArtifactFuse) resolveAttrs(ctx context.Context, path string) (mode uin
 	if n.Base.Type == "file" && n.Base.SizeState != "known" && n.Base.ObjectOID != "" {
 		_, hydratedSize, hErr := fs.engine.Hydrator.EnsureHydrated(ctx, fs.repo, n.Base)
 		if hErr != nil {
-			return 0, 0, "", time.Time{}, time.Time{}, hErr
+			return 0, 0, "", time.Time{}, time.Time{}, 0, hErr
 		}
 		size = hydratedSize
 	} else if n.Base.Type == "symlink" && n.Base.SizeState != "known" && n.Base.ObjectOID != "" {
 		target, readErr := fs.engine.Hydrator.ReadBlob(ctx, fs.repo, n.Base, model.MaxSymlinkTargetBytes)
 		if readErr != nil {
-			return 0, 0, "", time.Time{}, time.Time{}, readErr
+			return 0, 0, "", time.Time{}, time.Time{}, 0, readErr
 		}
 		size = int64(len(target))
 	}
@@ -544,7 +574,7 @@ func (fs *ArtifactFuse) resolveAttrs(ctx context.Context, path string) (mode uin
 		ct = generation // fallback: commit time unavailable
 	}
 	mt := time.Unix(ct, 0)
-	return mode, size, n.Base.Type, mt, mt, nil
+	return mode, size, n.Base.Type, mt, mt, generation, nil
 }
 
 func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp) error {
@@ -587,6 +617,7 @@ func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetI
 	if err != nil {
 		return syscall.EIO
 	}
+	fs.setInodeGeneration(op.Inode, 0)
 	op.Attributes = inodeAttrs(mode, uint64(size), typ, mtime, ctime)
 	op.AttributesExpiration = attrExpiry(time.Second)
 	return nil
@@ -728,8 +759,12 @@ func (fs *ArtifactFuse) childEntryFromReaddir(path string, gen, commitTime int64
 		return entry, nil
 	}
 	mode, size, typ, mtime, ctime := readdirAttrs(e, gen, commitTime)
+	refGen := gen
+	if e.FromOverlay {
+		refGen = 0
+	}
 	fs.mu.Lock()
-	ref := fs.allocInode(path, typ, mode, gen)
+	ref := fs.allocInode(path, typ, mode, refGen)
 	fs.mu.Unlock()
 	entry := fuseops.ChildInodeEntry{
 		Child:      ref.ID,
@@ -784,7 +819,7 @@ func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) er
 			fh.cacheFile = f
 			fh.cacheGeneration = -1
 		} else {
-			f, gen, base, err := fs.engine.baseCacheFile(ctx, metadataCtx, ref.Path)
+			f, gen, base, err := fs.engine.baseCacheFile(ctx, metadataCtx, ref.Path, ref.Gen)
 			if err != nil {
 				if isRequestCancellation(ctx, err) {
 					return syscall.EINTR
@@ -830,7 +865,7 @@ func (fs *ArtifactFuse) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) er
 		return nil
 	}
 
-	data, err := fh.read(ctx, fs.engine, op.Offset, int(op.Size))
+	data, err := fh.read(ctx, fs.engine, fs.inodeGeneration(op.Inode), op.Offset, int(op.Size))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return syscall.ENOENT
@@ -871,6 +906,7 @@ func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) 
 	if n != len(op.Data) {
 		return syscall.EIO
 	}
+	fs.setInodeGeneration(op.Inode, 0)
 	fs.closeCachedFilesForPath(path)
 	return nil
 }
@@ -886,7 +922,7 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 		return syscall.EIO
 	}
 	fs.mu.Lock()
-	ref := fs.allocInode(childPath, "file", uint32(op.Mode), fs.resolver.Generation())
+	ref := fs.allocInode(childPath, "file", uint32(op.Mode), 0)
 	fh := &FileHandle{inode: ref, path: childPath}
 	handle := fs.nextHandleID
 	fs.nextHandleID++
@@ -915,7 +951,7 @@ func (fs *ArtifactFuse) CreateSymlink(ctx context.Context, op *fuseops.CreateSym
 		return syscall.EIO
 	}
 	fs.mu.Lock()
-	ref := fs.allocInode(childPath, "symlink", 0o120000, fs.resolver.Generation())
+	ref := fs.allocInode(childPath, "symlink", 0o120000, 0)
 	fs.mu.Unlock()
 
 	op.Entry.Child = ref.ID
@@ -936,7 +972,7 @@ func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
 		return syscall.EIO
 	}
 	fs.mu.Lock()
-	ref := fs.allocInode(childPath, "dir", uint32(op.Mode), fs.resolver.Generation())
+	ref := fs.allocInode(childPath, "dir", uint32(op.Mode), 0)
 	fs.mu.Unlock()
 
 	op.Entry.Child = ref.ID
