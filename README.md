@@ -58,7 +58,8 @@ GOWORK=off go build -tags fskit -o artifact-fs ./cmd/artifact-fs
 Enable the `macFUSE` and `macFUSE (local)` file system extensions in System
 Settings, then set `ARTIFACT_FS_FUSE_BACKEND=fskit` for the daemon. This uses
 the user-space filesystem extension and requires no kernel extension. Builds
-without the `fskit` tag retain the existing transport.
+without the `fskit` tag retain the existing transport. Mounts fail when the
+variable holds any other value, or when the binary was built without FSKit.
 
 FSKit reuses directory handles across enumerations, so this backend refreshes
 entries when enumeration restarts. It rejects extended attributes to prevent

@@ -5,6 +5,7 @@ package fusefs
 import (
 	"bytes"
 	"context"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -55,6 +56,38 @@ func TestReadDirRefreshesReusedFSKitHandle(t *testing.T) {
 			}
 			if err := f.fs.ReleaseDirHandle(ctx, &fuseops.ReleaseDirHandleOp{Handle: open.Handle}); err != nil {
 				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestMountBackendRejectsUnknownValues(t *testing.T) {
+	fskitErr := ""
+	if !fskitSupported {
+		fskitErr = "requires a darwin cgo build with -tags fskit"
+	}
+	for _, test := range []struct {
+		value   string
+		want    string
+		wantErr string
+	}{
+		{value: ""},
+		{value: "fskit", want: "fskit", wantErr: fskitErr},
+		{value: "kernel", wantErr: "unsupported"},
+		{value: "FSKit", wantErr: "unsupported"},
+		{value: " fskit", wantErr: "unsupported"},
+	} {
+		t.Run(test.value, func(t *testing.T) {
+			t.Setenv(backendEnv, test.value)
+			got, err := MountBackend()
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("MountBackend() error = %v, want %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("MountBackend() = %q, %v; want %q", got, err, test.want)
 			}
 		})
 	}

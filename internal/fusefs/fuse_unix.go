@@ -9,7 +9,6 @@ import (
 	iofs "io/fs"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -107,7 +106,6 @@ func NewArtifactFuse(repo model.RepoConfig, resolver *Resolver, engine *Engine) 
 		repo:           repo,
 		resolver:       resolver,
 		engine:         engine,
-		fskit:          runtime.GOOS == "darwin" && os.Getenv("ARTIFACT_FS_FUSE_BACKEND") == "fskit",
 		gitfileContent: fmt.Appendf(nil, "gitdir: %s\n", repo.GitDir),
 		syntheticTime:  time.Now(),
 		inodes:         make(map[fuseops.InodeID]*InodeRef),
@@ -1206,8 +1204,31 @@ func MountRepo(repo model.RepoConfig, resolver *Resolver, engine *Engine) (Mount
 	return MountRepoWithGate(repo, resolver, engine, nil)
 }
 
+const backendEnv = "ARTIFACT_FS_FUSE_BACKEND"
+
+// MountBackend returns the transport ARTIFACT_FS_FUSE_BACKEND selects: empty for
+// the platform default, or fskit for macFUSE's FSKit backend.
+func MountBackend() (string, error) {
+	switch backend := os.Getenv(backendEnv); backend {
+	case "":
+		return "", nil
+	case "fskit":
+		if !fskitSupported {
+			return "", fmt.Errorf("%s=fskit requires a darwin cgo build with -tags fskit", backendEnv)
+		}
+		return backend, nil
+	default:
+		return "", fmt.Errorf("unsupported %s=%q; leave it empty or set fskit", backendEnv, backend)
+	}
+}
+
 func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine, gate *ReadyGate) (MountedFS, error) {
+	backend, err := MountBackend()
+	if err != nil {
+		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
+	}
 	fsint := NewArtifactFuse(repo, resolver, engine)
+	fsint.fskit = backend == "fskit"
 	server := fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate))
 
 	mountCfg := &fuse.MountConfig{
@@ -1217,7 +1238,7 @@ func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine
 		UseVectoredRead:         true,
 	}
 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.
-	platformMountConfig(mountCfg)
+	platformMountConfig(mountCfg, backend)
 
 	mfs, err := fuse.Mount(repo.MountPath, server, mountCfg)
 	if err != nil {
