@@ -45,27 +45,42 @@ go build -o artifact-fs github.com/cloudflare/artifact-fs/cmd/artifact-fs
 
 ### Native macOS FSKit backend in this fork
 
-This fork pins an FSKit-capable `jacobsa/fuse` replacement. Build from this
-checkout with macFUSE 5.5+ installed:
+This fork pins a `jacobsa/fuse` replacement that loads macFUSE's FSKit
+framework at run time. Every macOS build can mount through FSKit, with no build
+tags and no cgo:
 
 ```bash
-CGO_ENABLED=1 \
-CGO_CFLAGS='-F/Library/Filesystems/macfuse.fs/Contents/Frameworks' \
-CGO_LDFLAGS='-F/Library/Filesystems/macfuse.fs/Contents/Frameworks' \
-GOWORK=off go build -tags fskit -o artifact-fs ./cmd/artifact-fs
+GOWORK=off go build -o artifact-fs ./cmd/artifact-fs
 ```
 
-Enable the `macFUSE` and `macFUSE (local)` file system extensions in System
-Settings, then set `ARTIFACT_FS_FUSE_BACKEND=fskit` for the daemon. This uses
-the user-space filesystem extension and requires no kernel extension. Builds
-without the `fskit` tag retain the existing transport. Mounts fail when the
-variable holds any other value, or when the binary was built without FSKit.
+FSKit needs macOS 26 or later and macFUSE 5.3 or later. Enable the `macFUSE`
+and `macFUSE (local)` file system extensions under System Settings > General >
+Login Items & Extensions > File System Extensions. FSKit uses this user-space
+file system extension and needs no kernel extension.
+
+`ARTIFACT_FS_FUSE_BACKEND` selects the macOS transport:
+
+| Value | Transport |
+|-------|-----------|
+| `auto` (default) | FSKit. Falls back to the macFUSE kernel extension only when FSKit is unavailable on this Mac and the kernel extension is already loaded. |
+| `fskit` | FSKit only. |
+| `kernel` | The macFUSE kernel extension. macOS prompts to load it when it is not loaded. |
+
+Any other value fails the mount. Linux accepts the same values and ignores them.
+
+A failed FSKit mount logs what to fix, such as enabling the file system
+extensions or upgrading macOS. FSKit counts as unavailable when macFUSE's FSKit
+framework is missing, macOS is too old, the helper tool failed to install, or the
+file system extension is missing or not enabled. `auto` does not fall back after
+any other FSKit failure, because a retry could mount twice. The daemon logs the
+transport that mounted each repo.
 
 FSKit reuses directory handles across enumerations, so this backend refreshes
 entries when enumeration restarts. It rejects extended attributes to prevent
 AppleDouble metadata files; use `cp -X` when copying files with Finder metadata.
 The native mount API has no supported cancellation for a permanently stalled
-system mount service.
+system mount service. `umount` from a terminal cannot unmount an FSKit mount;
+use `diskutil unmount <path>`.
 
 Quick start against a public repo:
 
@@ -407,7 +422,7 @@ Unit tests:
 go test ./...
 ```
 
-End-to-end tests mount a git repo via FUSE and exercise filesystem + git operations (including commit and overlay reconciliation). They require a FUSE implementation (macFUSE on macOS, `fuse3` on Linux) and are off by default. On macOS they skip unless `ARTIFACT_FS_FUSE_BACKEND=fskit` is set or the macFUSE kernel extension is already loaded.
+End-to-end tests mount a git repo via FUSE and exercise filesystem + git operations (including commit and overlay reconciliation). They require a FUSE implementation (macFUSE on macOS, `fuse3` on Linux) and are off by default. On macOS they skip when the selected `ARTIFACT_FS_FUSE_BACKEND` transport cannot mount without prompting to load the macFUSE kernel extension.
 
 By default, e2e tests create a local bare repo -- no network required. Set `AFS_E2E_REPO` to test against a real remote.
 

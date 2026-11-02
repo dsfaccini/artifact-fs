@@ -23,6 +23,7 @@ test -x ./artifact-fs || go build -o artifact-fs ./cmd/artifact-fs
 - **`add-repo` does not mount.** It registers a blobless clone and exits. `daemon` mounts all registered repos and stays running.
 - **The mounted tree starts from committed Git state.** Remote commits, trees, and refs are the base view. Local edits live in an overlay and appear as dirty state until committed.
 - **One daemon can mount many repos.** Register each repo separately, then start one `daemon --root <mount-root>`.
+- **Unmount a stale macOS FSKit mount with `diskutil unmount <path>`.** macOS denies `umount` from a terminal for FSKit mounts.
 
 ## Quick Reference
 
@@ -53,7 +54,7 @@ git -C /tmp/workers-sdk status
 ./artifact-fs status --name workers-sdk
 
 kill $DAEMON_PID
-# If a stale mount remains:
+# If a stale mount remains (macOS FSKit: diskutil unmount /tmp/workers-sdk):
 umount /tmp/workers-sdk
 ```
 
@@ -79,6 +80,7 @@ ls /tmp/repo-b
 ./artifact-fs list-repos
 
 kill $DAEMON_PID
+# If stale mounts remain (macOS FSKit: diskutil unmount <path>):
 umount /tmp/repo-a
 umount /tmp/repo-b
 ```
