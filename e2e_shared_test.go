@@ -175,7 +175,7 @@ func (s *sharedE2ERepo) release(t *testing.T, needsRestore bool) {
 	restored := make(chan error, 1)
 	go func() {
 		if !needsRestore {
-			if err := s.verify(); err != nil {
+			if err := s.verifyUnchanged(); err != nil {
 				restored <- fmt.Errorf("the test is registered with runReadOnly but changed the mount: %w", err)
 				return
 			}
@@ -305,6 +305,20 @@ func (s *sharedE2ERepo) discardOverlay() error {
 		}
 	}
 	return nil
+}
+
+// verifyUnchanged reports how a test changed the mount, including a HEAD move
+// that the test undid: the daemon publishes a snapshot generation for each HEAD
+// it moves to.
+func (s *sharedE2ERepo) verifyUnchanged() error {
+	st, err := s.repo.svc.Status(context.Background(), repoName)
+	if err != nil {
+		return err
+	}
+	if st.SnapshotGeneration != s.generation {
+		return fmt.Errorf("daemon snapshot generation = %d, want %d", st.SnapshotGeneration, s.generation)
+	}
+	return s.verify()
 }
 
 // verify reports how the mount differs from the state it came up in.

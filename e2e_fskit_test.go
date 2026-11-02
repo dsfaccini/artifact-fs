@@ -3,13 +3,18 @@
 package main
 
 import (
+	"context"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/cloudflare/artifact-fs/internal/meta"
+	"github.com/cloudflare/artifact-fs/internal/daemon"
+	"github.com/cloudflare/artifact-fs/internal/logging"
+	"github.com/cloudflare/artifact-fs/internal/model"
+	"github.com/cloudflare/artifact-fs/internal/overlay"
 )
 
 // fskitMountBudget caps the FUSE mounts one e2e run starts on FSKit. macFUSE's
@@ -117,36 +122,87 @@ func TestSharedMountFailsReadOnlyTestThatChangesMount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(executable, "-test.run", "^TestSharedMountReadOnlyTestChangesMountHelper$")
-	cmd.Env = append(os.Environ(), "AFS_SHARED_READ_ONLY_HELPER=1")
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("a read-only shared-mount test that changed the mount passed:\n%s", out)
-	}
-	if !strings.Contains(string(out), "registered with runReadOnly but changed the mount: overlay entries") {
-		t.Fatalf("read-only shared-mount test failed for another reason:\n%s", out)
+	for change, want := range map[string]string{
+		"overlay": "registered with runReadOnly but changed the mount: overlay entries",
+		"head":    "registered with runReadOnly but changed the mount: daemon snapshot generation",
+	} {
+		t.Run(change, func(t *testing.T) {
+			cmd := exec.Command(executable, "-test.run", "^TestSharedMountReadOnlyTestChangesMountHelper$")
+			cmd.Env = append(os.Environ(), "AFS_SHARED_READ_ONLY_HELPER="+change)
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("a read-only shared-mount test that changed the mount passed:\n%s", out)
+			}
+			if !strings.Contains(string(out), want) {
+				t.Fatalf("read-only shared-mount test failed without %q:\n%s", want, out)
+			}
+		})
 	}
 }
 
+// TestSharedMountReadOnlyTestChangesMountHelper registers a test with
+// runReadOnly that changes an unmounted repo the way AFS_SHARED_READ_ONLY_HELPER
+// names: "overlay" adds an overlay entry, and "head" moves HEAD to a new commit.
 func TestSharedMountReadOnlyTestChangesMountHelper(t *testing.T) {
-	if os.Getenv("AFS_SHARED_READ_ONLY_HELPER") != "1" {
+	change := os.Getenv("AFS_SHARED_READ_ONLY_HELPER")
+	if change == "" {
 		t.Skip("helper for TestSharedMountFailsReadOnlyTestThatChangesMount")
 	}
 	previous := wedgedMount.Swap(nil)
 	t.Cleanup(func() { wedgedMount.Store(previous) })
 
+	ctx := context.Background()
+	remoteURL := createLocalTestRepo(t)
 	root := t.TempDir()
+	mountDir := t.TempDir()
+	svc, err := daemon.New(ctx, root, logging.NewJSONLogger(os.Stderr, slog.LevelWarn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+	svc.SetMountRoot(mountDir)
+	// AddRepo clones and publishes the first snapshot without mounting.
+	if err := svc.AddRepo(ctx, model.RepoConfig{Name: repoName, RemoteURL: remoteURL, Branch: "main", MountRoot: mountDir, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := svc.Status(ctx, repoName)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// gitDir does not exist, so a restore that runs anyway fails without
 	// touching a repository.
-	s := &sharedE2ERepo{repo: &mountedE2ERepo{root: root}, gitDir: filepath.Join(root, "missing-git")}
-	s.runReadOnly(t, "writes a file", func(t *testing.T, repo *mountedE2ERepo) {
-		db, err := meta.OpenDB(filepath.Join(repo.root, "overlays", repoName, "meta.sqlite"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer db.Close()
-		if _, err := db.Exec(`CREATE TABLE overlay_entries(path TEXT, kind TEXT); INSERT INTO overlay_entries VALUES('written.txt', 'file')`); err != nil {
-			t.Fatal(err)
+	s := &sharedE2ERepo{
+		repo:       &mountedE2ERepo{root: root, svc: svc},
+		gitDir:     filepath.Join(root, "missing-git"),
+		generation: st.SnapshotGeneration,
+	}
+	s.runReadOnly(t, change, func(t *testing.T, repo *mountedE2ERepo) {
+		switch change {
+		case "overlay":
+			repos, err := repo.svc.ListRepos(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store, err := overlay.New(ctx, repos[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if err := store.Remove(ctx, "README.md"); err != nil {
+				t.Fatal(err)
+			}
+		case "head":
+			writer := filepath.Join(t.TempDir(), "writer")
+			run(t, "", "git", "clone", "--branch", "main", remoteURL, writer)
+			writeTestFile(t, writer, "ADVANCED.md", "advanced\n")
+			run(t, writer, "git", "add", "ADVANCED.md")
+			run(t, writer, "git", "-c", "user.name=E2E Test", "-c", "user.email=e2e@test", "commit", "-m", "advance HEAD")
+			run(t, writer, "git", "push", "origin", "main")
+			if err := repo.svc.Prepare(ctx, repoName); err != nil {
+				t.Fatal(err)
+			}
+		default:
+			t.Fatalf("unknown AFS_SHARED_READ_ONLY_HELPER=%q", change)
 		}
 	})
 }
