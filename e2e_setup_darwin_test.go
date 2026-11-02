@@ -53,6 +53,13 @@ func skipIfNoFUSE(t *testing.T) {
 	}
 }
 
+// mountsThroughFSKit reports whether e2e mounts here go through FSKit:
+// ARTIFACT_FS_FUSE_BACKEND selects it, or the auto backend finds it available.
+func mountsThroughFSKit() bool {
+	backend, err := fusefs.MountBackend()
+	return err == nil && (backend == fusefs.BackendFSKit || backend == fusefs.BackendAuto && fskitAvailable())
+}
+
 // fskitAvailable mirrors the fuse fork's FSKit preflight: the MFMount framework
 // is installed and macOS is 26 or later. Extension approval is only known at mount time.
 func fskitAvailable() bool {

@@ -28,11 +28,11 @@ const kernelCacheExpiry = 1500 * time.Millisecond
 // seeded state on one mount, because each mount counts toward the series after
 // which macFUSE's FSKit extension can stop loading (see e2eMountsStarted). A
 // test whose subject is mounting, restarting, or the state of a fresh mount
-// keeps its own mount.
+// keeps its own mount. On FSKit only the runReadOnly tests run.
 func TestE2ESharedMount(t *testing.T) {
 	shared := newSharedE2ERepo(t)
-	shared.run(t, "GitCleanState", testE2EGitCleanState)
-	shared.run(t, "GitConcurrentReads", testE2EGitConcurrentReads)
+	shared.runReadOnly(t, "GitCleanState", testE2EGitCleanState)
+	shared.runReadOnly(t, "GitConcurrentReads", testE2EGitConcurrentReads)
 	shared.run(t, "HEADReconcileRetriesAfterSnapshotLock", testE2EHEADReconcileRetriesAfterSnapshotLock)
 	shared.run(t, "GitStatusDetectsSameSizeRewriteAfterMtimeRestore", testE2EGitStatusDetectsSameSizeRewriteAfterMtimeRestore)
 	shared.run(t, "GitStatusPorcelain", testE2EGitStatusPorcelain)
@@ -134,12 +134,28 @@ func newSharedE2ERepo(t *testing.T) *sharedE2ERepo {
 }
 
 // run runs test as a subtest on the shared mount, then restores the mount.
+// Undoing the changes of test moves HEAD, so run skips test on FSKit.
 func (s *sharedE2ERepo) run(t *testing.T, name string, test func(*testing.T, *mountedE2ERepo)) {
+	t.Helper()
+	s.runSubtest(t, name, test, true)
+}
+
+// runReadOnly runs a test that leaves the mount in the state it came up in.
+// Restoring after that test moves no HEAD, so runReadOnly also runs it on FSKit.
+func (s *sharedE2ERepo) runReadOnly(t *testing.T, name string, test func(*testing.T, *mountedE2ERepo)) {
+	t.Helper()
+	s.runSubtest(t, name, test, false)
+}
+
+func (s *sharedE2ERepo) runSubtest(t *testing.T, name string, test func(*testing.T, *mountedE2ERepo), needsRestore bool) {
 	t.Helper()
 	t.Run(name, func(t *testing.T) {
 		skipIfMountWedged(t)
 		if s.broken != "" {
 			t.Skipf("skipping: the shared mount could not be restored after %s", s.broken)
+		}
+		if needsRestore {
+			skipIfFSKitHEADMove(t, "restoring the shared mount after this test")
 		}
 		t.Cleanup(func() { s.release(t) })
 		test(t, s.repo)
