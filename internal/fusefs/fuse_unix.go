@@ -1007,7 +1007,8 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 	if sourceType == "dir" && strings.HasPrefix(newPath, oldPath+"/") {
 		return syscall.EINVAL
 	}
-	if destination, err := fs.resolver.ResolvePath(newPath); err == nil {
+	destination, destinationErr := fs.resolver.ResolvePath(newPath)
+	if destinationErr == nil {
 		destinationType := resolvedNodeType(destination)
 		if sourceType == "dir" && destinationType != "dir" {
 			return syscall.ENOTDIR
@@ -1017,6 +1018,23 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 		}
 	}
 	if sourceType != "dir" {
+		// Hydrate both paths before copying either, so an interrupted request
+		// cannot leave a copy-on-write source behind.
+		nodes := []ResolvedNode{source}
+		if destinationErr == nil {
+			nodes = append(nodes, destination)
+		}
+		for _, n := range nodes {
+			if n.FromOverlay || n.Base.ObjectOID == "" {
+				continue
+			}
+			if _, _, err := fs.engine.Hydrator.EnsureHydrated(ctx, fs.repo, n.Base); err != nil {
+				if isRequestCancellation(ctx, err) {
+					return syscall.EINTR
+				}
+				return syscall.EIO
+			}
+		}
 		if err := fs.engine.ensureOverlayWithContexts(ctx, metadataCtx, oldPath); err != nil {
 			if isRequestCancellation(ctx, err) {
 				return syscall.EINTR

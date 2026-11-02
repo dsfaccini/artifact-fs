@@ -296,6 +296,52 @@ func TestCanceledHydrationInterruptsRenameBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestCanceledDestinationHydrationInterruptsRenameBeforeMutation(t *testing.T) {
+	tmp := t.TempDir()
+	repo := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	store, err := overlaystore.New(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	sourceBlob := filepath.Join(tmp, "source-blob")
+	if err := os.WriteFile(sourceBlob, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	source := model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "source-blob", SizeState: "known", SizeBytes: 4}
+	destination := model.BaseNode{RepoID: repo.ID, Path: "renamed.txt", Type: "file", Mode: 0o100644, ObjectOID: "destination-blob", SizeState: "known", SizeBytes: 4}
+	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{source.Path: source, destination.Path: destination}}, Overlay: store}
+	resolver.SetGeneration(1)
+	// The source blob is cached; the destination fetch observes the canceled request.
+	hydrator := &fakeBatchHydrator{
+		pathsByOID:  map[string]string{source.ObjectOID: sourceBlob},
+		errorsByOID: map[string]error{destination.ObjectOID: context.Canceled},
+	}
+	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: store, Hydrator: hydrator}
+	fs := NewArtifactFuse(repo, resolver, engine)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = fs.Rename(ctx, &fuseops.RenameOp{
+		OldParent: fuseops.RootInodeID, OldName: source.Path,
+		NewParent: fuseops.RootInodeID, NewName: destination.Path,
+	})
+	if err != syscall.EINTR {
+		t.Fatalf("Rename after canceled destination hydration = %v, want EINTR", err)
+	}
+	for _, path := range []string{source.Path, destination.Path} {
+		if n, err := resolver.ResolvePath(path); err != nil || n.FromOverlay {
+			t.Fatalf("%s after interrupted rename = (%+v, %v), want base entry", path, n, err)
+		}
+	}
+	entries, err := store.ListAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("interrupted rename left overlay entries: %+v", entries)
+	}
+}
+
 func TestCanceledHydrationInterruptsOpenFile(t *testing.T) {
 	tmp := t.TempDir()
 	repo := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
