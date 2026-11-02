@@ -46,7 +46,7 @@ whose `go.mod` has a `replace` directive.
 Or build it directly from the module path:
 
 ```bash
-go build -o artifact-fs github.com/cloudflare/artifact-fs/cmd/artifact-fs
+go build -tags fskit -o artifact-fs github.com/cloudflare/artifact-fs/cmd/artifact-fs
 ```
 
 ### Native macOS FSKit backend in this fork
