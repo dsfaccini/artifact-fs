@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -11,11 +12,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// skipIfNoFUSE skips the test unless it can mount without prompting macOS to
-// load the macFUSE kernel extension or exec the mount helper, and fails when
-// ARTIFACT_FS_FUSE_BACKEND cannot mount in this build. Some sandboxed
-// environments expose the macFUSE bundle but deny exec of mount_macfuse;
-// without these preflights every e2e case waits for its mount timeout.
+// skipIfNoFUSE skips the test unless ARTIFACT_FS_FUSE_BACKEND selects a transport
+// that can mount here without prompting macOS to load the macFUSE kernel
+// extension, and fails when the variable is invalid. It also skips when the
+// mount helper cannot be executed: some sandboxed environments expose the
+// macFUSE bundle but deny exec of mount_macfuse. Without these preflights every
+// e2e case waits for its mount timeout.
 func skipIfNoFUSE(t *testing.T) {
 	t.Helper()
 	skipIfMountWedged(t)
@@ -26,11 +28,15 @@ func skipIfNoFUSE(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if backend != "fskit" {
-		if _, err := unix.SysctlRaw("vfs.generic.macfuse.version.number"); err != nil {
-			t.Skip("skipping: the macFUSE kernel extension is not loaded, and mounting would prompt to load it; " +
-				"set ARTIFACT_FS_FUSE_BACKEND=fskit and build with -tags fskit to test on FSKit")
-		}
+	const noFSKit = "FSKit is unavailable; it needs macOS 26 or later and macFUSE 5.3 or later"
+	_, kextErr := unix.SysctlRaw("vfs.generic.macfuse.version.number")
+	switch {
+	case backend == fusefs.BackendKernel && kextErr != nil:
+		t.Skip("skipping: ARTIFACT_FS_FUSE_BACKEND=kernel needs the macFUSE kernel extension loaded; mounting would prompt macOS to load it")
+	case backend == fusefs.BackendFSKit && !fskitAvailable():
+		t.Skip("skipping: " + noFSKit)
+	case backend == fusefs.BackendAuto && !fskitAvailable() && kextErr != nil:
+		t.Skip("skipping: " + noFSKit + ", and the macFUSE kernel extension is not loaded")
 	}
 	helper := "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse"
 	cmd := exec.Command(helper, "--help")
@@ -41,6 +47,21 @@ func skipIfNoFUSE(t *testing.T) {
 	if strings.Contains(err.Error(), "operation not permitted") || strings.Contains(string(out), "operation not permitted") {
 		t.Skipf("skipping: macFUSE mount helper is not executable in this environment: %v", err)
 	}
+}
+
+// fskitAvailable mirrors the fuse fork's FSKit preflight: the MFMount framework
+// is installed and macOS is 26 or later. Extension approval is only known at mount time.
+func fskitAvailable() bool {
+	if _, err := os.Stat("/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/Versions/A/MFMount"); err != nil {
+		return false
+	}
+	version, err := unix.Sysctl("kern.osproductversion")
+	if err != nil {
+		return false
+	}
+	major, _, _ := strings.Cut(version, ".")
+	n, err := strconv.Atoi(major)
+	return err == nil && n >= 26
 }
 
 // configGitSafeDir adds safe.directory entries for the mount path.

@@ -15,7 +15,7 @@ import (
 )
 
 // skipIfNoFUSE skips the test if the FUSE kernel module is not available, and
-// fails when ARTIFACT_FS_FUSE_BACKEND cannot mount in this build.
+// fails when ARTIFACT_FS_FUSE_BACKEND is invalid.
 func skipIfNoFUSE(t *testing.T) {
 	t.Helper()
 	skipIfMountWedged(t)
