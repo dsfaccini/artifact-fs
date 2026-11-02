@@ -36,6 +36,7 @@ const MOUNT_SCRIPT = '/usr/local/bin/mount-artifact-fs-repo';
 const MAX_REQUEST_BODY_BYTES = 16 * 1024;
 const MOUNT_CONFLICT_EXIT_CODE = 42;
 const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000;
+const MAX_LOGGED_STDERR_CHARS = 4096;
 
 type CommandResult = { exitCode: number; stdout: string; stderr: string };
 
@@ -90,12 +91,10 @@ export class Sandbox extends DurableObject<Env> {
       return { conflict: mountConflict };
     }
 
+    const bootstrapCommand = ['timeout', '--kill-after=5s', '120s', MOUNT_SCRIPT];
     let bootstrap: CommandResult;
     try {
-      bootstrap = await this.runCommand(
-        ['timeout', '--kill-after=5s', '120s', MOUNT_SCRIPT],
-        config.env
-      );
+      bootstrap = await this.runCommand(bootstrapCommand, config.env);
     } catch (error) {
       await this.destroyAfterFailure();
       throw error;
@@ -110,8 +109,9 @@ export class Sandbox extends DurableObject<Env> {
     if (bootstrap.exitCode !== 0) {
       const commandError = new SandboxCommandError(
         'ArtifactFS bootstrap failed',
-        MOUNT_SCRIPT,
-        bootstrap.exitCode
+        bootstrapCommand.join(' '),
+        bootstrap.exitCode,
+        bootstrap.stderr
       );
       await this.destroyAfterFailure();
       throw commandError;
@@ -299,7 +299,12 @@ export class Sandbox extends DurableObject<Env> {
   ): Promise<CommandResult> {
     const result = await this.runCommand(command, env);
     if (result.exitCode !== 0) {
-      throw new SandboxCommandError(message, command.join(' '), result.exitCode);
+      throw new SandboxCommandError(
+        message,
+        command.join(' '),
+        result.exitCode,
+        result.stderr
+      );
     }
     return result;
   }
@@ -724,25 +729,44 @@ function errorResponse(error: unknown, request: Request): Response {
 }
 
 function logError(message: string, error: unknown, request: Request): void {
-  const details =
-    error instanceof SandboxCommandError
-      ? {
-          error: error.message,
-          command: error.command,
-          exitCode: error.exitCode
-        }
-      : {
-          error: error instanceof Error ? error.message : String(error)
-        };
-
   console.error(
     JSON.stringify({
       message,
       method: request.method,
       path: new URL(request.url).pathname,
-      ...details
+      error: error instanceof Error ? error.message : String(error),
+      ...commandFailureDetails(error)
     })
   );
+}
+
+// An error thrown in the Durable Object loses its class over RPC, so
+// `instanceof SandboxCommandError` is false here. Its name and own fields survive
+// through enhanced error serialization, the default from compatibility date 2026-04-21.
+function commandFailureDetails(error: unknown) {
+  if (
+    error instanceof Error &&
+    error.name === 'SandboxCommandError' &&
+    'command' in error &&
+    'exitCode' in error &&
+    'stderrTail' in error
+  ) {
+    return {
+      command: error.command,
+      exitCode: error.exitCode,
+      stderrTail: error.stderrTail
+    };
+  }
+  return {};
+}
+
+function redactCredentials(text: string): string {
+  return text
+    .replace(/:\/\/[^\s/@]+@/g, '://REDACTED@')
+    .replace(
+      /(access_token|token|password|passwd|secret|key|authorization|x-token-auth)=[^&\s]+/gi,
+      '$1=REDACTED'
+    );
 }
 
 async function authorizeRequest(request: Request, env: Env): Promise<void> {
@@ -769,12 +793,17 @@ async function timingSafeEqual(left: string, right: string): Promise<boolean> {
 }
 
 class SandboxCommandError extends Error {
+  override name = 'SandboxCommandError';
+  readonly stderrTail: string;
+
   constructor(
     message: string,
     readonly command: string,
-    readonly exitCode: number
+    readonly exitCode: number,
+    stderr: string
   ) {
     super(message);
+    this.stderrTail = redactCredentials(stderr).slice(-MAX_LOGGED_STDERR_CHARS);
   }
 }
 
