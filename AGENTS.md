@@ -41,6 +41,7 @@ Repository-specific guidance for `artifact-fs`.
 - Build only the CLI with `go build ./cmd/artifact-fs`.
 - Benchmarks are opt-in: `AFS_RUN_BENCH=1 go test -run TestBenchRepos -v`.
 - FUSE e2e tests are opt-in: `AFS_RUN_E2E_TESTS=1 go test -run TestE2E -v .`. They require macFUSE on macOS or `/dev/fuse` on Linux.
+- To run e2e tests on the macOS FSKit backend, add the README's FSKit build flags, `-tags fskit`, and `ARTIFACT_FS_FUSE_BACKEND=fskit`. A deadlocked FSKit mount cannot be unmounted until reboot.
 - E2E tests use a local bare repository by default. Set `AFS_E2E_REPO` only when intentionally testing a real remote.
 - E2E benchmark coverage is separate: `AFS_RUN_E2E_BENCH=1 go test -run TestE2EBenchmarkRepos -v .`.
 - Package tests live beside the code. Benchmarks and `e2e*_test.go` live in the root package.

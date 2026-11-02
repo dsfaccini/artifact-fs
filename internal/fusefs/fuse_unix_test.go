@@ -386,7 +386,7 @@ func TestInodeAttrsPreservesExplicitZeroDirMode(t *testing.T) {
 }
 
 func TestGitFileAttrsUsesOneTimestamp(t *testing.T) {
-	fs := &ArtifactFuse{gitfileContent: []byte("gitdir: /tmp/repo/.git\n")}
+	fs := NewArtifactFuse(model.RepoConfig{GitDir: "/tmp/repo/.git"}, nil, nil)
 
 	attr := fs.gitFileAttrs()
 	if attr.Mtime.IsZero() || attr.Atime.IsZero() || attr.Ctime.IsZero() {
@@ -409,6 +409,35 @@ func TestRootInodeAttributesDoNotRequireResolver(t *testing.T) {
 	}
 	if op.Attributes.Size == 0 {
 		t.Fatal("root size = 0, want non-zero placeholder size")
+	}
+}
+
+func TestSyntheticAttributesRemainStable(t *testing.T) {
+	ctx := context.Background()
+	f := newLocalOverlayFuseFixture(t)
+	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: ".git"}
+	if err := f.fs.LookUpInode(ctx, lookup); err != nil {
+		t.Fatal(err)
+	}
+	gitfile := &fuseops.GetInodeAttributesOp{Inode: lookup.Entry.Child}
+	if err := f.fs.GetInodeAttributes(ctx, gitfile); err != nil {
+		t.Fatal(err)
+	}
+	if gitfile.Attributes != lookup.Entry.Attributes {
+		t.Fatal("synthetic Git file attributes changed between lookup and stat")
+	}
+
+	fs := NewArtifactFuse(model.RepoConfig{Name: "repo", GitDir: "/tmp/repo.git"}, nil, nil)
+	statRoot := func() fuseops.InodeAttributes {
+		t.Helper()
+		op := &fuseops.GetInodeAttributesOp{Inode: fuseops.RootInodeID}
+		if err := fs.GetInodeAttributes(ctx, op); err != nil {
+			t.Fatal(err)
+		}
+		return op.Attributes
+	}
+	if statRoot() != statRoot() {
+		t.Fatal("fallback root attributes changed between stats")
 	}
 }
 

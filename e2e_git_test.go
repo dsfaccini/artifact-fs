@@ -218,6 +218,45 @@ func TestE2EGitCleanState(t *testing.T) {
 	}
 }
 
+// Editors poll Git while other processes stat the mount. On FSKit a deadlock in this workload wedges the mount
+// until reboot, so the test fails on a deadline instead of waiting on stuck processes.
+func TestE2EGitConcurrentReads(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+	const workers = 8
+	deadline := time.Now().Add(3 * time.Second)
+	errs := make(chan error, workers)
+	for range workers {
+		go func() {
+			for time.Now().Before(deadline) {
+				if _, err := os.Stat(filepath.Join(repo.mountPath, ".git")); err != nil {
+					errs <- err
+					return
+				}
+				for _, args := range [][]string{{"rev-parse", "--is-shallow-repository"}, {"for-each-ref", "--merged", "HEAD"}} {
+					cmd := exec.Command("git", gitArgsWithSafeDirectory(repo.mountPath, args...)...)
+					cmd.Dir = repo.mountPath
+					if out, err := cmd.CombinedOutput(); err != nil {
+						errs <- fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, out)
+						return
+					}
+				}
+			}
+			errs <- nil
+		}()
+	}
+	stalled := time.After(time.Until(deadline) + 30*time.Second)
+	for range workers {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-stalled:
+			t.Fatalf("concurrent Git reads stalled; the mount at %s may stay wedged until reboot", repo.mountPath)
+		}
+	}
+}
+
 func TestE2EHEADReconcileRetriesAfterSnapshotLock(t *testing.T) {
 	repo := newMountedE2ERepo(t)
 	gitDir := filepath.Join(repo.root, "repos", repoName, "git")

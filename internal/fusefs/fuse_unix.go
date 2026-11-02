@@ -35,8 +35,8 @@ type ArtifactFuse struct {
 	resolver       *Resolver
 	engine         *Engine
 	fskit          bool
-	gitfileContent []byte // synthesized .git gitfile, computed once
-	gitfileTime    time.Time
+	gitfileContent []byte    // synthesized .git gitfile, computed once
+	syntheticTime  time.Time // timestamps of synthesized entries; changing them can deadlock concurrent FSKit Git reads
 
 	mu           sync.RWMutex
 	handleOps    sync.RWMutex
@@ -109,7 +109,7 @@ func NewArtifactFuse(repo model.RepoConfig, resolver *Resolver, engine *Engine) 
 		engine:         engine,
 		fskit:          runtime.GOOS == "darwin" && os.Getenv("ARTIFACT_FS_FUSE_BACKEND") == "fskit",
 		gitfileContent: fmt.Appendf(nil, "gitdir: %s\n", repo.GitDir),
-		gitfileTime:    time.Now(),
+		syntheticTime:  time.Now(),
 		inodes:         make(map[fuseops.InodeID]*InodeRef),
 		pathToInode:    make(map[string]fuseops.InodeID),
 		nextInodeID:    fuseops.RootInodeID + 1,
@@ -486,8 +486,7 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 				return nil
 			}
 		}
-		now := time.Now()
-		op.Attributes = inodeAttrs(ref.Mode, 4096, "dir", now, now)
+		op.Attributes = inodeAttrs(ref.Mode, 4096, "dir", fs.syntheticTime, fs.syntheticTime)
 		op.AttributesExpiration = attrExpiry(time.Second)
 		return nil
 	}
@@ -1260,19 +1259,14 @@ func setChildEntryExpiry(entry *fuseops.ChildInodeEntry, ttl time.Duration) {
 }
 
 func (fs *ArtifactFuse) gitFileAttrs() fuseops.InodeAttributes {
-	now := time.Now()
-	if fs.fskit {
-		// Changing timestamps on this immutable file can deadlock concurrent FSKit Git reads.
-		now = fs.gitfileTime
-	}
 	return fuseops.InodeAttributes{
 		Size:  uint64(len(fs.gitfileContent)),
 		Mode:  0o644,
 		Nlink: 1,
 		Uid:   uint32(os.Getuid()),
 		Gid:   uint32(os.Getgid()),
-		Atime: now,
-		Mtime: now,
-		Ctime: now,
+		Atime: fs.syntheticTime,
+		Mtime: fs.syntheticTime,
+		Ctime: fs.syntheticTime,
 	}
 }
