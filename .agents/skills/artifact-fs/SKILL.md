@@ -13,7 +13,7 @@ Run from the repo root. If either check fails, STOP and fix the environment firs
 
 ```bash
 test -e /Library/Filesystems/macfuse.fs || test -e /dev/fuse
-test -x ./artifact-fs || go build -o artifact-fs ./cmd/artifact-fs
+test -x ./artifact-fs || go build -tags fskit -o artifact-fs ./cmd/artifact-fs
 ```
 
 ## Critical Rules

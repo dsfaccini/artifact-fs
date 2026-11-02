@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"slices"
 	"strings"
 	"syscall"
@@ -95,20 +94,11 @@ func TestMountBackendRejectsUnknownValues(t *testing.T) {
 }
 
 func TestMountWithBackendFallsBackOnlyWhenFSKitIsUnavailable(t *testing.T) {
-	unavailable := fmt.Errorf("mount: %w: dlopen failed", fuse.ErrFSKitUnavailable)
-	result := func(code int32) error {
-		return fmt.Errorf("mount (background): %w", fuse.FSKitMountError{Result: code})
-	}
+	unavailable := errors.New("FSKit unavailable")
+	fskitUnavailable := func(err error) bool { return errors.Is(err, unavailable) }
 	kernelFailure := errors.New("kernel mount failed")
 	otherFailure := errors.New("FSKit transport failed")
-	unavailableCases := map[string]error{
-		"framework unavailable":       unavailable,
-		"unsupported OS version":      result(fuse.FSKitMountResultUnsupportedOSVersion),
-		"helper tools install failed": result(fuse.FSKitMountResultHelperToolsInstallationFailed),
-		"extension not found":         result(fuse.FSKitMountResultFileSystemExtensionNotFound),
-		"extension requires approval": result(fuse.FSKitMountResultFileSystemExtensionRequiresApproval),
-	}
-	type testCase struct {
+	tests := []struct {
 		name        string
 		backend     string
 		fskitErr    error
@@ -117,23 +107,16 @@ func TestMountWithBackendFallsBackOnlyWhenFSKitIsUnavailable(t *testing.T) {
 		wantMounts  []bool
 		wantBackend string
 		wantErrs    []error
-	}
-	tests := []testCase{
+	}{
 		{name: "kernel without kext", backend: BackendKernel, wantMounts: []bool{false}, wantBackend: BackendKernel},
 		{name: "kernel failure", backend: BackendKernel, kernelErr: kernelFailure, wantMounts: []bool{false}, wantBackend: BackendKernel, wantErrs: []error{kernelFailure}},
 		{name: "fskit", backend: BackendFSKit, wantMounts: []bool{true}, wantBackend: BackendFSKit},
-		{name: "fskit unavailable never falls back", backend: BackendFSKit, fskitErr: unavailable, kextLoaded: true, wantMounts: []bool{true}, wantBackend: BackendFSKit, wantErrs: []error{fuse.ErrFSKitUnavailable}},
+		{name: "fskit unavailable never falls back", backend: BackendFSKit, fskitErr: unavailable, kextLoaded: true, wantMounts: []bool{true}, wantBackend: BackendFSKit, wantErrs: []error{unavailable}},
 		{name: "auto mounts FSKit", backend: BackendAuto, kextLoaded: true, wantMounts: []bool{true}, wantBackend: BackendFSKit},
-		{name: "auto mount point failure", backend: BackendAuto, fskitErr: result(fuse.FSKitMountResultCreatingMountPointFailed), kextLoaded: true, wantMounts: []bool{true}, wantBackend: BackendFSKit, wantErrs: []error{fuse.FSKitMountError{Result: fuse.FSKitMountResultCreatingMountPointFailed}}},
-		{name: "auto unexpected failure", backend: BackendAuto, fskitErr: result(fuse.FSKitMountResultUnexpectedFailure), kextLoaded: true, wantMounts: []bool{true}, wantBackend: BackendFSKit, wantErrs: []error{fuse.FSKitMountError{Result: fuse.FSKitMountResultUnexpectedFailure}}},
 		{name: "auto other failure", backend: BackendAuto, fskitErr: otherFailure, kextLoaded: true, wantMounts: []bool{true}, wantBackend: BackendFSKit, wantErrs: []error{otherFailure}},
-		{name: "auto fallback failure", backend: BackendAuto, fskitErr: unavailable, kernelErr: kernelFailure, kextLoaded: true, wantMounts: []bool{true, false}, wantBackend: BackendKernel, wantErrs: []error{fuse.ErrFSKitUnavailable, kernelFailure}},
-	}
-	for name, fskitErr := range unavailableCases {
-		tests = append(tests,
-			testCase{name: "auto " + name + " with kext", backend: BackendAuto, fskitErr: fskitErr, kextLoaded: true, wantMounts: []bool{true, false}, wantBackend: BackendKernel},
-			testCase{name: "auto " + name + " without kext", backend: BackendAuto, fskitErr: fskitErr, wantMounts: []bool{true}, wantBackend: BackendFSKit, wantErrs: []error{fskitErr}},
-		)
+		{name: "auto unavailable with kext", backend: BackendAuto, fskitErr: unavailable, kextLoaded: true, wantMounts: []bool{true, false}, wantBackend: BackendKernel},
+		{name: "auto unavailable without kext", backend: BackendAuto, fskitErr: unavailable, wantMounts: []bool{true}, wantBackend: BackendFSKit, wantErrs: []error{unavailable}},
+		{name: "auto fallback failure", backend: BackendAuto, fskitErr: unavailable, kernelErr: kernelFailure, kextLoaded: true, wantMounts: []bool{true, false}, wantBackend: BackendKernel, wantErrs: []error{unavailable, kernelFailure}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -145,7 +128,7 @@ func TestMountWithBackendFallsBackOnlyWhenFSKitIsUnavailable(t *testing.T) {
 				}
 				return nil, test.kernelErr
 			}
-			_, backend, err := mountWithBackend(test.backend, mount, func() bool { return test.kextLoaded })
+			_, backend, err := mountWithBackend(test.backend, mount, fskitUnavailable, func() bool { return test.kextLoaded })
 			if !slices.Equal(mounts, test.wantMounts) {
 				t.Fatalf("mount attempts (true is FSKit) = %v, want %v", mounts, test.wantMounts)
 			}

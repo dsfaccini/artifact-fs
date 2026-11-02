@@ -37,6 +37,10 @@ Install the CLI from the module:
 go install github.com/cloudflare/artifact-fs/cmd/artifact-fs@latest
 ```
 
+This builds without the FSKit backend below. `go install` with a version
+fetches the upstream module from the Go module proxy and never applies a
+`replace` directive, so the binary uses upstream `jacobsa/fuse`.
+
 Or build it directly from the module path:
 
 ```bash
@@ -46,12 +50,16 @@ go build -o artifact-fs github.com/cloudflare/artifact-fs/cmd/artifact-fs
 ### Native macOS FSKit backend in this fork
 
 This fork pins a `jacobsa/fuse` replacement that loads macFUSE's FSKit
-framework at run time. Every macOS build can mount through FSKit, with no build
-tags and no cgo:
+framework at run time, with no cgo. Build from a checkout with the `fskit` tag:
 
 ```bash
-GOWORK=off go build -o artifact-fs ./cmd/artifact-fs
+GOWORK=off go build -tags fskit -o artifact-fs ./cmd/artifact-fs
 ```
+
+Only the `fskit` tag compiles the code that needs the replacement, so every
+build without it also compiles against upstream `jacobsa/fuse`. A macOS build
+without the tag mounts only through the macFUSE kernel extension. The tag
+changes nothing on Linux.
 
 FSKit needs macOS 26 or later and macFUSE 5.3 or later. Enable the `macFUSE`
 and `macFUSE (local)` file system extensions under System Settings > General >
@@ -67,6 +75,8 @@ file system extension and needs no kernel extension.
 | `kernel` | The macFUSE kernel extension. macOS prompts to load it when it is not loaded. |
 
 Any other value fails the mount. Linux accepts the same values and ignores them.
+In a macOS build without the `fskit` tag, `fskit` fails the mount and `auto`
+mounts through the kernel extension only when it is already loaded.
 
 A failed FSKit mount logs what to fix, such as enabling the file system
 extensions or upgrading macOS. FSKit counts as unavailable when macFUSE's FSKit
@@ -425,7 +435,7 @@ Unit tests:
 go test ./...
 ```
 
-End-to-end tests mount a git repo via FUSE and exercise filesystem + git operations (including commit and overlay reconciliation). They require a FUSE implementation (macFUSE on macOS, `fuse3` on Linux) and are off by default. On macOS they skip when the selected `ARTIFACT_FS_FUSE_BACKEND` transport cannot mount without prompting to load the macFUSE kernel extension.
+End-to-end tests mount a git repo via FUSE and exercise filesystem + git operations (including commit and overlay reconciliation). They require a FUSE implementation (macFUSE on macOS, `fuse3` on Linux) and are off by default. On macOS they skip when the selected `ARTIFACT_FS_FUSE_BACKEND` transport cannot mount without prompting to load the macFUSE kernel extension. Add `-tags fskit` to run them on FSKit.
 
 By default, e2e tests create a local bare repo -- no network required. Set `AFS_E2E_REPO` to test against a real remote.
 
