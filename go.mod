@@ -23,4 +23,4 @@ require (
 	modernc.org/memory v1.12.1 // indirect
 )
 
-replace github.com/jacobsa/fuse => github.com/dsfaccini/fuse v0.0.0-20261102163808-cb60ed15470d
+replace github.com/jacobsa/fuse => github.com/dsfaccini/fuse v0.0.0-20261102171500-63f996bb2dd2
