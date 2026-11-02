@@ -733,6 +733,7 @@ func (s *Service) Status(ctx context.Context, name string) (model.RepoRuntimeSta
 		s.mu.Unlock()
 		applyHydrationStats(&st, blobCacheDir)
 		applySourceStatus(&st, cfg)
+		st.MountError = cfg.MountError
 		return st, nil
 	}
 	s.mu.Unlock()
@@ -1113,7 +1114,7 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 		Hydrator: h,
 	}
 
-	mfs, err := s.mountFS(cfg, resolver, engine, nil)
+	mfs, err := s.mountFS(ctx, cfg, resolver, engine, nil)
 	if err != nil {
 		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
 		mfs = nil
@@ -1144,8 +1145,16 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 }
 
 // mountFS mounts cfg through s.mount and logs which backend serves the mount.
-func (s *Service) mountFS(cfg model.RepoConfig, resolver *fusefs.Resolver, engine *fusefs.Engine, gate *fusefs.ReadyGate) (fusefs.MountedFS, error) {
+// It persists the mount error that status reports, and clears it on success.
+func (s *Service) mountFS(ctx context.Context, cfg model.RepoConfig, resolver *fusefs.Resolver, engine *fusefs.Engine, gate *fusefs.ReadyGate) (fusefs.MountedFS, error) {
 	mfs, err := s.mount(cfg, resolver, engine, gate)
+	mountErr := ""
+	if err != nil {
+		mountErr = auth.RedactLogString(err.Error(), cfg.RemoteURL)
+	}
+	if writeErr := s.registry.UpdateMountError(ctx, cfg.ID, mountErr); writeErr != nil {
+		s.logger.Error("repo mount error write failed", "repo", cfg.Name, "error", writeErr)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1193,7 +1202,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		Hydrator: h,
 	}
 
-	mfs, err := s.mountFS(cfg, resolver, engine, gate)
+	mfs, err := s.mountFS(ctx, cfg, resolver, engine, gate)
 	if err != nil {
 		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
 		mfs = nil
@@ -2030,7 +2039,7 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 func (s *Service) readPersistedStatus(ctx context.Context, cfg model.RepoConfig) model.RepoRuntimeState {
 	// One-shot CLI process: reconstruct state from persisted stores and
 	// OS-level mount check since we don't share memory with the daemon.
-	st := model.RepoRuntimeState{RepoID: cfg.ID, State: repoStateUnmounted, LastFetchResult: "never", PrepareError: cfg.PrepareError}
+	st := model.RepoRuntimeState{RepoID: cfg.ID, State: repoStateUnmounted, LastFetchResult: "never", PrepareError: cfg.PrepareError, MountError: cfg.MountError}
 	if cfg.PrepareState == model.PrepareStateSyncPreparing {
 		st.State = model.PrepareStatePreparing
 	} else if isPendingOrFailedPrepareState(cfg.PrepareState) {
@@ -2242,7 +2251,7 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 	s.mu.Unlock()
 	defer rt.mounts.Done()
 
-	mfs, err := s.mountFS(cfg, resolver, engine, gate)
+	mfs, err := s.mountFS(rt.ctx, cfg, resolver, engine, gate)
 	s.mu.Lock()
 	if err != nil {
 		mf = s.mountFailures[cfg.ID]

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
@@ -230,6 +231,69 @@ func TestReadPersistedStatusIncludesHydrationStats(t *testing.T) {
 	}
 	if st.HydratedBlobBytes != 8 {
 		t.Fatalf("HydratedBlobBytes = %d, want 8", st.HydratedBlobBytes)
+	}
+}
+
+func TestStatusReportsMountErrorUntilRetryMounts(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	runCmd(t, "git", "init", "--initial-branch", "main", remote)
+	if err := os.WriteFile(filepath.Join(remote, "README.md"), []byte("main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", remote, "add", "README.md")
+	runCmd(t, "git", "-C", remote, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "main")
+
+	root := filepath.Join(tmp, "artifact-fs")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc, err := New(ctx, root, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	svc.SetMountRoot(filepath.Join(tmp, "mnt"))
+	mountErr := errors.New("fskit: file system extension requires approval")
+	svc.mount = func(model.RepoConfig, *fusefs.Resolver, *fusefs.Engine, *fusefs.ReadyGate) (fusefs.MountedFS, error) {
+		return nil, mountErr
+	}
+	if err := svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st, err := svc.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State != repoStateDegraded || st.MountError != mountErr.Error() {
+		t.Fatalf("daemon status after failed mount: state=%q mount_error=%q", st.State, st.MountError)
+	}
+	// The status CLI runs in its own process and reads only persisted state.
+	cliSvc, err := New(ctx, root, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err = cliSvc.Status(ctx, "repo")
+	if closeErr := cliSvc.Close(); err != nil || closeErr != nil {
+		t.Fatalf("CLI status: %v, close: %v", err, closeErr)
+	}
+	if st.State != repoStateUnmounted || st.MountError != mountErr.Error() {
+		t.Fatalf("CLI status after failed mount: state=%q mount_error=%q", st.State, st.MountError)
+	}
+
+	svc.mount = fakeMount
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st, err = svc.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State != repoStateMounted || st.MountError != "" {
+		t.Fatalf("status after retry mounted: state=%q mount_error=%q", st.State, st.MountError)
 	}
 }
 

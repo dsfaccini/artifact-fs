@@ -49,6 +49,7 @@ type RepoConfig struct {
 	FetchRef              string
 	PrepareState          string
 	PrepareError          string
+	MountError            string
 	RequiredCommit        string
 	HistoryDepth          int
 	RemoteRefreshDisabled bool
@@ -73,6 +74,7 @@ type RepoRuntimeState struct {
 	DirtyOverlay          bool
 	State                 string
 	PrepareError          string
+	MountError            string
 	SourceRef             string
 	RequiredCommit        string
 	Acquisition           string
