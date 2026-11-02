@@ -210,8 +210,7 @@ func newAsyncPreparedE2ERepo(t *testing.T, preparedGitDir string, fetchRef strin
 		t.Fatalf("add-repo async prepared-gitdir: %v", err)
 	}
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- svc.Start(ctx) }()
+	errCh := startE2EDaemon(ctx, svc)
 
 	if err := waitForMount(svc, mountPath, 60*time.Second); err != nil {
 		cancel()

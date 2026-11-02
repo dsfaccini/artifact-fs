@@ -106,8 +106,7 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 		t.Fatalf("add-repo: %v", err)
 	}
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- svc.Start(ctx) }()
+	errCh := startE2EDaemon(ctx, svc)
 
 	if err := waitForMount(svc, mountPath, 60*time.Second); err != nil {
 		cancel()
@@ -182,8 +181,7 @@ func (r *mountedE2ERepo) restart(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc.SetMountRoot(r.mountDir)
-	errCh := make(chan error, 1)
-	go func() { errCh <- svc.Start(ctx) }()
+	errCh := startE2EDaemon(ctx, svc)
 	if err := waitForMount(svc, r.mountPath, 60*time.Second); err != nil {
 		cancel()
 		_ = svc.Close()

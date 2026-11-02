@@ -209,8 +209,7 @@ func runE2EBenchmarkOnce(t *testing.T, repo e2eBenchRepoSpec, iteration int, hyd
 		t.Fatalf("add-repo: %v", err)
 	}
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- svc.Start(ctx) }()
+	errCh := startE2EDaemon(ctx, svc)
 
 	if err := waitForMount(svc, mountPath, 60*time.Second); err != nil {
 		cancel()

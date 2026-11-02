@@ -178,8 +178,7 @@ func TestE2E(t *testing.T) {
 	}
 
 	// Start the daemon in background (it blocks on ctx.Done)
-	errCh := make(chan error, 1)
-	go func() { errCh <- svc.Start(ctx) }()
+	errCh := startE2EDaemon(ctx, svc)
 
 	// Wait for the FUSE mount to appear
 	if err := waitForMount(svc, mountPath, 60*time.Second); err != nil {
@@ -1145,8 +1144,7 @@ func TestE2EVerifiedSource(t *testing.T) {
 		t.Fatalf("verified acquisition hydrated README before mount read: %v", err)
 	}
 
-	firstErrCh := make(chan error, 1)
-	go func() { firstErrCh <- firstSvc.Start(firstCtx) }()
+	firstErrCh := startE2EDaemon(firstCtx, firstSvc)
 	if err := waitForMount(firstSvc, mountPath, 60*time.Second); err != nil {
 		firstCancel()
 		_ = firstSvc.Close()
@@ -1239,8 +1237,7 @@ func TestE2EVerifiedSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	secondSvc.SetMountRoot(mountDir)
-	secondErrCh := make(chan error, 1)
-	go func() { secondErrCh <- secondSvc.Start(secondCtx) }()
+	secondErrCh := startE2EDaemon(secondCtx, secondSvc)
 	if err := waitForMount(secondSvc, mountPath, 60*time.Second); err != nil {
 		secondCancel()
 		_ = secondSvc.Close()
@@ -1311,6 +1308,15 @@ func stopE2EDaemon(t *testing.T, svc *daemon.Service, cancel context.CancelFunc,
 // The daemon retries a failed mount at its next registry sync, 3s later, so an
 // error that outlasts that retry is not transient.
 const mountErrorGrace = 10 * time.Second
+
+// startE2EDaemon runs svc.Start in the background and counts its mount. An e2e
+// daemon has one registered repo, so each start mounts once.
+func startE2EDaemon(ctx context.Context, svc *daemon.Service) chan error {
+	e2eMountsStarted.Add(1)
+	errCh := make(chan error, 1)
+	go func() { errCh <- svc.Start(ctx) }()
+	return errCh
+}
 
 // waitForMount waits for svc to mount repoName at path. It returns the
 // daemon's mount error once that error outlasts mountErrorGrace.
