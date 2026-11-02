@@ -114,6 +114,81 @@ func TestAdoptGitDirPreservesGitStateAndScopesConfig(t *testing.T) {
 	}
 }
 
+func TestRemoveRepoStopsAdoptedFSMonitor(t *testing.T) {
+	ctx := t.Context()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
+	runCmd(t, "git", "init", "--initial-branch=main", source)
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", source, "add", "README.md")
+	runCmd(t, "git", "-C", source, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
+	runCmd(t, "git", "-C", source, "worktree", "add", "-b", "topic", worktree)
+	gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
+	root := filepath.Join(dir, "state")
+	svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{Name: "adopted", GitDir: gitDir, MountPath: worktree, AdoptGitDir: true, Enabled: true}
+	if err := svc.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.git.ConfigureFSMonitorHook(ctx, stored, root); err != nil {
+		t.Fatal(err)
+	}
+	// The installed hook would run this test binary. Answer as an empty
+	// overlay does instead: nothing changed since the last token.
+	hookPath := filepath.Join(gitDir, "hooks", "artifact-fs-fsmonitor")
+	if got := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "config", "--get", "core.fsmonitor")); got != hookPath {
+		t.Fatalf("core.fsmonitor = %q, want %q", got, hookPath)
+	}
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\nprintf 'artifact-fs:adopted:1\\000'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := runCmdOutput(t, "git", "-C", worktree, "status", "--porcelain"); got != "" {
+		t.Fatalf("adopted worktree status = %q", got)
+	}
+	if err := svc.RemoveRepo(ctx, cfg.Name); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "README.md"), []byte("native edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := runCmdOutput(t, "git", "-C", worktree, "status", "--porcelain"); got != " M README.md\n" {
+		t.Fatalf("status after remove-repo = %q, want the native edit", got)
+	}
+	if got := strings.TrimSpace(runCmdOutput(t, "git", "-C", source, "config", "--get", "extensions.worktreeConfig")); got != "true" {
+		t.Fatalf("extensions.worktreeConfig = %q", got)
+	}
+	// Removal still succeeds when core.fsmonitor is already unset or the
+	// worktree's Git metadata is gone.
+	if err := svc.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.RemoveRepo(ctx, cfg.Name); err != nil {
+		t.Fatalf("remove-repo with core.fsmonitor unset: %v", err)
+	}
+	if err := svc.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.RemoveRepo(ctx, cfg.Name); err != nil {
+		t.Fatalf("remove-repo without Git metadata: %v", err)
+	}
+}
+
 func TestAdoptGitDirRejectsAcquisitionOptions(t *testing.T) {
 	for _, cfg := range []model.RepoConfig{
 		{AdoptGitDir: true},

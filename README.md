@@ -252,9 +252,11 @@ siblings retain their settings.
 
 Stop the owning daemon and wait for process exit and actual unmount before
 restoring the saved gitfile, unlocking metadata or removing the worktree.
-`remove-repo` only updates the registry when invoked outside the owning daemon;
-its return alone does not acknowledge that the live mount has stopped. Preserve
-a recovery ref before deleting a branch containing local commits.
+`remove-repo` only updates the registry and Git config when invoked outside the
+owning daemon; its return alone does not acknowledge that the live mount has stopped.
+It unsets the worktree's `core.fsmonitor` and keeps `extensions.worktreeConfig`,
+which sibling worktrees may rely on. Preserve a recovery ref before deleting a
+branch containing local commits.
 
 ## Verified shallow sources
 

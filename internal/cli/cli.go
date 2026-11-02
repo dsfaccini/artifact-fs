@@ -222,7 +222,8 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				if name == "" {
 					return fmt.Errorf("--name required")
 				}
-				return svc.FSMonitorHook(ctx, name, stdout)
+				// Git passes the hook protocol version, then its last token.
+				return svc.FSMonitorHook(ctx, name, c.Args().Get(1), stdout)
 			}),
 		},
 		{

@@ -337,6 +337,9 @@ func TestFSMonitorHookOutputsDirtyOverlayPaths(t *testing.T) {
 		Branch:          "main",
 		RefreshInterval: time.Minute,
 		Enabled:         true,
+		ConfigVersion:   "v1",
+		// "/" is always in the mount table, so it stands in for a live mount.
+		MountPath: "/",
 	}
 	svc.fillPaths(&cfg)
 	if err := svc.registry.AddRepo(ctx, cfg); err != nil {
@@ -357,11 +360,11 @@ func TestFSMonitorHookOutputsDirtyOverlayPaths(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := svc.FSMonitorHook(ctx, "repo", &out); err != nil {
+	if err := svc.FSMonitorHook(ctx, "repo", "artifact-fs:repo:v1:1", &out); err != nil {
 		t.Fatal(err)
 	}
 	parts := strings.Split(out.String(), "\x00")
-	if !strings.HasPrefix(parts[0], "artifact-fs:repo:") {
+	if !strings.HasPrefix(parts[0], "artifact-fs:repo:v1:") {
 		t.Fatalf("token = %q", parts[0])
 	}
 	got := map[string]bool{}
@@ -374,5 +377,87 @@ func TestFSMonitorHookOutputsDirtyOverlayPaths(t *testing.T) {
 		if !got[want] {
 			t.Fatalf("fsmonitor paths missing %q: %v", want, got)
 		}
+	}
+}
+
+func TestFSMonitorHookRescansUnlessTokenAndMountAreCurrent(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		since string
+		live  bool
+		want  string
+	}{
+		{name: "foreign token", since: "other-hook:1", live: true, want: "MM README.md"},
+		{name: "earlier registration token", since: "artifact-fs:repo:v0:1", live: true, want: "MM README.md"},
+		{name: "unmounted worktree", since: "artifact-fs:repo:v1:1", want: "MM README.md"},
+		{name: "current token and mount", since: "artifact-fs:repo:v1:1", live: true, want: "M  README.md"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			dir := t.TempDir()
+			svc, err := New(ctx, filepath.Join(dir, "state"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer svc.Close()
+			cfg := model.RepoConfig{Name: "repo", ID: "repo", Branch: "main", RefreshInterval: time.Minute, Enabled: true, ConfigVersion: "v1", MountPath: filepath.Join(dir, "unmounted")}
+			if tc.live {
+				// "/" is always in the mount table, so it stands in for a live mount.
+				cfg.MountPath = "/"
+			}
+			svc.fillPaths(&cfg)
+			if err := svc.registry.AddRepo(ctx, cfg); err != nil {
+				t.Fatal(err)
+			}
+			repo := filepath.Join(dir, "repo")
+			readme := filepath.Join(repo, "README.md")
+			runCmd(t, "git", "init", "--initial-branch=main", repo)
+			if err := os.WriteFile(readme, []byte("base\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runCmd(t, "git", "-C", repo, "add", "README.md")
+			runCmd(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
+			if err := os.WriteFile(readme, []byte("staged\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runCmd(t, "git", "-C", repo, "add", "README.md")
+			// An earlier hook leaves its token and fsmonitor-valid bits in the index.
+			earlierHook := filepath.Join(dir, "earlier-hook")
+			if err := os.WriteFile(earlierHook, []byte("#!/bin/sh\nprintf '%s\\000' '"+tc.since+"'\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			runCmd(t, "git", "-C", repo, "config", "core.fsmonitor", earlierHook)
+			if got := runCmdOutput(t, "git", "-C", repo, "status", "--porcelain"); got != "M  README.md\n" {
+				t.Fatalf("staged status = %q", got)
+			}
+			// The worktree shows HEAD content again, as a mount without the edit does.
+			if err := os.WriteFile(readme, []byte("base\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var answer bytes.Buffer
+			if err := svc.FSMonitorHook(ctx, cfg.Name, tc.since, &answer); err != nil {
+				t.Fatal(err)
+			}
+			answerPath, tokenPath := filepath.Join(dir, "answer"), filepath.Join(dir, "token")
+			if err := os.WriteFile(answerPath, answer.Bytes(), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			// Replay the computed answer so Git consumes it without re-executing this test binary.
+			replayHook := filepath.Join(dir, "replay-hook")
+			if err := os.WriteFile(replayHook, []byte("#!/bin/sh\nprintf '%s' \"$2\" > '"+tokenPath+"'\ncat '"+answerPath+"'\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			runCmd(t, "git", "-C", repo, "config", "core.fsmonitor", replayHook)
+			status, err := exec.Command("git", "-C", repo, "status", "--porcelain").Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if token, err := os.ReadFile(tokenPath); err != nil || string(token) != tc.since {
+				t.Fatalf("Git queried token %q, want %q: %v", token, tc.since, err)
+			}
+			if got := strings.TrimSuffix(string(status), "\n"); got != tc.want {
+				t.Fatalf("git status = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

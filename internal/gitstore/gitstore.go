@@ -2035,6 +2035,24 @@ func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfi
 	return nil
 }
 
+// RemoveAdoptedFSMonitorHook stops native Git from consulting ArtifactFS once
+// a worktree is released. extensions.worktreeConfig stays on because sibling
+// worktrees may now keep their own settings in config.worktree.
+func (s *Store) RemoveAdoptedFSMonitorHook(ctx context.Context, repo model.RepoConfig) error {
+	// --worktree resolves to this file, but fails once the extension is off.
+	worktreeConfig := filepath.Join(repo.GitDir, "config.worktree")
+	if _, err := os.Stat(worktreeConfig); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if _, err := runGit(ctx, repo.GitDir, "config", "--file", worktreeConfig, "--unset-all", "core.fsmonitor"); err != nil {
+		var exitErr *gitCommandError
+		if !errors.As(err, &exitErr) || exitErr.exitCode != 5 {
+			return err
+		}
+	}
+	return nil
+}
+
 // BootstrapCleanIndexForFSMonitor marks snapshot paths valid only while the
 // real index is locked and proven to match the immutable snapshot commit.
 func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.RepoConfig, snapshotOID string, validate func() (bool, error)) (bool, error) {

@@ -3,10 +3,13 @@ package cli
 import (
 	"bytes"
 	"context"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -194,5 +197,34 @@ func TestPrepareCLIReportsQueuedPrepare(t *testing.T) {
 	}
 	if got := stdout.String(); got != "preparing repo\n" {
 		t.Fatalf("stdout = %q, want preparing repo", got)
+	}
+}
+
+func TestFSMonitorHookCLIAnswersGitToken(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ARTIFACT_FS_ROOT", root)
+	ctx := context.Background()
+	svc, err := daemon.New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// "/" is always in the mount table, so it stands in for a live mount.
+	cfg := model.RepoConfig{Name: "repo", RemoteURL: "https://github.com/example/repo.git", MountPath: "/", Enabled: true}
+	if err := svc.AddRepoWithOptions(ctx, cfg, daemon.AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	repos, err := svc.ListRepos(ctx)
+	if closeErr := svc.Close(); err != nil || closeErr != nil || len(repos) != 1 {
+		t.Fatalf("list repos: %v, %v, %d", err, closeErr, len(repos))
+	}
+	var stdout, stderr bytes.Buffer
+	since := "artifact-fs:repo:" + repos[0].ConfigVersion + ":1"
+	if code := Run(ctx, []string{"fsmonitor-hook", "--name", "repo", "2", since}, &stdout, &stderr); code != 0 {
+		t.Fatalf("fsmonitor-hook exit = %d, stderr=%q", code, stderr.String())
+	}
+	// A new token and no paths: the empty overlay answers the current token.
+	fields := strings.Split(stdout.String(), "\x00")
+	if len(fields) != 2 || !strings.HasPrefix(fields[0], "artifact-fs:repo:") || fields[1] != "" {
+		t.Fatalf("fsmonitor-hook output = %q", stdout.String())
 	}
 }

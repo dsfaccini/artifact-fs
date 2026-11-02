@@ -651,6 +651,11 @@ func (s *Service) RemoveRepo(ctx context.Context, name string) error {
 		if latest.ConfigVersion != cfg.ConfigVersion {
 			return registry.ErrRepoChanged
 		}
+		if latest.AdoptGitDir {
+			if err := s.git.RemoveAdoptedFSMonitorHook(ctx, latest); err != nil {
+				return err
+			}
+		}
 		return s.registry.RemoveRepo(ctx, name)
 	})
 }
@@ -1882,23 +1887,34 @@ func (s *Service) configureStatusOptimization(ctx context.Context, cfg model.Rep
 	}
 }
 
-func (s *Service) FSMonitorHook(ctx context.Context, name string, w io.Writer) error {
+// FSMonitorHook answers Git's fsmonitor hook protocol version 2 from the
+// overlay, which records changes made through the mount. It trusts only tokens
+// issued for this registration, and only while the worktree is mounted.
+// Otherwise native edits may have bypassed the overlay, and "/" makes Git
+// rescan the worktree.
+func (s *Service) FSMonitorHook(ctx context.Context, name string, since string, w io.Writer) error {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
 		return err
 	}
 	s.fillPaths(&cfg)
-	ov, err := overlay.New(ctx, cfg)
-	if err != nil {
-		return err
+	prefix := fmt.Sprintf("artifact-fs:%s:%s:", cfg.ID, cfg.ConfigVersion)
+	paths := []string{"/"}
+	// The mount table check sends no request to the mount, which stays gated
+	// while the daemon runs Git during preparation.
+	if strings.HasPrefix(since, prefix) && isMounted(cfg.MountPath) {
+		ov, err := overlay.New(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		defer ov.Close()
+		entries, err := ov.ListAll(ctx)
+		if err != nil {
+			return err
+		}
+		paths = fsMonitorDirtyPaths(entries)
 	}
-	defer ov.Close()
-	entries, err := ov.ListAll(ctx)
-	if err != nil {
-		return err
-	}
-	paths := fsMonitorDirtyPaths(entries)
-	token := fmt.Sprintf("artifact-fs:%s:%d", cfg.ID, time.Now().UnixNano())
+	token := fmt.Sprintf("%s%d", prefix, time.Now().UnixNano())
 	if err := writeHookField(w, token); err != nil {
 		return err
 	}
