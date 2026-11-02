@@ -37,7 +37,7 @@ Repository-specific guidance for `artifact-fs`.
 ## Validation
 
 - Start with the narrowest relevant test: `go test ./internal/<pkg>` or `go test -run TestName ./internal/<pkg>`.
-- For non-trivial code changes, reproduce CI in order: `go build ./cmd/artifact-fs`, `go vet ./...`, then `go test ./...`.
+- For non-trivial code changes, reproduce CI in order: `go build ./cmd/artifact-fs`, `go vet ./...` with `GOOS=linux` and with `GOOS=darwin`, then `go test ./...`.
 - Never mount from a unit test. E2E tests own all mounts, so `go test ./...` never mounts.
 - Build only the CLI with `go build ./cmd/artifact-fs`.
 - Enable the pre-commit checks with `git config core.hooksPath .githooks`.

@@ -40,6 +40,23 @@ jobs:
       - name: Race test concurrency-sensitive packages
         run: go test -race ./internal/gitstore ./internal/daemon ./internal/fusefs ./internal/overlay
 
+  darwin-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: GOOS=darwin go vet ./...
+
+      - name: Build
+        run: GOOS=darwin go build -o /dev/null ./cmd/artifact-fs
+
   fuse-e2e:
     runs-on: ubuntu-24.04
     steps:
