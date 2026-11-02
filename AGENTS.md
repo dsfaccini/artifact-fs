@@ -43,6 +43,7 @@ Repository-specific guidance for `artifact-fs`.
 - Assert the observable outcome: what `git status` reports, the resolved entry, or the persisted state. A nil error or a log line is not an outcome.
 - Assert a result that only the code path under test produces. `TestBootstrapCleanStatusIndexSkipsDeleteOnlyOverlay` checks only that the index is unchanged, so it passes whichever check skips the bootstrap.
 - Never mount in a package test. Only the root-package e2e tests mount.
+- Run a new e2e test as a `TestE2ESharedMount` subtest. Give it its own mount only when its subject is mounting, a daemon restart, or a fresh mount's state. macFUSE's FSKit extension can stop loading after a series of mounts in one session.
 
 ## Validation
 
