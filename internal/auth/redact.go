@@ -116,7 +116,7 @@ func HasInlineCredentials(raw string) bool {
 
 func malformedAuthorityStart(raw string) int {
 	lower := strings.ToLower(strings.TrimSpace(raw))
-	if i := strings.Index(lower, "://"); i >= 0 {
+	if i := strings.Index(lower, "://"); i >= 0 && isURLScheme(lower[:i]) {
 		return i + len("://")
 	}
 	if schemeLessUserinfoStart(raw) >= 0 {
@@ -127,7 +127,24 @@ func malformedAuthorityStart(raw string) int {
 			return len(prefix)
 		}
 	}
+	// A "://" that follows no scheme, as in "user:pass@host://", can follow the userinfo.
+	if strings.Contains(lower, "://") {
+		return 0
+	}
 	return -1
+}
+
+// isURLScheme reports whether s is an RFC 3986 scheme: a letter, then letters, digits, "+", "-" or ".".
+func isURLScheme(s string) bool {
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z':
+		case i > 0 && (r >= '0' && r <= '9' || r == '+' || r == '-' || r == '.'):
+		default:
+			return false
+		}
+	}
+	return s != ""
 }
 
 func isHTTPRemoteLike(raw string, scheme string) bool {
@@ -272,7 +289,7 @@ func userinfoLikeBeforePath(candidate string) bool {
 }
 
 func schemeLessUserinfoStart(raw string) int {
-	if strings.Contains(raw, "://") {
+	if i := strings.Index(raw, "://"); i >= 0 && isURLScheme(raw[:i]) {
 		return -1
 	}
 	if isSCPStyleRemote(raw) {
@@ -535,10 +552,12 @@ func remoteStartIndex(s string) int {
 			best = i
 		}
 	}
-	if best >= 0 {
+	// A marker after the first "@", as in "user:pass@git:repo", sits inside the remote.
+	at := strings.Index(s, "@")
+	if best >= 0 && (at < 0 || best < at) {
 		return best
 	}
-	if at := strings.Index(s, "@"); at >= 0 && strings.ContainsAny(s[at:], "?#") {
+	if at >= 0 && strings.ContainsAny(s[at:], "?#") {
 		if eq := strings.LastIndex(s[:at], "="); eq >= 0 {
 			return eq + 1
 		}

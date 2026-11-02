@@ -314,6 +314,11 @@ func TestRedactRemoteURL(t *testing.T) {
 	if containsAny(out, []string{"alice", "ghp_secret"}) {
 		t.Fatalf("scheme-less delimiter-split userinfo leaked in output: %s", out)
 	}
+
+	out = RedactString("fatal: path/x://user:ghp_secret@example.com failed")
+	if containsAny(out, []string{"ghp_secret"}) {
+		t.Fatalf("userinfo after a non-scheme separator leaked in redacted string: %s", out)
+	}
 }
 
 func TestHasInlineCredentials(t *testing.T) {
@@ -592,6 +597,78 @@ func TestRedactLogStringBoundsDiagnostics(t *testing.T) {
 	if len(got) > maxLogStringBytes+len(logStringTruncatedLabel)+1 || !strings.Contains(got, logStringTruncatedLabel) {
 		t.Fatalf("RedactLogString returned %d bytes without truncation marker", len(got))
 	}
+}
+
+// remoteForms are the remote prefixes the redaction heuristics recognize,
+// including the typos and the scheme-less form.
+var remoteForms = []string{"https://", "http://", "ssh://", "git://", "https:/", "https//", "https:", "ssh:/", ""}
+
+func FuzzRedactionHidesPassword(f *testing.F) {
+	for _, seed := range []struct {
+		form           int
+		user, password string
+		rest           string
+	}{
+		{0, "user", "pass", "example.com/org/repo.git/"},
+		{0, "ghp_secret%zz", "password", "example.com/org/repo.git"},
+		{0, "user.name", "secret", "example.com/org/repo.git"},
+		{2, "git", "secret", "github.com/org/repo.git"},
+		{2, "git", "sec%zzret", "example.com/org/repo.git"},
+		{4, "user", "ghp_secret", "github.com/org/repo.git"},
+		{7, "git", "pa", "github.com/org/repo.git"},
+		{8, "alice", "ghp_secret", "github.com:org/repo.git"},
+		{8, "x-token-auth", "secret", "bitbucket.org/org/repo.git"},
+		{8, "1", "000000", "0://"},
+		{8, "A", "0", "://"},
+		{8, "alice", "ghp_secret", "git:0"},
+	} {
+		f.Add(uint8(seed.form), seed.user, seed.password, seed.rest)
+	}
+	f.Fuzz(func(t *testing.T, form uint8, user, password, rest string) {
+		if !onlyRunes(user, "-._~%") || password == "" || !onlyRunes(password, "-._~%") || !onlyRunes(rest, "-._~%:/@") {
+			t.Skip()
+		}
+		remote := remoteForms[int(form)%len(remoteForms)] + user + ":" + password + "@" + rest
+		if !HasInlineCredentials(remote) {
+			t.Fatalf("HasInlineCredentials(%q) = false", remote)
+		}
+		lowerPassword := strings.ToLower(password)
+		for _, line := range []string{
+			remote,
+			"fatal: unable to access '" + remote + "': HTTP 401",
+			"clone " + remote + " failed",
+			"remotes=https://example.com/a.git," + remote,
+		} {
+			if strings.Count(strings.ToLower(line), lowerPassword) != 1 || strings.Contains(lowerPassword, "redacted") {
+				continue
+			}
+			if got := RedactString(line); leaksPassword(got, password) {
+				t.Fatalf("RedactString(%q) = %q leaks the password", line, got)
+			}
+			if got := RedactLogString(line); leaksPassword(got, password) {
+				t.Fatalf("RedactLogString(%q) = %q leaks the password", line, got)
+			}
+		}
+	})
+}
+
+var redactionMarkers = strings.NewReplacer("REDACTED_REMOTE", "\x00", "REDACTED", "\x00")
+
+// leaksPassword masks the redaction markers, which can join with neighboring
+// text into the password, and ignores case, because redaction uppercases
+// percent-encodings.
+func leaksPassword(redacted string, password string) bool {
+	return strings.Contains(strings.ToLower(redactionMarkers.Replace(redacted)), strings.ToLower(password))
+}
+
+// onlyRunes reports whether s holds only ASCII letters, digits and extra.
+func onlyRunes(s string, extra string) bool {
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune(extra, r)) {
+			return false
+		}
+	}
+	return true
 }
 
 func containsAny(s string, needles []string) bool {
