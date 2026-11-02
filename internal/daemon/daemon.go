@@ -86,9 +86,16 @@ const (
 	logRepoConfigChanged         = "repo config changed, remounting"
 )
 
+// mountFunc mounts a repo's filesystem. A nil gate mounts it ungated.
+type mountFunc func(model.RepoConfig, *fusefs.Resolver, *fusefs.Engine, *fusefs.ReadyGate) (fusefs.MountedFS, error)
+
+// defaultMount is what New installs as Service.mount. Package tests replace it so they cannot mount.
+var defaultMount mountFunc = fusefs.MountRepoWithGate
+
 type Service struct {
 	root                 string
 	mountRoot            string
+	mount                mountFunc
 	hydrationConcurrency int
 	prepareTimeout       time.Duration
 	logger               *slog.Logger
@@ -218,6 +225,7 @@ func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error
 	}
 	svc := &Service{
 		root:            root,
+		mount:           defaultMount,
 		logger:          logger,
 		registry:        reg,
 		git:             gitstore.New(logger),
@@ -1100,7 +1108,7 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 		Hydrator: h,
 	}
 
-	mfs, err := fusefs.MountRepo(cfg, resolver, engine)
+	mfs, err := s.mount(cfg, resolver, engine, nil)
 	if err != nil {
 		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
 		mfs = nil
@@ -1170,7 +1178,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		Hydrator: h,
 	}
 
-	mfs, err := fusefs.MountRepoWithGate(cfg, resolver, engine, gate)
+	mfs, err := s.mount(cfg, resolver, engine, gate)
 	if err != nil {
 		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
 		mfs = nil
@@ -2208,7 +2216,7 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 	s.mu.Unlock()
 	defer rt.mounts.Done()
 
-	mfs, err := fusefs.MountRepoWithGate(cfg, resolver, engine, gate)
+	mfs, err := s.mount(cfg, resolver, engine, gate)
 	s.mu.Lock()
 	if err != nil {
 		mf = s.mountFailures[cfg.ID]

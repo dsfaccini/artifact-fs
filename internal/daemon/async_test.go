@@ -1284,6 +1284,7 @@ func TestRunPrepareDoesNotOpenGateWhenReadyPersistenceFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer svc.Close()
+	svc.mount = fakeMount
 
 	cfg := model.RepoConfig{
 		Name:            "repo",
