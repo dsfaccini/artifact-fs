@@ -3,7 +3,13 @@
 package main
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/cloudflare/artifact-fs/internal/meta"
 )
 
 // fskitMountBudget caps the FUSE mounts one e2e run starts on FSKit. macFUSE's
@@ -101,4 +107,46 @@ func TestSharedMountSkipsTestsThatNeedRestoreOnFSKit(t *testing.T) {
 	if !ran((*sharedE2ERepo).run) {
 		t.Fatal("a shared-mount test that needs the restore skipped on another backend")
 	}
+}
+
+// TestSharedMountFailsReadOnlyTestThatChangesMount runs
+// TestSharedMountReadOnlyTestChangesMountHelper in a child process, because the
+// failure it asserts fails the test that hits it.
+func TestSharedMountFailsReadOnlyTestThatChangesMount(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(executable, "-test.run", "^TestSharedMountReadOnlyTestChangesMountHelper$")
+	cmd.Env = append(os.Environ(), "AFS_SHARED_READ_ONLY_HELPER=1")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("a read-only shared-mount test that changed the mount passed:\n%s", out)
+	}
+	if !strings.Contains(string(out), "registered with runReadOnly but changed the mount: overlay entries") {
+		t.Fatalf("read-only shared-mount test failed for another reason:\n%s", out)
+	}
+}
+
+func TestSharedMountReadOnlyTestChangesMountHelper(t *testing.T) {
+	if os.Getenv("AFS_SHARED_READ_ONLY_HELPER") != "1" {
+		t.Skip("helper for TestSharedMountFailsReadOnlyTestThatChangesMount")
+	}
+	previous := wedgedMount.Swap(nil)
+	t.Cleanup(func() { wedgedMount.Store(previous) })
+
+	root := t.TempDir()
+	// gitDir does not exist, so a restore that runs anyway fails without
+	// touching a repository.
+	s := &sharedE2ERepo{repo: &mountedE2ERepo{root: root}, gitDir: filepath.Join(root, "missing-git")}
+	s.runReadOnly(t, "writes a file", func(t *testing.T, repo *mountedE2ERepo) {
+		db, err := meta.OpenDB(filepath.Join(repo.root, "overlays", repoName, "meta.sqlite"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if _, err := db.Exec(`CREATE TABLE overlay_entries(path TEXT, kind TEXT); INSERT INTO overlay_entries VALUES('written.txt', 'file')`); err != nil {
+			t.Fatal(err)
+		}
+	})
 }

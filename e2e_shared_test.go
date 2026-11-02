@@ -157,21 +157,31 @@ func (s *sharedE2ERepo) runSubtest(t *testing.T, name string, test func(*testing
 		if needsRestore {
 			skipIfFSKitHEADMove(t, "restoring the shared mount after this test")
 		}
-		t.Cleanup(func() { s.release(t) })
+		t.Cleanup(func() { s.release(t, needsRestore) })
 		test(t, s.repo)
 	})
 }
 
 // release restores the shared mount after t. A restore that fails fails t,
 // whose changes it could not undo, and skips the tests after it. A restore
-// that stalls marks the mount wedged.
-func (s *sharedE2ERepo) release(t *testing.T) {
+// that stalls marks the mount wedged. When t needs no restore, release first
+// fails t if it changed the mount, because on FSKit restoring that change
+// would move HEAD.
+func (s *sharedE2ERepo) release(t *testing.T, needsRestore bool) {
 	t.Helper()
 	if wedgedMount.Load() != nil {
 		return
 	}
 	restored := make(chan error, 1)
-	go func() { restored <- s.restore() }()
+	go func() {
+		if !needsRestore {
+			if err := s.verify(); err != nil {
+				restored <- fmt.Errorf("the test is registered with runReadOnly but changed the mount: %w", err)
+				return
+			}
+		}
+		restored <- s.restore()
+	}()
 	select {
 	case err := <-restored:
 		if err != nil {
