@@ -45,6 +45,8 @@ type startedDaemon struct {
 	root    string
 	workDir string
 	gitDir  string
+	// startErr delivers Start's error if Start returns before the test ends.
+	startErr chan error
 }
 
 func startDaemonWithRepo(t *testing.T) *startedDaemon {
@@ -74,18 +76,23 @@ func startDaemonWithRepo(t *testing.T) *startedDaemon {
 		t.Fatal(err)
 	}
 	startCtx, cancel := context.WithCancel(ctx)
-	errCh := make(chan error, 1)
-	go func() { errCh <- svc.Start(startCtx) }()
+	d.startErr = make(chan error, 1)
+	stopped := make(chan error, 1)
+	go func() {
+		err := svc.Start(startCtx)
+		d.startErr <- err
+		stopped <- err
+	}()
 	t.Cleanup(func() {
 		cancel()
-		if err := <-errCh; !errors.Is(err, context.Canceled) {
+		if err := <-stopped; !errors.Is(err, context.Canceled) {
 			t.Errorf("Start = %v, want context canceled", err)
 		}
 		if err := svc.Close(); err != nil {
 			t.Errorf("Close: %v", err)
 		}
 	})
-	waitFor(t, nil, func() bool {
+	waitFor(t, d.startErr, func() bool {
 		st, err := svc.Status(ctx, "repo")
 		return err == nil && st.State == repoStateMounted && d.mounts.resolver() != nil
 	})
@@ -123,7 +130,7 @@ func (d *startedDaemon) status(t *testing.T) model.RepoRuntimeState {
 // mounted resolver serves path as blob.
 func (d *startedDaemon) waitForServedHEAD(t *testing.T, oid string, generation int64, path, blob string) {
 	t.Helper()
-	waitFor(t, nil, func() bool {
+	waitFor(t, d.startErr, func() bool {
 		st := d.status(t)
 		node, err := d.mounts.resolver().ResolvePath(path)
 		return st.CurrentHEADOID == oid && st.SnapshotGeneration == generation &&
@@ -172,7 +179,7 @@ func TestStartRetriesHEADReconcileAfterSnapshotLock(t *testing.T) {
 
 	want := d.commit(t, "README.md", "reconciled after the lock\n")
 	d.moveMain(t, want)
-	waitFor(t, nil, func() bool { return strings.Contains(d.logs.String(), "snapshot publish failed") })
+	waitFor(t, d.startErr, func() bool { return strings.Contains(d.logs.String(), "snapshot publish failed") })
 	if st := d.status(t); st.CurrentHEADOID != initial.CurrentHEADOID || st.SnapshotGeneration != initial.SnapshotGeneration {
 		t.Fatalf("HEAD advanced while the snapshot was locked: %+v", st)
 	}

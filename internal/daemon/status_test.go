@@ -175,14 +175,14 @@ func TestBootstrapCleanStatusIndexSkipsOverlayEntryWrittenDuringBootstrap(t *tes
 	bin := t.TempDir()
 	started, release := filepath.Join(bin, "started"), filepath.Join(bin, "release")
 	// Hold the bootstrap at the update-index that marks entries valid, after
-	// every check that runs before it. The hold gives up after about a minute,
-	// so a timeout panic leaves no fake git behind.
+	// every check that runs before it. The hold ends after 60 seconds, so a
+	// fake git left behind by a timeout panic exits on its own.
 	script := `#!/bin/sh
 case " $* " in
 *" update-index --fsmonitor "*)
 	: > "$AFS_BOOTSTRAP_STARTED"
-	i=0
-	while [ ! -e "$AFS_BOOTSTRAP_RELEASE" ] && [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done ;;
+	start=$(date +%s)
+	while [ ! -e "$AFS_BOOTSTRAP_RELEASE" ] && [ $(($(date +%s) - start)) -lt 60 ]; do sleep 0.01; done ;;
 esac
 exec "$AFS_REAL_GIT" "$@"
 `
