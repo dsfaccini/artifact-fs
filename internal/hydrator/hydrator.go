@@ -689,9 +689,11 @@ func (s *Service) requeueFetched(tasks []model.HydrationTask, local bool) {
 	s.signalWork()
 }
 
-// takeQueued removes key's fetched task from the queue so the caller hydrates
-// it. It reports false when another worker took the task or the service
-// stopped.
+// takeQueued removes key's queued task so the caller hydrates it. It reports
+// false when nothing is queued for key: another worker took the task, or the
+// service stopped. If another worker already hydrated the task and a later
+// prefetch queued key again, it takes that newer task, which is harmless:
+// hydrate serves it from the cache.
 func (s *Service) takeQueued(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
