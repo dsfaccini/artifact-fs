@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -1532,5 +1533,175 @@ func TestSetMtime(t *testing.T) {
 	}
 	if e.CtimeUnixNs == 0 {
 		t.Fatal("ctime should be non-zero")
+	}
+}
+
+func changesSince(t *testing.T, cfg model.RepoConfig, since int64) Changes {
+	t.Helper()
+	changes, ok, err := ReadChangesSince(context.Background(), cfg, since)
+	if err != nil || !ok {
+		t.Fatalf("ReadChangesSince = %v, %v", ok, err)
+	}
+	return changes
+}
+
+func TestRenameTreeLogsBothRootsAndOnePathPerDirectory(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	for _, dir := range []string{"src", "src/sub"} {
+		if err := s.Mkdir(ctx, dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{"src/a.txt", "src/b.txt", "src/sub/c.txt", "src/sub/d.txt"} {
+		if _, err := s.CreateFile(ctx, path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := changesSince(t, cfg, 0).Seq
+	if err := s.Rename(ctx, "src", "dst", false); err != nil {
+		t.Fatal(err)
+	}
+	// Each path names a listing Git must reread: src/a.txt drops the cached
+	// listing of src, as a row for every moved entry would.
+	want := []string{"dst", "dst/a.txt", "dst/sub/c.txt", "src", "src/a.txt", "src/sub/c.txt"}
+	if got := changesSince(t, cfg, before).Paths; !slices.Equal(got, want) {
+		t.Fatalf("changed paths = %q, want %q", got, want)
+	}
+}
+
+// Linux allows a name that is not valid UTF-8, and Git reports it byte for byte.
+func TestRenameTreeLogsNonUTF8PathsVerbatim(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	for _, dir := range []string{"src\xff", "src\xff/sub\xfe"} {
+		if err := s.Mkdir(ctx, dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.CreateFile(ctx, "src\xff/sub\xfe/a.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := changesSince(t, cfg, 0).Seq
+	if err := s.Rename(ctx, "src\xff", "dst\xfd", false); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"dst\xfd", "dst\xfd/sub\xfe", "dst\xfd/sub\xfe/a.txt", "src\xff", "src\xff/sub\xfe", "src\xff/sub\xfe/a.txt"}
+	if got := changesSince(t, cfg, before).Paths; !slices.Equal(got, want) {
+		t.Fatalf("changed paths = %q, want %q", got, want)
+	}
+}
+
+func TestReconcileLogsOnlyDeleteMarkersOverBasePaths(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	base := model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
+	cacheTestBlob(t, cfg, base.ObjectOID)
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "a.txt", base); err != nil {
+		t.Fatal(err)
+	}
+	// The chain leaves a delete marker at the untracked b.txt that names a.txt.
+	if err := s.Rename(ctx, "a.txt", "b.txt", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, "b.txt", "c.txt", false); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		if err := s.Remove(ctx, fmt.Sprintf("gone/%d.txt", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := changesSince(t, cfg, 0).Seq
+	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+		switch path {
+		case "a.txt":
+			return model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "bbb"}, true
+		case "b.txt":
+			return model.BaseNode{Path: "b.txt", Type: "file", Mode: 0o644, ObjectOID: "new-b"}, true
+		}
+		return model.BaseNode{}, false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Get("gone/0.txt"); ok {
+		t.Fatal("delete marker for a path the base lacks survived reconcile")
+	}
+	// Dropping the gone/ markers and rebasing c.txt leave the merged view as
+	// it was. Dropping b.txt's marker shows the new base file.
+	if got := changesSince(t, cfg, before).Paths; !slices.Equal(got, []string{"b.txt"}) {
+		t.Fatalf("changed paths after reconcile = %q, want [b.txt]", got)
+	}
+}
+
+func TestChangesSinceQuerySearchesTheSequenceRange(t *testing.T) {
+	s, _ := testStore(t)
+	rows, err := s.db.Query(`EXPLAIN QUERY PLAN `+changesSinceQuery, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) == 0 || !strings.HasPrefix(plan[0], "SEARCH overlay_changes USING INTEGER PRIMARY KEY") {
+		t.Fatalf("query plan = %q, want a search of the seq range", plan)
+	}
+}
+
+func TestReadChangesSinceDistrustsALogMissingATrigger(t *testing.T) {
+	s, cfg := testStore(t)
+	changesSince(t, cfg, 0)
+	if _, err := s.db.Exec(`DROP TRIGGER overlay_entries_delete_change`); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := ReadChangesSince(context.Background(), cfg, 0); err != nil || ok {
+		t.Fatalf("ReadChangesSince without the delete trigger = %v, %v; want false, nil", ok, err)
+	}
+}
+
+// Another connection holds the write lock briefly, as each overlay write does.
+// New must wait it out within busy_timeout instead of failing.
+func TestNewWaitsOutAnotherConnectionsWriteLock(t *testing.T) {
+	ctx := context.Background()
+	s, cfg := testStore(t)
+	s.Close()
+	holder, err := meta.OpenDB(cfg.OverlayDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	conn, err := holder.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	// The hold is far below busy_timeout, so it cannot make a waiting New
+	// fail. A New that does not wait fails before the commit, unless the
+	// machine delays it past the hold; then the test passes without proof.
+	committed := make(chan error, 1)
+	time.AfterFunc(200*time.Millisecond, func() {
+		_, err := conn.ExecContext(ctx, `COMMIT`)
+		committed <- err
+	})
+	reopened, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatalf("New while another connection held the write lock: %v", err)
+	}
+	reopened.Close()
+	if err := <-committed; err != nil {
+		t.Fatal(err)
 	}
 }

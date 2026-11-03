@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
+	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
@@ -444,107 +446,325 @@ func TestStopRuntimeKeepsWorkersAliveWhenUnmountFails(t *testing.T) {
 	}
 }
 
-func TestFSMonitorDirtyPathsIncludesChangedPathsAndRenameEndpoints(t *testing.T) {
-	paths := fsMonitorDirtyPaths([]model.OverlayEntry{
-		{Path: "src/pkg/file.go", Kind: model.OverlayKindModify},
-		{Path: "new/name.go", Kind: model.OverlayKindRename, TargetPath: "old/name.go"},
-		{Path: "readme-link", Kind: model.OverlayKindSymlink, TargetPath: "../README.md"},
-		{Path: ".", Kind: model.OverlayKindMkdir},
-	})
-	want := []string{
-		"new/name.go",
-		"old/name.go",
-		"readme-link",
-		"src/pkg/file.go",
-	}
-	if !reflect.DeepEqual(paths, want) {
-		t.Fatalf("dirty paths = %#v, want %#v", paths, want)
-	}
-}
-
-func TestFSMonitorHookOutputsDirtyOverlayPaths(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+// newHookService registers repo at mountPath. "/" is always in the mount
+// table, so it stands in for a live mount.
+func newHookService(t *testing.T, mountPath string) (*Service, model.RepoConfig) {
+	t.Helper()
+	ctx := t.Context()
+	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer svc.Close()
-	cfg := model.RepoConfig{
-		Name:            "repo",
-		ID:              "repo",
-		Branch:          "main",
-		RefreshInterval: time.Minute,
-		Enabled:         true,
-		ConfigVersion:   "v1",
-		// "/" is always in the mount table, so it stands in for a live mount.
-		MountPath: "/",
-	}
+	t.Cleanup(func() { _ = svc.Close() })
+	cfg := model.RepoConfig{Name: "repo", ID: "repo", Branch: "main", RefreshInterval: time.Minute, Enabled: true, ConfigVersion: "v1", MountPath: mountPath}
 	svc.fillPaths(&cfg)
 	if err := svc.registry.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
+	return svc, cfg
+}
+
+// hookAnswer returns the hook's raw answer, its token and its paths.
+func hookAnswer(t *testing.T, svc *Service, since string) ([]byte, string, []string) {
+	t.Helper()
+	var out bytes.Buffer
+	if err := svc.FSMonitorHook(t.Context(), "repo", since, &out); err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Split(strings.TrimSuffix(out.String(), "\x00"), "\x00")
+	return out.Bytes(), fields[0], fields[1:]
+}
+
+// gitStatusWithAnswer runs git status in repo through a hook that replays
+// answer, so Git consumes it without re-executing this test binary. It
+// returns the token Git queried with and the status.
+func gitStatusWithAnswer(t *testing.T, repo string, answer []byte) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	answerPath, tokenPath, hook := filepath.Join(dir, "answer"), filepath.Join(dir, "token"), filepath.Join(dir, "hook")
+	if err := os.WriteFile(answerPath, answer, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf '%s' \"$2\" > '"+tokenPath+"'\ncat '"+answerPath+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	status, err := exec.Command("git", "-C", repo, "-c", "core.fsmonitor="+hook, "status", "--porcelain").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := os.ReadFile(tokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(token), string(status)
+}
+
+func TestFSMonitorHookReturnsPathsChangedSinceToken(t *testing.T) {
+	ctx := t.Context()
+	svc, cfg := newHookService(t, "/")
 	ov, err := overlay.New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ov.CreateFile(ctx, "new/file.txt", 0o644); err != nil {
+	defer ov.Close()
+	if _, err := ov.CreateFile(ctx, "written.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ov.CreateFile(ctx, "moved.txt", 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := ov.Remove(ctx, "deleted.txt"); err != nil {
 		t.Fatal(err)
 	}
+	_, token, paths := hookAnswer(t, svc, "other-hook:1")
+	if !reflect.DeepEqual(paths, []string{"/"}) {
+		t.Fatalf("paths for a foreign token = %q, want a rescan", paths)
+	}
+	first := token[:strings.LastIndex(token, ":")+1] + "0"
+	if _, _, paths := hookAnswer(t, svc, first); !reflect.DeepEqual(paths, []string{"deleted.txt", "moved.txt", "written.txt"}) {
+		t.Fatalf("paths since sequence 0 = %q, want every overlay path", paths)
+	}
+	if _, token, paths = hookAnswer(t, svc, token); len(paths) != 0 {
+		t.Fatalf("paths since the current token = %q, want none", paths)
+	}
+
+	if _, err := ov.WriteFile(ctx, "written.txt", 0, []byte("edit")); err != nil {
+		t.Fatal(err)
+	}
+	// An untracked source leaves no delete marker, so only the change log
+	// still names moved.txt.
+	if err := ov.Rename(ctx, "moved.txt", "renamed.txt", false); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"moved.txt", "renamed.txt", "written.txt"}
+	_, next, paths := hookAnswer(t, svc, token)
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("paths since the earlier token = %q, want %q", paths, want)
+	}
+	// Git that has not stored the newer token asks from the earlier one again.
+	if _, _, paths := hookAnswer(t, svc, token); !reflect.DeepEqual(paths, want) {
+		t.Fatalf("repeated query from the earlier token = %q, want %q", paths, want)
+	}
+	if _, _, paths := hookAnswer(t, svc, next); len(paths) != 0 {
+		t.Fatalf("paths since the newer token = %q, want none", paths)
+	}
+}
+
+func TestFSMonitorHookRescansForTokenFromRecreatedOverlay(t *testing.T) {
+	ctx := t.Context()
+	svc, cfg := newHookService(t, "/")
+	ov, err := overlay.New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"old1", "old2", "old3"} {
+		if _, err := ov.CreateFile(ctx, path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, token, _ := hookAnswer(t, svc, "other-hook:1")
 	if err := ov.Close(); err != nil {
 		t.Fatal(err)
 	}
-
-	var out bytes.Buffer
-	if err := svc.FSMonitorHook(ctx, "repo", "artifact-fs:repo:v1:1", &out); err != nil {
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if err := os.Remove(cfg.OverlayDBPath + suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+	}
+	ov, err = overlay.New(ctx, cfg)
+	if err != nil {
 		t.Fatal(err)
 	}
-	parts := strings.Split(out.String(), "\x00")
-	if !strings.HasPrefix(parts[0], "artifact-fs:repo:v1:") {
-		t.Fatalf("token = %q", parts[0])
-	}
-	got := map[string]bool{}
-	for _, p := range parts[1:] {
-		if p != "" {
-			got[p] = true
+	defer ov.Close()
+	// The new database's sequence passes the token's, so only the database id
+	// tells the token apart.
+	for _, path := range []string{"new1", "new2", "new3", "new4", "new5"} {
+		if _, err := ov.CreateFile(ctx, path, 0o644); err != nil {
+			t.Fatal(err)
 		}
 	}
-	for _, want := range []string{"deleted.txt", "new/file.txt"} {
-		if !got[want] {
-			t.Fatalf("fsmonitor paths missing %q: %v", want, got)
+	if _, _, paths := hookAnswer(t, svc, token); !reflect.DeepEqual(paths, []string{"/"}) {
+		t.Fatalf("paths for a token from the deleted database = %q, want a rescan", paths)
+	}
+}
+
+func TestFSMonitorHookLeavesOverlaySchemaToTheDaemon(t *testing.T) {
+	ctx := t.Context()
+	svc, cfg := newHookService(t, "/")
+	// An overlay database from before the change log, with a row whose ctime
+	// New would backfill.
+	db, err := meta.OpenDB(cfg.OverlayDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `CREATE TABLE overlay_entries (path TEXT PRIMARY KEY, kind TEXT NOT NULL, backing_path TEXT, mode INTEGER NOT NULL, size_bytes INTEGER NOT NULL DEFAULT 0, mtime_unix_ns INTEGER NOT NULL, ctime_unix_ns INTEGER NOT NULL, source_oid TEXT, source_mode INTEGER NOT NULL DEFAULT 0, target_path TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, mode, mtime_unix_ns, ctime_unix_ns) VALUES ('created.txt', 'create', 420, 1, 0)`); err != nil {
+		t.Fatal(err)
+	}
+	_, token, paths := hookAnswer(t, svc, "other-hook:1")
+	if !reflect.DeepEqual(paths, []string{"/"}) {
+		t.Fatalf("paths without a change log = %q, want a rescan", paths)
+	}
+	if _, _, paths := hookAnswer(t, svc, token); !reflect.DeepEqual(paths, []string{"/"}) {
+		t.Fatalf("paths for the token issued without a change log = %q, want a rescan", paths)
+	}
+	var tables, ctime int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE name = 'overlay_changes'`).Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT ctime_unix_ns FROM overlay_entries`).Scan(&ctime); err != nil {
+		t.Fatal(err)
+	}
+	if tables != 0 || ctime != 0 {
+		t.Fatalf("after the hook: change log tables = %d, ctime = %d; want the schema and rows untouched", tables, ctime)
+	}
+}
+
+// Git trusts its cached directory listings after a delta answer, so the hook
+// must name a path inside every directory whose listing a rename changes.
+func TestFSMonitorHookKeepsGitUntrackedCacheAcrossDirectoryRenames(t *testing.T) {
+	// rename mirrors an overlay rename in the repository.
+	rename := func(t *testing.T, ov *overlay.Store, repo, from, to string) {
+		t.Helper()
+		if err := ov.Rename(t.Context(), from, to, false); err != nil {
+			t.Fatal(err)
 		}
+		if err := os.Rename(filepath.Join(repo, from), filepath.Join(repo, to)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		// emptyDir exists next to src, which holds a.txt.
+		emptyDir string
+		change   func(t *testing.T, ov *overlay.Store, repo string)
+		want     string
+	}{
+		{name: "rename onto a cached empty directory", emptyDir: "dst", change: func(t *testing.T, ov *overlay.Store, repo string) {
+			if err := os.Remove(filepath.Join(repo, "dst")); err != nil {
+				t.Fatal(err)
+			}
+			rename(t, ov, repo, "src", "dst")
+		}, want: "?? dst/\n"},
+		{name: "directory recreated at the source", change: func(t *testing.T, ov *overlay.Store, repo string) {
+			rename(t, ov, repo, "src", "tmp")
+			if err := ov.Mkdir(t.Context(), "src", 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(filepath.Join(repo, "src"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}, want: "?? tmp/\n"},
+		{name: "empty directory renamed onto the source", emptyDir: "e", change: func(t *testing.T, ov *overlay.Store, repo string) {
+			rename(t, ov, repo, "src", "tmp")
+			rename(t, ov, repo, "e", "src")
+		}, want: "?? tmp/\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			svc, cfg := newHookService(t, "/")
+			ov, err := overlay.New(ctx, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ov.Close()
+			repo := filepath.Join(t.TempDir(), "repo")
+			runCmd(t, "git", "init", "--initial-branch=main", repo)
+			if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runCmd(t, "git", "-C", repo, "add", "tracked.txt")
+			runCmd(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
+			runCmd(t, "git", "-C", repo, "config", "core.untrackedCache", "true")
+			// The repository mirrors the mount.
+			for _, dir := range []string{tc.emptyDir, "src"} {
+				if dir == "" {
+					continue
+				}
+				if err := ov.Mkdir(ctx, dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(filepath.Join(repo, dir), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := ov.CreateFile(ctx, "src/a.txt", 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repo, "src", "a.txt"), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			answer, token, _ := hookAnswer(t, svc, "other-hook:1")
+			if _, status := gitStatusWithAnswer(t, repo, answer); status != "?? src/\n" {
+				t.Fatalf("status after a rescan = %q", status)
+			}
+			answer, next, _ := hookAnswer(t, svc, token)
+			if queried, status := gitStatusWithAnswer(t, repo, answer); queried != token || status != "?? src/\n" {
+				t.Fatalf("status after an empty delta = %q from token %q, want ?? src/ from %q", status, queried, token)
+			}
+
+			tc.change(t, ov, repo)
+			answer, _, paths := hookAnswer(t, svc, next)
+			if queried, status := gitStatusWithAnswer(t, repo, answer); queried != next || status != tc.want {
+				t.Fatalf("status = %q from token %q with paths %q, want %q from %q", status, queried, paths, tc.want, next)
+			}
+		})
 	}
 }
 
 func TestFSMonitorHookRescansUnlessTokenAndMountAreCurrent(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		since string
-		live  bool
-		want  string
+		name string
+		// since turns the token the hook issued into the one Git sends; nil
+		// sends it unchanged.
+		since           func(issued string) string
+		issuedUnmounted bool
+		bootstrap       bool
+		live            bool
+		want            string
 	}{
-		{name: "foreign token", since: "other-hook:1", live: true, want: "MM README.md"},
-		{name: "earlier registration token", since: "artifact-fs:repo:v0:1", live: true, want: "MM README.md"},
-		{name: "unmounted worktree", since: "artifact-fs:repo:v1:1", want: "MM README.md"},
-		{name: "current token and mount", since: "artifact-fs:repo:v1:1", live: true, want: "M  README.md"},
+		{name: "foreign token", since: func(string) string { return "other-hook:1" }, live: true, want: "MM README.md"},
+		{name: "earlier registration token", since: func(issued string) string { return strings.Replace(issued, ":v1:", ":v0:", 1) }, live: true, want: "MM README.md"},
+		{name: "token past the overlay's sequence", since: func(issued string) string { return strings.TrimSuffix(issued, ":0") + ":1" }, live: true, want: "MM README.md"},
+		{name: "unmounted worktree", want: "MM README.md"},
+		{name: "token issued while unmounted", issuedUnmounted: true, live: true, want: "MM README.md"},
+		{name: "token the bootstrap issued while unmounted", issuedUnmounted: true, bootstrap: true, live: true, want: "M  README.md"},
+		{name: "current token and mount", live: true, want: "M  README.md"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
 			dir := t.TempDir()
-			svc, err := New(ctx, filepath.Join(dir, "state"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+			unmounted := filepath.Join(dir, "unmounted")
+			mountPath := func(live bool) string {
+				if live {
+					return "/"
+				}
+				return unmounted
+			}
+			svc, cfg := newHookService(t, mountPath(!tc.issuedUnmounted))
+			ov, err := overlay.New(ctx, cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer svc.Close()
-			cfg := model.RepoConfig{Name: "repo", ID: "repo", Branch: "main", RefreshInterval: time.Minute, Enabled: true, ConfigVersion: "v1", MountPath: filepath.Join(dir, "unmounted")}
-			if tc.live {
-				// "/" is always in the mount table, so it stands in for a live mount.
-				cfg.MountPath = "/"
+			if err := ov.Close(); err != nil {
+				t.Fatal(err)
 			}
-			svc.fillPaths(&cfg)
+			if tc.bootstrap {
+				t.Setenv(gitstore.FSMonitorBootstrapEnv, "1")
+			}
+			_, since, _ := hookAnswer(t, svc, "other-hook:1")
+			if tc.bootstrap {
+				if err := os.Unsetenv(gitstore.FSMonitorBootstrapEnv); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.since != nil {
+				since = tc.since(since)
+			}
+			cfg.MountPath = mountPath(tc.live)
 			if err := svc.registry.AddRepo(ctx, cfg); err != nil {
 				t.Fatal(err)
 			}
@@ -562,7 +782,7 @@ func TestFSMonitorHookRescansUnlessTokenAndMountAreCurrent(t *testing.T) {
 			runCmd(t, "git", "-C", repo, "add", "README.md")
 			// An earlier hook leaves its token and fsmonitor-valid bits in the index.
 			earlierHook := filepath.Join(dir, "earlier-hook")
-			if err := os.WriteFile(earlierHook, []byte("#!/bin/sh\nprintf '%s\\000' '"+tc.since+"'\n"), 0o755); err != nil {
+			if err := os.WriteFile(earlierHook, []byte("#!/bin/sh\nprintf '%s\\000' '"+since+"'\n"), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			runCmd(t, "git", "-C", repo, "config", "core.fsmonitor", earlierHook)
@@ -573,28 +793,12 @@ func TestFSMonitorHookRescansUnlessTokenAndMountAreCurrent(t *testing.T) {
 			if err := os.WriteFile(readme, []byte("base\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			var answer bytes.Buffer
-			if err := svc.FSMonitorHook(ctx, cfg.Name, tc.since, &answer); err != nil {
-				t.Fatal(err)
+			answer, _, _ := hookAnswer(t, svc, since)
+			queried, status := gitStatusWithAnswer(t, repo, answer)
+			if queried != since {
+				t.Fatalf("Git queried token %q, want %q", queried, since)
 			}
-			answerPath, tokenPath := filepath.Join(dir, "answer"), filepath.Join(dir, "token")
-			if err := os.WriteFile(answerPath, answer.Bytes(), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			// Replay the computed answer so Git consumes it without re-executing this test binary.
-			replayHook := filepath.Join(dir, "replay-hook")
-			if err := os.WriteFile(replayHook, []byte("#!/bin/sh\nprintf '%s' \"$2\" > '"+tokenPath+"'\ncat '"+answerPath+"'\n"), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			runCmd(t, "git", "-C", repo, "config", "core.fsmonitor", replayHook)
-			status, err := exec.Command("git", "-C", repo, "status", "--porcelain").Output()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if token, err := os.ReadFile(tokenPath); err != nil || string(token) != tc.since {
-				t.Fatalf("Git queried token %q, want %q: %v", token, tc.since, err)
-			}
-			if got := strings.TrimSuffix(string(status), "\n"); got != tc.want {
+			if got := strings.TrimSuffix(status, "\n"); got != tc.want {
 				t.Fatalf("git status = %q, want %q", got, tc.want)
 			}
 		})
