@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
@@ -78,15 +77,6 @@ func fskitAvailable() bool {
 	major, _, _ := strings.Cut(version, ".")
 	n, err := strconv.Atoi(major)
 	return err == nil && n >= 26
-}
-
-// configGitSafeDir adds safe.directory entries for the mount path.
-// macOS resolves /tmp to /private/tmp, so we add both variants.
-func configGitSafeDir(t *testing.T, path string) {
-	t.Helper()
-	for _, p := range []string{path, fmt.Sprintf("/private%s", path)} {
-		exec.Command("git", "config", "--global", "--add", "safe.directory", p).Run()
-	}
 }
 
 // isMounted checks whether the given path is a FUSE mount point.

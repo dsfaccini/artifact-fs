@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -23,8 +24,11 @@ func TestMain(m *testing.M) {
 	defaultMount = func(cfg model.RepoConfig, _ *fusefs.Resolver, _ *fusefs.Engine, _ *fusefs.ReadyGate) (fusefs.MountedFS, error) {
 		panic(fmt.Sprintf("daemon unit test tried to mount %q; set Service.mount to fakeMount", cfg.MountPath))
 	}
+	gittest.IsolateConfig()
 	m.Run()
 }
+
+func TestGitIgnoresMachineConfig(t *testing.T) { gittest.RequireConfigIsolated(t) }
 
 // fakeMount stands in for a successful mount.
 func fakeMount(model.RepoConfig, *fusefs.Resolver, *fusefs.Engine, *fusefs.ReadyGate) (fusefs.MountedFS, error) {

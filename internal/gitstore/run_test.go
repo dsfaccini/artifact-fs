@@ -56,15 +56,15 @@ func TestRunGitCancellationKillsDescendants(t *testing.T) {
 		_, err := runGit(ctx, "", "version")
 		errCh <- err
 	}()
-	deadline := time.Now().Add(time.Second)
 	for {
 		if _, err := os.Stat(started); err == nil {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("git command did not start")
+		select {
+		case err := <-errCh:
+			t.Fatalf("runGit returned before git started: %v", err)
+		case <-time.After(5 * time.Millisecond):
 		}
-		time.Sleep(5 * time.Millisecond)
 	}
 	data, err := os.ReadFile(childPID)
 	if err != nil {

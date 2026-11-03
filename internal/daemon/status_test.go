@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
@@ -408,24 +409,21 @@ func (m *blockingMountedFS) Backend() string { return "fake" }
 func (m *blockingMountedFS) Unmount() error { return m.unmountErr }
 
 func TestJoinRuntimeMountIsNotCanceledWithWorkers(t *testing.T) {
-	runtimeCtx, cancel := context.WithCancel(context.Background())
-	mfs := &blockingMountedFS{started: make(chan context.Context, 1), release: make(chan struct{})}
-	rt := &repoRuntime{ctx: runtimeCtx, mfs: mfs, stopping: true}
-	svc := &Service{}
-	svc.joinRuntimeMount(rt)
-	joinCtx := <-mfs.started
-	cancel()
-	select {
-	case <-joinCtx.Done():
-		t.Fatal("Join context was canceled with runtime workers")
-	case <-time.After(25 * time.Millisecond):
-	}
-	close(mfs.release)
-	select {
-	case <-rt.joinDone:
-	case <-time.After(time.Second):
-		t.Fatal("Join did not finish after mount drained")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		runtimeCtx, cancel := context.WithCancel(context.Background())
+		mfs := &blockingMountedFS{started: make(chan context.Context, 1), release: make(chan struct{})}
+		rt := &repoRuntime{ctx: runtimeCtx, mfs: mfs, stopping: true}
+		svc := &Service{}
+		svc.joinRuntimeMount(rt)
+		joinCtx := <-mfs.started
+		cancel()
+		synctest.Wait()
+		if err := joinCtx.Err(); err != nil {
+			t.Fatalf("Join context was canceled with runtime workers: %v", err)
+		}
+		close(mfs.release)
+		<-rt.joinDone
+	})
 }
 
 func TestStopRuntimeKeepsWorkersAliveWhenUnmountFails(t *testing.T) {

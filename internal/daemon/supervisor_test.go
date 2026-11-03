@@ -85,10 +85,10 @@ func startDaemonWithRepo(t *testing.T) *startedDaemon {
 			t.Errorf("Close: %v", err)
 		}
 	})
-	waitForHeadCondition(t, 10*time.Second, func() bool {
+	waitFor(t, nil, func() bool {
 		st, err := svc.Status(ctx, "repo")
 		return err == nil && st.State == repoStateMounted && d.mounts.resolver() != nil
-	}, "Start to mount the repo")
+	})
 	return d
 }
 
@@ -123,12 +123,12 @@ func (d *startedDaemon) status(t *testing.T) model.RepoRuntimeState {
 // mounted resolver serves path as blob.
 func (d *startedDaemon) waitForServedHEAD(t *testing.T, oid string, generation int64, path, blob string) {
 	t.Helper()
-	waitForHeadCondition(t, 20*time.Second, func() bool {
+	waitFor(t, nil, func() bool {
 		st := d.status(t)
 		node, err := d.mounts.resolver().ResolvePath(path)
 		return st.CurrentHEADOID == oid && st.SnapshotGeneration == generation &&
 			err == nil && node.Base.ObjectOID == blob
-	}, "the mount to serve "+oid)
+	})
 }
 
 func (d *startedDaemon) blobOID(t *testing.T, commit, path string) string {
@@ -172,9 +172,7 @@ func TestStartRetriesHEADReconcileAfterSnapshotLock(t *testing.T) {
 
 	want := d.commit(t, "README.md", "reconciled after the lock\n")
 	d.moveMain(t, want)
-	waitForHeadCondition(t, 20*time.Second, func() bool {
-		return strings.Contains(d.logs.String(), "snapshot publish failed")
-	}, "snapshot publication to fail while the database is locked")
+	waitFor(t, nil, func() bool { return strings.Contains(d.logs.String(), "snapshot publish failed") })
 	if st := d.status(t); st.CurrentHEADOID != initial.CurrentHEADOID || st.SnapshotGeneration != initial.SnapshotGeneration {
 		t.Fatalf("HEAD advanced while the snapshot was locked: %+v", st)
 	}

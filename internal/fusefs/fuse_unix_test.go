@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -812,43 +813,43 @@ func TestInodeAndHandleCreationWaitForNamespaceMutation(t *testing.T) {
 			case <-time.After(25 * time.Millisecond):
 			}
 			fs.handleOps.Unlock()
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-				t.Fatal("operation remained blocked after namespace mutation")
-			}
+			<-done
 		})
 	}
 }
 
 func TestRootInodeAttributesUseStableResolverAttrsWhenReady(t *testing.T) {
-	resolver := &Resolver{
-		Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{
-			".": {Path: ".", Type: "dir", Mode: 0o755, SizeBytes: 4096},
-		}},
-		Overlay: &fakeOverlay{entries: map[string]model.OverlayEntry{}},
-	}
-	resolver.SetGeneration(7)
-	resolver.SetCommitTime(1_700_000_000)
-	fs := NewArtifactFuse(model.RepoConfig{Name: "repo", GitDir: "/tmp/repo.git"}, resolver, nil)
+	// The synctest clock moves exactly as far as the sleep, so attributes read
+	// from the clock would differ between the two calls.
+	synctest.Test(t, func(t *testing.T) {
+		resolver := &Resolver{
+			Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{
+				".": {Path: ".", Type: "dir", Mode: 0o755, SizeBytes: 4096},
+			}},
+			Overlay: &fakeOverlay{entries: map[string]model.OverlayEntry{}},
+		}
+		resolver.SetGeneration(7)
+		resolver.SetCommitTime(1_700_000_000)
+		fs := NewArtifactFuse(model.RepoConfig{Name: "repo", GitDir: "/tmp/repo.git"}, resolver, nil)
 
-	first := &fuseops.GetInodeAttributesOp{Inode: fuseops.RootInodeID}
-	if err := fs.GetInodeAttributes(context.Background(), first); err != nil {
-		t.Fatalf("first GetInodeAttributes(root): %v", err)
-	}
-	time.Sleep(2 * time.Millisecond)
-	second := &fuseops.GetInodeAttributesOp{Inode: fuseops.RootInodeID}
-	if err := fs.GetInodeAttributes(context.Background(), second); err != nil {
-		t.Fatalf("second GetInodeAttributes(root): %v", err)
-	}
+		first := &fuseops.GetInodeAttributesOp{Inode: fuseops.RootInodeID}
+		if err := fs.GetInodeAttributes(context.Background(), first); err != nil {
+			t.Fatalf("first GetInodeAttributes(root): %v", err)
+		}
+		time.Sleep(2 * time.Millisecond)
+		second := &fuseops.GetInodeAttributesOp{Inode: fuseops.RootInodeID}
+		if err := fs.GetInodeAttributes(context.Background(), second); err != nil {
+			t.Fatalf("second GetInodeAttributes(root): %v", err)
+		}
 
-	want := time.Unix(1_700_000_000, 0)
-	if !first.Attributes.Mtime.Equal(want) || !second.Attributes.Mtime.Equal(want) {
-		t.Fatalf("root mtime = %v then %v, want stable %v", first.Attributes.Mtime, second.Attributes.Mtime, want)
-	}
-	if !first.Attributes.Ctime.Equal(second.Attributes.Ctime) {
-		t.Fatalf("root ctime changed: %v then %v", first.Attributes.Ctime, second.Attributes.Ctime)
-	}
+		want := time.Unix(1_700_000_000, 0)
+		if !first.Attributes.Mtime.Equal(want) || !second.Attributes.Mtime.Equal(want) {
+			t.Fatalf("root mtime = %v then %v, want stable %v", first.Attributes.Mtime, second.Attributes.Mtime, want)
+		}
+		if !first.Attributes.Ctime.Equal(second.Attributes.Ctime) {
+			t.Fatalf("root ctime changed: %v then %v", first.Attributes.Ctime, second.Attributes.Ctime)
+		}
+	})
 }
 
 func TestLookUpInodeHydratesUnknownSizeBaseFileAttributes(t *testing.T) {

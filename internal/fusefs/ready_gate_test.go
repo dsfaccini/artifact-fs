@@ -4,29 +4,29 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
+	"testing/synctest"
 )
 
 func TestReadyGateWaitsUntilReady(t *testing.T) {
-	g := NewReadyGate(false)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		g := NewReadyGate(false)
+		done := make(chan error, 1)
+		go func() {
+			done <- g.Wait(context.Background())
+		}()
 
-	done := make(chan error, 1)
-	go func() {
-		done <- g.Wait(ctx)
-	}()
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("Wait returned before ready: %v", err)
+		default:
+		}
 
-	select {
-	case err := <-done:
-		t.Fatalf("Wait returned before ready: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
-
-	g.MarkReady()
-	if err := <-done; err != nil {
-		t.Fatalf("Wait returned error after ready: %v", err)
-	}
+		g.MarkReady()
+		if err := <-done; err != nil {
+			t.Fatalf("Wait returned error after ready: %v", err)
+		}
+	})
 }
 
 func TestReadyGateFailureFailsFastAndCanReset(t *testing.T) {
