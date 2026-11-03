@@ -54,6 +54,7 @@ func assertEscapedGitCancellationIsBounded(t *testing.T, call func(context.Conte
 		t.Fatal(err)
 	}
 	marker := filepath.Join(tmp, "escaped")
+	finished := filepath.Join(tmp, "escaped-finished")
 	script := "#!/bin/sh\n\"$AFS_TEST_BINARY\" -test.run '^TestRunGitEscapedDescriptorHelper$' &\nwait\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -62,13 +63,13 @@ func assertEscapedGitCancellationIsBounded(t *testing.T, call func(context.Conte
 	t.Setenv("AFS_TEST_BINARY", executable)
 	t.Setenv("AFS_ESCAPED_HELPER", "1")
 	t.Setenv("AFS_ESCAPED_MARKER", marker)
+	t.Setenv("AFS_ESCAPED_FINISHED", finished)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- call(ctx)
 	}()
-	deadline := time.Now().Add(time.Second)
 	var helperPID int
 	for {
 		data, err := os.ReadFile(marker)
@@ -82,27 +83,23 @@ func assertEscapedGitCancellationIsBounded(t *testing.T, call func(context.Conte
 		if !errors.Is(err, os.ErrNotExist) {
 			t.Fatal(err)
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("escaped helper did not start")
+		select {
+		case err := <-errCh:
+			t.Fatalf("Git call returned before the escaped helper started: %v", err)
+		case <-time.After(5 * time.Millisecond):
 		}
-		time.Sleep(5 * time.Millisecond)
 	}
-	if helper, err := os.FindProcess(helperPID); err == nil {
-		defer helper.Kill()
-	}
+	defer syscall.Kill(helperPID, syscall.SIGKILL)
 
-	started := time.Now()
+	// The helper holds the descriptors until it is killed or marks its minute
+	// finished, so the call returns before that mark only if it did not wait
+	// for the descriptors.
 	cancel()
-	select {
-	case err := <-errCh:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("runGit error = %v, want context canceled", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("runGit remained blocked by escaped descriptor holder")
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("runGit error = %v, want context canceled", err)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("Git cancellation took %v, want bounded descriptor wait", elapsed)
+	if _, err := os.Stat(finished); err == nil {
+		t.Fatal("Git call waited for the escaped helper to finish")
 	}
 }
 
@@ -124,5 +121,11 @@ func TestRunGitEscapedDescriptorHelper(t *testing.T) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	time.Sleep(10 * time.Second)
+	// Setsid puts the helper beyond the process-group kill, and a timeout panic
+	// skips the test's kill, so the sleep bounds how long an orphan lives.
+	time.Sleep(time.Minute)
+	if err := os.WriteFile(os.Getenv("AFS_ESCAPED_FINISHED"), nil, 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 }

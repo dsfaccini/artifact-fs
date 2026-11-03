@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -343,11 +344,7 @@ func TestQueuedHydrationUsesValidCacheHit(t *testing.T) {
 	h.Start(1, cfg)
 	defer h.Stop()
 
-	select {
-	case <-hydrated:
-	case <-time.After(2 * time.Second):
-		t.Fatal("queued hydration did not complete")
-	}
+	<-hydrated
 	if fetcher.Calls() != 0 {
 		t.Fatalf("fetch calls = %d, want 0", fetcher.Calls())
 	}
@@ -399,39 +396,43 @@ func TestEnsureHydratedVerificationIgnoresLeaderTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	releaseVerify := make(chan struct{})
-	verifyStarted := make(chan struct{})
-	fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true, verifyStarted: verifyStarted, verifyWait: releaseVerify}
-	h := New(fetcher)
+	// In a synctest bubble the leader's deadline passes only once the follower
+	// is blocked on the running verification.
+	synctest.Test(t, func(t *testing.T) {
+		releaseVerify := make(chan struct{})
+		verifyStarted := make(chan struct{})
+		fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true, verifyStarted: verifyStarted, verifyWait: releaseVerify}
+		h := New(fetcher)
 
-	leaderCtx, leaderCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer leaderCancel()
-	leaderErrCh := make(chan error, 1)
-	go func() {
-		_, _, err := h.EnsureHydrated(leaderCtx, cfg, node)
-		leaderErrCh <- err
-	}()
-	<-verifyStarted
+		leaderCtx, leaderCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer leaderCancel()
+		leaderErrCh := make(chan error, 1)
+		go func() {
+			_, _, err := h.EnsureHydrated(leaderCtx, cfg, node)
+			leaderErrCh <- err
+		}()
+		<-verifyStarted
 
-	followerCtx, followerCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer followerCancel()
-	followerErrCh := make(chan error, 1)
-	go func() {
-		_, _, err := h.EnsureHydrated(followerCtx, cfg, node)
-		followerErrCh <- err
-	}()
+		followerCtx, followerCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer followerCancel()
+		followerErrCh := make(chan error, 1)
+		go func() {
+			_, _, err := h.EnsureHydrated(followerCtx, cfg, node)
+			followerErrCh <- err
+		}()
 
-	leaderErr := <-leaderErrCh
-	if leaderErr == nil {
-		t.Fatal("leader call unexpectedly succeeded")
-	}
-	close(releaseVerify)
-	if err := <-followerErrCh; err != nil {
-		t.Fatalf("follower EnsureHydrated: %v", err)
-	}
-	if fetcher.VerifyCalls() != 1 {
-		t.Fatalf("verify calls = %d, want 1", fetcher.VerifyCalls())
-	}
+		leaderErr := <-leaderErrCh
+		if leaderErr == nil {
+			t.Fatal("leader call unexpectedly succeeded")
+		}
+		close(releaseVerify)
+		if err := <-followerErrCh; err != nil {
+			t.Fatalf("follower EnsureHydrated: %v", err)
+		}
+		if fetcher.VerifyCalls() != 1 {
+			t.Fatalf("verify calls = %d, want 1", fetcher.VerifyCalls())
+		}
+	})
 }
 
 func TestValidateCachedBlobKeepsFileOnVerifyError(t *testing.T) {
@@ -600,37 +601,36 @@ func TestStopWaitsForWorkerAndRejectsLaterWork(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
-	started := make(chan struct{})
-	release := make(chan struct{})
-	fetcher := &fakeBlobFetcher{payload: []byte("content"), fetchStarted: started, fetchWait: release}
-	h := New(fetcher)
-	h.Start(1, cfg)
-	go func() { _, _, _ = h.EnsureHydrated(context.Background(), cfg, node) }()
-	<-started
+	synctest.Test(t, func(t *testing.T) {
+		started := make(chan struct{})
+		release := make(chan struct{})
+		fetcher := &fakeBlobFetcher{payload: []byte("content"), fetchStarted: started, fetchWait: release}
+		h := New(fetcher)
+		h.Start(1, cfg)
+		go func() { _, _, _ = h.EnsureHydrated(context.Background(), cfg, node) }()
+		<-started
 
-	stopped := make(chan struct{})
-	go func() {
-		h.Stop()
-		close(stopped)
-	}()
-	select {
-	case <-stopped:
-		t.Fatal("Stop returned while worker was still running")
-	case <-time.After(20 * time.Millisecond):
-	}
-	close(release)
-	select {
-	case <-stopped:
-	case <-time.After(time.Second):
-		t.Fatal("Stop did not return after worker exited")
-	}
-	if _, _, err := h.EnsureHydrated(context.Background(), cfg, node); !errors.Is(err, ErrStopped) {
-		t.Fatalf("EnsureHydrated after Stop err = %v, want ErrStopped", err)
-	}
-	h.Enqueue(model.HydrationTask{RepoID: cfg.ID, ObjectOID: "other"})
-	if depth := h.QueueDepth(cfg.ID); depth != 0 {
-		t.Fatalf("queue depth after Stop = %d, want 0", depth)
-	}
+		stopped := make(chan struct{})
+		go func() {
+			h.Stop()
+			close(stopped)
+		}()
+		synctest.Wait()
+		select {
+		case <-stopped:
+			t.Fatal("Stop returned while worker was still running")
+		default:
+		}
+		close(release)
+		<-stopped
+		if _, _, err := h.EnsureHydrated(context.Background(), cfg, node); !errors.Is(err, ErrStopped) {
+			t.Fatalf("EnsureHydrated after Stop err = %v, want ErrStopped", err)
+		}
+		h.Enqueue(model.HydrationTask{RepoID: cfg.ID, ObjectOID: "other"})
+		if depth := h.QueueDepth(cfg.ID); depth != 0 {
+			t.Fatalf("queue depth after Stop = %d, want 0", depth)
+		}
+	})
 }
 
 func TestReadBlobRejectsKnownOversizedWithoutFetch(t *testing.T) {
@@ -703,22 +703,18 @@ func TestReadBlobSkipsVerificationForOversizedCache(t *testing.T) {
 	}
 }
 
+// waitForFetchCalls polls until fetcher has seen want calls; go test -timeout
+// is its only bound.
 func waitForFetchCalls(t *testing.T, fetcher *fakeBlobFetcher, want int) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if fetcher.Calls() >= want {
-			return
-		}
+	for fetcher.Calls() < want {
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("fetch calls = %d, want at least %d", fetcher.Calls(), want)
 }
 
 func waitForHydratorIdle(t *testing.T, h *Service, repoID model.RepoID) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	for {
 		h.mu.Lock()
 		queued := 0
 		for _, item := range h.pq {
@@ -733,7 +729,6 @@ func waitForHydratorIdle(t *testing.T, h *Service, repoID model.RepoID) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("hydrator did not become idle")
 }
 
 type fakeBlobFetcher struct {

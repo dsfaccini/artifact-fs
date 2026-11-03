@@ -70,6 +70,13 @@ func (b *lockedBuffer) String() string {
 
 func newHeadReconcileFixture(t *testing.T) *headReconcileFixture {
 	t.Helper()
+	return newHeadReconcileFixtureWithBackoff(t, time.Millisecond)
+}
+
+// newHeadReconcileFixtureWithBackoff starts the HEAD reconcile loop with backoff
+// as its first retry delay.
+func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *headReconcileFixture {
+	t.Helper()
 	root := t.TempDir()
 	workDir := filepath.Join(root, "work")
 	runCmd(t, "git", "init", "--initial-branch", "main", workDir)
@@ -134,9 +141,10 @@ func newHeadReconcileFixture(t *testing.T) *headReconcileFixture {
 		state:       newRuntimeState(cfg.ID, oldOID, "main", oldGen),
 	}
 	svc := &Service{
-		logger:  logger,
-		git:     git,
-		running: map[model.RepoID]*repoRuntime{cfg.ID: rt},
+		logger:               logger,
+		git:                  git,
+		running:              map[model.RepoID]*repoRuntime{cfg.ID: rt},
+		headReconcileBackoff: backoff,
 	}
 	f := &headReconcileFixture{
 		t:       t,
@@ -158,11 +166,7 @@ func newHeadReconcileFixture(t *testing.T) *headReconcileFixture {
 	}()
 	t.Cleanup(func() {
 		cancel()
-		select {
-		case <-f.done:
-		case <-time.After(time.Second):
-			t.Error("HEAD reconciliation worker did not stop")
-		}
+		<-f.done
 		rt.headMu.Lock()
 		_ = rt.snapshot.Close()
 		_ = rt.overlay.Close()
@@ -183,38 +187,19 @@ func (f *headReconcileFixture) signal() {
 
 func (f *headReconcileFixture) waitForLog(message string) {
 	f.t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if strings.Contains(f.logs.String(), message) {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	f.t.Fatalf("timed out waiting for log message %q:\n%s", message, f.logs.String())
+	waitFor(f.t, nil, func() bool { return strings.Contains(f.logs.String(), message) })
 }
 
 func (f *headReconcileFixture) waitForHead(oid, ref string, generation int64) {
 	f.t.Helper()
-	waitForHeadCondition(f.t, 3*time.Second, func() bool {
+	waitFor(f.t, nil, func() bool {
 		f.svc.mu.Lock()
 		defer f.svc.mu.Unlock()
 		return f.rt.state.CurrentHEADOID == oid &&
 			f.rt.state.CurrentHEADRef == ref &&
 			f.rt.state.SnapshotGeneration == generation &&
 			f.rt.resolver.Generation() == generation
-	}, "runtime and resolver HEAD reconciliation")
-}
-
-func waitForHeadCondition(t *testing.T, timeout time.Duration, condition func() bool, description string) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if condition() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", description)
+	})
 }
 
 func TestHeadReconcileRetriesTransientResolveFailureWithoutAnotherSignal(t *testing.T) {
@@ -415,7 +400,8 @@ func TestHeadReconcileCoalescesSignalsAndPublishesLatestHEAD(t *testing.T) {
 }
 
 func TestHeadReconcileBackoffStopsOnCancellation(t *testing.T) {
-	f := newHeadReconcileFixture(t)
+	// Only cancellation can end an hour-long backoff before go test -timeout.
+	f := newHeadReconcileFixtureWithBackoff(t, time.Hour)
 	unavailable := f.rt.cfg.GitDir + ".unavailable"
 	if err := os.Rename(f.rt.cfg.GitDir, unavailable); err != nil {
 		t.Fatal(err)
@@ -429,11 +415,7 @@ func TestHeadReconcileBackoffStopsOnCancellation(t *testing.T) {
 	f.waitForLog("HEAD resolve failed")
 
 	f.cancel()
-	select {
-	case <-f.done:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("HEAD reconciliation worker did not stop during retry backoff")
-	}
+	<-f.done
 }
 
 func TestHeadReconcileResumesAfterUnmountFailure(t *testing.T) {
@@ -452,8 +434,8 @@ func TestHeadReconcileResumesAfterUnmountFailure(t *testing.T) {
 	}()
 	select {
 	case <-mfs.started:
-	case <-time.After(time.Second):
-		t.Fatal("unmount did not start")
+	case err := <-errCh:
+		t.Fatalf("unmount returned before reaching the mount: %v", err)
 	}
 
 	f.updateMain(f.nextOID)
