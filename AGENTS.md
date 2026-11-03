@@ -4,7 +4,7 @@ Repository-specific guidance for `artifact-fs`.
 
 ## Code review rules
 
-- Flag credentials in Git CLI arguments or unredacted logs. Pass credentials through the environment-based helper in `internal/gitstore/credentials.go`, and redact log output with `auth.RedactString`.
+- Flag credentials in Git CLI arguments or unredacted logs. Pass credentials through the environment-based helper in `internal/gitstore/credentials.go`. Redact a log field with `auth.RedactLogString`, which drops the whole remote. Redact an error message with `auth.RedactString`, which keeps the remote without its credentials.
 - Keep adoption's inline-credential check in `WarnAdoptedOriginCredentials` a redacted warning, not a rejection. Adoption stores no URL and never clones, fetches or refreshes. Only Git's lazy fetches of missing blobs and trees use the user's existing origin. Flag any other path that persists inline credentials or lets the daemon fetch with them.
 - Flag blob bytes converted to `string`. Keep `BlobToCache` binary-safe by streaming `git cat-file --batch` output to disk.
 - Keep `GIT_NO_LAZY_FETCH=1` on `git cat-file --batch-check` in `batchResolveSizes`. Removing it turns size resolution in blobless clones into network round-trips.

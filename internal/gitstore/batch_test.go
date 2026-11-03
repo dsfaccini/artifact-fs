@@ -316,12 +316,16 @@ func TestBlobToCacheRedactsBatchStderr(t *testing.T) {
 	if strings.Contains(logs, "s3cret") {
 		t.Fatalf("logs leaked the password: %s", logs)
 	}
+	if strings.Contains(logs, "example.com/repo.git") {
+		t.Fatalf("logs kept the remote's location: %s", logs)
+	}
 }
 
 func TestBlobToCacheRedactsBatchStderrBeforeBoundingLine(t *testing.T) {
-	// The logged bound falls inside the password.
-	prefix := strings.Repeat("x", maxGitErrorBytes-len("https://alice:s3cr"))
-	logs := batchStderrLogs(t, "echo '"+prefix+"https://alice:s3cretpassword@example.com/repo.git' >&2")
+	// The logged bound falls inside the password. Redaction drops a whole
+	// token that holds "://", so the remote is scheme-less.
+	prefix := strings.Repeat("x", maxGitErrorBytes-len(" alice:s3cr"))
+	logs := batchStderrLogs(t, "echo '"+prefix+" alice:s3cretpassword@example.com/repo.git' >&2")
 	if !strings.Contains(logs, `"truncated":true`) {
 		t.Fatalf("logs = %.200s, want a truncated line", logs)
 	}
@@ -333,7 +337,7 @@ func TestBlobToCacheRedactsBatchStderrBeforeBoundingLine(t *testing.T) {
 func TestBlobToCacheDropsPartialTokenAtBatchStderrBufferBound(t *testing.T) {
 	// The buffer bound falls inside the password, and redacting the token
 	// before it shrinks the line below the logged bound.
-	head := "token=" + strings.Repeat("a", 4*maxGitErrorBytes-25) + " https://alice:s3cr"
+	head := "token=" + strings.Repeat("a", 4*maxGitErrorBytes-len("token=")-len(" alice:s3cr")) + " alice:s3cr"
 	logs := batchStderrLogs(t, "printf '%s' '"+head+"' >&2; echo 'etpassword@example.com/repo.git' >&2")
 	if !strings.Contains(logs, `"truncated":true`) {
 		t.Fatalf("logs = %.300s, want a truncated line", logs)

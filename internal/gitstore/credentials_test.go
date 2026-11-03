@@ -367,6 +367,25 @@ func TestCredentialEnvRejectsMalformedSSHPassword(t *testing.T) {
 	}
 }
 
+func TestCredentialEnvRejectsUserinfoBeforeLaterSeparator(t *testing.T) {
+	t.Parallel()
+	if safeURL, _, err := credentialEnv("alice:s3cret@host/a://b@c"); err == nil {
+		t.Fatalf("credentialEnv passed %q to git", safeURL)
+	}
+}
+
+func TestCredentialEnvRejectsUsernameBehindHTTPSRemoteHelper(t *testing.T) {
+	t.Parallel()
+	if safeURL, _, err := credentialEnv("gcrypt::https://ghp_token@github.com/org/repo.git"); err == nil {
+		t.Fatalf("credentialEnv passed %q to git", safeURL)
+	}
+	// Behind a helper address that is not http(s), a username alone names an ambient profile.
+	const profile = "codecommit::us-east-1://demo-profile@MyRepositoryName"
+	if safeURL, _, err := credentialEnv(profile); err != nil || safeURL != profile {
+		t.Fatalf("credentialEnv(%q) = %q, %v; want it unchanged", profile, safeURL, err)
+	}
+}
+
 func TestCloneBloblessRejectsMalformedCredentialURLBeforeGit(t *testing.T) {
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "bin")

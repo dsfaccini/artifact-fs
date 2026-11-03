@@ -20,6 +20,11 @@ func RedactRemoteURL(raw string) string {
 		return ""
 	}
 	if start, end, ok := userinfoBeforeSeparator(raw); ok {
+		// Keep a "?" or "#" inside the userinfo: the query and fragment
+		// redaction then still hides the text after it.
+		if query := strings.IndexAny(raw[start:end], "?#"); query >= 0 {
+			end = start + query
+		}
 		raw = raw[:start] + "REDACTED" + raw[end:]
 	}
 	u, err := url.Parse(raw)
@@ -147,30 +152,46 @@ func malformedAuthorityStart(raw string) int {
 	return -1
 }
 
-// userinfoBeforeSeparator returns the bounds of "user:pass" text that ends at
-// an "@" before the first "://" when an "@" also follows that "://", as in
-// "alice:pw@host/a://b@c". The heuristics take the userinfo to follow the
-// "://", but either side can hold it.
+// userinfoBeforeSeparator returns the bounds of "user:pass" text before the
+// first "://" when an "@" follows that "://", as in "alice:pw@host/a://b@c".
+// The heuristics take the userinfo to follow the "://", but either side can
+// hold it. Before the "://", userinfo can end at any "@" or at the first "?" or
+// "#", as in "u:pw?x://y@z". The bounds cover every candidate that holds a ":".
 func userinfoBeforeSeparator(raw string) (start int, end int, ok bool) {
 	separator := strings.Index(raw, "://")
 	if separator < 0 || !strings.Contains(raw[separator:], "@") {
 		return 0, 0, false
 	}
-	end = strings.LastIndex(raw[:separator], "@")
-	if end < 0 {
-		return 0, 0, false
-	}
-	start = strings.LastIndex(raw[:end], "/") + 1
+	head := raw[:separator]
 	lower := strings.ToLower(raw)
-	for _, marker := range []string{"https:/", "http:/", "ssh:/", "git:/", "https:", "http:", "ssh:", "git:"} {
-		if strings.HasPrefix(lower, marker) && len(marker) > start {
-			start = len(marker)
+	candidateEnds := []int{strings.IndexAny(head, "?#")}
+	for i := range len(head) {
+		if head[i] == '@' {
+			candidateEnds = append(candidateEnds, i)
 		}
 	}
-	if start > end || !strings.Contains(raw[start:end], ":") {
-		return 0, 0, false
+	for _, candidateEnd := range candidateEnds {
+		if candidateEnd < 0 {
+			continue
+		}
+		candidateStart := strings.LastIndex(raw[:candidateEnd], "/") + 1
+		for _, marker := range []string{"https:/", "http:/", "ssh:/", "git:/", "https:", "http:", "ssh:", "git:"} {
+			if strings.HasPrefix(lower, marker) && len(marker) > candidateStart && len(marker) <= candidateEnd {
+				candidateStart = len(marker)
+			}
+		}
+		if !strings.Contains(raw[candidateStart:candidateEnd], ":") {
+			continue
+		}
+		if !ok || candidateStart < start {
+			start = candidateStart
+		}
+		if !ok || candidateEnd > end {
+			end = candidateEnd
+		}
+		ok = true
 	}
-	return start, end, true
+	return start, end, ok
 }
 
 // userinfoAfterLaterSeparator reports an "@" after a "://" that does not end
@@ -471,7 +492,9 @@ func RedactLogString(s string, sensitiveValues ...string) string {
 			remoteStart := remoteStartIndex(core)
 			// Text with an "@" before the marker is redacted userinfo or an scp
 			// remote, as in "REDACTED@host/x,https://...", so it goes too.
-			if strings.Contains(core[:remoteStart], "@") {
+			// RedactString can have removed that "@", so check the token as it
+			// came in as well.
+			if strings.Contains(core[:remoteStart], "@") || i < len(unredacted) && atBeforeRemote(unredacted[i]) {
 				remoteStart = 0
 			}
 			parts[i] = token[:start] + core[:remoteStart] + "REDACTED_REMOTE" + token[end+1:]
@@ -482,6 +505,21 @@ func RedactLogString(s string, sensitiveValues ...string) string {
 		s = strings.ToValidUTF8(s[:maxLogStringBytes], "") + "\n" + logStringTruncatedLabel
 	}
 	return s
+}
+
+// atBeforeRemote reports an "@" in a token's core before its remote starts.
+func atBeforeRemote(token string) bool {
+	start := strings.IndexFunc(token, func(r rune) bool {
+		return !strings.ContainsRune("'\"([{<", r)
+	})
+	end := strings.LastIndexFunc(token, func(r rune) bool {
+		return !strings.ContainsRune("'\")]}>,.:", r)
+	})
+	if start < 0 || end < start {
+		return false
+	}
+	core := token[start : end+1]
+	return strings.Contains(core[:remoteStartIndex(core)], "@")
 }
 
 func redactTruncatedSensitivePrefix(s string, sensitive string) string {
@@ -531,15 +569,10 @@ func redactRemoteCore(core string) string {
 		next := strings.TrimLeft(core[sep+1:], " ")
 		if insideUserinfo := separatorInsideUserinfo(core, sep); insideUserinfo || !hasSplitRemoteMarker(next) {
 			whole := redactSingleRemoteCore(core)
-			nextSegment := next
-			if end := strings.IndexAny(next, ",;"); end >= 0 {
-				nextSegment = next[:end]
-			}
 			// A later segment can hold a remote behind a prefix, as in
 			// "remote=https//u:pw@h", which the whole core's redaction misses.
-			// Redacting each segment of the result as well removes only more.
-			if wholeSep := strings.IndexAny(whole, ",;"); !insideUserinfo && containsRemoteMarker(nextSegment) && wholeSep >= 0 {
-				whole = redactSingleRemoteCore(whole[:wholeSep]) + whole[wholeSep:wholeSep+1] + redactRemoteCore(whole[wholeSep+1:])
+			if !insideUserinfo && containsRemoteMarker(core[sep+1:]) {
+				whole = redactTailBySegment(whole, core, sep)
 			}
 			b.WriteString(whole)
 			break
@@ -549,6 +582,51 @@ func redactRemoteCore(core string) string {
 		core = core[sep+1:]
 	}
 	return b.String()
+}
+
+// redactTailBySegment redacts core's text after the separator at sep segment
+// by segment too, where whole, the whole core's redaction, kept that text: as
+// it was, or apart from a query or fragment that whole replaced. The result
+// shows no more than whole.
+func redactTailBySegment(whole string, core string, sep int) string {
+	tail := core[sep+1:]
+	if strings.HasSuffix(whole, core[sep:]) {
+		return whole[:len(whole)-len(tail)] + redactRemoteCore(tail)
+	}
+	query := strings.IndexAny(tail, "?#")
+	if query < 0 || strings.ContainsAny(tail[query:], ",;") {
+		return whole
+	}
+	for _, redacted := range []string{"?REDACTED", "?REDACTED#REDACTED", "#REDACTED"} {
+		kept := core[sep:sep+1+query] + redacted
+		if !strings.HasSuffix(whole, kept) {
+			continue
+		}
+		// Keep whole's query redaction. The segment's redaction can start a
+		// remote inside the query and keep the text before it.
+		bySegment := redactRemoteCore(tail)
+		if cut := strings.IndexAny(bySegment, "?#"); cut >= 0 {
+			bySegment = bySegment[:cut]
+		}
+		if !shownWithin(bySegment, tail[:query]) {
+			return whole
+		}
+		return whole[:len(whole)-len(kept)] + core[sep:sep+1] + bySegment + redacted
+	}
+	return whole
+}
+
+// shownWithin reports whether each run of redacted text between "REDACTED"
+// markers occurs in original, in order.
+func shownWithin(redacted string, original string) bool {
+	for _, run := range strings.Split(redacted, "REDACTED") {
+		i := strings.Index(original, run)
+		if i < 0 {
+			return false
+		}
+		original = original[i+len(run):]
+	}
+	return true
 }
 
 func separatorInsideUserinfo(core string, sep int) bool {
