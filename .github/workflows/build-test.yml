@@ -43,6 +43,10 @@ jobs:
       - name: Test
         run: go test -race ./...
 
+      # The fuse replacement defines its FSKit error types on every OS, so Linux runs their classification tests.
+      - name: Test with the fskit tag
+        run: go test -race -tags fskit ./internal/fusefs
+
       - name: Pre-commit hook on Linux
         run: |
           printf '\n// pre-commit hook smoke test\n' >> internal/model/types.go
@@ -61,10 +65,44 @@ jobs:
           go-version-file: go.mod
 
       - name: Vet
-        run: GOOS=darwin go vet ./...
+        run: |
+          GOOS=darwin go vet ./...
+          GOOS=darwin go vet -tags fskit ./...
 
       - name: Build
-        run: GOOS=darwin go build -o /dev/null ./cmd/artifact-fs
+        run: |
+          GOOS=darwin go build -o /dev/null ./cmd/artifact-fs
+          GOOS=darwin go build -tags fskit -o /dev/null ./cmd/artifact-fs
+
+  # Only the fskit build tag may use the github.com/dsfaccini/fuse replacement's
+  # FSKit API, so every untagged build must also compile against upstream jacobsa/fuse.
+  build-without-fuse-replace:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Drop the jacobsa/fuse replace
+        run: |
+          go mod edit -dropreplace=github.com/jacobsa/fuse
+          go mod tidy
+          replace=$(go list -m -f '{{.Replace}}' github.com/jacobsa/fuse)
+          if [ "$replace" != "<nil>" ]; then
+            echo "github.com/jacobsa/fuse is still replaced by $replace" >&2
+            exit 1
+          fi
+
+      - name: Build and vet on Linux and macOS
+        run: |
+          for goos in linux darwin; do
+            GOOS=$goos go build ./...
+            GOOS=$goos go vet ./...
+          done
 
   fuse-e2e:
     runs-on: ubuntu-24.04
