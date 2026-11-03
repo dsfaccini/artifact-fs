@@ -444,28 +444,9 @@ func TestStopRuntimeKeepsWorkersAliveWhenUnmountFails(t *testing.T) {
 	}
 }
 
-func TestFSMonitorDirtyPathsIncludesChangedPathsAndRenameEndpoints(t *testing.T) {
-	paths := fsMonitorDirtyPaths([]model.OverlayEntry{
-		{Path: "src/pkg/file.go", Kind: model.OverlayKindModify},
-		{Path: "new/name.go", Kind: model.OverlayKindRename, TargetPath: "old/name.go"},
-		{Path: "readme-link", Kind: model.OverlayKindSymlink, TargetPath: "../README.md"},
-		{Path: ".", Kind: model.OverlayKindMkdir},
-	})
-	want := []string{
-		"new/name.go",
-		"old/name.go",
-		"readme-link",
-		"src/pkg/file.go",
-	}
-	if !reflect.DeepEqual(paths, want) {
-		t.Fatalf("dirty paths = %#v, want %#v", paths, want)
-	}
-}
-
-func TestFSMonitorHookOutputsDirtyOverlayPaths(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+func TestFSMonitorHookReturnsPathsChangedSinceToken(t *testing.T) {
+	ctx := t.Context()
+	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,34 +469,55 @@ func TestFSMonitorHookOutputsDirtyOverlayPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ov.CreateFile(ctx, "new/file.txt", 0o644); err != nil {
+	defer ov.Close()
+	hook := func(since string) (string, []string) {
+		t.Helper()
+		var out bytes.Buffer
+		if err := svc.FSMonitorHook(ctx, "repo", since, &out); err != nil {
+			t.Fatal(err)
+		}
+		fields := strings.Split(strings.TrimSuffix(out.String(), "\x00"), "\x00")
+		return fields[0], fields[1:]
+	}
+	if _, err := ov.CreateFile(ctx, "written.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ov.CreateFile(ctx, "moved.txt", 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := ov.Remove(ctx, "deleted.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if err := ov.Close(); err != nil {
-		t.Fatal(err)
+	if _, paths := hook("artifact-fs:repo:v1:0"); !reflect.DeepEqual(paths, []string{"deleted.txt", "moved.txt", "written.txt"}) {
+		t.Fatalf("paths since sequence 0 = %q, want every overlay path", paths)
+	}
+	token, paths := hook("other-hook:1")
+	if !reflect.DeepEqual(paths, []string{"/"}) {
+		t.Fatalf("paths for a foreign token = %q, want a rescan", paths)
+	}
+	if token, paths = hook(token); len(paths) != 0 {
+		t.Fatalf("paths since the current token = %q, want none", paths)
 	}
 
-	var out bytes.Buffer
-	if err := svc.FSMonitorHook(ctx, "repo", "artifact-fs:repo:v1:1", &out); err != nil {
+	if _, err := ov.WriteFile(ctx, "written.txt", 0, []byte("edit")); err != nil {
 		t.Fatal(err)
 	}
-	parts := strings.Split(out.String(), "\x00")
-	if !strings.HasPrefix(parts[0], "artifact-fs:repo:v1:") {
-		t.Fatalf("token = %q", parts[0])
+	// An untracked source leaves no delete marker, so only the change log
+	// still names moved.txt.
+	if err := ov.Rename(ctx, "moved.txt", "renamed.txt", false); err != nil {
+		t.Fatal(err)
 	}
-	got := map[string]bool{}
-	for _, p := range parts[1:] {
-		if p != "" {
-			got[p] = true
-		}
+	want := []string{"moved.txt", "renamed.txt", "written.txt"}
+	next, paths := hook(token)
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("paths since the earlier token = %q, want %q", paths, want)
 	}
-	for _, want := range []string{"deleted.txt", "new/file.txt"} {
-		if !got[want] {
-			t.Fatalf("fsmonitor paths missing %q: %v", want, got)
-		}
+	// Git that has not stored the newer token asks from the earlier one again.
+	if _, paths := hook(token); !reflect.DeepEqual(paths, want) {
+		t.Fatalf("repeated query from the earlier token = %q, want %q", paths, want)
+	}
+	if _, paths := hook(next); len(paths) != 0 {
+		t.Fatalf("paths since the newer token = %q, want none", paths)
 	}
 }
 
@@ -528,8 +530,9 @@ func TestFSMonitorHookRescansUnlessTokenAndMountAreCurrent(t *testing.T) {
 	}{
 		{name: "foreign token", since: "other-hook:1", live: true, want: "MM README.md"},
 		{name: "earlier registration token", since: "artifact-fs:repo:v0:1", live: true, want: "MM README.md"},
-		{name: "unmounted worktree", since: "artifact-fs:repo:v1:1", want: "MM README.md"},
-		{name: "current token and mount", since: "artifact-fs:repo:v1:1", live: true, want: "M  README.md"},
+		{name: "token past the overlay's sequence", since: "artifact-fs:repo:v1:1", live: true, want: "MM README.md"},
+		{name: "unmounted worktree", since: "artifact-fs:repo:v1:0", want: "MM README.md"},
+		{name: "current token and mount", since: "artifact-fs:repo:v1:0", live: true, want: "M  README.md"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()

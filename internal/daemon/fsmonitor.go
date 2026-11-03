@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sort"
+	"math"
+	"strconv"
 	"strings"
-	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
@@ -72,34 +72,42 @@ func (s *Service) configureStatusOptimization(ctx context.Context, cfg model.Rep
 }
 
 // FSMonitorHook answers Git's fsmonitor hook protocol version 2 from the
-// overlay, which records changes made through the mount. It trusts only tokens
-// issued for this registration, and only while the worktree is mounted.
-// Otherwise native edits may have bypassed the overlay, and "/" makes Git
-// rescan the worktree.
+// overlay, which records changes made through the mount. Its token carries the
+// overlay's change sequence, so Git receives only the paths changed since its
+// last query. It trusts only tokens issued for this registration and this
+// overlay, and only while the worktree is mounted. Otherwise native edits may
+// have bypassed the overlay, and "/" makes Git rescan the worktree.
 func (s *Service) FSMonitorHook(ctx context.Context, name string, since string, w io.Writer) error {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
 		return err
 	}
 	s.fillPaths(&cfg)
+	ov, err := overlay.New(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer ov.Close()
 	prefix := fmt.Sprintf("artifact-fs:%s:%s:", cfg.ID, cfg.ConfigVersion)
-	paths := []string{"/"}
+	seqText, trusted := strings.CutPrefix(since, prefix)
+	sinceSeq, err := strconv.ParseInt(seqText, 10, 64)
 	// The mount table check sends no request to the mount, which stays gated
 	// while the daemon runs Git during preparation.
-	if strings.HasPrefix(since, prefix) && isMounted(cfg.MountPath) {
-		ov, err := overlay.New(ctx, cfg)
-		if err != nil {
-			return err
-		}
-		defer ov.Close()
-		entries, err := ov.ListAll(ctx)
-		if err != nil {
-			return err
-		}
-		paths = fsMonitorDirtyPaths(entries)
+	trusted = trusted && err == nil && sinceSeq >= 0 && isMounted(cfg.MountPath)
+	if !trusted {
+		sinceSeq = math.MaxInt64
 	}
-	token := fmt.Sprintf("%s%d", prefix, time.Now().UnixNano())
-	if err := writeHookField(w, token); err != nil {
+	seq, changed, err := ov.ChangesSince(ctx, sinceSeq)
+	if err != nil {
+		return err
+	}
+	paths := []string{"/"}
+	// A sequence past the overlay's latest comes from another overlay database
+	// or an earlier token format.
+	if trusted && sinceSeq <= seq {
+		paths = changed
+	}
+	if err := writeHookField(w, fmt.Sprintf("%s%d", prefix, seq)); err != nil {
 		return err
 	}
 	for _, p := range paths {
@@ -126,27 +134,4 @@ func writeHookField(w io.Writer, value string) error {
 		return io.ErrShortWrite
 	}
 	return nil
-}
-
-func fsMonitorDirtyPaths(entries []model.OverlayEntry) []string {
-	set := map[string]struct{}{}
-	add := func(path string) {
-		path = model.CleanPath(path)
-		if path == "." {
-			return
-		}
-		set[path] = struct{}{}
-	}
-	for _, e := range entries {
-		add(e.Path)
-		if e.Kind == model.OverlayKindRename && e.TargetPath != "" {
-			add(e.TargetPath)
-		}
-	}
-	out := make([]string, 0, len(set))
-	for p := range set {
-		out = append(out, p)
-	}
-	sort.Strings(out)
-	return out
 }

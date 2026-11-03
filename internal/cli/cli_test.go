@@ -281,7 +281,7 @@ func TestFSMonitorHookCLIAnswersGitToken(t *testing.T) {
 		t.Fatalf("list repos: %v, %v, %d", err, closeErr, len(repos))
 	}
 	var stdout, stderr bytes.Buffer
-	since := "artifact-fs:repo:" + repos[0].ConfigVersion + ":1"
+	since := "artifact-fs:repo:" + repos[0].ConfigVersion + ":0"
 	if code := Run(ctx, []string{"fsmonitor-hook", "--name", "repo", "2", since}, &stdout, &stderr); code != 0 {
 		t.Fatalf("fsmonitor-hook exit = %d, stderr=%q", code, stderr.String())
 	}

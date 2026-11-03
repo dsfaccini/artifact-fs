@@ -32,6 +32,25 @@ var migrations = []string{
 	  target_path TEXT
 	);`,
 	`CREATE INDEX IF NOT EXISTS idx_overlay_kind ON overlay_entries(kind);`,
+	// overlay_changes keeps one row per path ever changed, renumbered on each
+	// change. AUTOINCREMENT never reuses a sequence number, so the FSMonitor
+	// hook can answer "changed since sequence N" without scanning the overlay.
+	`CREATE TABLE IF NOT EXISTS overlay_changes (
+	  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+	  path TEXT NOT NULL UNIQUE
+	);`,
+	`CREATE TRIGGER IF NOT EXISTS overlay_entries_insert_change AFTER INSERT ON overlay_entries BEGIN
+	  DELETE FROM overlay_changes WHERE path = NEW.path;
+	  INSERT INTO overlay_changes(path) VALUES (NEW.path);
+	END;`,
+	`CREATE TRIGGER IF NOT EXISTS overlay_entries_update_change AFTER UPDATE ON overlay_entries BEGIN
+	  DELETE FROM overlay_changes WHERE path IN (OLD.path, NEW.path);
+	  INSERT INTO overlay_changes(path) SELECT OLD.path UNION SELECT NEW.path;
+	END;`,
+	`CREATE TRIGGER IF NOT EXISTS overlay_entries_delete_change AFTER DELETE ON overlay_entries BEGIN
+	  DELETE FROM overlay_changes WHERE path = OLD.path;
+	  INSERT INTO overlay_changes(path) VALUES (OLD.path);
+	END;`,
 }
 
 type Store struct {
@@ -987,6 +1006,35 @@ func (s *Store) DirtyCount(ctx context.Context) (int64, error) {
 	var c int64
 	err := row.Scan(&c)
 	return c, err
+}
+
+// ChangesSince returns the latest change sequence and the paths whose entries
+// were inserted, updated or deleted after sequence since, read in one snapshot
+// so the sequence covers exactly the paths returned.
+func (s *Store) ChangesSince(ctx context.Context, since int64) (int64, []string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer tx.Rollback()
+	var seq int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM overlay_changes`).Scan(&seq); err != nil {
+		return 0, nil, err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT path FROM overlay_changes WHERE seq > ? ORDER BY path`, since)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return 0, nil, err
+		}
+		paths = append(paths, path)
+	}
+	return seq, paths, rows.Err()
 }
 
 func (s *Store) ListAll(ctx context.Context) ([]model.OverlayEntry, error) {
