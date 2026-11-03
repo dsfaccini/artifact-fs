@@ -65,6 +65,15 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Diagnose (temporary)
+        continue-on-error: true
+        run: |
+          which -a git; git --version; /usr/bin/git --version
+          time /usr/bin/git --version
+          time /usr/bin/git --version
+          GIT_TRACE="$RUNNER_TEMP/trace" go test -count=1 -run TestAddRepoSyncBuildTreeCancellationIsPersisted -v ./internal/daemon || true
+          tail -60 "$RUNNER_TEMP/trace"
+
       - name: Test
         run: go test -race ./...
 
