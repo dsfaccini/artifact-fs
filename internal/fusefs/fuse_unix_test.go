@@ -14,7 +14,7 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/model"
 	overlaystore "github.com/cloudflare/artifact-fs/internal/overlay"
-	"github.com/jacobsa/fuse/fuseops"
+	"github.com/dsfaccini/fuse/fuseops"
 )
 
 type localOverlayFuseFixture struct {
