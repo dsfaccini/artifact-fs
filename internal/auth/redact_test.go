@@ -315,9 +315,9 @@ func TestRedactRemoteURL(t *testing.T) {
 		t.Fatalf("scheme-less delimiter-split userinfo leaked in output: %s", out)
 	}
 
-	out = RedactString("fatal: path/x://user:ghp_secret@example.com failed")
+	out = RedactString("fatal: unable to access 'jane@example.com:https:user:ghp_secret@example.com/org/repo.git': HTTP 401")
 	if containsAny(out, []string{"ghp_secret"}) {
-		t.Fatalf("userinfo after a non-scheme separator leaked in redacted string: %s", out)
+		t.Fatalf("typo-scheme userinfo after an at-sign prefix leaked in redacted string: %s", out)
 	}
 }
 
@@ -584,16 +584,15 @@ func TestRedactLogStringRemovesRemoteReferences(t *testing.T) {
 		"clone https://user:secret@example.com/org/repo.git failed",
 		"fetch git@example.com:private/repo.git failed",
 		"fatal: path/x://user:ghp_secret@example.com failed",
-		"jane@example.com:https://user:secret@example.com/org/repo.git",
 		"fatal: repository 'codecommit::us-east-1://demo-profile@MyRepositoryName' not found",
 		"fatal: repository 'gcrypt::rsync://user@example.com/repo' not found",
-		"fatal: unable to access '1:000000@0://': HTTP 401",
+		"fetch remotes=alice:secret@example.com/org/repo.git,https://github.example.com/x.git failed",
 	} {
 		got := RedactLogString(input)
 		if !strings.Contains(got, "REDACTED_REMOTE") {
 			t.Fatalf("RedactLogString(%q) = %q, want remote marker", input, got)
 		}
-		for _, secret := range []string{"github.example.com", "private/repo.git", "user", "secret", "example.com", "org/repo.git", "MyRepositoryName", "000000"} {
+		for _, secret := range []string{"github.example.com", "private/repo.git", "user", "secret", "example.com", "org/repo.git", "MyRepositoryName"} {
 			if strings.Contains(got, secret) {
 				t.Fatalf("RedactLogString(%q) leaked %q in %q", input, secret, got)
 			}
@@ -623,29 +622,36 @@ func TestRedactLogStringBoundsDiagnostics(t *testing.T) {
 // including the typos and the scheme-less form.
 var remoteForms = []string{"https://", "http://", "ssh://", "git://", "https:/", "https//", "https:", "ssh:/", ""}
 
+// tokenPrefixes are text that a log token can carry in front of a remote.
+var tokenPrefixes = []string{"", "jane@example.com:", "HEAD@{1}:", "remote="}
+
 func FuzzRedactionHidesPassword(f *testing.F) {
 	for _, seed := range []struct {
-		form           int
+		prefix, form   int
 		user, password string
 		rest           string
 	}{
-		{0, "user", "pass", "example.com/org/repo.git/"},
-		{0, "ghp_secret%zz", "password", "example.com/org/repo.git"},
-		{0, "user.name", "secret", "example.com/org/repo.git"},
-		{2, "git", "secret", "github.com/org/repo.git"},
-		{2, "git", "sec%zzret", "example.com/org/repo.git"},
-		{4, "user", "ghp_secret", "github.com/org/repo.git"},
-		{7, "git", "pa", "github.com/org/repo.git"},
-		{8, "alice", "ghp_secret", "github.com:org/repo.git"},
-		{8, "x-token-auth", "secret", "bitbucket.org/org/repo.git"},
-		{8, "1", "000000", "0://"},
-		{8, "A", "0", "://"},
-		{8, "alice", "ghp_secret", "git:0"},
-		{5, "0", "00", "://"},
+		{0, 0, "user", "pass", "example.com/org/repo.git/"},
+		{0, 0, "ghp_secret%zz", "password", "example.com/org/repo.git"},
+		{0, 0, "user.name", "secret", "example.com/org/repo.git"},
+		{0, 2, "git", "secret", "github.com/org/repo.git"},
+		{0, 2, "git", "sec%zzret", "example.com/org/repo.git"},
+		{0, 4, "user", "ghp_secret", "github.com/org/repo.git"},
+		{0, 7, "git", "pa", "github.com/org/repo.git"},
+		{0, 8, "alice", "ghp_secret", "github.com:org/repo.git"},
+		{0, 8, "x-token-auth", "secret", "bitbucket.org/org/repo.git"},
+		{0, 8, "1", "000000", "0://"},
+		{0, 8, "A", "0", "://"},
+		{0, 8, "alice", "ghp_secret", "git:0"},
+		{0, 5, "0", "00", "://"},
+		{0, 8, "alice", "ghp_secret", "corpgit:org/repo.git"},
+		{1, 6, "user", "ghp_secret", "example.com/org/repo.git"},
+		{2, 4, "alice", "ghp_secret", "example.com"},
+		{3, 0, "user", "ghp_secret", "example.com/org/repo.git"},
 	} {
-		f.Add(uint8(seed.form), seed.user, seed.password, seed.rest)
+		f.Add(uint8(seed.prefix), uint8(seed.form), seed.user, seed.password, seed.rest)
 	}
-	f.Fuzz(func(t *testing.T, form uint8, user, password, rest string) {
+	f.Fuzz(func(t *testing.T, prefixIndex, formIndex uint8, user, password, rest string) {
 		if !onlyRunes(user, "-._~%") || password == "" || !onlyRunes(password, "-._~%") || !onlyRunes(rest, "-._~%:/@") {
 			t.Skip()
 		}
@@ -654,17 +660,28 @@ func FuzzRedactionHidesPassword(f *testing.F) {
 		if _, after, ok := strings.Cut(rest, "://"); ok && strings.Contains(after, "@") {
 			t.Skip()
 		}
-		remote := remoteForms[int(form)%len(remoteForms)] + user + ":" + password + "@" + rest
+		prefix := tokenPrefixes[int(prefixIndex)%len(tokenPrefixes)]
+		form := remoteForms[int(formIndex)%len(remoteForms)]
+		// "jane@example.com:alice:pw@host" is an scp remote whose path holds "alice:pw@host".
+		if form == "" && strings.Contains(prefix, "@") {
+			t.Skip()
+		}
+		remote := form + user + ":" + password + "@" + rest
 		if !HasInlineCredentials(remote) {
 			t.Fatalf("HasInlineCredentials(%q) = false", remote)
 		}
+		lines := []string{
+			prefix + remote,
+			"fatal: unable to access '" + prefix + remote + "': HTTP 401",
+			"clone " + prefix + remote + " failed",
+		}
+		// A comma list splits only before a remote marker, so a prefixed
+		// second remote stays joined to the first.
+		if prefix == "" {
+			lines = append(lines, "remotes=https://example.com/a.git,"+remote)
+		}
 		lowerPassword := strings.ToLower(password)
-		for _, line := range []string{
-			remote,
-			"fatal: unable to access '" + remote + "': HTTP 401",
-			"clone " + remote + " failed",
-			"remotes=https://example.com/a.git," + remote,
-		} {
+		for _, line := range lines {
 			if strings.Count(strings.ToLower(line), lowerPassword) != 1 || strings.Contains(lowerPassword, "redacted") {
 				continue
 			}

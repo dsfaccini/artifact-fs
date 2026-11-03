@@ -116,11 +116,6 @@ func HasInlineCredentials(raw string) bool {
 
 func malformedAuthorityStart(raw string) int {
 	lower := strings.ToLower(strings.TrimSpace(raw))
-	// Userinfo follows a "://" unless every "@" precedes it, as in "user:pass@host://".
-	separator := strings.Index(lower, "://")
-	if separator >= 0 && strings.Contains(lower[separator:], "@") {
-		return separator + len("://")
-	}
 	if schemeLessUserinfoStart(raw) >= 0 {
 		return 0
 	}
@@ -129,8 +124,8 @@ func malformedAuthorityStart(raw string) int {
 			return len(prefix)
 		}
 	}
-	if separator >= 0 {
-		return separator + len("://")
+	if i := strings.Index(lower, "://"); i >= 0 {
+		return i + len("://")
 	}
 	return -1
 }
@@ -378,6 +373,11 @@ func RedactLogString(s string, sensitiveValues ...string) string {
 			}
 			core := token[start : end+1]
 			remoteStart := remoteStartIndex(core)
+			// Text with an "@" before the marker is redacted userinfo or an scp
+			// remote, as in "REDACTED@host/x,https://...", so it goes too.
+			if strings.Contains(core[:remoteStart], "@") {
+				remoteStart = 0
+			}
 			parts[i] = token[:start] + core[:remoteStart] + "REDACTED_REMOTE" + token[end+1:]
 		}
 		s = strings.Join(parts, " ")
@@ -531,7 +531,12 @@ func containsRemoteMarker(s string) bool {
 
 func redactSingleRemoteCore(core string) string {
 	remoteStart := remoteStartIndex(core)
-	return core[:remoteStart] + RedactRemoteURL(core[remoteStart:])
+	prefix := core[:remoteStart]
+	// Userinfo can precede a marker inside the host, as in "user:pass@corpgit:repo".
+	if at := strings.LastIndex(prefix, "@"); at >= 0 && strings.Contains(prefix[:at], ":") {
+		prefix = "REDACTED" + prefix[at:]
+	}
+	return prefix + RedactRemoteURL(core[remoteStart:])
 }
 
 func remoteStartIndex(s string) int {
@@ -541,12 +546,10 @@ func remoteStartIndex(s string) int {
 			best = i
 		}
 	}
-	// A marker after the first "@", as in "user:pass@git:repo", sits inside the remote.
-	at := strings.Index(s, "@")
-	if best >= 0 && (at < 0 || best < at) {
+	if best >= 0 {
 		return best
 	}
-	if at >= 0 && strings.ContainsAny(s[at:], "?#") {
+	if at := strings.Index(s, "@"); at >= 0 && strings.ContainsAny(s[at:], "?#") {
 		if eq := strings.LastIndex(s[:at], "="); eq >= 0 {
 			return eq + 1
 		}
