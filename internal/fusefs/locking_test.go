@@ -640,11 +640,7 @@ func TestRenameLargeDirectoryUnderFDLimit(t *testing.T) {
 	}
 	restore := limit
 	t.Cleanup(func() { _ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &restore) })
-	open, err := os.ReadDir("/dev/fd")
-	if err != nil {
-		t.Fatal(err)
-	}
-	limit.Cur = uint64(len(open) + 64)
+	limit.Cur = uint64(openFDCount(t) + 64)
 	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
 		t.Fatal(err)
 	}
@@ -660,6 +656,22 @@ func TestRenameLargeDirectoryUnderFDLimit(t *testing.T) {
 	if err != nil || string(got) != "oid-199" {
 		t.Fatalf("moved/f199 = (%q, %v), want oid-199", got, err)
 	}
+}
+
+// openFDCount counts the process's open descriptors. It reads only names:
+// on macOS, ReadDir lstats each entry, including its own closed descriptor.
+func openFDCount(t *testing.T) int {
+	t.Helper()
+	dir, err := os.Open("/dev/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	names, err := dir.Readdirnames(-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(names)
 }
 
 // lockProbeOverlay records each overlay lookup and sync that ran while the
