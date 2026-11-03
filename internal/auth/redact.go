@@ -113,8 +113,8 @@ func HasInlineCredentials(raw string) bool {
 	if u.User == nil && userinfoAfterLaterSeparator(raw, u) {
 		// A username alone, as in "codecommit::us-east-1://profile@Repo", names
 		// an ambient profile unless the address is http(s).
-		separator := strings.Index(raw, "://")
-		lower := strings.ToLower(raw[:separator])
+		before, _, _ := strings.Cut(raw, "://")
+		lower := strings.ToLower(before)
 		return RawUserinfoHasPassword(raw) || strings.HasSuffix(lower, "http") || strings.HasSuffix(lower, "https")
 	}
 	if u.User == nil {
@@ -619,7 +619,7 @@ func redactTailBySegment(whole string, core string, sep int) string {
 // shownWithin reports whether each run of redacted text between "REDACTED"
 // markers occurs in original, in order.
 func shownWithin(redacted string, original string) bool {
-	for _, run := range strings.Split(redacted, "REDACTED") {
+	for run := range strings.SplitSeq(redacted, "REDACTED") {
 		i := strings.Index(original, run)
 		if i < 0 {
 			return false
