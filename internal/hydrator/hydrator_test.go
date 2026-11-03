@@ -505,6 +505,35 @@ func TestQueuedHydrationCapsFetchBatch(t *testing.T) {
 	}
 }
 
+func TestQueuedHydrationFetchesOnlyUnknownSizes(t *testing.T) {
+	t.Parallel()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	fetcher := &fakeBlobFetcher{payload: []byte("content")}
+	h := New(fetcher)
+	var tasks []model.HydrationTask
+	for _, oid := range []string{"local-1", "local-2", "local-3"} {
+		tasks = append(tasks, model.HydrationTask{RepoID: cfg.ID, Path: oid, ObjectOID: oid, SizeState: "known", SizeBytes: 7, Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()})
+	}
+	for _, oid := range []string{"missing-1", "missing-2"} {
+		tasks = append(tasks, model.HydrationTask{RepoID: cfg.ID, Path: oid, ObjectOID: oid, SizeState: "unknown", Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()})
+	}
+	h.EnqueueBatch(tasks)
+	h.Start(1, cfg)
+	defer h.Stop()
+	waitForHydratorIdle(t, h, cfg.ID)
+
+	got := fetcher.Batches()
+	for _, batch := range got {
+		slices.Sort(batch)
+	}
+	if want := [][]string{{"missing-1", "missing-2"}}; !slices.EqualFunc(got, want, slices.Equal) {
+		t.Fatalf("fetch batches = %v, want %v", got, want)
+	}
+	if got := fetcher.Calls(); got != len(tasks) {
+		t.Fatalf("copies = %d, want %d", got, len(tasks))
+	}
+}
+
 func TestExplicitReadCopiesBeforeFetchedPrefetch(t *testing.T) {
 	t.Parallel()
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}

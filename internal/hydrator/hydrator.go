@@ -587,12 +587,16 @@ func (s *Service) fetchBatch(repo model.RepoConfig, batch []model.HydrationTask)
 	if len(uncached) == 0 {
 		return
 	}
-	// A single blob's own lazy fetch costs the same as a batch fetch.
-	if len(uncached) > 1 {
-		oids := make([]string, len(uncached))
-		for i, task := range uncached {
-			oids[i] = task.ObjectOID
+	// A known size means batchResolveSizes or an earlier hydration found the
+	// blob in the object store, so only blobs of unknown size can need a fetch.
+	var oids []string
+	for _, task := range uncached {
+		if task.SizeState != "known" {
+			oids = append(oids, task.ObjectOID)
 		}
+	}
+	// A single blob's own lazy fetch costs the same as a batch fetch.
+	if len(oids) > 1 {
 		ctx, cancel := s.fetchContext()
 		// A failed batch leaves each blob to its own lazy fetch, so an object
 		// the remote refuses fails only its own task.
