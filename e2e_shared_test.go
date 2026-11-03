@@ -28,11 +28,11 @@ const kernelCacheExpiry = 1500 * time.Millisecond
 // seeded state on one mount, because each mount counts toward the series after
 // which macFUSE's FSKit extension can stop loading (see e2eMountsStarted). A
 // test whose subject is mounting, restarting, or the state of a fresh mount
-// keeps its own mount.
+// keeps its own mount. On FSKit only the runReadOnly tests run.
 func TestE2ESharedMount(t *testing.T) {
 	shared := newSharedE2ERepo(t)
-	shared.run(t, "GitCleanState", testE2EGitCleanState)
-	shared.run(t, "GitConcurrentReads", testE2EGitConcurrentReads)
+	shared.runReadOnly(t, "GitCleanState", testE2EGitCleanState)
+	shared.runReadOnly(t, "GitConcurrentReads", testE2EGitConcurrentReads)
 	shared.run(t, "HEADReconcileRetriesAfterSnapshotLock", testE2EHEADReconcileRetriesAfterSnapshotLock)
 	shared.run(t, "GitStatusDetectsSameSizeRewriteAfterMtimeRestore", testE2EGitStatusDetectsSameSizeRewriteAfterMtimeRestore)
 	shared.run(t, "GitStatusPorcelain", testE2EGitStatusPorcelain)
@@ -134,28 +134,54 @@ func newSharedE2ERepo(t *testing.T) *sharedE2ERepo {
 }
 
 // run runs test as a subtest on the shared mount, then restores the mount.
+// Undoing the changes of test moves HEAD, so run skips test on FSKit.
 func (s *sharedE2ERepo) run(t *testing.T, name string, test func(*testing.T, *mountedE2ERepo)) {
+	t.Helper()
+	s.runSubtest(t, name, test, true)
+}
+
+// runReadOnly runs a test that leaves the mount in the state it came up in.
+// Restoring after that test moves no HEAD, so runReadOnly also runs it on FSKit.
+func (s *sharedE2ERepo) runReadOnly(t *testing.T, name string, test func(*testing.T, *mountedE2ERepo)) {
+	t.Helper()
+	s.runSubtest(t, name, test, false)
+}
+
+func (s *sharedE2ERepo) runSubtest(t *testing.T, name string, test func(*testing.T, *mountedE2ERepo), needsRestore bool) {
 	t.Helper()
 	t.Run(name, func(t *testing.T) {
 		skipIfMountWedged(t)
 		if s.broken != "" {
 			t.Skipf("skipping: the shared mount could not be restored after %s", s.broken)
 		}
-		t.Cleanup(func() { s.release(t) })
+		if needsRestore {
+			skipIfFSKitHEADMove(t, "restoring the shared mount after this test")
+		}
+		t.Cleanup(func() { s.release(t, needsRestore) })
 		test(t, s.repo)
 	})
 }
 
 // release restores the shared mount after t. A restore that fails fails t,
 // whose changes it could not undo, and skips the tests after it. A restore
-// that stalls marks the mount wedged.
-func (s *sharedE2ERepo) release(t *testing.T) {
+// that stalls marks the mount wedged. When t needs no restore, release first
+// fails t if it changed the mount, because on FSKit restoring that change
+// would move HEAD.
+func (s *sharedE2ERepo) release(t *testing.T, needsRestore bool) {
 	t.Helper()
 	if wedgedMount.Load() != nil {
 		return
 	}
 	restored := make(chan error, 1)
-	go func() { restored <- s.restore() }()
+	go func() {
+		if !needsRestore {
+			if err := s.verifyUnchanged(); err != nil {
+				restored <- fmt.Errorf("the test is registered with runReadOnly but changed the mount: %w", err)
+				return
+			}
+		}
+		restored <- s.restore()
+	}()
 	select {
 	case err := <-restored:
 		if err != nil {
@@ -279,6 +305,20 @@ func (s *sharedE2ERepo) discardOverlay() error {
 		}
 	}
 	return nil
+}
+
+// verifyUnchanged reports how a test changed the mount, including a HEAD move
+// that the test undid: the daemon publishes a snapshot generation for each HEAD
+// it moves to.
+func (s *sharedE2ERepo) verifyUnchanged() error {
+	st, err := s.repo.svc.Status(context.Background(), repoName)
+	if err != nil {
+		return err
+	}
+	if st.SnapshotGeneration != s.generation {
+		return fmt.Errorf("daemon snapshot generation = %d, want %d", st.SnapshotGeneration, s.generation)
+	}
+	return s.verify()
 }
 
 // verify reports how the mount differs from the state it came up in.

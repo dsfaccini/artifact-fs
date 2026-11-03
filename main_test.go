@@ -12,7 +12,8 @@ import (
 
 // e2eMountsStarted counts the FUSE mounts e2e tests start. macFUSE's FSKit
 // extension can stop being found or enabled after a series of mounts in one
-// session (https://github.com/macfuse/macfuse/issues/1232), so TestMain reports it.
+// session (https://github.com/macfuse/macfuse/issues/1232), so TestMain reports
+// it and skipIfOverMountBudget caps it on FSKit.
 var e2eMountsStarted atomic.Int64
 
 func TestMain(m *testing.M) {

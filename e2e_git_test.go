@@ -64,6 +64,7 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 		t.Skip("skipping e2e tests (set AFS_RUN_E2E_TESTS=1 to run)")
 	}
 	skipIfNoFUSE(t)
+	skipIfOverMountBudget(t, 1)
 
 	remoteURL := os.Getenv("AFS_E2E_REPO")
 	if remoteURL == "" {
@@ -178,6 +179,7 @@ func (r *mountedE2ERepo) stop(t *testing.T) {
 
 func (r *mountedE2ERepo) restart(t *testing.T) {
 	t.Helper()
+	skipIfOverMountBudget(t, 1)
 	r.stop(t)
 
 	ctx, cancel := context.WithCancel(context.Background())

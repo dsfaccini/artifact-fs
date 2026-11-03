@@ -21,6 +21,7 @@ func TestE2EAsyncPreparedGitDirBlocksUntilReady(t *testing.T) {
 		t.Skip("skipping e2e tests (set AFS_RUN_E2E_TESTS=1 to run)")
 	}
 	skipIfNoFUSE(t)
+	skipIfOverMountBudget(t, 1)
 
 	remoteURL := os.Getenv("AFS_E2E_REPO")
 	if remoteURL == "" {
@@ -84,6 +85,7 @@ func TestE2EAsyncPreparedGitDirFailureThenRetry(t *testing.T) {
 		t.Skip("skipping e2e tests (set AFS_RUN_E2E_TESTS=1 to run)")
 	}
 	skipIfNoFUSE(t)
+	skipIfOverMountBudget(t, 1)
 
 	remoteURL := os.Getenv("AFS_E2E_REPO")
 	if remoteURL == "" {

@@ -361,12 +361,12 @@ func (fs *ArtifactFuse) moveOpenHandles(oldPath, newPath string) {
 
 // read serves the overlay when it holds the path, and otherwise the base content
 // of generation gen, or of the current generation when gen is 0.
-func (fh *FileHandle) read(ctx context.Context, engine *Engine, gen int64, off int64, size int) ([]byte, error) {
+func (fh *FileHandle) read(ctx context.Context, engine *Engine, gen int64, off int64, dst []byte) ([]byte, error) {
 	fh.mu.Lock()
 	path := fh.path
 	if fh.detached && fh.cacheFile != nil {
 		defer fh.mu.Unlock()
-		return readFileChunkFrom(fh.cacheFile, off, size)
+		return readFileChunkFrom(fh.cacheFile, off, dst)
 	}
 	fh.mu.Unlock()
 	if gen == 0 {
@@ -375,7 +375,7 @@ func (fh *FileHandle) read(ctx context.Context, engine *Engine, gen int64, off i
 	fh.mu.Lock()
 	if fh.cacheFile != nil && (fh.cacheGeneration == -1 || fh.cacheGeneration == gen) {
 		defer fh.mu.Unlock()
-		return readFileChunkFrom(fh.cacheFile, off, size)
+		return readFileChunkFrom(fh.cacheFile, off, dst)
 	}
 	if fh.cacheFile != nil {
 		f := fh.cacheFile
@@ -394,13 +394,13 @@ func (fh *FileHandle) read(ctx context.Context, engine *Engine, gen int64, off i
 		return nil, err
 	}
 	if !ok {
-		return engine.Read(ctx, path, off, size)
+		return engine.Read(ctx, path, off, dst)
 	}
 	fh.mu.Lock()
 	if fh.invalidateSeq != seq {
 		fh.mu.Unlock()
 		_ = f.Close()
-		return engine.Read(ctx, path, off, size)
+		return engine.Read(ctx, path, off, dst)
 	}
 	if fh.cacheFile != nil && fh.cacheGeneration == gen {
 		_ = f.Close()
@@ -413,7 +413,7 @@ func (fh *FileHandle) read(ctx context.Context, engine *Engine, gen int64, off i
 		fh.cacheGeneration = gen
 	}
 	defer fh.mu.Unlock()
-	return readFileChunkFrom(f, off, size)
+	return readFileChunkFrom(f, off, dst)
 }
 
 func (fh *FileHandle) closeCachedFile() {
@@ -865,14 +865,21 @@ func (fs *ArtifactFuse) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) er
 		return nil
 	}
 
-	data, err := fh.read(ctx, fs.engine, fs.inodeGeneration(op.Inode), op.Offset, int(op.Size))
+	// The library leaves Dst nil for reads larger than its request buffer.
+	dst := op.Dst
+	if dst == nil {
+		dst = make([]byte, op.Size)
+	}
+	data, err := fh.read(ctx, fs.engine, fs.inodeGeneration(op.Inode), op.Offset, dst)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return syscall.ENOENT
 		}
 		return syscall.EIO
 	}
-	op.Data = [][]byte{data}
+	if op.Dst == nil {
+		op.Data = [][]byte{data}
+	}
 	op.BytesRead = len(data)
 	return nil
 }
@@ -1268,10 +1275,11 @@ func MountBackend() (string, error) {
 
 // mountWithBackend mounts through the transports backend allows and returns the
 // backend that mounted. mount(true) mounts through FSKit, mount(false) through the
-// kernel transport. BackendAuto falls back to the kernel transport only when FSKit
-// cannot serve any mount here and kextLoaded reports a loaded macFUSE kernel
-// extension, because mounting through an unloaded one prompts macOS to load it.
-func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileSystem, error), kextLoaded func() bool) (*fuse.MountedFileSystem, string, error) {
+// kernel transport. BackendAuto falls back to the kernel transport only when
+// fskitUnavailable reports that FSKit cannot serve any mount here and kextLoaded
+// reports a loaded macFUSE kernel extension, because mounting through an unloaded
+// one prompts macOS to load it.
+func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileSystem, error), fskitUnavailable func(error) bool, kextLoaded func() bool) (*fuse.MountedFileSystem, string, error) {
 	switch backend {
 	case BackendKernel:
 		mfs, err := mount(false)
@@ -1294,27 +1302,6 @@ func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileS
 	return mfs, BackendKernel, nil
 }
 
-// fskitUnavailable reports whether err means FSKit cannot serve any mount on this
-// machine. Other FSKit failures may leave a mount behind, so retrying through the
-// kernel transport could mount twice.
-func fskitUnavailable(err error) bool {
-	if errors.Is(err, fuse.ErrFSKitUnavailable) {
-		return true
-	}
-	var mountErr fuse.FSKitMountError
-	if !errors.As(err, &mountErr) {
-		return false
-	}
-	switch mountErr.Result {
-	case fuse.FSKitMountResultUnsupportedOSVersion,
-		fuse.FSKitMountResultHelperToolsInstallationFailed,
-		fuse.FSKitMountResultFileSystemExtensionNotFound,
-		fuse.FSKitMountResultFileSystemExtensionRequiresApproval:
-		return true
-	}
-	return false
-}
-
 func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine, gate *ReadyGate) (MountedFS, error) {
 	backend, err := MountBackend()
 	if err != nil {
@@ -1327,7 +1314,6 @@ func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine
 		FSName:                  "artifact-fs:" + repo.Name,
 		Subtype:                 "artifact-fs",
 		DisableWritebackCaching: true,
-		UseVectoredRead:         true,
 	}
 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.
 	platformMountConfig(&mountCfg)
