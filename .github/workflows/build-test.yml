@@ -40,12 +40,13 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # setup-go restores Go's test cache, so -count=1 makes each run execute the tests.
       - name: Test
-        run: go test -race ./...
+        run: go test -race -count=1 ./...
 
       # The fuse replacement defines its FSKit error types on every OS, so Linux runs their classification tests.
       - name: Test with the fskit tag
-        run: go test -race -tags fskit ./internal/fusefs
+        run: go test -race -count=1 -tags fskit ./internal/fusefs
 
       - name: Pre-commit hook on Linux
         run: |
