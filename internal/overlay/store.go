@@ -993,17 +993,17 @@ func (s *Store) ListAll(ctx context.Context) ([]model.OverlayEntry, error) {
 	return s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries ORDER BY path`)
 }
 
-// ListByPrefix returns overlay entries that are direct children of the given
-// directory path. Uses path + "/" prefix to avoid matching sibling directories.
+// listByPrefixQuery selects paths in [prefix/, prefix0): '0' follows '/', so
+// the range holds exactly the paths below prefix and searches the primary key.
+const listByPrefixQuery = `SELECT ` + overlayCols + ` FROM overlay_entries WHERE path >= ? AND path < ? ORDER BY path`
+
+// ListByPrefix returns every overlay entry below the given directory path.
 func (s *Store) ListByPrefix(ctx context.Context, prefix string) ([]model.OverlayEntry, error) {
 	prefix = model.CleanPath(prefix)
-	var pattern string
 	if prefix == "." {
-		pattern = "%"
-	} else {
-		pattern = prefix + "/%"
+		return s.ListAll(ctx)
 	}
-	return s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries WHERE path LIKE ? ORDER BY path`, pattern)
+	return s.queryEntries(ctx, listByPrefixQuery, prefix+"/", prefix+"0")
 }
 
 // queryEntries runs an arbitrary overlay query and scans the results.

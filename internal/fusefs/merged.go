@@ -195,6 +195,10 @@ func (r *Resolver) readdirTypedAt(ctx context.Context, path string, generation i
 	if err != nil {
 		return nil, err
 	}
+	// ListByPrefix returns every descendant, so a child's own entry, when it has
+	// one, is in the listing.
+	own := map[string]model.OverlayEntry{}
+	implicitDirs := map[string]bool{}
 	for _, e := range ovEntries {
 		if e.Path == path {
 			continue
@@ -203,20 +207,21 @@ func (r *Resolver) readdirTypedAt(ctx context.Context, path string, generation i
 		if !ok {
 			continue
 		}
-		childPath := model.CleanPath(filepath.Join(path, name))
-		if e.IsDeleted() && e.Path == childPath {
+		if e.Path == model.CleanPath(filepath.Join(path, name)) {
+			own[name] = e
+		} else {
+			implicitDirs[name] = true
+		}
+	}
+	for name, ov := range own {
+		if ov.IsDeleted() {
 			delete(set, name)
 			continue
 		}
-		ov, ok, err := r.Overlay.Lookup(ctx, childPath)
-		if err != nil {
-			return nil, err
-		}
-		if ok && ov.IsDeleted() {
-			continue
-		}
-		if ok {
-			set[name] = entry{name: name, typ: ov.NodeType(), overlay: ov, fromOverlay: true}
+		set[name] = entry{name: name, typ: ov.NodeType(), overlay: ov, fromOverlay: true}
+	}
+	for name := range implicitDirs {
+		if _, ok := own[name]; ok {
 			continue
 		}
 		if _, ok := set[name]; !ok {
