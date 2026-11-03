@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -1544,7 +1545,7 @@ func changesSince(t *testing.T, cfg model.RepoConfig, since int64) Changes {
 	return changes
 }
 
-func TestRenameTreeLogsEachEndpointDirectoryOnce(t *testing.T) {
+func TestRenameTreeLogsBothRootsAndOnePathPerDirectory(t *testing.T) {
 	s, cfg := testStore(t)
 	ctx := context.Background()
 	for _, dir := range []string{"src", "src/sub"} {
@@ -1552,7 +1553,7 @@ func TestRenameTreeLogsEachEndpointDirectoryOnce(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, path := range []string{"src/a.txt", "src/sub/b.txt"} {
+	for _, path := range []string{"src/a.txt", "src/b.txt", "src/sub/c.txt", "src/sub/d.txt"} {
 		if _, err := s.CreateFile(ctx, path, 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -1561,18 +1562,9 @@ func TestRenameTreeLogsEachEndpointDirectoryOnce(t *testing.T) {
 	if err := s.Rename(ctx, "src", "dst", false); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT path FROM overlay_changes WHERE seq > ? ORDER BY path`, before)
-	if err != nil {
-		t.Fatal(err)
-	}
-	logged, err := scanPaths(rows)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := []string{"dst/", "src/"}; !slices.Equal(logged, want) {
-		t.Fatalf("change log rows for the tree rename = %q, want %q", logged, want)
-	}
-	want := []string{"dst/", "dst/a.txt", "dst/sub", "dst/sub/b.txt", "src/"}
+	// Each path names a listing Git must reread: src/a.txt drops the cached
+	// listing of src, as a row for every moved entry would.
+	want := []string{"dst", "dst/a.txt", "dst/sub/c.txt", "src", "src/a.txt", "src/sub/c.txt"}
 	if got := changesSince(t, cfg, before).Paths; !slices.Equal(got, want) {
 		t.Fatalf("changed paths = %q, want %q", got, want)
 	}
@@ -1652,5 +1644,42 @@ func TestReadChangesSinceDistrustsALogMissingATrigger(t *testing.T) {
 	}
 	if _, ok, err := ReadChangesSince(context.Background(), cfg, 0); err != nil || ok {
 		t.Fatalf("ReadChangesSince without the delete trigger = %v, %v; want false, nil", ok, err)
+	}
+}
+
+// Another connection holds the write lock briefly, as each overlay write does.
+// New must wait it out within busy_timeout instead of failing.
+func TestNewWaitsOutAnotherConnectionsWriteLock(t *testing.T) {
+	ctx := context.Background()
+	s, cfg := testStore(t)
+	s.Close()
+	holder, err := meta.OpenDB(cfg.OverlayDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	conn, err := holder.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	// The hold is far below busy_timeout, so it cannot make a waiting New
+	// fail. A New that does not wait fails before the commit, unless the
+	// machine delays it past the hold; then the test passes without proof.
+	committed := make(chan error, 1)
+	time.AfterFunc(200*time.Millisecond, func() {
+		_, err := conn.ExecContext(ctx, `COMMIT`)
+		committed <- err
+	})
+	reopened, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatalf("New while another connection held the write lock: %v", err)
+	}
+	reopened.Close()
+	if err := <-committed; err != nil {
+		t.Fatal(err)
 	}
 }

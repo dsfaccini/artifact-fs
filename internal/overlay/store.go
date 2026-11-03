@@ -3,6 +3,7 @@ package overlay
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -35,7 +36,6 @@ var migrations = slices.Concat([]string{
 	// overlay_changes keeps one row per path ever changed, renumbered on each
 	// change. AUTOINCREMENT never reuses a sequence number, so the FSMonitor
 	// hook can answer "changed since sequence N" without scanning the overlay.
-	// A path ending in "/" stands for every entry below it.
 	`CREATE TABLE IF NOT EXISTS overlay_changes (
 	  seq INTEGER PRIMARY KEY AUTOINCREMENT,
 	  path TEXT NOT NULL UNIQUE
@@ -78,7 +78,7 @@ func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := meta.ExecMigrations(ctx, db, migrations); err != nil {
+	if err := migrate(ctx, db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -92,6 +92,36 @@ func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
 		return nil, err
 	}
 	return &Store{db: db, repo: cfg, upperDir: upperDir}, nil
+}
+
+// migrate runs the migrations in a transaction that takes the write lock
+// before it reads. A deferred transaction that reads first and then writes,
+// as INSERT INTO overlay_instance does, fails at once with SQLITE_BUSY while
+// another connection writes, instead of waiting out busy_timeout. New closes
+// the pool on an error, so a connection left inside the transaction is never
+// reused.
+func migrate(ctx context.Context, db *sql.DB) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return err
+	}
+	rollback := func(err error) error {
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
+		return err
+	}
+	for _, stmt := range migrations {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			return rollback(err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return rollback(err)
+	}
+	return nil
 }
 
 func ensureOverlaySchema(ctx context.Context, db *sql.DB) error {
@@ -648,7 +678,7 @@ func (s *Store) renameTreeLocked(ctx context.Context, oldPath, newPath string, s
 			return err
 		}
 	}
-	if err := resumeChangeLog(ctx, tx, oldPath+"/", newPath+"/"); err != nil {
+	if err := resumeChangeLog(ctx, tx, treeRenameChanges(oldPath, newPath, sourceEntries, destinationEntries, moved, tracked, replacedBasePaths)...); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -661,6 +691,36 @@ func (s *Store) renameTreeLocked(ctx context.Context, oldPath, newPath string, s
 		}
 	}
 	return nil
+}
+
+// treeRenameChanges returns the paths that tell Git what a tree rename
+// changed. Git reads a changed path as a change to the listing of its
+// directory, and a path with no index entry of its own, such as a directory,
+// as a change to every index entry below it. Both roots and one removed or
+// written path per directory therefore stand for every entry.
+func treeRenameChanges(oldPath, newPath string, removed, destination, moved []model.OverlayEntry, whiteouts, replaced map[string]bool) []string {
+	perDir := map[string]string{}
+	add := func(path string) {
+		dir := path[:max(strings.LastIndexByte(path, '/'), 0)]
+		if logged, ok := perDir[dir]; !ok || path < logged {
+			perDir[dir] = path
+		}
+	}
+	for _, entries := range [][]model.OverlayEntry{removed, destination, moved} {
+		for _, e := range entries {
+			add(e.Path)
+		}
+	}
+	for _, paths := range []map[string]bool{whiteouts, replaced} {
+		for path := range paths {
+			add(path)
+		}
+	}
+	changes := []string{oldPath, newPath}
+	for _, path := range perDir {
+		changes = append(changes, path)
+	}
+	return changes
 }
 
 func (s *Store) listTreeEntries(ctx context.Context, path string) ([]model.OverlayEntry, error) {
@@ -1063,15 +1123,16 @@ func resumeChangeLog(ctx context.Context, tx *sql.Tx, paths ...string) error {
 			return err
 		}
 	}
-	for _, path := range paths {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_changes WHERE path = ?`, path); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_changes(path) VALUES (?)`, path); err != nil {
-			return err
-		}
+	if len(paths) == 0 {
+		return nil
 	}
-	return nil
+	list, err := json.Marshal(paths)
+	if err != nil {
+		return err
+	}
+	// REPLACE moves a path that is already logged to a new sequence number.
+	_, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO overlay_changes(path) SELECT value FROM json_each(?)`, string(list))
+	return err
 }
 
 // changesSinceQuery sorts with a unary + so SQLite searches the seq range and
@@ -1084,8 +1145,7 @@ type Changes struct {
 	Instance string
 	// Seq is the latest change sequence.
 	Seq int64
-	// Paths changed after the sequence the caller asked about, sorted. Each
-	// changed directory, which ends in "/", comes with every entry below it.
+	// Paths changed after the sequence the caller asked about, sorted.
 	Paths []string
 }
 
@@ -1129,29 +1189,6 @@ func ReadChangesSince(ctx context.Context, cfg model.RepoConfig, since int64) (c
 	}
 	if changes.Paths, err = scanPaths(rows); err != nil {
 		return Changes{}, false, err
-	}
-	// Git clears the valid bit of every index entry below "dir/", but its
-	// untracked cache drops only the listing of dir's parent. Each entry below
-	// dir drops the listing of the directory that holds it.
-	var below []string
-	for _, path := range changes.Paths {
-		if !strings.HasSuffix(path, "/") {
-			continue
-		}
-		rows, err := tx.QueryContext(ctx, `SELECT path FROM overlay_entries WHERE path >= ? AND path < ?`, path, strings.TrimSuffix(path, "/")+"0")
-		if err != nil {
-			return Changes{}, false, err
-		}
-		entries, err := scanPaths(rows)
-		if err != nil {
-			return Changes{}, false, err
-		}
-		below = append(below, entries...)
-	}
-	if len(below) != 0 {
-		changes.Paths = append(changes.Paths, below...)
-		slices.Sort(changes.Paths)
-		changes.Paths = slices.Compact(changes.Paths)
 	}
 	return changes, true, nil
 }

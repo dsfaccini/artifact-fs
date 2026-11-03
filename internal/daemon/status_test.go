@@ -623,59 +623,95 @@ func TestFSMonitorHookLeavesOverlaySchemaToTheDaemon(t *testing.T) {
 	}
 }
 
-func TestFSMonitorHookShowsDirectoryRenamedOntoCachedDirectory(t *testing.T) {
-	ctx := t.Context()
-	svc, cfg := newHookService(t, "/")
-	ov, err := overlay.New(ctx, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ov.Close()
-	repo := filepath.Join(t.TempDir(), "repo")
-	runCmd(t, "git", "init", "--initial-branch=main", repo)
-	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	runCmd(t, "git", "-C", repo, "add", "tracked.txt")
-	runCmd(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
-	runCmd(t, "git", "-C", repo, "config", "core.untrackedCache", "true")
-	// The repository mirrors the mount: an empty dst and an untracked src/a.txt.
-	for _, dir := range []string{"dst", "src"} {
-		if err := ov.Mkdir(ctx, dir, 0o755); err != nil {
+// Git trusts its cached directory listings after a delta answer, so the hook
+// must name a path inside every directory whose listing a rename changes.
+func TestFSMonitorHookKeepsGitUntrackedCacheAcrossDirectoryRenames(t *testing.T) {
+	// rename mirrors an overlay rename in the repository.
+	rename := func(t *testing.T, ov *overlay.Store, repo, from, to string) {
+		t.Helper()
+		if err := ov.Rename(t.Context(), from, to, false); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Mkdir(filepath.Join(repo, dir), 0o755); err != nil {
+		if err := os.Rename(filepath.Join(repo, from), filepath.Join(repo, to)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := ov.CreateFile(ctx, "src/a.txt", 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repo, "src", "a.txt"), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	answer, token, _ := hookAnswer(t, svc, "other-hook:1")
-	if _, status := gitStatusWithAnswer(t, repo, answer); status != "?? src/\n" {
-		t.Fatalf("status after a rescan = %q", status)
-	}
-	// After a delta answer Git trusts its cached directory listings.
-	answer, next, _ := hookAnswer(t, svc, token)
-	if queried, status := gitStatusWithAnswer(t, repo, answer); queried != token || status != "?? src/\n" {
-		t.Fatalf("status after an empty delta = %q from token %q, want ?? src/ from %q", status, queried, token)
-	}
+	for _, tc := range []struct {
+		name string
+		// emptyDir exists next to src, which holds a.txt.
+		emptyDir string
+		change   func(t *testing.T, ov *overlay.Store, repo string)
+		want     string
+	}{
+		{name: "rename onto a cached empty directory", emptyDir: "dst", change: func(t *testing.T, ov *overlay.Store, repo string) {
+			if err := os.Remove(filepath.Join(repo, "dst")); err != nil {
+				t.Fatal(err)
+			}
+			rename(t, ov, repo, "src", "dst")
+		}, want: "?? dst/\n"},
+		{name: "directory recreated at the source", change: func(t *testing.T, ov *overlay.Store, repo string) {
+			rename(t, ov, repo, "src", "tmp")
+			if err := ov.Mkdir(t.Context(), "src", 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(filepath.Join(repo, "src"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}, want: "?? tmp/\n"},
+		{name: "empty directory renamed onto the source", emptyDir: "e", change: func(t *testing.T, ov *overlay.Store, repo string) {
+			rename(t, ov, repo, "src", "tmp")
+			rename(t, ov, repo, "e", "src")
+		}, want: "?? tmp/\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			svc, cfg := newHookService(t, "/")
+			ov, err := overlay.New(ctx, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ov.Close()
+			repo := filepath.Join(t.TempDir(), "repo")
+			runCmd(t, "git", "init", "--initial-branch=main", repo)
+			if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runCmd(t, "git", "-C", repo, "add", "tracked.txt")
+			runCmd(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
+			runCmd(t, "git", "-C", repo, "config", "core.untrackedCache", "true")
+			// The repository mirrors the mount.
+			for _, dir := range []string{tc.emptyDir, "src"} {
+				if dir == "" {
+					continue
+				}
+				if err := ov.Mkdir(ctx, dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(filepath.Join(repo, dir), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := ov.CreateFile(ctx, "src/a.txt", 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repo, "src", "a.txt"), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			answer, token, _ := hookAnswer(t, svc, "other-hook:1")
+			if _, status := gitStatusWithAnswer(t, repo, answer); status != "?? src/\n" {
+				t.Fatalf("status after a rescan = %q", status)
+			}
+			answer, next, _ := hookAnswer(t, svc, token)
+			if queried, status := gitStatusWithAnswer(t, repo, answer); queried != token || status != "?? src/\n" {
+				t.Fatalf("status after an empty delta = %q from token %q, want ?? src/ from %q", status, queried, token)
+			}
 
-	if err := ov.Rename(ctx, "src", "dst", false); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(filepath.Join(repo, "dst")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(filepath.Join(repo, "src"), filepath.Join(repo, "dst")); err != nil {
-		t.Fatal(err)
-	}
-	answer, _, paths := hookAnswer(t, svc, next)
-	if queried, status := gitStatusWithAnswer(t, repo, answer); queried != next || status != "?? dst/\n" {
-		t.Fatalf("status after renaming src onto dst = %q from token %q with paths %q, want ?? dst/ from %q", status, queried, paths, next)
+			tc.change(t, ov, repo)
+			answer, _, paths := hookAnswer(t, svc, next)
+			if queried, status := gitStatusWithAnswer(t, repo, answer); queried != next || status != tc.want {
+				t.Fatalf("status = %q from token %q with paths %q, want %q from %q", status, queried, paths, tc.want, next)
+			}
+		})
 	}
 }
 
