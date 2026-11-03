@@ -1268,10 +1268,11 @@ func MountBackend() (string, error) {
 
 // mountWithBackend mounts through the transports backend allows and returns the
 // backend that mounted. mount(true) mounts through FSKit, mount(false) through the
-// kernel transport. BackendAuto falls back to the kernel transport only when FSKit
-// cannot serve any mount here and kextLoaded reports a loaded macFUSE kernel
-// extension, because mounting through an unloaded one prompts macOS to load it.
-func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileSystem, error), kextLoaded func() bool) (*fuse.MountedFileSystem, string, error) {
+// kernel transport. BackendAuto falls back to the kernel transport only when
+// fskitUnavailable reports that FSKit cannot serve any mount here and kextLoaded
+// reports a loaded macFUSE kernel extension, because mounting through an unloaded
+// one prompts macOS to load it.
+func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileSystem, error), fskitUnavailable func(error) bool, kextLoaded func() bool) (*fuse.MountedFileSystem, string, error) {
 	switch backend {
 	case BackendKernel:
 		mfs, err := mount(false)
@@ -1292,27 +1293,6 @@ func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileS
 		return nil, BackendKernel, fmt.Errorf("%w; kernel transport fallback: %w", fskitErr, err)
 	}
 	return mfs, BackendKernel, nil
-}
-
-// fskitUnavailable reports whether err means FSKit cannot serve any mount on this
-// machine. Other FSKit failures may leave a mount behind, so retrying through the
-// kernel transport could mount twice.
-func fskitUnavailable(err error) bool {
-	if errors.Is(err, fuse.ErrFSKitUnavailable) {
-		return true
-	}
-	var mountErr fuse.FSKitMountError
-	if !errors.As(err, &mountErr) {
-		return false
-	}
-	switch mountErr.Result {
-	case fuse.FSKitMountResultUnsupportedOSVersion,
-		fuse.FSKitMountResultHelperToolsInstallationFailed,
-		fuse.FSKitMountResultFileSystemExtensionNotFound,
-		fuse.FSKitMountResultFileSystemExtensionRequiresApproval:
-		return true
-	}
-	return false
 }
 
 func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine, gate *ReadyGate) (MountedFS, error) {

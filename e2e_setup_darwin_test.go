@@ -32,14 +32,18 @@ func skipIfNoFUSE(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const noFSKit = "FSKit is unavailable; it needs macOS 26 or later and macFUSE 5.3 or later"
+	noFSKit := "FSKit is unavailable; it needs macOS 26 or later and macFUSE 5.3 or later"
+	if !fusefs.FSKitBuilt {
+		noFSKit = "this test binary has no FSKit transport; run go test with -tags fskit"
+	}
+	fskit := fusefs.FSKitBuilt && fskitAvailable()
 	_, kextErr := unix.SysctlRaw("vfs.generic.macfuse.version.number")
 	switch {
 	case backend == fusefs.BackendKernel && kextErr != nil:
 		t.Skip("skipping: ARTIFACT_FS_FUSE_BACKEND=kernel needs the macFUSE kernel extension loaded; mounting would prompt macOS to load it")
-	case backend == fusefs.BackendFSKit && !fskitAvailable():
+	case backend == fusefs.BackendFSKit && !fskit:
 		t.Skip("skipping: " + noFSKit)
-	case backend == fusefs.BackendAuto && !fskitAvailable() && kextErr != nil:
+	case backend == fusefs.BackendAuto && !fskit && kextErr != nil:
 		t.Skip("skipping: " + noFSKit + ", and the macFUSE kernel extension is not loaded")
 	}
 	helper := "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse"

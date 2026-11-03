@@ -37,21 +37,31 @@ Install the CLI from the module:
 go install github.com/cloudflare/artifact-fs/cmd/artifact-fs@latest
 ```
 
+This installs upstream `cloudflare/artifact-fs`, not this fork, so it builds
+without the FSKit backend below. Upstream has no `ARTIFACT_FS_FUSE_BACKEND` and
+mounts on macOS only through the macFUSE kernel extension. This fork cannot be
+installed with `go install …@version`, because such an install refuses a module
+whose `go.mod` has a `replace` directive.
+
 Or build it directly from the module path:
 
 ```bash
-go build -o artifact-fs github.com/cloudflare/artifact-fs/cmd/artifact-fs
+go build -tags fskit -o artifact-fs github.com/cloudflare/artifact-fs/cmd/artifact-fs
 ```
 
 ### Native macOS FSKit backend in this fork
 
 This fork pins a `jacobsa/fuse` replacement that loads macFUSE's FSKit
-framework at run time. Every macOS build can mount through FSKit, with no build
-tags and no cgo:
+framework at run time, with no cgo. Build from a checkout with the `fskit` tag:
 
 ```bash
-GOWORK=off go build -o artifact-fs ./cmd/artifact-fs
+GOWORK=off go build -tags fskit -o artifact-fs ./cmd/artifact-fs
 ```
+
+Only the `fskit` tag compiles the code that needs the replacement, so every
+build without it also compiles against upstream `jacobsa/fuse`. A macOS build
+without the tag mounts only through the macFUSE kernel extension. The tag
+changes nothing on Linux.
 
 FSKit needs macOS 26 or later and macFUSE 5.3 or later. Enable the `macFUSE`
 and `macFUSE (local)` file system extensions under System Settings > General >
@@ -67,6 +77,8 @@ file system extension and needs no kernel extension.
 | `kernel` | The macFUSE kernel extension. macOS prompts to load it when it is not loaded. |
 
 Any other value fails the mount. Linux accepts the same values and ignores them.
+In a macOS build without the `fskit` tag, `fskit` fails the mount and `auto`
+mounts through the kernel extension only when it is already loaded.
 
 A failed FSKit mount logs what to fix, such as enabling the file system
 extensions or upgrading macOS. FSKit counts as unavailable when macFUSE's FSKit
@@ -425,18 +437,18 @@ Unit tests:
 go test ./...
 ```
 
-End-to-end tests mount a git repo via FUSE and exercise filesystem + git operations (including commit and overlay reconciliation). They require a FUSE implementation (macFUSE on macOS, `fuse3` on Linux) and are off by default. On macOS they skip when the selected `ARTIFACT_FS_FUSE_BACKEND` transport cannot mount without prompting to load the macFUSE kernel extension.
+End-to-end tests mount a git repo via FUSE and exercise filesystem + git operations (including commit and overlay reconciliation). They require a FUSE implementation (macFUSE on macOS, `fuse3` on Linux) and are off by default. On macOS they skip when the selected `ARTIFACT_FS_FUSE_BACKEND` transport cannot mount without prompting to load the macFUSE kernel extension. The commands below pass `-tags fskit`, which macOS needs to mount through FSKit and Linux ignores.
 
 By default, e2e tests create a local bare repo -- no network required. Set `AFS_E2E_REPO` to test against a real remote.
 
 ```bash
 # Run e2e tests (uses a local test repo by default)
-AFS_RUN_E2E_TESTS=1 go test -v -run TestE2E -count=1 -timeout 10m .
+AFS_RUN_E2E_TESTS=1 go test -tags fskit -v -run TestE2E -count=1 -timeout 10m .
 
 # Run against a specific remote repo
 AFS_RUN_E2E_TESTS=1 \
   AFS_E2E_REPO=https://github.com/cloudflare/workers-sdk.git \
-  go test -v -run TestE2E -count=1 -timeout 10m .
+  go test -tags fskit -v -run TestE2E -count=1 -timeout 10m .
 ```
 
 ### Environment variables
