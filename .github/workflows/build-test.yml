@@ -65,12 +65,13 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # setup-go restores Go's test cache, so -count=1 makes each run execute the tests.
       - name: Test
-        run: go test -race ./...
+        run: go test -race -count=1 ./...
 
       # Only the fskit tag builds the FSKit platformMount.
       - name: Test with the fskit tag
-        run: go test -race -tags fskit ./internal/fusefs
+        run: go test -race -count=1 -tags fskit ./internal/fusefs
 
   darwin-build:
     runs-on: ubuntu-latest

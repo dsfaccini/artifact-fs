@@ -70,8 +70,8 @@ func TestBuildTreeIndexPropagatesBatchCancellation(t *testing.T) {
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("AFS_CAT_FILE_STARTED", started)
 
-	var logs bytes.Buffer
-	store := New(slog.New(slog.NewTextHandler(&logs, nil)))
+	var warnings bytes.Buffer
+	store := New(slog.New(slog.NewTextHandler(&warnings, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
@@ -94,9 +94,9 @@ func TestBuildTreeIndexPropagatesBatchCancellation(t *testing.T) {
 	if err := <-errCh; !errors.Is(err, context.Canceled) {
 		t.Fatalf("BuildTreeIndex error = %v, want context canceled", err)
 	}
-	// Size resolution failures are non-fatal and logged. A canceled build is not one.
-	if strings.Contains(logs.String(), "batch size resolution failed") {
-		t.Fatalf("cancellation was reported as a size resolution failure:\n%s", logs.String())
+	// Size resolution failures are non-fatal and logged as warnings. A canceled build is not one.
+	if warnings.Len() != 0 {
+		t.Fatalf("cancellation was logged as a warning:\n%s", warnings.String())
 	}
 }
 
