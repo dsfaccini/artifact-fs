@@ -10,8 +10,8 @@ import (
 	"testing"
 	"testing/synctest"
 
-	"github.com/jacobsa/fuse/fuseops"
-	"github.com/jacobsa/fuse/fuseutil"
+	"github.com/dsfaccini/fuse/fuseops"
+	"github.com/dsfaccini/fuse/fuseutil"
 )
 
 type recordingFS struct {

@@ -19,7 +19,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
-	"github.com/jacobsa/fuse/fuseops"
+	"github.com/dsfaccini/fuse/fuseops"
 )
 
 type headReconcileFixture struct {

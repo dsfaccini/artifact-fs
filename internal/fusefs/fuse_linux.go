@@ -1,7 +1,7 @@
 package fusefs
 
 import (
-	"github.com/jacobsa/fuse"
+	"github.com/dsfaccini/fuse"
 )
 
 func platformMountConfig(cfg *fuse.MountConfig) {

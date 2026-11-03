@@ -1,5 +1,3 @@
-//go:build fskit
-
 package fusefs
 
 import (
@@ -7,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/jacobsa/fuse"
+	"github.com/dsfaccini/fuse"
 )
 
 func TestMountWithBackendFallsBackOnlyOnMachineWideFSKitFailures(t *testing.T) {

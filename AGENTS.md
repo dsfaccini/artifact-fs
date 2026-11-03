@@ -49,20 +49,20 @@ Repository-specific guidance for `artifact-fs`.
 - Assert that something has not happened yet inside `synctest.Test`, after `synctest.Wait`. Drive ticker-based code there too. `synctest.Wait` does not treat a goroutine blocked on a `sync.Mutex` or a subprocess as idle, so those tests cannot use it.
 - Never mount in a package test. Only the root-package e2e tests mount.
 - Run a new e2e test as a `TestE2ESharedMount` subtest. Give it its own mount only when its subject is mounting, a daemon restart, or a fresh mount's state. macFUSE's FSKit extension can stop loading after a series of mounts in one session.
-- Register a shared-mount test that leaves the mount unchanged with `runReadOnly`, and every other one with `run`. When e2e tests mount through FSKit (`-tags fskit` on macOS), `run` skips the test, because the restore that undoes its changes moves HEAD. A `runReadOnly` test that changes the mount fails.
+- Register a shared-mount test that leaves the mount unchanged with `runReadOnly`, and every other one with `run`. When e2e tests mount through FSKit on macOS, `run` skips the test, because the restore that undoes its changes moves HEAD. A `runReadOnly` test that changes the mount fails.
 - Call `skipIfFSKitHEADMove` in a test that moves HEAD on its own mount. After a HEAD move, FSKit can pad a short read with bytes that are not file data ([macfuse#1231](https://github.com/macfuse/macfuse/issues/1231)).
 - Before a test's first mount, call `skipIfOverMountBudget` with the number of mounts the test starts. A run that mounts through FSKit starts at most 8 mounts. `newMountedE2ERepo` checks one mount.
 
 ## Validation
 
 - Start with the narrowest relevant test: `go test ./internal/<pkg>` or `go test -run TestName ./internal/<pkg>`.
-- For non-trivial code changes, reproduce CI in order: `go build -o /dev/null ./cmd/artifact-fs`, `go vet ./...` with `GOOS=linux`, with `GOOS=darwin`, and with `GOOS=darwin` plus `-tags fskit`, then `go test -race ./...` and `go test -race -tags fskit ./internal/fusefs`.
-- Build only the CLI with `go build -tags fskit ./cmd/artifact-fs`. The `fskit` tag adds the macOS FSKit transport and changes nothing on Linux.
+- For non-trivial code changes, reproduce CI in order: `go build -o /dev/null ./cmd/artifact-fs`, `go vet ./...` with `GOOS=linux` and with `GOOS=darwin`, then `go test -race ./...`.
+- Build only the CLI with `go build ./cmd/artifact-fs`.
 - Enable the pre-commit checks with `git config core.hooksPath .githooks`.
 - Benchmarks are opt-in: `AFS_RUN_BENCH=1 go test -run TestBenchRepos -v`.
-- FUSE e2e tests are opt-in. Run them with the same command on macOS and Linux: `AFS_RUN_E2E_TESTS=1 go test -tags fskit -run TestE2E -count=1 -timeout 20m -v .`. Keep `-timeout 20m`: the default 10m can expire mid-suite, and a timeout panic skips every unmount cleanup.
+- FUSE e2e tests are opt-in. Run them with the same command on macOS and Linux: `AFS_RUN_E2E_TESTS=1 go test -run TestE2E -count=1 -timeout 20m -v .`. Keep `-timeout 20m`: the default 10m can expire mid-suite, and a timeout panic skips every unmount cleanup.
 - On Linux, e2e tests need `/dev/fuse` plus either root or `fusermount3` from the `fuse3` package. Unmount a leftover mount with `fusermount3 -u <path>`, or `fusermount3 -uz <path>` when it hangs.
-- On macOS, e2e tests mount through FSKit. Without `-tags fskit`, they skip unless the macFUSE kernel extension is loaded. Set `ARTIFACT_FS_FUSE_BACKEND=kernel` only to test the macFUSE kernel extension; without a loaded kernel extension those tests skip. Unmount a leftover FSKit mount with `diskutil unmount <path>`. A deadlocked FSKit mount cannot be unmounted until reboot.
+- On macOS, e2e tests mount through FSKit. Set `ARTIFACT_FS_FUSE_BACKEND=kernel` only to test the macFUSE kernel extension; without a loaded kernel extension those tests skip. Unmount a leftover FSKit mount with `diskutil unmount <path>`. A deadlocked FSKit mount cannot be unmounted until reboot.
 - E2E tests use a local bare repository by default. Set `AFS_E2E_REPO` only when intentionally testing a real remote.
-- E2E benchmark coverage is separate: `AFS_RUN_E2E_BENCH=1 go test -tags fskit -run TestE2EBenchmarkRepos -v .`.
+- E2E benchmark coverage is separate: `AFS_RUN_E2E_BENCH=1 go test -run TestE2EBenchmarkRepos -v .`.
 - Package tests live beside the code. Benchmarks and `e2e*_test.go` live in the root package.
