@@ -430,12 +430,12 @@ By default, e2e tests create a local bare repo -- no network required. Set `AFS_
 
 ```bash
 # Run e2e tests (uses a local test repo by default)
-AFS_RUN_E2E_TESTS=1 go test -v -run TestE2E -count=1 -timeout 10m .
+AFS_RUN_E2E_TESTS=1 go test -v -run TestE2E -count=1 -timeout 20m .
 
 # Run against a specific remote repo
 AFS_RUN_E2E_TESTS=1 \
   AFS_E2E_REPO=https://github.com/cloudflare/workers-sdk.git \
-  go test -v -run TestE2E -count=1 -timeout 10m .
+  go test -v -run TestE2E -count=1 -timeout 20m .
 ```
 
 ### Environment variables
