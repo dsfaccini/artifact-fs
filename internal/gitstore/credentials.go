@@ -35,7 +35,7 @@ func credentialEnv(rawURL string) (safeURL string, env []string, err error) {
 		if remoteHasInlineCredentials(rawURL) {
 			return "", nil, errors.New("malformed remote URL")
 		}
-		if rawUserinfoCandidateHasPassword(rawURL) {
+		if auth.RawUserinfoHasPassword(rawURL) {
 			return "", nil, errors.New("malformed remote URL")
 		}
 		if strings.Contains(rawURL, "://") {
@@ -124,7 +124,7 @@ func remoteHasInlineCredentials(rawURL string) bool {
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return auth.HasInlineCredentials(rawURL) || rawUserinfoCandidateHasPassword(rawURL)
+		return auth.HasInlineCredentials(rawURL) || auth.RawUserinfoHasPassword(rawURL)
 	}
 	if u.User != nil {
 		_, hasPassword := u.User.Password()
@@ -143,44 +143,7 @@ func malformedUserinfoInRemote(rawURL string, u *url.URL) bool {
 	if isHTTPRemote(rawURL, u.Scheme) && strings.Contains(u.Hostname(), ".") {
 		return false
 	}
-	return rawUserinfoCandidateHasPassword(rawURL)
-}
-
-func rawUserinfoCandidateHasPassword(raw string) bool {
-	if isSCPStyleRemote(raw) {
-		return false
-	}
-	if schemeLessUserinfoHasPassword(raw) {
-		return true
-	}
-	prefix := raw
-	start := -1
-	if i := strings.LastIndex(prefix, "://"); i >= 0 {
-		start = i + len("://")
-	} else if i := strings.Index(prefix, ":/"); i >= 0 {
-		start = i + len(":/")
-	} else if i := strings.Index(prefix, "//"); i >= 0 {
-		start = i + len("//")
-	} else if i := strings.Index(prefix, ":"); i >= 0 {
-		start = i + len(":")
-	}
-	if start < 0 || start >= len(raw) {
-		return false
-	}
-	endChars := "?#"
-	if strings.Contains(raw, "://") {
-		endChars = "/?#"
-	}
-	end := len(raw)
-	if relEnd := strings.IndexAny(raw[start:], endChars); relEnd >= 0 {
-		end = start + relEnd
-	}
-	at := strings.LastIndex(raw[start:end], "@")
-	if at < 0 {
-		return false
-	}
-	at += start
-	return strings.Contains(raw[start:at], ":")
+	return auth.RawUserinfoHasPassword(rawURL)
 }
 
 func schemeLessUserinfoHasPassword(raw string) bool {

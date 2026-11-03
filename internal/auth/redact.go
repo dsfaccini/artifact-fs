@@ -19,11 +19,14 @@ func RedactRemoteURL(raw string) string {
 	if raw == "" {
 		return ""
 	}
+	if start, end, ok := userinfoBeforeSeparator(raw); ok {
+		raw = raw[:start] + "REDACTED" + raw[end:]
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return redactMalformedURL(raw)
 	}
-	if u.User == nil && strings.Contains(raw, "@") && (isMalformedHTTPUserinfo(raw, u) || schemeLessUserinfoStart(raw) >= 0) {
+	if u.User == nil && strings.Contains(raw, "@") && (isMalformedHTTPUserinfo(raw, u) || schemeLessUserinfoStart(raw) >= 0 || userinfoAfterLaterSeparator(raw, u)) {
 		return redactMalformedURL(raw)
 	}
 	if u.User != nil {
@@ -79,6 +82,9 @@ func HasInlineCredentials(raw string) bool {
 	if strings.ContainsAny(raw, "?#") {
 		return true
 	}
+	if _, _, ok := userinfoBeforeSeparator(raw); ok {
+		return true
+	}
 	urlLike := strings.Contains(raw, "://")
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -98,6 +104,13 @@ func HasInlineCredentials(raw string) bool {
 	}
 	if tokenLike.MatchString(u.RawQuery) {
 		return true
+	}
+	if u.User == nil && userinfoAfterLaterSeparator(raw, u) {
+		// A username alone, as in "codecommit::us-east-1://profile@Repo", names
+		// an ambient profile unless the address is http(s).
+		separator := strings.Index(raw, "://")
+		lower := strings.ToLower(raw[:separator])
+		return RawUserinfoHasPassword(raw) || strings.HasSuffix(lower, "http") || strings.HasSuffix(lower, "https")
 	}
 	if u.User == nil {
 		return false
@@ -134,6 +147,40 @@ func malformedAuthorityStart(raw string) int {
 	return -1
 }
 
+// userinfoBeforeSeparator returns the bounds of "user:pass" text that ends at
+// an "@" before the first "://" when an "@" also follows that "://", as in
+// "alice:pw@host/a://b@c". The heuristics take the userinfo to follow the
+// "://", but either side can hold it.
+func userinfoBeforeSeparator(raw string) (start int, end int, ok bool) {
+	separator := strings.Index(raw, "://")
+	if separator < 0 || !strings.Contains(raw[separator:], "@") {
+		return 0, 0, false
+	}
+	end = strings.LastIndex(raw[:separator], "@")
+	if end < 0 {
+		return 0, 0, false
+	}
+	start = strings.LastIndex(raw[:end], "/") + 1
+	lower := strings.ToLower(raw)
+	for _, marker := range []string{"https:/", "http:/", "ssh:/", "git:/", "https:", "http:", "ssh:", "git:"} {
+		if strings.HasPrefix(lower, marker) && len(marker) > start {
+			start = len(marker)
+		}
+	}
+	if start > end || !strings.Contains(raw[start:end], ":") {
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
+// userinfoAfterLaterSeparator reports an "@" after a "://" that does not end
+// the parsed scheme, as in "ssh:/x://u:pw@h" or "gcrypt::https://u:pw@h". The
+// parser keeps that userinfo in the path or opaque part.
+func userinfoAfterLaterSeparator(raw string, u *url.URL) bool {
+	separator := strings.Index(raw, "://")
+	return u.Scheme != "" && separator >= 0 && separator != len(u.Scheme) && strings.Contains(raw[separator:], "@")
+}
+
 func isHTTPRemoteLike(raw string, scheme string) bool {
 	switch strings.ToLower(scheme) {
 	case "http", "https":
@@ -165,7 +212,7 @@ func isMalformedHTTPUserinfo(raw string, u *url.URL) bool {
 		}
 		return !validParsedHostPort(u)
 	}
-	if !rawUserinfoCandidateHasPassword(raw) {
+	if !RawUserinfoHasPassword(raw) {
 		return false
 	}
 	pathBeforeAt := u.Path
@@ -313,7 +360,16 @@ func isSCPStyleRemote(raw string) bool {
 	return at > 0 && colon > at
 }
 
-func rawUserinfoCandidateHasPassword(raw string) bool {
+// RawUserinfoHasPassword reports whether a remote that url.Parse misreads or
+// rejects, such as "https:user:pw@host", holds "user:pass@" userinfo. It checks
+// two candidate authorities and reports a password when either holds one.
+func RawUserinfoHasPassword(raw string) bool {
+	return authorityUserinfoHasPassword(raw) || delimitedUserinfoHasPassword(raw)
+}
+
+// authorityUserinfoHasPassword checks the authority malformedAuthorityStart
+// finds, up to the last "@" before any "?" or "#".
+func authorityUserinfoHasPassword(raw string) bool {
 	authorityStart := malformedAuthorityStart(raw)
 	if authorityStart < 0 {
 		return false
@@ -328,6 +384,39 @@ func rawUserinfoCandidateHasPassword(raw string) bool {
 	}
 	candidate := raw[authorityStart : authorityStart+at]
 	return strings.Contains(candidate, ":")
+}
+
+// delimitedUserinfoHasPassword checks the text after the last "://", or else
+// after the first ":/", "//" or ":", up to the last "@" before the next "/" (or
+// "?" or "#" when there is no "://"). It finds userinfo behind a path, as in
+// "x/alice:pw@host/a@b", which the authority check reads differently.
+func delimitedUserinfoHasPassword(raw string) bool {
+	if isSCPStyleRemote(raw) {
+		return false
+	}
+	start := -1
+	if i := strings.LastIndex(raw, "://"); i >= 0 {
+		start = i + len("://")
+	} else if i := strings.Index(raw, ":/"); i >= 0 {
+		start = i + len(":/")
+	} else if i := strings.Index(raw, "//"); i >= 0 {
+		start = i + len("//")
+	} else if i := strings.Index(raw, ":"); i >= 0 {
+		start = i + len(":")
+	}
+	if start < 0 || start >= len(raw) {
+		return false
+	}
+	endChars := "?#"
+	if strings.Contains(raw, "://") {
+		endChars = "/?#"
+	}
+	end := len(raw)
+	if relEnd := strings.IndexAny(raw[start:], endChars); relEnd >= 0 {
+		end = start + relEnd
+	}
+	at := strings.LastIndex(raw[start:end], "@")
+	return at >= 0 && strings.Contains(raw[start:start+at], ":")
 }
 
 func RedactString(s string) string {
@@ -440,8 +529,19 @@ func redactRemoteCore(core string) string {
 			break
 		}
 		next := strings.TrimLeft(core[sep+1:], " ")
-		if separatorInsideUserinfo(core, sep) || !hasSplitRemoteMarker(next) {
-			b.WriteString(redactSingleRemoteCore(core))
+		if insideUserinfo := separatorInsideUserinfo(core, sep); insideUserinfo || !hasSplitRemoteMarker(next) {
+			whole := redactSingleRemoteCore(core)
+			nextSegment := next
+			if end := strings.IndexAny(next, ",;"); end >= 0 {
+				nextSegment = next[:end]
+			}
+			// A later segment can hold a remote behind a prefix, as in
+			// "remote=https//u:pw@h", which the whole core's redaction misses.
+			// Redacting each segment of the result as well removes only more.
+			if wholeSep := strings.IndexAny(whole, ",;"); !insideUserinfo && containsRemoteMarker(nextSegment) && wholeSep >= 0 {
+				whole = redactSingleRemoteCore(whole[:wholeSep]) + whole[wholeSep:wholeSep+1] + redactRemoteCore(whole[wholeSep+1:])
+			}
+			b.WriteString(whole)
 			break
 		}
 		b.WriteString(redactSingleRemoteCore(core[:sep]))
@@ -456,7 +556,7 @@ func separatorInsideUserinfo(core string, sep int) bool {
 	if strings.Contains(core[remoteStart:sep], "@") {
 		return false
 	}
-	authorityStart := authorityStartInCore(core, remoteStart)
+	authorityStart := authorityStartInCore(core[:sep], remoteStart)
 	if authorityStart < 0 {
 		return false
 	}
@@ -542,6 +642,10 @@ func redactSingleRemoteCore(core string) string {
 	// Userinfo can precede a marker inside the host, as in "user:pass@corpgit:repo".
 	if at := strings.LastIndex(prefix, "@"); at >= 0 && strings.Contains(prefix[:at], ":") {
 		prefix = "REDACTED" + prefix[at:]
+	}
+	// Userinfo can end at a "?" or "#" before the marker, as in "u:pw?git:@".
+	if end := strings.IndexAny(prefix, "?#"); end >= 0 && strings.Contains(prefix[:end], ":") && strings.Contains(core[remoteStart:], "@") {
+		prefix = "REDACTED" + prefix[end:]
 	}
 	return prefix + RedactRemoteURL(core[remoteStart:])
 }
