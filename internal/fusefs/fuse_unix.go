@@ -493,8 +493,7 @@ func toErrno(ctx context.Context, err error) error {
 	if isRequestCancellation(ctx, err) {
 		return fmt.Errorf("%w: %w", syscall.EINTR, err)
 	}
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
+	if _, ok := errors.AsType[syscall.Errno](err); ok {
 		return err
 	}
 	for _, m := range []struct {

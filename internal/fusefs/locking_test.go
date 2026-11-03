@@ -195,8 +195,7 @@ func kernelErrno(err error) syscall.Errno {
 	if err == nil {
 		return 0
 	}
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
+	if errno, ok := errors.AsType[syscall.Errno](err); ok {
 		return errno
 	}
 	return syscall.EIO
