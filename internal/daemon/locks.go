@@ -19,7 +19,7 @@ func (s *Service) withRepoPrepareLock(ctx context.Context, repoName string, fn f
 
 func (s *Service) withRepoLock(ctx context.Context, lockName string, fn func() error) error {
 	lockDir := filepath.Join(s.root, "config", "locks")
-	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
 		return err
 	}
 	lockFile, err := os.OpenFile(filepath.Join(lockDir, lockName), os.O_CREATE|os.O_RDWR, 0o600)

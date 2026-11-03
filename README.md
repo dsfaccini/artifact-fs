@@ -97,27 +97,33 @@ use `diskutil unmount <path>`.
 Quick start against a public repo:
 
 ```bash
-export ARTIFACT_FS_ROOT=/tmp/artifact-fs-test
+export ARTIFACT_FS_ROOT="$HOME/.local/share/artifact-fs"
+MOUNT_ROOT="$HOME/artifact-fs-mnt"
 
 # Register, clone, and build the initial snapshot
 ./artifact-fs add-repo \
   --name workers-sdk \
   --remote https://github.com/cloudflare/workers-sdk.git \
   --ref refs/heads/main \
-  --mount-root /tmp
+  --mount-root "$MOUNT_ROOT"
 
 # Start the daemon (mounts via FUSE, blocks until killed)
-./artifact-fs daemon --root /tmp &
+./artifact-fs daemon --root "$MOUNT_ROOT" &
 DAEMON_PID=$!
 
 # Use the repo
-ls /tmp/workers-sdk/
-cat /tmp/workers-sdk/README.md
-git -C /tmp/workers-sdk log --oneline -5
+ls "$MOUNT_ROOT/workers-sdk/"
+cat "$MOUNT_ROOT/workers-sdk/README.md"
+git -C "$MOUNT_ROOT/workers-sdk" log --oneline -5
 
 # Cleanup
 kill $DAEMON_PID
 ```
+
+ArtifactFS creates the state root and its subdirectories with mode `0700`. It
+refuses a state root, or one of its subdirectories, that another user owns or
+that group or others can write: the state root holds each clone's fsmonitor
+hook, which Git runs on every `git status`.
 
 ## Monitoring hydration and repo status
 
@@ -256,6 +262,8 @@ Adoption disables remote refresh and rejects acquisition options (`--remote`,
 watching remains active, including shared loose and packed branch refs, so
 commits and branch changes reconcile normally. Run ordinary Git fetch/push
 commands when needed; the worktree's original remote configuration is retained.
+If `origin` embeds credentials, adoption logs a redacted warning and proceeds:
+Git's lazy blob fetches use that URL.
 
 ArtifactFS enables `extensions.worktreeConfig`, migrating shared `core.worktree`
 and `core.bare=true` settings into the primary worktree's config when necessary.

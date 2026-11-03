@@ -37,7 +37,7 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 		return err
 	}
 	parent := filepath.Dir(cfg.GitDir)
-	if err := os.MkdirAll(parent, 0o755); err != nil {
+	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return err
 	}
 
@@ -71,7 +71,7 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 			if cfg.HistoryDepth > 0 {
 				args = append(args, fmt.Sprintf("--depth=%d", cfg.HistoryDepth))
 			}
-			args = append(args, "--no-checkout", "--single-branch", "--no-tags", "--branch", branch, safeURL, target)
+			args = append(args, "--no-checkout", "--single-branch", "--no-tags", "--branch", branch, "--", safeURL, target)
 			_, err = runGitWithEnv(ctx, "", env, args...)
 		} else {
 			err = cloneExactRef(ctx, target, safeURL, env, sourceRef, cfg.HistoryDepth)
@@ -135,7 +135,7 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 	}
 
 	parent := filepath.Dir(cfg.GitDir)
-	if err := os.MkdirAll(parent, 0o755); err != nil {
+	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return model.PreparedSource{}, err
 	}
 	safeURL, credHelper, err := credentialEnv(cfg.RemoteURL)
@@ -168,7 +168,7 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 		if err := configureArtifactWorktree(ctx, candidateGitDir); err != nil {
 			return err
 		}
-		if _, err := runGitWithEnv(ctx, candidateGitDir, env, "remote", "add", "origin", safeURL); err != nil {
+		if _, err := runGitWithEnv(ctx, candidateGitDir, env, "remote", "add", "--", "origin", safeURL); err != nil {
 			return err
 		}
 		refspec := "+" + requirement.Ref + ":" + verifiedSourceTrackingRef
@@ -229,7 +229,7 @@ func configureArtifactWorktree(ctx context.Context, gitDir string) error {
 }
 
 func cloneExactRef(ctx context.Context, target string, safeURL string, env []string, ref string, depth int) error {
-	advertisement, err := runGitWithEnv(ctx, "", env, "ls-remote", safeURL, ref)
+	advertisement, err := runGitWithEnv(ctx, "", env, "ls-remote", "--", safeURL, ref)
 	if err != nil {
 		return err
 	}
@@ -257,7 +257,7 @@ func cloneExactRef(ctx context.Context, target string, safeURL string, env []str
 		return err
 	}
 	gitDir := filepath.Join(target, ".git")
-	if _, err := runGitWithEnv(ctx, gitDir, env, "remote", "add", "origin", safeURL); err != nil {
+	if _, err := runGitWithEnv(ctx, gitDir, env, "remote", "add", "--", "origin", safeURL); err != nil {
 		return err
 	}
 	refspec := "+" + ref + ":" + fetchedFullRefRemoteTrackingRef
@@ -452,7 +452,7 @@ func (s *Store) configureRemote(ctx context.Context, repo model.RepoConfig, targ
 		return err
 	}
 	if strings.TrimSpace(actualRemote) != strings.TrimSpace(targetRemote) {
-		if _, err := runGitWithEnv(ctx, repo.GitDir, env, "remote", "set-url", "origin", targetRemote); err != nil {
+		if _, err := runGitWithEnv(ctx, repo.GitDir, env, "remote", "set-url", "--", "origin", targetRemote); err != nil {
 			return err
 		}
 	}

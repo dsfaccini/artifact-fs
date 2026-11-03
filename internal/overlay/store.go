@@ -55,7 +55,7 @@ func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
 		return nil, err
 	}
 	upperDir := filepath.Join(cfg.OverlayDir, "upper")
-	if err := os.MkdirAll(upperDir, 0o755); err != nil {
+	if err := os.MkdirAll(upperDir, 0o700); err != nil {
 		db.Close()
 		return nil, err
 	}

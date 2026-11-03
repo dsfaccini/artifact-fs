@@ -9,11 +9,23 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/auth"
 )
 
+// ValidateRemoteNotOption refuses a remote that git would parse as an option,
+// such as --upload-pack=<command>.
+func ValidateRemoteNotOption(rawURL string) error {
+	if strings.HasPrefix(rawURL, "-") {
+		return errors.New("remote URL must not start with '-'")
+	}
+	return nil
+}
+
 // credentialEnv returns a sanitized URL (safe for ps) and env vars that
 // configure a one-shot git credential helper to supply the real credentials.
 func credentialEnv(rawURL string) (safeURL string, env []string, err error) {
 	if rawURL == "" {
 		return "", nil, nil
+	}
+	if err := ValidateRemoteNotOption(rawURL); err != nil {
+		return "", nil, err
 	}
 	if strings.ContainsAny(rawURL, "?#") {
 		return "", nil, errors.New("remote URL must not include query or fragment")

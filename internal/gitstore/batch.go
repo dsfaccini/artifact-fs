@@ -2,6 +2,7 @@ package gitstore
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -46,7 +48,7 @@ func (s *Store) BlobToCache(ctx context.Context, repo model.RepoConfig, objectOI
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o700); err != nil {
 		return 0, err
 	}
 	pool, err := s.getPool(repo.GitDir)
@@ -319,14 +321,16 @@ type batchCatFile struct {
 	stdin      io.WriteCloser
 	stdoutPipe io.ReadCloser
 	stdout     *bufio.Reader
+	stderr     *gitStderrLogger
 	logger     *slog.Logger
 	closeOnce  sync.Once
 }
 
 func newBatchCatFile(gitDir string, logger *slog.Logger) (*batchCatFile, error) {
 	cmd := exec.Command("git", "cat-file", "--batch")
-	cmd.Env = append(os.Environ(), "GIT_DIR="+gitDir)
-	cmd.Stderr = os.Stderr
+	cmd.Env = append(append(os.Environ(), "GIT_DIR="+gitDir), nonInteractiveGitEnv()...)
+	stderr := &gitStderrLogger{logger: logger, gitDir: gitDir}
+	cmd.Stderr = stderr
 	configureCommandProcessGroup(cmd)
 
 	stdin, err := cmd.StdinPipe()
@@ -345,8 +349,44 @@ func newBatchCatFile(gitDir string, logger *slog.Logger) (*batchCatFile, error) 
 		stdin:      stdin,
 		stdoutPipe: stdout,
 		stdout:     bufio.NewReaderSize(stdout, 256*1024),
+		stderr:     stderr,
 		logger:     logger,
 	}, nil
+}
+
+// gitStderrLogger logs each stderr line of a long-lived git process through
+// redaction. A lazy fetch can print the promisor remote's URL, which may embed
+// credentials.
+type gitStderrLogger struct {
+	logger    *slog.Logger
+	gitDir    string
+	line      []byte
+	truncated bool
+}
+
+func (w *gitStderrLogger) Write(p []byte) (int, error) {
+	n := len(p)
+	for len(p) > 0 {
+		chunk, rest, found := bytes.Cut(p, []byte{'\n'})
+		if room := maxGitErrorBytes - len(w.line); len(chunk) > room {
+			chunk = chunk[:room]
+			w.truncated = true
+		}
+		w.line = append(w.line, chunk...)
+		if !found {
+			break
+		}
+		w.flush()
+		p = rest
+	}
+	return n, nil
+}
+
+func (w *gitStderrLogger) flush() {
+	if line := strings.TrimSpace(string(w.line)); line != "" {
+		w.logger.Warn("git cat-file stderr", "git_dir", w.gitDir, "line", auth.RedactString(line), "truncated", w.truncated)
+	}
+	w.line, w.truncated = w.line[:0], false
 }
 
 func (b *batchCatFile) alive() bool {
@@ -375,6 +415,7 @@ func (b *batchCatFile) shutdown(kill bool) {
 		}
 		if b.cmd != nil && b.cmd.Process != nil {
 			_ = b.cmd.Wait()
+			b.stderr.flush()
 		}
 	})
 }

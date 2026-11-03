@@ -96,7 +96,7 @@ func TestExistingCloneCredentialOperationsKeepCredentialsOutOfArguments(t *testi
 	if strings.Contains(string(commandData), "alice") || strings.Contains(string(commandData), "super-secret") {
 		t.Fatalf("credentials appeared in git arguments: %s", commandData)
 	}
-	if !strings.Contains(string(commandData), "remote set-url origin https://example.com/org/repo.git") {
+	if !strings.Contains(string(commandData), "remote set-url -- origin https://example.com/org/repo.git") {
 		t.Fatalf("sanitized remote was not configured: %s", commandData)
 	}
 	credentialData, err := os.ReadFile(credentials)
@@ -391,6 +391,40 @@ func TestCloneBloblessRejectsMalformedCredentialURLBeforeGit(t *testing.T) {
 	}
 	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("git was invoked before rejecting malformed URL")
+	}
+}
+
+func TestCloneBloblessRejectsOptionRemoteBeforeGit(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(tmp, "git-invoked")
+	fakeGit := filepath.Join(bin, "git")
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\n: > \"$GIT_INVOKED_MARKER\"\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_INVOKED_MARKER", marker)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// A ref outside refs/heads/ takes the ls-remote path, where git runs an
+	// injected --upload-pack value.
+	for _, branch := range []string{"main", "refs/tags/v1"} {
+		t.Run(branch, func(t *testing.T) {
+			cfg := model.RepoConfig{
+				GitDir:    filepath.Join(tmp, "repo.git"),
+				RemoteURL: "--upload-pack=a@b:c",
+				Branch:    branch,
+			}
+			err := New(nil).CloneBlobless(context.Background(), cfg)
+			if err == nil || !strings.Contains(err.Error(), "must not start with '-'") {
+				t.Fatalf("CloneBlobless error = %v, want leading-dash rejection", err)
+			}
+			if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatal("git was invoked before rejecting the remote")
+			}
+		})
 	}
 }
 

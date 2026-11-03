@@ -204,3 +204,48 @@ func TestAdoptGitDirRejectsAcquisitionOptions(t *testing.T) {
 		}
 	}
 }
+
+func TestAdoptGitDirWarnsAboutCredentialedOrigin(t *testing.T) {
+	ctx := t.Context()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
+	runCmd(t, "git", "init", "--initial-branch=main", source)
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", source, "add", "README.md")
+	runCmd(t, "git", "-C", source, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
+	runCmd(t, "git", "-C", source, "remote", "add", "origin", "https://alice:s3cret@example.invalid/repository.git")
+	runCmd(t, "git", "-C", source, "worktree", "add", "-b", "topic", worktree)
+	gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
+
+	var logs bytes.Buffer
+	svc, err := New(ctx, filepath.Join(dir, "state"), slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{Name: "adopted", GitDir: gitDir, MountPath: worktree, AdoptGitDir: true, Enabled: true}
+	if err := svc.AddRepo(ctx, cfg); err != nil {
+		t.Fatalf("adoption with a credentialed origin failed: %v", err)
+	}
+	stored, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.PrepareState != "" || stored.PrepareError != "" {
+		t.Fatalf("adopted repo prepare state=%q error=%q, want ready", stored.PrepareState, stored.PrepareError)
+	}
+	if !strings.Contains(logs.String(), "adopted worktree origin embeds credentials") {
+		t.Fatalf("logs = %s, want a credentialed-origin warning", logs.String())
+	}
+	if strings.Contains(logs.String(), "s3cret") {
+		t.Fatalf("warning leaked the password: %s", logs.String())
+	}
+	if got := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "remote", "get-url", "origin")); got != "https://alice:s3cret@example.invalid/repository.git" {
+		t.Fatalf("adoption changed origin to %q", got)
+	}
+}

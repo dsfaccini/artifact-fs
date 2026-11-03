@@ -10,6 +10,7 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/registry"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
@@ -65,6 +66,9 @@ func samePrepareConfig(a model.RepoConfig, b model.RepoConfig) bool {
 }
 
 func normalizeSourceConfig(cfg *model.RepoConfig) error {
+	if err := gitstore.ValidateRemoteNotOption(cfg.RemoteURL); err != nil {
+		return err
+	}
 	if cfg.AdoptGitDir {
 		if strings.TrimSpace(cfg.GitDir) == "" {
 			return errors.New("--adopt-gitdir requires --git-dir")

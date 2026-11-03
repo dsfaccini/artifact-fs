@@ -535,7 +535,7 @@ func (s *Service) step(repo model.RepoConfig) bool {
 		s.notifyHydrated(item.task.RepoID, item.task.ObjectOID, size)
 		return true
 	}
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
 		s.finishHydration(key, result{err: err})
 		return true
 	}

@@ -26,6 +26,11 @@ validate_remote() {
     exit 1
   fi
 
+  if [[ "$remote" == -* ]]; then
+    echo "artifact-fs: MOUNT_GIT_REMOTE must not start with '-'" >&2
+    exit 1
+  fi
+
   if [[ "$remote" != https://* && "$remote" != ssh://* && ! "$remote" =~ ^[^@:[:space:]]+@[^:[:space:]]+:[^[:space:]?#]+$ ]]; then
     echo "artifact-fs: MOUNT_GIT_REMOTE must be an HTTPS or SSH remote" >&2
     exit 1

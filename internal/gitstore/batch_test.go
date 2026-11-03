@@ -1,9 +1,13 @@
 package gitstore
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -196,4 +200,101 @@ func TestBatchPoolBoundsConcurrentProcesses(t *testing.T) {
 	}
 	p.release(second)
 	p.closeAll()
+}
+
+func TestBlobToCacheLogsLazyFetchStderrWithoutPrompting(t *testing.T) {
+	// Keep the machine's credential helpers out of the lazy fetch.
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	run(t, "git", "init", "--initial-branch", "main", src)
+	if err := os.WriteFile(filepath.Join(src, "file.txt"), []byte("data\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", src, "add", "file.txt")
+	run(t, "git", "-C", src, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+	run(t, "git", "-C", src, "config", "uploadpack.allowFilter", "true")
+	clone := filepath.Join(tmp, "clone")
+	run(t, "git", "clone", "--filter=blob:none", "--no-checkout", "file://"+src, clone)
+	blobOID := strings.TrimSpace(runOutput(t, "git", "-C", src, "rev-parse", "HEAD:file.txt"))
+
+	// The promisor remote asks for credentials, which a lazy fetch must not prompt for.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="test"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	run(t, "git", "-C", clone, "remote", "set-url", "origin", server.URL+"/repo.git")
+
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(clone, ".git")}
+	if _, err := store.BlobToCache(ctx, cfg, blobOID, filepath.Join(tmp, "cache", blobOID)); err == nil {
+		t.Fatal("BlobToCache fetched a blob the promisor remote refused")
+	}
+	store.Close()
+	if !strings.Contains(logs.String(), `"msg":"git cat-file stderr"`) || !strings.Contains(logs.String(), "terminal prompts disabled") {
+		t.Fatalf("logs = %s, want the lazy fetch's non-interactive failure", logs.String())
+	}
+}
+
+func TestBlobToCacheRedactsBatchStderr(t *testing.T) {
+	// Git anonymizes HTTP URLs itself, so only a fake git can print a
+	// credentialed URL the way a remote helper or SSH may.
+	logs := batchStderrLogs(t, `echo "fatal: unable to access 'https://alice:s3cret@example.com/repo.git/': HTTP 401" >&2`)
+	if !strings.Contains(logs, "unable to access") {
+		t.Fatalf("logs = %s, want the batch process's stderr", logs)
+	}
+	if strings.Contains(logs, "s3cret") {
+		t.Fatalf("logs leaked the password: %s", logs)
+	}
+}
+
+func TestBlobToCacheBoundsBatchStderrLine(t *testing.T) {
+	logs := batchStderrLogs(t, `printf '%040000d\n' 0 >&2`)
+	decoder := json.NewDecoder(strings.NewReader(logs))
+	for decoder.More() {
+		var entry struct {
+			Line      string
+			Truncated bool
+		}
+		if err := decoder.Decode(&entry); err != nil {
+			t.Fatal(err)
+		}
+		if len(entry.Line) != maxGitErrorBytes || !entry.Truncated {
+			t.Fatalf("logged %d bytes, truncated=%v; want %d bytes, truncated", len(entry.Line), entry.Truncated, maxGitErrorBytes)
+		}
+	}
+	if logs == "" {
+		t.Fatal("no stderr was logged")
+	}
+}
+
+// batchStderrLogs runs BlobToCache against a fake git whose cat-file --batch
+// runs stderrScript, then reports every blob missing, and returns the logs.
+func batchStderrLogs(t *testing.T, stderrScript string) string {
+	t.Helper()
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeGit := "#!/bin/sh\n" + stderrScript + "\nwhile read -r oid; do echo \"$oid missing\"; done\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(fakeGit), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
+	oid := strings.Repeat("a", 40)
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(tmp, "repo.git")}
+	if _, err := store.BlobToCache(context.Background(), cfg, oid, filepath.Join(tmp, "cache", oid)); err == nil {
+		t.Fatal("BlobToCache succeeded for a missing blob")
+	}
+	store.Close()
+	return logs.String()
 }

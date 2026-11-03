@@ -92,6 +92,9 @@ type Service struct {
 }
 
 func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error) {
+	if err := ensureStateRoot(root); err != nil {
+		return nil, err
+	}
 	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
 	if err != nil {
 		return nil, err
