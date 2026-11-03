@@ -88,6 +88,37 @@ func TestFetchMissingBlobsRequestsOnlyMissingObjects(t *testing.T) {
 	}
 }
 
+func TestFetchMissingBlobsKeepsRemoteConfigWhenOriginIsNotThePromisor(t *testing.T) {
+	t.Parallel()
+	remote := gittest.PartialCloneRemote(t, map[string]string{"a.txt": "a\n", "b.txt": "b\n"})
+	// The user cloned blobless from upstream, then added origin for the same
+	// repository.
+	gitDir := filepath.Join(t.TempDir(), "repo.git")
+	run(t, "git", "clone", "-q", "--bare", "--filter=blob:none", "--origin", "upstream", remote, gitDir)
+	run(t, "git", "--git-dir", gitDir, "remote", "add", "origin", remote)
+	config := runOutput(t, "git", "--git-dir", gitDir, "config", "--list", "--local")
+	var oids []string
+	for _, name := range []string{"a.txt", "b.txt"} {
+		oids = append(oids, strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", "HEAD:"+name)))
+	}
+	store := New(nil)
+	defer store.Close()
+
+	if err := store.FetchMissingBlobs(context.Background(), model.RepoConfig{ID: "x", Name: "x", GitDir: gitDir}, oids); err != nil {
+		t.Fatalf("FetchMissingBlobs: %v", err)
+	}
+	// A filtered fetch from origin would record origin as a promisor.
+	if got := runOutput(t, "git", "--git-dir", gitDir, "config", "--list", "--local"); got != config {
+		t.Fatalf("repo config changed:\nbefore:\n%s\nafter:\n%s", config, got)
+	}
+	out := runOutput(t, "env", "GIT_NO_LAZY_FETCH=1", "git", "--git-dir", gitDir, "cat-file", "--batch-check", "--batch-all-objects")
+	for _, oid := range oids {
+		if !strings.Contains(out, oid+" blob") {
+			t.Fatalf("blob %s missing after FetchMissingBlobs:\n%s", oid, out)
+		}
+	}
+}
+
 // packedObjects counts the objects in gitDir's packs, a duplicate once per pack.
 func packedObjects(t *testing.T, gitDir string) int {
 	t.Helper()

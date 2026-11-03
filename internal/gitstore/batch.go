@@ -84,21 +84,56 @@ func (s *Store) BlobToCache(ctx context.Context, repo model.RepoConfig, objectOI
 }
 
 // FetchMissingBlobs fetches the objects in objectOIDs that the object store
-// lacks in one fetch from origin. It runs the fetch that a lazy fetch runs for
-// one missing object, so N blobs cost one fetch and one pack instead of N.
+// lacks in one fetch from the promisor remote. It runs the fetch that a lazy
+// fetch runs for one missing object, so N blobs cost one fetch and one pack
+// instead of N.
 func (s *Store) FetchMissingBlobs(ctx context.Context, repo model.RepoConfig, objectOIDs []string) error {
 	missing, err := missingObjects(ctx, repo.GitDir, objectOIDs)
 	if err != nil || len(missing) == 0 {
 		return err
 	}
-	// The fetch downloads every wanted object again, present or not, so it
-	// asks only for the missing ones.
-	_, err = runGitInput(ctx, repo.GitDir, nil, []byte(strings.Join(missing, "\n")+"\n"),
-		"-c", "fetch.negotiationAlgorithm=noop", "fetch", "origin", "--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--filter=blob:none", "--stdin")
+	// A filtered fetch from a remote that is not a promisor records it as one
+	// in the repo config, so the fetch goes only to a promisor.
+	remote, err := promisorRemote(ctx, repo.GitDir)
+	if err == nil && remote == "" {
+		err = errors.New("no promisor remote")
+	}
+	if err == nil {
+		// The fetch downloads every wanted object again, present or not, so
+		// it asks only for the missing ones.
+		_, err = runGitInput(ctx, repo.GitDir, nil, []byte(strings.Join(missing, "\n")+"\n"),
+			"-c", "fetch.negotiationAlgorithm=noop", "fetch", "--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--filter=blob:none", "--stdin", "--", remote)
+	}
 	if err != nil {
 		s.logger.Warn("batch blob fetch failed, blobs will fetch one at a time", "repo", repo.Name, "blobs", len(missing), "error", err)
 	}
 	return err
+}
+
+// promisorRemote returns the remote a lazy fetch tries first: the first remote
+// with remote.<name>.promisor set, else the one extensions.partialClone names,
+// which git moves to the end of its list. It returns "" when there is none.
+func promisorRemote(ctx context.Context, gitDir string) (string, error) {
+	out, err := runGit(ctx, gitDir, "config", "--get-regexp", `^(remote\..+\.promisor|extensions\.partialclone)$`)
+	if err != nil {
+		if exitErr, ok := errors.AsType[*gitCommandError](err); ok && exitErr.exitCode == 1 {
+			return "", nil
+		}
+		return "", err
+	}
+	partialClone := ""
+	for line := range strings.Lines(out) {
+		key, value, _ := strings.Cut(strings.TrimSpace(line), " ")
+		if key == "extensions.partialclone" {
+			partialClone = value
+			continue
+		}
+		switch strings.ToLower(value) {
+		case "", "true", "yes", "on", "1":
+			return strings.TrimSuffix(strings.TrimPrefix(key, "remote."), ".promisor"), nil
+		}
+	}
+	return partialClone, nil
 }
 
 // missingObjects returns the objects in oids that the object store lacks.

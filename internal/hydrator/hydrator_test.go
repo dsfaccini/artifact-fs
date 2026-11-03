@@ -570,6 +570,124 @@ func TestQueuedHydrationVerifiesCachedBlobsInParallel(t *testing.T) {
 	}
 }
 
+func TestReadOfFetchingPrefetchBlobGoesAheadOfOtherPrefetch(t *testing.T) {
+	t.Parallel()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	fetcher := &fakeBlobFetcher{payload: []byte("content")}
+	started, release := gateBatchFetches(fetcher)
+	h := New(fetcher)
+	h.Start(1, cfg)
+	defer h.Stop()
+	h.EnqueueBatch(prefetchTasksFor(cfg.ID, PriorityBinary, "a-0", "a-1"))
+	<-started
+	// A read of a-0 joins its batch while the batch downloads, and another
+	// directory is opened.
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := h.EnsureHydrated(context.Background(), cfg, model.BaseNode{RepoID: cfg.ID, Path: "a-0", ObjectOID: "a-0"})
+		done <- err
+	}()
+	waitForWaiter(t, h, taskKey(cfg.ID, "a-0"))
+	h.EnqueueBatch(prefetchTasksFor(cfg.ID, PriorityLikelyText, "b-0", "b-1"))
+	release <- struct{}{}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("EnsureHydrated: %v", err)
+		}
+	case oids := <-started:
+		if !slices.Contains(fetcher.Copied(), "a-0") {
+			t.Fatalf("worker started fetching %v while a read waited on fetched blob a-0", oids)
+		}
+		if err := <-done; err != nil {
+			t.Fatalf("EnsureHydrated: %v", err)
+		}
+	}
+}
+
+func TestReadOfFetchedPrefetchBlobGoesAheadOfOtherPrefetch(t *testing.T) {
+	t.Parallel()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	fetcher := &fakeBlobFetcher{payload: []byte("content")}
+	started, release := gateBatchFetches(fetcher)
+	h := New(fetcher)
+	h.Start(1, cfg)
+	defer h.Stop()
+	h.EnqueueBatch(prefetchTasksFor(cfg.ID, PriorityBinary, "a-0", "a-1"))
+	<-started
+	h.EnqueueBatch(prefetchTasksFor(cfg.ID, PriorityLikelyText, "c-0", "c-1"))
+	release <- struct{}{}
+	// a-0 now waits in the queue, fetched, while the worker fetches c.
+	<-started
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := h.EnsureHydrated(context.Background(), cfg, model.BaseNode{RepoID: cfg.ID, Path: "a-0", ObjectOID: "a-0"})
+		done <- err
+	}()
+	waitForWaiter(t, h, taskKey(cfg.ID, "a-0"))
+	release <- struct{}{}
+	if err := <-done; err != nil {
+		t.Fatalf("EnsureHydrated: %v", err)
+	}
+	waitForHydratorIdle(t, h, cfg.ID)
+
+	want := []string{"a-0", "c-0", "c-1", "a-1"}
+	if got := fetcher.Copied(); !slices.Equal(got, want) {
+		t.Fatalf("copy order = %v, want %v", got, want)
+	}
+}
+
+func TestReadOfVerifiedBlobDoesNotWaitForSiblingFetch(t *testing.T) {
+	t.Parallel()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	payload := []byte("content")
+	fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true}
+	started, release := gateBatchFetches(fetcher)
+	h := New(fetcher)
+	h.Start(1, cfg)
+	defer h.Stop()
+	cached := model.BaseNode{RepoID: cfg.ID, Path: "cached", ObjectOID: "cached", SizeState: "unknown"}
+	if err := os.WriteFile(cachePathFor(cfg, "cached"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.EnsureHydrated(context.Background(), cfg, cached); err != nil {
+		t.Fatalf("EnsureHydrated verifying the cached blob: %v", err)
+	}
+	// The directory is opened: the verified file and two missing siblings.
+	h.EnqueueBatch(prefetchTasksFor(cfg.ID, PriorityLikelyText, "cached", "sib-0", "sib-1"))
+	<-started
+
+	h.mu.Lock()
+	_, waits := h.active[taskKey(cfg.ID, "cached")]
+	h.mu.Unlock()
+	if waits {
+		t.Fatal("a read of the verified blob would wait for its siblings' fetch")
+	}
+	if _, _, err := h.EnsureHydrated(context.Background(), cfg, cached); err != nil {
+		t.Fatalf("EnsureHydrated during the siblings' fetch: %v", err)
+	}
+	release <- struct{}{}
+}
+
+func TestStopCancelsBatchFetch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+		fetcher := &fakeBlobFetcher{payload: []byte("content")}
+		started, _ := gateBatchFetches(fetcher)
+		h := New(fetcher)
+		h.Start(1, cfg)
+		h.EnqueueBatch(prefetchTasksFor(cfg.ID, PriorityLikelyText, "a-0", "a-1"))
+		<-started
+
+		begin := time.Now()
+		h.Stop()
+		if waited := time.Since(begin); waited != 0 {
+			t.Fatalf("Stop waited %v for the batch fetch to time out", waited)
+		}
+	})
+}
+
 func TestExplicitReadCopiesBeforeFetchedPrefetch(t *testing.T) {
 	t.Parallel()
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
@@ -1062,6 +1180,8 @@ type fakeBlobFetcher struct {
 	verifyOnce    sync.Once
 	batches       [][]string
 	copied        []string
+	// fetchMissing, when set, runs inside FetchMissingBlobs.
+	fetchMissing func(ctx context.Context, objectOIDs []string) error
 }
 
 func (f *fakeBlobFetcher) BlobToCache(_ context.Context, _ model.RepoConfig, objectOID string, dstPath string) (int64, error) {
@@ -1087,11 +1207,55 @@ func (f *fakeBlobFetcher) BlobToCache(_ context.Context, _ model.RepoConfig, obj
 	return int64(len(f.payload)), nil
 }
 
-func (f *fakeBlobFetcher) FetchMissingBlobs(_ context.Context, _ model.RepoConfig, objectOIDs []string) error {
+func (f *fakeBlobFetcher) FetchMissingBlobs(ctx context.Context, _ model.RepoConfig, objectOIDs []string) error {
 	f.mu.Lock()
 	f.batches = append(f.batches, append([]string(nil), objectOIDs...))
 	f.mu.Unlock()
+	if f.fetchMissing != nil {
+		return f.fetchMissing(ctx, objectOIDs)
+	}
 	return nil
+}
+
+// gateBatchFetches makes each FetchMissingBlobs call report its OIDs on the
+// returned channel, then block until a value arrives on release or ctx ends.
+func gateBatchFetches(f *fakeBlobFetcher) (started <-chan []string, release chan<- struct{}) {
+	startedCh := make(chan []string, 16)
+	releaseCh := make(chan struct{})
+	f.fetchMissing = func(ctx context.Context, objectOIDs []string) error {
+		startedCh <- objectOIDs
+		select {
+		case <-releaseCh:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return startedCh, releaseCh
+}
+
+func prefetchTasksFor(repoID model.RepoID, priority int, oids ...string) []model.HydrationTask {
+	start := time.Now()
+	tasks := make([]model.HydrationTask, len(oids))
+	for i, oid := range oids {
+		tasks[i] = model.HydrationTask{RepoID: repoID, Path: oid, ObjectOID: oid, SizeState: "unknown", Priority: priority, Reason: "prefetch", EnqueuedAt: start.Add(time.Duration(i))}
+	}
+	return tasks
+}
+
+// waitForWaiter polls until a read waits on key; go test -timeout is its only
+// bound.
+func waitForWaiter(t *testing.T, h *Service, key string) {
+	t.Helper()
+	for {
+		h.mu.Lock()
+		n := len(h.wait[key])
+		h.mu.Unlock()
+		if n > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func (f *fakeBlobFetcher) Copied() []string {

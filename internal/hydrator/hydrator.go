@@ -197,6 +197,7 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, nod
 	}
 	if _, ok := s.active[key]; ok || len(s.wait[key]) > 0 {
 		s.wait.add(key, ch)
+		s.raiseForReadLocked(key)
 		s.mu.Unlock()
 		return s.awaitHydration(ctx, key, ch)
 	}
@@ -219,7 +220,18 @@ func (s *Service) joinInflight(key string) (chan result, bool) {
 	}
 	ch := make(chan result, 1)
 	s.wait.add(key, ch)
+	s.raiseForReadLocked(key)
 	return ch, true
+}
+
+// raiseForReadLocked moves key's queued task ahead of speculative work, because
+// a read now waits on it. A fetched task stays in queued for this, though it is
+// active, so Enqueue still ignores it.
+func (s *Service) raiseForReadLocked(key string) {
+	if item, ok := s.queued[key]; ok && !isExplicitRead(item.task) {
+		item.task.Priority = PriorityExplicitRead
+		heap.Fix(&s.pq, item.index)
+	}
 }
 
 func (s *Service) awaitHydration(ctx context.Context, key string, ch chan result) (cachePath string, size int64, err error) {
@@ -528,6 +540,7 @@ func (s *Service) step(repo model.RepoConfig) bool {
 	}
 	if s.pq[0].fetched {
 		item := heap.Pop(&s.pq).(*taskItem)
+		delete(s.queued, taskKey(item.task.RepoID, item.task.ObjectOID))
 		more := len(s.pq) > 0
 		s.mu.Unlock()
 		if more {
@@ -567,17 +580,27 @@ func (s *Service) popBatchLocked() []model.HydrationTask {
 	return batch
 }
 
-// fetchBatch fetches the batch's missing blobs with one fetch and requeues the
-// batch, so every worker can validate or copy its tasks in priority order.
+// fetchBatch finishes the batch's verified cache hits, fetches its missing
+// blobs with one fetch, and requeues the rest, so every worker can validate or
+// copy them in priority order.
 func (s *Service) fetchBatch(repo model.RepoConfig, batch []model.HydrationTask) {
+	var pending []model.HydrationTask
 	var oids []string
 	for _, task := range batch {
-		// A known size means batchResolveSizes or an earlier hydration found
-		// the blob in the object store. A cached blob is validated in hydrate.
-		if task.SizeState == "known" {
+		key := taskKey(task.RepoID, task.ObjectOID)
+		cachePath := cachePathFor(repo, task.ObjectOID)
+		st, err := os.Stat(cachePath)
+		// A read of a verified blob must not wait for its siblings' fetch.
+		// Verifying an unverified one hashes it, so hydrate does that.
+		if err == nil && (task.SizeState != "known" || st.Size() == task.SizeBytes) && s.isVerified(key, st) {
+			s.finishHydration(key, result{cachePath: cachePath, size: st.Size()})
+			s.notifyHydrated(task.RepoID, task.ObjectOID, st.Size())
 			continue
 		}
-		if _, err := os.Stat(cachePathFor(repo, task.ObjectOID)); err == nil {
+		pending = append(pending, task)
+		// A known size means batchResolveSizes or an earlier hydration found
+		// the blob in the object store.
+		if err == nil || task.SizeState == "known" {
 			continue
 		}
 		oids = append(oids, task.ObjectOID)
@@ -595,8 +618,14 @@ func (s *Service) fetchBatch(repo model.RepoConfig, batch []model.HydrationTask)
 		s.mu.Unlock()
 		return
 	}
-	for _, task := range batch {
-		heap.Push(&s.pq, &taskItem{task: task, fetched: true})
+	for _, task := range pending {
+		key := taskKey(task.RepoID, task.ObjectOID)
+		if len(s.wait[key]) > 0 && !isExplicitRead(task) {
+			task.Priority = PriorityExplicitRead
+		}
+		item := &taskItem{task: task, fetched: true}
+		heap.Push(&s.pq, item)
+		s.queued[key] = item
 	}
 	s.mu.Unlock()
 	s.signalWork()
@@ -748,7 +777,7 @@ type taskItem struct {
 	task  model.HydrationTask
 	index int
 	// fetched marks a task whose batch fetch already ran. It stays active, so
-	// Enqueue never finds it, and a worker hydrates it alone.
+	// Enqueue ignores it, and a worker hydrates it alone.
 	fetched bool
 }
 
