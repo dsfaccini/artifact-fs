@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -1351,6 +1353,49 @@ func TestListByPrefix(t *testing.T) {
 	}
 	if paths["readme.md"] {
 		t.Fatal("readme.md should not match src/ prefix")
+	}
+}
+
+func TestListByPrefixMatchesPathPrefixExactly(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	for _, p := range []string{"src_a/mine.txt", "src_a/deep/nested.txt", "srcXa/secret.txt", "SRC_A/upper.txt", "src_a.txt", "src_a0/sibling.txt", "src_ab/sibling.txt"} {
+		if _, err := s.CreateFile(ctx, p, 0o644); err != nil {
+			t.Fatalf("CreateFile(%q): %v", p, err)
+		}
+	}
+
+	entries, err := s.ListByPrefix(ctx, "src_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range entries {
+		got = append(got, e.Path)
+	}
+	if want := []string{"src_a/deep/nested.txt", "src_a/mine.txt"}; !slices.Equal(got, want) {
+		t.Fatalf("ListByPrefix(src_a) = %q, want %q", got, want)
+	}
+
+	rows, err := s.db.QueryContext(ctx, `EXPLAIN QUERY PLAN `+listByPrefixQuery, "src_a/", "src_a0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) != 1 || !strings.HasPrefix(plan[0], "SEARCH overlay_entries") || !strings.Contains(plan[0], "(path>? AND path<?)") {
+		t.Fatalf("ListByPrefix plan = %q, want one range search of the path key", plan)
 	}
 }
 

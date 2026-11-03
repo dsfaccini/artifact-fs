@@ -2,13 +2,9 @@ package overlay
 
 import (
 	"context"
-	"crypto/sha1"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	iofs "io/fs"
 	"os"
@@ -976,46 +972,14 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 	return nil
 }
 
-func backingMatchesBlobOID(path string, oid string) (bool, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return false, err
-	}
-	return readerMatchesBlobOID(f, st.Size(), oid)
-}
-
 func overlayEntryMatchesBase(e model.OverlayEntry, base model.BaseNode) (bool, error) {
 	if base.Mode != 0 && e.Mode&0o777 != base.Mode&0o777 {
 		return false, nil
 	}
 	if e.Kind == model.OverlayKindSymlink {
-		return readerMatchesBlobOID(strings.NewReader(e.TargetPath), int64(len(e.TargetPath)), base.ObjectOID)
+		return model.ReaderMatchesBlobOID(strings.NewReader(e.TargetPath), int64(len(e.TargetPath)), base.ObjectOID)
 	}
-	return backingMatchesBlobOID(e.BackingPath, base.ObjectOID)
-}
-
-func readerMatchesBlobOID(r io.Reader, size int64, oid string) (bool, error) {
-	var h hash.Hash
-	switch len(oid) {
-	case sha1.Size * 2:
-		h = sha1.New()
-	case sha256.Size * 2:
-		h = sha256.New()
-	default:
-		return false, nil
-	}
-	if _, err := fmt.Fprintf(h, "blob %d\x00", size); err != nil {
-		return false, err
-	}
-	if _, err := io.Copy(h, r); err != nil {
-		return false, err
-	}
-	return strings.EqualFold(hex.EncodeToString(h.Sum(nil)), oid), nil
+	return model.FileMatchesBlobOID(e.BackingPath, base.ObjectOID)
 }
 
 func (s *Store) DirtyCount(ctx context.Context) (int64, error) {
@@ -1029,17 +993,17 @@ func (s *Store) ListAll(ctx context.Context) ([]model.OverlayEntry, error) {
 	return s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries ORDER BY path`)
 }
 
-// ListByPrefix returns overlay entries that are direct children of the given
-// directory path. Uses path + "/" prefix to avoid matching sibling directories.
+// listByPrefixQuery selects paths in [prefix/, prefix0): '0' follows '/', so
+// the range holds exactly the paths below prefix and searches the primary key.
+const listByPrefixQuery = `SELECT ` + overlayCols + ` FROM overlay_entries WHERE path >= ? AND path < ? ORDER BY path`
+
+// ListByPrefix returns every overlay entry below the given directory path.
 func (s *Store) ListByPrefix(ctx context.Context, prefix string) ([]model.OverlayEntry, error) {
 	prefix = model.CleanPath(prefix)
-	var pattern string
 	if prefix == "." {
-		pattern = "%"
-	} else {
-		pattern = prefix + "/%"
+		return s.ListAll(ctx)
 	}
-	return s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries WHERE path LIKE ? ORDER BY path`, pattern)
+	return s.queryEntries(ctx, listByPrefixQuery, prefix+"/", prefix+"0")
 }
 
 // queryEntries runs an arbitrary overlay query and scans the results.

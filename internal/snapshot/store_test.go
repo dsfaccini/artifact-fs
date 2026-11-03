@@ -96,6 +96,40 @@ func TestListChildren(t *testing.T) {
 	}
 }
 
+func TestListChildrenSearchesParentIndex(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	gen, err := s.PublishGeneration(ctx, "h1", "main", []model.BaseNode{
+		{RepoID: "r", Path: ".", Type: "dir", Mode: 0o755, SizeState: "known"},
+		{RepoID: "r", Path: "sub", Type: "dir", Mode: 0o755, SizeState: "known"},
+		{RepoID: "r", Path: "sub/c.txt", Type: "file", Mode: 0o644, ObjectOID: "c1", SizeState: "known", SizeBytes: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.db.QueryContext(ctx, `EXPLAIN QUERY PLAN `+listChildrenQuery, gen, "sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) != 1 || !strings.Contains(plan[0], "idx_base_nodes_gen_parent (generation=? AND parent_path=?)") {
+		t.Fatalf("ListChildren plan = %q, want one search of idx_base_nodes_gen_parent", plan)
+	}
+}
+
 func TestGenerationCleanup(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
