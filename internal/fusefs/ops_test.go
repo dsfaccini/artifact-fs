@@ -200,11 +200,11 @@ func TestFileHandleCachesHydratedBaseFile(t *testing.T) {
 	fh := &FileHandle{path: "file.txt"}
 	defer fh.closeCachedFile()
 
-	first, err := fh.read(context.Background(), engine, 0, 0, 4)
+	first, err := fh.read(context.Background(), engine, 0, 0, make([]byte, 4))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := fh.read(context.Background(), engine, 0, 4, 3)
+	second, err := fh.read(context.Background(), engine, 0, 4, make([]byte, 3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,12 +240,12 @@ func TestFileHandleRehydratesAfterGenerationChange(t *testing.T) {
 	fh := &FileHandle{path: "file.txt"}
 	defer fh.closeCachedFile()
 
-	first, err := fh.read(context.Background(), engine, 0, 0, 3)
+	first, err := fh.read(context.Background(), engine, 0, 0, make([]byte, 3))
 	if err != nil {
 		t.Fatal(err)
 	}
 	resolver.SetGeneration(2)
-	second, err := fh.read(context.Background(), engine, 0, 0, 3)
+	second, err := fh.read(context.Background(), engine, 0, 0, make([]byte, 3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 	fs.fileHandles[1] = fh
 	defer fh.closeCachedFile()
 
-	first, err := fh.read(context.Background(), engine, 0, 0, 3)
+	first, err := fh.read(context.Background(), engine, 0, 0, make([]byte, 3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 	}()
 
 	<-overlay.beforeCopy
-	overlapped, err := fh.read(context.Background(), engine, 0, 0, 3)
+	overlapped, err := fh.read(context.Background(), engine, 0, 0, make([]byte, 3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +309,7 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	after, err := fh.read(context.Background(), engine, 0, 0, 3)
+	after, err := fh.read(context.Background(), engine, 0, 0, make([]byte, 3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +356,7 @@ func TestRenameBaseDirectoryHydratesAndMovesContents(t *testing.T) {
 	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
 		t.Fatal(err)
 	}
-	got, err := engine.Read(context.Background(), "dst/a.txt", 0, 64)
+	got, err := engine.Read(context.Background(), "dst/a.txt", 0, make([]byte, 64))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -473,7 +473,7 @@ func TestRenameRecreatedTrackedEntryHidesSource(t *testing.T) {
 					t.Fatal("recreated source remains in root directory listing")
 				}
 			}
-			got, err := engine.Read(ctx, destination, 0, len(content))
+			got, err := engine.Read(ctx, destination, 0, make([]byte, len(content)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -697,7 +697,7 @@ func TestRenameChainHidesReplacedTrackedIntermediate(t *testing.T) {
 			if len(entries) != 1 || entries[0].Name != "final.txt" {
 				t.Fatalf("root entries = %+v, want only final.txt", entries)
 			}
-			got, err := engine.Read(ctx, "final.txt", 0, len(content))
+			got, err := engine.Read(ctx, "final.txt", 0, make([]byte, len(content)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -775,7 +775,7 @@ func TestRenameBaseDirectoryHydratesBeforeMutatingOverlay(t *testing.T) {
 		t.Fatalf("retry Rename: %v", err)
 	}
 	for path, want := range map[string]string{"dst/a.txt": "first", "dst/b.txt": "second"} {
-		got, err := engine.Read(context.Background(), path, 0, 64)
+		got, err := engine.Read(context.Background(), path, 0, make([]byte, 64))
 		if err != nil {
 			t.Fatalf("read %q after retry: %v", path, err)
 		}

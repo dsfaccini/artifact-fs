@@ -89,6 +89,27 @@ func TestCanceledContextOpensOverlayFile(t *testing.T) {
 	}
 }
 
+func TestReadFileFillsLibraryBuffer(t *testing.T) {
+	f := newLocalOverlayFuseFixture(t)
+	open := &fuseops.OpenFileOp{Inode: f.fileInode}
+	if err := f.fs.OpenFile(context.Background(), open); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: open.Handle})
+	})
+	read := &fuseops.ReadFileOp{Handle: open.Handle, Offset: 8, Size: 64, Dst: make([]byte, 64)}
+	if err := f.fs.ReadFile(context.Background(), read); err != nil {
+		t.Fatal(err)
+	}
+	if read.Data != nil {
+		t.Fatalf("ReadFile set Data = %q, want the read in Dst", read.Data)
+	}
+	if got := string(read.Dst[:read.BytesRead]); got != "content" {
+		t.Fatalf("Dst[:BytesRead] = %q, want content", got)
+	}
+}
+
 func TestCanceledContextOpensOverlayDirectory(t *testing.T) {
 	f := newLocalOverlayFuseFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())

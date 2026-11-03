@@ -53,7 +53,8 @@ func (e *Engine) ensureOverlayWithContexts(ctx, metadataCtx context.Context, pat
 	return err
 }
 
-func (e *Engine) Read(ctx context.Context, path string, off int64, size int) ([]byte, error) {
+// Read fills dst from path at off and returns the filled prefix of dst.
+func (e *Engine) Read(ctx context.Context, path string, off int64, dst []byte) ([]byte, error) {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
 	if ov, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
@@ -62,7 +63,7 @@ func (e *Engine) Read(ctx context.Context, path string, off int64, size int) ([]
 		if ov.IsDeleted() {
 			return nil, os.ErrNotExist
 		}
-		return readFileChunk(ov.BackingPath, off, size)
+		return readFileChunk(ov.BackingPath, off, dst)
 	}
 	n, err := e.Resolver.resolvePath(path)
 	if err != nil {
@@ -73,7 +74,7 @@ func (e *Engine) Read(ctx context.Context, path string, off int64, size int) ([]
 		return nil, err
 	}
 	defer f.Close()
-	return readFileChunkFrom(f, off, size)
+	return readFileChunkFrom(f, off, dst)
 }
 
 // BaseCacheFile opens the base content of path at generation gen, or at the
@@ -463,23 +464,19 @@ func (e *Engine) PrefetchDir(dirPath string, entries []ReaddirEntry) {
 	e.Hydrator.EnqueueBatch(tasks)
 }
 
-func readFileChunk(path string, off int64, size int) ([]byte, error) {
+func readFileChunk(path string, off int64, dst []byte) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	return readFileChunkFrom(f, off, size)
+	return readFileChunkFrom(f, off, dst)
 }
 
-func readFileChunkFrom(f *os.File, off int64, size int) ([]byte, error) {
-	if _, err := f.Seek(off, io.SeekStart); err != nil {
-		return nil, err
-	}
-	buf := make([]byte, size)
-	n, err := f.Read(buf)
+func readFileChunkFrom(f *os.File, off int64, dst []byte) ([]byte, error) {
+	n, err := f.ReadAt(dst, off)
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
-	return buf[:n], nil
+	return dst[:n], nil
 }
