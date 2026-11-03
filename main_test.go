@@ -21,7 +21,8 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == "fsmonitor-hook" {
 		os.Exit(cli.Run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
 	}
-	// A real remote can need the developer's ambient Git credential helper.
+	// AFS_E2E_REPO opts into a real remote, and the README authenticates it
+	// through the machine's ambient Git credential helper, so keep that config.
 	if os.Getenv("AFS_E2E_REPO") == "" {
 		gittest.IsolateConfig()
 	}

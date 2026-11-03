@@ -854,13 +854,18 @@ func TestAddRepoSyncBuildTreeCancellationIsPersisted(t *testing.T) {
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
 	started := filepath.Join(tmp, "ls-tree-started")
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" = 'ls-tree' ]; then : > \"$AFS_GIT_STARTED\"; exec sleep 10; fi\n" +
-		"exec /usr/bin/git \"$@\"\n"
+		"exec \"$AFS_REAL_GIT\" \"$@\"\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("AFS_REAL_GIT", realGit)
 	t.Setenv("AFS_GIT_STARTED", started)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
@@ -1243,15 +1248,20 @@ func TestRunPrepareFreshCloneSkipsSecondFetchForBranchFetchRef(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			realGit, err := exec.LookPath("git")
+			if err != nil {
+				t.Fatal(err)
+			}
 			bin := filepath.Join(t.TempDir(), "bin")
 			if err := os.Mkdir(bin, 0o755); err != nil {
 				t.Fatal(err)
 			}
 			logPath := filepath.Join(t.TempDir(), "git.log")
 			fakeGit := filepath.Join(bin, "git")
-			if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_COMMAND_LOG\"\nexec /usr/bin/git \"$@\"\n"), 0o755); err != nil {
+			if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_COMMAND_LOG\"\nexec \"$AFS_REAL_GIT\" \"$@\"\n"), 0o755); err != nil {
 				t.Fatal(err)
 			}
+			t.Setenv("AFS_REAL_GIT", realGit)
 			t.Setenv("GIT_COMMAND_LOG", logPath)
 			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
