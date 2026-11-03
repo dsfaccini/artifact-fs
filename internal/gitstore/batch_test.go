@@ -345,6 +345,13 @@ func TestBlobToCacheDropsPartialTokenAtBatchStderrBufferBound(t *testing.T) {
 	}
 }
 
+func TestBlobToCacheLogsOverflowingBatchStderrTokenAsTruncated(t *testing.T) {
+	logs := batchStderrLogs(t, `printf 'fatal:%070000d\n' 0 >&2`)
+	if !strings.Contains(logs, `"line":"","truncated":true`) {
+		t.Fatalf("logs = %.300s, want an empty truncated line", logs)
+	}
+}
+
 func TestBlobToCacheLogsBatchStderrWithoutTrailingNewline(t *testing.T) {
 	logs := batchStderrLogs(t, "printf 'fatal: last line has no newline' >&2")
 	if !strings.Contains(logs, "fatal: last line has no newline") {

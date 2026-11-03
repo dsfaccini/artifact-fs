@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,11 +31,18 @@ var stateRootDirs = []string{"config", filepath.Join("config", "locks"), "repos"
 // It narrows each existing subdirectory to 0700. The root keeps its mode,
 // because the user chose it.
 func ensureStateRoot(root string) (string, error) {
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return "", err
-	}
+	// Check the owner before creating anything. With a trailing slash, macOS's
+	// mkdir follows a dangling symlink and creates its target.
+	root = filepath.Clean(root)
 	var link unix.Stat_t
-	if err := lstat(filepath.Clean(root), &link); err != nil {
+	err := lstat(root, &link)
+	if errors.Is(err, unix.ENOENT) {
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			return "", err
+		}
+		err = lstat(root, &link)
+	}
+	if err != nil {
 		return "", &os.PathError{Op: "lstat", Path: root, Err: err}
 	}
 	if link.Uid != uint32(os.Geteuid()) {

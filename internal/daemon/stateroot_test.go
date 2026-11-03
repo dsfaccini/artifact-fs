@@ -243,3 +243,35 @@ func TestNewRefusesStateRootLinkOwnedByAnotherUser(t *testing.T) {
 		t.Fatalf("New wrote into the link's target: %v, %v", entries, err)
 	}
 }
+
+func TestNewRefusesDanglingStateRootLinkBeforeCreatingItsTarget(t *testing.T) {
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "missing")
+	link := filepath.Join(tmp, "state")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	// Only root can chown a symlink, so report the link as another user's.
+	realLstat := lstat
+	t.Cleanup(func() { lstat = realLstat })
+	lstat = func(path string, st *unix.Stat_t) error {
+		err := realLstat(path, st)
+		if path == link {
+			st.Uid++
+		}
+		return err
+	}
+
+	// With the trailing slash, macOS's mkdir follows the dangling link.
+	svc, err := New(context.Background(), link+"/", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil {
+		svc.Close()
+		t.Fatal("New accepted a state root link another user owns")
+	}
+	if !strings.Contains(err.Error(), "owned by another user") {
+		t.Fatalf("New error = %v, want ownership rejection", err)
+	}
+	if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("New created the dangling link's target: %v", err)
+	}
+}

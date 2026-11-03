@@ -391,7 +391,8 @@ func (w *gitStderrLogger) flush() {
 	if w.truncated {
 		// Buffering stopped inside the last token, which can hold a partial
 		// credential that redaction does not recognize. RedactString splits
-		// tokens on spaces, so every earlier token is whole.
+		// tokens on spaces, so every earlier token is whole. A line with no
+		// space keeps nothing, and is still logged as truncated.
 		text = text[:max(strings.LastIndexByte(text, ' '), 0)]
 	}
 	line := auth.RedactString(strings.TrimSpace(text))
@@ -399,7 +400,7 @@ func (w *gitStderrLogger) flush() {
 	if len(line) > maxGitErrorBytes {
 		line, truncated = line[:maxGitErrorBytes], true
 	}
-	if line != "" {
+	if line != "" || truncated {
 		w.logger.Warn("git cat-file stderr", "git_dir", w.gitDir, "line", line, "truncated", truncated)
 	}
 	w.line, w.truncated = w.line[:0], false
