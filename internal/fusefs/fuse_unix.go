@@ -1314,7 +1314,6 @@ func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine
 		FSName:                  "artifact-fs:" + repo.Name,
 		Subtype:                 "artifact-fs",
 		DisableWritebackCaching: true,
-		UseVectoredRead:         true,
 	}
 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.
 	platformMountConfig(&mountCfg)
