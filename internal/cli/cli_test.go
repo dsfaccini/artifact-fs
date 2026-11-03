@@ -149,6 +149,11 @@ func TestAddRepoAsyncCLIFlagValidation(t *testing.T) {
 			want: "async repositories must use ambient credentials",
 		},
 		{
+			name: "async_rejects_password_left_after_ssh_username",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "ssh://git@host.example.com/a://u2:pw2zq@h2zz/r"},
+			want: "async repositories must use ambient credentials",
+		},
+		{
 			name: "required_commit_requires_explicit_ref",
 			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--require-commit", "0123456789012345678901234567890123456789"},
 			want: "--require-commit requires an explicit --ref",

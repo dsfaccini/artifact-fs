@@ -1,8 +1,11 @@
 package auth
 
 import (
+	"regexp"
 	"strings"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 )
 
 func TestRedactRemoteURL(t *testing.T) {
@@ -658,6 +661,8 @@ func TestRedactionHidesLeftoverPasswords(t *testing.T) {
 		{"gcrypt::ssh://a.b:s3cretq[::1]:8443:/a://u:pw@h", "s3cretq"},
 		{"ssh:alice:pwzq@host.example.com:22:/a://u:pw#f@z", "pw#"},
 		{"http::pwzq@host.example.com:22/a://u:pw@h", "pwzq"},
+		// "Ⱥ" is 2 bytes and lowercases to 3.
+		{"x:ȺȺȺȺȺȺȺȺ://alice:s3cret@host/repo", "alice:s3"},
 	} {
 		for name, redact := range map[string]func(string) string{"RedactRemoteURL": RedactRemoteURL, "RedactString": RedactString, "RedactLogString": func(s string) string { return RedactLogString(s) }} {
 			if got := redact(tt.raw); strings.Contains(got, tt.password) {
@@ -674,6 +679,16 @@ func TestRedactionHandlesSeparatorBeforeRemote(t *testing.T) {
 		}
 		if got := RedactLogString(raw); !strings.Contains(got, "REDACTED_REMOTE") {
 			t.Errorf("RedactLogString(%q) = %q keeps the remote", raw, got)
+		}
+	}
+}
+
+func TestRedactionKeepsTrailingRunesWhole(t *testing.T) {
+	// "Ѡ" is 2 bytes, so the remote must end after both.
+	const line = "clone http://u:pw@hostѠ failed"
+	for name, redact := range map[string]func(string) string{"RedactString": RedactString, "RedactLogString": func(s string) string { return RedactLogString(s) }} {
+		if got := redact(line); !utf8.ValidString(got) {
+			t.Errorf("%s(%q) = %q splits a rune", name, line, got)
 		}
 	}
 }
@@ -792,11 +807,20 @@ func FuzzRedactionHidesPassword(f *testing.F) {
 		{0, 8, 1, "", "0", "1", "/@://@"},
 		{3, 8, 0, "", "0", "1", "/@://@"},
 		{3, 5, 0, "", "user", "s3cretzq", "host/x"},
+		// "Ⱥ" is 2 bytes and lowercases to 3, "İ" is 2 and lowercases to 1, and
+		// "K" (Kelvin) is 3 and lowercases to 1.
+		{0, 8, 0, "x:ȺȺȺȺȺȺȺȺ://", "alice", "s3cret", "host/repo"},
+		{0, 0, 0, "", "ȺȺȺȺ", "pwzq", "example.com/org/repo.git"},
+		{0, 8, 0, "", "İİİİ", "pwzq", "host/a://b@c"},
+		{2, 4, 1, "", "u", "pwKKzq", "x@example.com"},
+		// RedactRemoteURL percent-escapes non-ASCII text it keeps.
+		{3, 5, 0, "", "خ", "1", "0"},
+		{3, 5, 0, "", "Л", "1", "%00"},
 	} {
 		f.Add(uint8(seed.prefix), uint8(seed.form), uint8(seed.end), seed.lead, seed.user, seed.password, seed.rest)
 	}
 	f.Fuzz(func(t *testing.T, prefixIndex, formIndex, endIndex uint8, lead, user, password, rest string) {
-		if !onlyRunes(user, "-._~%") || password == "" || !onlyRunes(password, "-._~%") || !onlyRunes(rest, "-._~%:/@") {
+		if !onlyText(user, "-._~%") || password == "" || !onlyText(password, "-._~%") || !onlyText(rest, "-._~%:/@") {
 			t.Skip()
 		}
 		prefix := tokenPrefixes[int(prefixIndex)%len(tokenPrefixes)]
@@ -804,7 +828,7 @@ func FuzzRedactionHidesPassword(f *testing.F) {
 		end := userinfoEnds[int(endIndex)%len(userinfoEnds)]
 		// A lead puts the userinfo after a later "://", as in "https:/example.com/a://u:pw@z".
 		// The authority follows the first "://", so the lead holds one, at its end.
-		if !onlyRunes(lead, "-._~%:/") || lead != "" && (!strings.HasSuffix(lead, "://") || strings.Index(lead, "://") != len(lead)-len("://")) {
+		if !onlyText(lead, "-._~%:/") || lead != "" && (!strings.HasSuffix(lead, "://") || strings.Index(lead, "://") != len(lead)-len("://")) {
 			t.Skip()
 		}
 		// A "://" form, a form and lead that join into a "://" before the lead's
@@ -859,12 +883,30 @@ var redactionMarkers = strings.NewReplacer("REDACTED_REMOTE", "\x00", "REDACTED"
 // leaksPassword masks the redaction markers, which can join with neighboring
 // text into the password, and ignores case, because redaction uppercases
 // percent-encodings.
+// nonASCIIEscape matches the escape url.URL.String writes for a non-ASCII byte.
+var nonASCIIEscape = regexp.MustCompile(`%[89A-Fa-f][0-9A-Fa-f]`)
+
 func leaksPassword(redacted string, password string) bool {
-	return strings.Contains(strings.ToLower(redactionMarkers.Replace(redacted)), strings.ToLower(password))
+	shown := redactionMarkers.Replace(redacted)
+	// The "1" in "%D1" is not the password "1".
+	if !strings.Contains(password, "%") {
+		shown = nonASCIIEscape.ReplaceAllString(shown, "\x00")
+	}
+	return strings.Contains(strings.ToLower(shown), strings.ToLower(password))
 }
 
 func asciiLetter(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+// onlyText reports whether s holds only letters, ASCII digits and extra.
+func onlyText(s string, extra string) bool {
+	for _, r := range s {
+		if !(r > unicode.MaxASCII && unicode.IsLetter(r) || onlyRunes(string(r), extra)) {
+			return false
+		}
+	}
+	return true
 }
 
 // onlyRunes reports whether s holds only ASCII letters, digits and extra.

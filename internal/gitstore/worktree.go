@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -51,8 +50,9 @@ func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfi
 	return s.ReadTreeHEAD(ctx, repo)
 }
 
-// WarnAdoptedOriginCredentials logs a redacted warning when an adopted
-// worktree's origin embeds credentials.
+// WarnAdoptedOriginCredentials logs a warning when an adopted worktree's origin
+// embeds credentials. The warning leaves the origin out: redaction is
+// heuristic, and this origin is known to hold credentials.
 //
 // add-repo never persists inline credentials: a sync clone uses them once
 // and stores the URL without them, and async and prepared repos reject them,
@@ -63,7 +63,7 @@ func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfi
 // worktree would. ArtifactFS redacts all Git output it logs.
 func (s *Store) WarnAdoptedOriginCredentials(ctx context.Context, repo model.RepoConfig) {
 	if remote, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin"); err == nil && remoteHasInlineCredentials(remote) {
-		s.logger.WarnContext(ctx, "adopted worktree origin embeds credentials; Git's lazy fetches use them", "repo", repo.Name, "origin", auth.RedactLogString(remote))
+		s.logger.WarnContext(ctx, "adopted worktree origin embeds credentials; Git's lazy fetches use them", "repo", repo.Name)
 	}
 }
 

@@ -3,6 +3,7 @@ package gitstore
 import (
 	"context"
 	"errors"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -736,13 +737,14 @@ func TestNonInteractiveGitEnvPreservesEscapedDollar(t *testing.T) {
 
 func TestCloneBloblessAcceptsAtSignInPathAfterHostAndPort(t *testing.T) {
 	commit, _ := serveSSHFromLocalRepo(t)
-	const remote = "ssh://host.example.com:22/org/repo@v1.git"
-	gitDir := filepath.Join(t.TempDir(), "repo.git")
-	if err := New(nil).CloneBlobless(context.Background(), model.RepoConfig{Name: "repo", GitDir: gitDir, RemoteURL: remote, Branch: "main"}); err != nil {
-		t.Fatalf("CloneBlobless(%q): %v", remote, err)
-	}
-	if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", "HEAD")); got != commit {
-		t.Fatalf("clone HEAD = %s, want %s", got, commit)
+	for _, remote := range []string{"ssh://host.example.com:22/org/repo@v1.git", "ssh://git@host.example.com:22/org/repo@v1.git"} {
+		gitDir := filepath.Join(t.TempDir(), "repo.git")
+		if err := New(nil).CloneBlobless(context.Background(), model.RepoConfig{Name: "repo", GitDir: gitDir, RemoteURL: remote, Branch: "main"}); err != nil {
+			t.Fatalf("CloneBlobless(%q): %v", remote, err)
+		}
+		if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", "HEAD")); got != commit {
+			t.Fatalf("clone of %q HEAD = %s, want %s", remote, got, commit)
+		}
 	}
 }
 
@@ -760,16 +762,28 @@ func TestCloneBloblessRejectsPasswordHoldingSlashBeforeGit(t *testing.T) {
 	}
 }
 
-func TestCredentialChecksAgreeOnPasswordURLParseMisreads(t *testing.T) {
+func TestCredentialChecksAgreeOnMisparsedCredentials(t *testing.T) {
 	t.Parallel()
-	// url.Parse reads host "user" and port "1234", and a path holding the "@".
 	for _, tt := range []struct{ remote, password string }{
+		// url.Parse reads host "user" and port "1234", and a path holding the "@".
 		{"ssh://user:1234/secret@host/repo", "1234/secret"},
 		{"git://alice:22/s3cret@host", "22/s3cret"},
 		{"ssh://hostzz:22/org/repo@v1.git", "22/org/repo"},
+		// The userinfo url.Parse reads ends early, and the URL left without it
+		// still holds credentials.
+		{"https://alice:p@ss/w0rd@github.com/org/repo.git", "ss/w0rd"},
+		{"ssh://git@host.example.com/a://u2:pw2zq@h2zz/r", "pw2zq"},
+		{"https://user:tok@localhost/a://u2:pw2zq@h2zz/r", "pw2zq"},
+		{"ssh://git@gitserver:2222/org/repo@v1.git", "gitserver:2222/org/repo"},
 	} {
 		if _, _, err := credentialEnv(tt.remote); err == nil {
 			t.Errorf("credentialEnv accepted %q", tt.remote)
+		}
+		if u, err := url.Parse(tt.remote); err == nil && u.User != nil {
+			u.User = nil
+			if _, _, err := credentialEnv(u.String()); err == nil {
+				t.Errorf("credentialEnv accepts %q without its userinfo, so it is not the same check", tt.remote)
+			}
 		}
 		if !auth.HasInlineCredentials(tt.remote) {
 			t.Errorf("HasInlineCredentials(%q) = false", tt.remote)
@@ -777,6 +791,23 @@ func TestCredentialChecksAgreeOnPasswordURLParseMisreads(t *testing.T) {
 		if got := auth.RedactRemoteURL(tt.remote); strings.Contains(got, tt.password) {
 			t.Errorf("RedactRemoteURL(%q) = %q shows %q", tt.remote, got, tt.password)
 		}
+	}
+}
+
+func TestCloneBloblessReportsServerStderrWithCaseFoldingText(t *testing.T) {
+	// "Ⱥ" is 2 bytes and lowercases to 3, so an index found in lowercased text
+	// overruns the original. A server controls what its transport prints.
+	tmp := t.TempDir()
+	ssh := filepath.Join(tmp, "ssh")
+	if err := os.WriteFile(ssh, []byte("#!/bin/sh\nprintf '%s\\n' 'denied x:ȺȺȺȺ://a@b here' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_SSH_COMMAND", ssh)
+	t.Setenv("GIT_SSH_VARIANT", "ssh")
+	cfg := model.RepoConfig{Name: "repo", GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "ssh://host.example.com/org/repo.git", Branch: "main"}
+	err := New(nil).CloneBlobless(context.Background(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "denied") {
+		t.Fatalf("CloneBlobless error = %v, want the server's message", err)
 	}
 }
 

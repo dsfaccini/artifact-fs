@@ -254,7 +254,7 @@ Adoption disables remote refresh and rejects acquisition options (`--remote`,
 watching remains active, including shared loose and packed branch refs, so
 commits and branch changes reconcile normally. Run ordinary Git fetch/push
 commands when needed; the worktree's original remote configuration is retained.
-If `origin` embeds credentials, adoption logs a redacted warning and proceeds:
+If `origin` embeds credentials, adoption logs a warning that names no remote and proceeds:
 Git's lazy fetches of missing blobs and trees use that URL.
 
 ArtifactFS enables `extensions.worktreeConfig`, migrating shared `core.worktree`

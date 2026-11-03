@@ -52,6 +52,9 @@ func credentialEnv(rawURL string) (safeURL string, env []string, err error) {
 	if u.User == nil {
 		return rawURL, nil, nil
 	}
+	if auth.HasMisparsedCredentials(rawURL, u) {
+		return "", nil, errors.New("malformed remote URL")
+	}
 	if !isHTTPRemote(rawURL, u.Scheme) {
 		if strings.ToLower(u.Scheme) != "ssh" {
 			return "", nil, errors.New("remote URL includes unsupported inline credentials")
@@ -143,7 +146,7 @@ func malformedUserinfoInRemote(rawURL string, u *url.URL) bool {
 	if isHTTPRemote(rawURL, u.Scheme) && strings.Contains(u.Hostname(), ".") {
 		return false
 	}
-	return auth.MisparsedUserinfoHasPassword(rawURL, u)
+	return auth.HasMisparsedCredentials(rawURL, u)
 }
 
 func schemeLessUserinfoHasPassword(raw string) bool {
