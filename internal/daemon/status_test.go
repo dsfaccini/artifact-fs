@@ -62,82 +62,157 @@ func TestVerifiedSourceStatusAndRefreshPolicy(t *testing.T) {
 	}
 }
 
-func TestBootstrapCleanStatusIndexSkipsDeleteOnlyOverlay(t *testing.T) {
+// bootstrapFixture is a repo whose index matches its published snapshot, so
+// bootstrapCleanStatusIndex marks tracked.txt FSMonitor-valid while the
+// overlay is empty.
+type bootstrapFixture struct {
+	svc     *Service
+	cfg     model.RepoConfig
+	headOID string
+	gen     int64
+	snap    *snapshot.Store
+	ov      *overlay.Store
+}
+
+func newBootstrapFixture(t *testing.T) *bootstrapFixture {
+	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
 	repoPath := filepath.Join(root, "worktree")
-	if err := os.MkdirAll(repoPath, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	runGit := func(args ...string) string {
-		t.Helper()
-		cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repoPath}, args...)...)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
-		return string(out)
-	}
-	runGit("init")
-	runGit("config", "user.name", "test")
-	runGit("config", "user.email", "test@example.com")
+	runCmd(t, "git", "init", "--initial-branch", "main", repoPath)
 	if err := os.WriteFile(filepath.Join(repoPath, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	runGit("add", "tracked.txt")
-	runGit("commit", "-m", "base")
-	headOID := strings.TrimSpace(runGit("rev-parse", "HEAD"))
-	runGit("read-tree", "HEAD")
-	indexPath := filepath.Join(repoPath, ".git", "index")
-	indexBefore, err := os.ReadFile(indexPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	runCmd(t, "git", "-C", repoPath, "add", "tracked.txt")
+	runCmd(t, "git", "-C", repoPath, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base")
+	headOID := strings.TrimSpace(runCmdOutput(t, "git", "-C", repoPath, "rev-parse", "HEAD"))
+	runCmd(t, "git", "-C", repoPath, "read-tree", "HEAD")
 
 	svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer svc.Close()
+	t.Cleanup(func() { _ = svc.Close() })
 	cfg := model.RepoConfig{ID: "repo", Name: "repo", GitDir: filepath.Join(repoPath, ".git"), MountPath: repoPath}
 	svc.fillPaths(&cfg)
 	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	gen, err := snap.PublishGeneration(ctx, headOID, "refs/heads/master", []model.BaseNode{
+	t.Cleanup(func() { _ = snap.Close() })
+	gen, err := snap.PublishGeneration(ctx, headOID, "refs/heads/main", []model.BaseNode{
 		{RepoID: cfg.ID, Path: ".", Type: "dir", Mode: 0o755, SizeState: "known"},
 		{RepoID: cfg.ID, Path: "tracked.txt", Type: "file", Mode: 0o644, SizeState: "known"},
 	})
 	if err != nil {
-		snap.Close()
 		t.Fatal(err)
 	}
-	defer snap.Close()
 	ov, err := overlay.New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ov.Close()
-	if err := ov.Remove(ctx, "tracked.txt"); err != nil {
+	t.Cleanup(func() { _ = ov.Close() })
+	return &bootstrapFixture{svc: svc, cfg: cfg, headOID: headOID, gen: gen, snap: snap, ov: ov}
+}
+
+func (f *bootstrapFixture) bootstrap() error {
+	return f.svc.bootstrapCleanStatusIndex(context.Background(), f.cfg, f.headOID, f.gen, f.snap, f.ov)
+}
+
+// removeTracked records a delete of tracked.txt, which leaves the overlay
+// with no dirty entry.
+func (f *bootstrapFixture) removeTracked(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	if err := f.ov.Remove(ctx, "tracked.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if dirty, err := ov.DirtyCount(ctx); err != nil || dirty != 0 {
+	if dirty, err := f.ov.DirtyCount(ctx); err != nil || dirty != 0 {
 		t.Fatalf("delete-only dirty count = %d, %v; want zero", dirty, err)
 	}
-	entries, err := ov.ListAll(ctx)
-	if err != nil || len(entries) != 1 || entries[0].Kind != model.OverlayKindDelete {
-		t.Fatalf("delete-only overlay entries = %+v, %v", entries, err)
-	}
-	if err := svc.bootstrapCleanStatusIndex(ctx, cfg, headOID, gen, snap, ov); err != nil {
+}
+
+// indexEntries lists the index through a hook that reports no changes.
+// ls-files -f prints an FSMonitor-valid entry, which Git does not stat, in
+// lowercase.
+func (f *bootstrapFixture) indexEntries(t *testing.T) string {
+	t.Helper()
+	hook := filepath.Join(t.TempDir(), "fsmonitor")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	indexAfter, err := os.ReadFile(indexPath)
+	return strings.TrimSpace(runCmdOutput(t, "git", "-C", f.cfg.MountPath, "-c", "core.fsmonitor="+hook, "ls-files", "-f"))
+}
+
+func TestBootstrapCleanStatusIndexSkipsDeleteOnlyOverlay(t *testing.T) {
+	// The fixture bootstraps without an overlay entry, so only the delete
+	// below can leave tracked.txt to a stat.
+	clean := newBootstrapFixture(t)
+	if err := clean.bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	if got := clean.indexEntries(t); got != "h tracked.txt" {
+		t.Fatalf("index without an overlay entry = %q, want FSMonitor-valid h tracked.txt", got)
+	}
+
+	f := newBootstrapFixture(t)
+	f.removeTracked(t)
+	if err := f.bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.indexEntries(t); got != "H tracked.txt" {
+		t.Fatalf("index with a delete-only overlay = %q, want H tracked.txt", got)
+	}
+}
+
+func TestBootstrapCleanStatusIndexSkipsOverlayEntryWrittenDuringBootstrap(t *testing.T) {
+	f := newBootstrapFixture(t)
+	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(indexBefore, indexAfter) {
-		t.Fatal("delete-only overlay allowed clean index bootstrap")
+	bin := t.TempDir()
+	started, release := filepath.Join(bin, "started"), filepath.Join(bin, "release")
+	// Hold the bootstrap at the update-index that marks entries valid, after
+	// every check that runs before it.
+	script := `#!/bin/sh
+case " $* " in
+*" update-index --fsmonitor "*)
+	: > "$AFS_BOOTSTRAP_STARTED"
+	while [ ! -e "$AFS_BOOTSTRAP_RELEASE" ]; do sleep 0.01; done ;;
+esac
+exec "$AFS_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AFS_REAL_GIT", realGit)
+	t.Setenv("AFS_BOOTSTRAP_STARTED", started)
+	t.Setenv("AFS_BOOTSTRAP_RELEASE", release)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o644) })
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- f.bootstrap() }()
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("bootstrap returned before marking entries valid: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	f.removeTracked(t)
+	if err := os.WriteFile(release, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+	if got := f.indexEntries(t); got != "H tracked.txt" {
+		t.Fatalf("index after an overlay entry appeared during bootstrap = %q, want H tracked.txt", got)
 	}
 }
 

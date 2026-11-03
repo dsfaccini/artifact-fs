@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -39,14 +41,14 @@ func TestRunGitCancellationKillsDescendants(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := filepath.Join(tmp, "started")
-	survived := filepath.Join(tmp, "survived")
-	script := "#!/bin/sh\n(sleep 0.2; : > \"$AFS_CHILD_SURVIVED\") &\n: > \"$AFS_GIT_STARTED\"\nwait\n"
+	childPID := filepath.Join(tmp, "child.pid")
+	script := "#!/bin/sh\nsleep 60 &\necho $! > \"$AFS_CHILD_PID\"\n: > \"$AFS_GIT_STARTED\"\nwait\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("AFS_GIT_STARTED", started)
-	t.Setenv("AFS_CHILD_SURVIVED", survived)
+	t.Setenv("AFS_CHILD_PID", childPID)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -64,13 +66,32 @@ func TestRunGitCancellationKillsDescendants(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	data, err := os.ReadFile(childPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if t.Failed() {
+			_ = child.Kill()
+		}
+	})
 	cancel()
 	if err := <-errCh; !errors.Is(err, context.Canceled) {
 		t.Fatalf("runGit error = %v, want context canceled", err)
 	}
-	time.Sleep(300 * time.Millisecond)
-	if _, err := os.Stat(survived); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("git descendant survived cancellation")
+	// The child sleeps far longer than this wait, so it is gone only if cancellation killed it.
+	for deadline := time.Now().Add(10 * time.Second); child.Signal(syscall.Signal(0)) == nil; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("git descendant %d survived cancellation", pid)
+		}
 	}
 }
 

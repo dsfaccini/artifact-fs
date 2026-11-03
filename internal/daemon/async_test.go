@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/registry"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
@@ -1279,7 +1280,8 @@ func TestRunPrepareDoesNotOpenGateWhenReadyPersistenceFails(t *testing.T) {
 	tmp := t.TempDir()
 	preparedGitDir := createPreparedGitDir(t, tmp)
 
-	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	root := filepath.Join(tmp, "artifact-fs")
+	svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1312,17 +1314,30 @@ func TestRunPrepareDoesNotOpenGateWhenReadyPersistenceFails(t *testing.T) {
 	if gate == nil {
 		t.Fatal("runtime gate is nil")
 	}
-	if err := svc.registry.Close(); err != nil {
+	// Reject only the ready write, so preparation runs every step before it.
+	const writeErr = "ready state write failed"
+	db, err := meta.OpenDB(filepath.Join(root, "config", "repos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `CREATE TRIGGER reject_ready BEFORE UPDATE OF prepare_state ON repos
+		WHEN NEW.prepare_state = '`+model.PrepareStateReady+`' BEGIN SELECT RAISE(ABORT, '`+writeErr+`'); END`); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := svc.runPrepare(ctx, got); err == nil {
-		t.Fatal("expected ready state persistence failure")
+	if err := svc.runPrepare(ctx, got); err == nil || !strings.Contains(err.Error(), writeErr) {
+		t.Fatalf("runPrepare = %v, want the ready state write failure", err)
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
-	defer cancel()
-	if err := gate.Wait(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("gate wait = %v, want deadline because ready was not durably persisted", err)
+	// Wait reports an open or failed gate before it checks the context, so a
+	// canceled context reads the gate's state without waiting.
+	probeCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := gate.Wait(probeCtx); err == nil || !strings.Contains(err.Error(), writeErr) {
+		t.Fatalf("gate wait = %v, want the gate failed with the ready state write failure", err)
+	}
+	if stored, err := svc.registry.GetRepo(ctx, "repo"); err != nil || stored.PrepareState != model.PrepareStateFailed {
+		t.Fatalf("persisted prepare state = %q, %v; want failed", stored.PrepareState, err)
 	}
 }
 

@@ -1,10 +1,12 @@
 package gitstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -59,18 +61,42 @@ func TestBuildTreeIndexPropagatesBatchCancellation(t *testing.T) {
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	started := filepath.Join(tmp, "cat-file-started")
 	oid := strings.Repeat("a", 40)
-	script := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in\nls-tree) printf '100644 blob %s\\tfile.txt\\0' ;;\ncat-file) exec sleep 10 ;;\nesac\n", oid)
+	script := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in\nls-tree) printf '100644 blob %s\\tfile.txt\\0' ;;\ncat-file) : > \"$AFS_CAT_FILE_STARTED\"; exec sleep 30 ;;\nesac\n", oid)
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AFS_CAT_FILE_STARTED", started)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewTextHandler(&logs, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	_, err := New(nil).BuildTreeIndex(ctx, model.RepoConfig{ID: "repo", GitDir: t.TempDir()}, oid)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("BuildTreeIndex error = %v, want deadline exceeded", err)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := store.BuildTreeIndex(ctx, model.RepoConfig{ID: "repo", GitDir: t.TempDir()}, oid)
+		errCh <- err
+	}()
+	// Cancel only once size resolution runs, after ls-tree has finished.
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("BuildTreeIndex returned before cat-file started: %v", err)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("BuildTreeIndex error = %v, want context canceled", err)
+	}
+	// Size resolution failures are non-fatal and logged. A canceled build is not one.
+	if strings.Contains(logs.String(), "batch size resolution failed") {
+		t.Fatalf("cancellation was reported as a size resolution failure:\n%s", logs.String())
 	}
 }
 

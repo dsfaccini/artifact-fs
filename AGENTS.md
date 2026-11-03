@@ -41,7 +41,7 @@ Repository-specific guidance for `artifact-fs`.
 - Drive behavior through the entry point real callers use, not an internal helper.
 - Use real Git repositories in `t.TempDir()`. Fake the `git` binary only to inject failures a local repository cannot produce, such as HTTP errors.
 - Assert the observable outcome: what `git status` reports, the resolved entry, or the persisted state. A nil error or a log line is not an outcome.
-- Assert a result that only the code path under test produces. `TestBootstrapCleanStatusIndexSkipsDeleteOnlyOverlay` checks only that the index is unchanged, so it passes whichever check skips the bootstrap.
+- Assert a result that only the code path under test produces. An unchanged index passes whichever check skips the bootstrap. `TestBootstrapCleanStatusIndexSkipsDeleteOnlyOverlay` therefore first bootstraps the same fixture without the overlay entry.
 - Never mount in a package test. Only the root-package e2e tests mount.
 - Run a new e2e test as a `TestE2ESharedMount` subtest. Give it its own mount only when its subject is mounting, a daemon restart, or a fresh mount's state. macFUSE's FSKit extension can stop loading after a series of mounts in one session.
 - Register a shared-mount test that leaves the mount unchanged with `runReadOnly`, and every other one with `run`. When e2e tests mount through FSKit (`-tags fskit` on macOS), `run` skips the test, because the restore that undoes its changes moves HEAD. A `runReadOnly` test that changes the mount fails.

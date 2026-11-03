@@ -53,6 +53,25 @@ jobs:
           git add internal/model/types.go
           .githooks/pre-commit
 
+  # Runs the package tests on macOS, including the darwin-only files, without mounting.
+  darwin-test:
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test -race ./...
+
+      # Only the fskit tag builds the FSKit platformMount.
+      - name: Test with the fskit tag
+        run: go test -race -tags fskit ./internal/fusefs
+
   darwin-build:
     runs-on: ubuntu-latest
     steps:
@@ -129,7 +148,8 @@ jobs:
         env:
           AFS_RUN_E2E_TESTS: "1"
         run: |
-          go test -c -o "$RUNNER_TEMP/artifact-fs-e2e.test" .
+          # The daemon runs inside the test binary, so -race covers it under kernel load.
+          go test -race -c -o "$RUNNER_TEMP/artifact-fs-e2e.test" .
           sudo --preserve-env=AFS_RUN_E2E_TESTS "$RUNNER_TEMP/artifact-fs-e2e.test" \
             -test.count=1 \
             -test.run '^TestFUSEMountSmoke$' \
