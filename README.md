@@ -355,7 +355,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 | `gitstore` | Git CLI wrapper: clone, fetch, ls-tree, batch pool for `cat-file --batch` |
 | `snapshot` | SQLite store for `base_nodes` keyed by `(generation, path)` |
 | `overlay` | SQLite metadata + `upper/` directory for local writes, whiteouts, reconciliation |
-| `hydrator` | Priority queue with deduped waiters; workers fetch queued blobs in batches and block on a `workReady` channel |
+| `hydrator` | Priority queue with deduped waiters; workers fetch queued blobs in batches. With more than one worker, a reserved worker takes only reads and copies of local blobs and blocks on `reservedReady`; the others block on `workReady` |
 | `watcher` | Polls gitdir mtimes (HEAD, index, refs) at 500ms intervals |
 | `registry` | SQLite-backed repo config persistence |
 | `model` | Shared types and canonical interfaces (`GitStore`, `SnapshotStore`, `OverlayStore`, `Hydrator`) |

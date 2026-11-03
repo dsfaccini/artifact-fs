@@ -194,7 +194,10 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, nod
 		return "", 0, ErrStopped
 	}
 	s.mu.Unlock()
-	if ch, ok := s.joinInflight(key); ok {
+	if ch, raised, ok := s.joinInflight(key); ok {
+		if raised {
+			s.signalWork()
+		}
 		return s.awaitHydration(ctx, key, ch)
 	}
 	if size, ok, err := s.validateCachedBlob(ctx, repo, cachePath, node); err != nil {
@@ -210,8 +213,11 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, nod
 	}
 	if _, ok := s.active[key]; ok || len(s.wait[key]) > 0 {
 		s.wait.add(key, ch)
-		s.raiseForReadLocked(key)
+		raised := s.raiseForReadLocked(key)
 		s.mu.Unlock()
+		if raised {
+			s.signalWork()
+		}
 		return s.awaitHydration(ctx, key, ch)
 	}
 	first := s.wait.add(key, ch)
@@ -225,26 +231,31 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, nod
 	return s.awaitHydration(ctx, key, ch)
 }
 
-func (s *Service) joinInflight(key string) (chan result, bool) {
+// joinInflight adds a waiter to key's hydration when one is active or queued.
+// raised says it moved key's queued task ahead of speculative work, so the
+// caller must wake the reserved worker.
+func (s *Service) joinInflight(key string) (ch chan result, raised bool, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.active[key]; !ok && len(s.wait[key]) == 0 {
-		return nil, false
+		return nil, false, false
 	}
-	ch := make(chan result, 1)
+	ch = make(chan result, 1)
 	s.wait.add(key, ch)
-	s.raiseForReadLocked(key)
-	return ch, true
+	return ch, s.raiseForReadLocked(key), true
 }
 
 // raiseForReadLocked moves key's queued task ahead of speculative work, because
-// a read now waits on it. A fetched task stays in queued for this, though it is
-// active, so Enqueue still ignores it.
-func (s *Service) raiseForReadLocked(key string) {
-	if item, ok := s.queued[key]; ok && !isExplicitRead(item.task) {
-		item.task.Priority = PriorityExplicitRead
-		heap.Fix(&s.pq, item.index)
+// a read now waits on it, and reports whether it did. A fetched task stays in
+// queued for this, though it is active, so Enqueue still ignores it.
+func (s *Service) raiseForReadLocked(key string) bool {
+	item, ok := s.queued[key]
+	if !ok || isExplicitRead(item.task) {
+		return false
 	}
+	item.task.Priority = PriorityExplicitRead
+	heap.Fix(&s.pq, item.index)
+	return true
 }
 
 func (s *Service) awaitHydration(ctx context.Context, key string, ch chan result) (cachePath string, size int64, err error) {
@@ -624,21 +635,22 @@ func (s *Service) fetchBatch(repo model.RepoConfig, batch []model.HydrationTask)
 			missing = append(missing, task)
 		}
 	}
+	s.requeueFetched(local, true)
 	// A single blob's own lazy fetch costs the same as a batch fetch.
 	if len(missing) < 2 {
-		s.requeueFetched(local, true)
 		s.requeueFetched(missing, false)
 		return
 	}
 	// A read of a blob that needs no fetch must not wait for its siblings'
-	// fetch. Every other worker may be downloading prefetches, so the worker
-	// that took a read batch serves those reads itself before it fetches.
+	// fetch. Free workers copy those blobs in parallel, and the worker that
+	// took the read batch hydrates the ones no other worker has taken before it
+	// fetches. With a single worker, it hydrates them all.
 	if isExplicitRead(batch[0]) {
 		for _, task := range local {
-			s.hydrate(repo, task)
+			if s.takeQueued(taskKey(task.RepoID, task.ObjectOID)) {
+				s.hydrate(repo, task)
+			}
 		}
-	} else {
-		s.requeueFetched(local, true)
 	}
 	oids := make([]string, len(missing))
 	for i, task := range missing {
@@ -675,6 +687,21 @@ func (s *Service) requeueFetched(tasks []model.HydrationTask, local bool) {
 	}
 	s.mu.Unlock()
 	s.signalWork()
+}
+
+// takeQueued removes key's fetched task from the queue so the caller hydrates
+// it. It reports false when another worker took the task or the service
+// stopped.
+func (s *Service) takeQueued(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.queued[key]
+	if !ok {
+		return false
+	}
+	heap.Remove(&s.pq, item.index)
+	delete(s.queued, key)
+	return true
 }
 
 // hydrate serves task from a valid cached blob, or else copies the blob into
