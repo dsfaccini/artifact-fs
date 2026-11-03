@@ -552,6 +552,21 @@ func TestHasInlineCredentials(t *testing.T) {
 			raw:  "https://localhost/team/repo:v1@2026.git",
 			want: false,
 		},
+		{
+			name: "remote helper with ambient profile",
+			raw:  "codecommit::us-east-1://demo-profile@MyRepositoryName",
+			want: false,
+		},
+		{
+			name: "remote helper over ssh username",
+			raw:  "gcrypt::ssh://git@github.com/org/repo.git",
+			want: false,
+		},
+		{
+			name: "userinfo before a trailing scheme separator",
+			raw:  "A:0@://",
+			want: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -568,12 +583,17 @@ func TestRedactLogStringRemovesRemoteReferences(t *testing.T) {
 		"fatal: repository 'https://github.example.com/private/repo.git' not found",
 		"clone https://user:secret@example.com/org/repo.git failed",
 		"fetch git@example.com:private/repo.git failed",
+		"fatal: path/x://user:ghp_secret@example.com failed",
+		"jane@example.com:https://user:secret@example.com/org/repo.git",
+		"fatal: repository 'codecommit::us-east-1://demo-profile@MyRepositoryName' not found",
+		"fatal: repository 'gcrypt::rsync://user@example.com/repo' not found",
+		"fatal: unable to access '1:000000@0://': HTTP 401",
 	} {
 		got := RedactLogString(input)
 		if !strings.Contains(got, "REDACTED_REMOTE") {
 			t.Fatalf("RedactLogString(%q) = %q, want remote marker", input, got)
 		}
-		for _, secret := range []string{"github.example.com", "private/repo.git", "user", "secret", "example.com", "org/repo.git"} {
+		for _, secret := range []string{"github.example.com", "private/repo.git", "user", "secret", "example.com", "org/repo.git", "MyRepositoryName", "000000"} {
 			if strings.Contains(got, secret) {
 				t.Fatalf("RedactLogString(%q) leaked %q in %q", input, secret, got)
 			}
@@ -621,11 +641,17 @@ func FuzzRedactionHidesPassword(f *testing.F) {
 		{8, "1", "000000", "0://"},
 		{8, "A", "0", "://"},
 		{8, "alice", "ghp_secret", "git:0"},
+		{5, "0", "00", "://"},
 	} {
 		f.Add(uint8(seed.form), seed.user, seed.password, seed.rest)
 	}
 	f.Fuzz(func(t *testing.T, form uint8, user, password, rest string) {
 		if !onlyRunes(user, "-._~%") || password == "" || !onlyRunes(password, "-._~%") || !onlyRunes(rest, "-._~%:/@") {
+			t.Skip()
+		}
+		// An "@" after a later "://", as in "alice:pw@host/a://b@c", puts the
+		// userinfo after that "://", and the userinfo before it is left as is.
+		if _, after, ok := strings.Cut(rest, "://"); ok && strings.Contains(after, "@") {
 			t.Skip()
 		}
 		remote := remoteForms[int(form)%len(remoteForms)] + user + ":" + password + "@" + rest

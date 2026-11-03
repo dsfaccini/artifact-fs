@@ -116,8 +116,10 @@ func HasInlineCredentials(raw string) bool {
 
 func malformedAuthorityStart(raw string) int {
 	lower := strings.ToLower(strings.TrimSpace(raw))
-	if i := strings.Index(lower, "://"); i >= 0 && isURLScheme(lower[:i]) {
-		return i + len("://")
+	// Userinfo follows a "://" unless every "@" precedes it, as in "user:pass@host://".
+	separator := strings.Index(lower, "://")
+	if separator >= 0 && strings.Contains(lower[separator:], "@") {
+		return separator + len("://")
 	}
 	if schemeLessUserinfoStart(raw) >= 0 {
 		return 0
@@ -127,24 +129,10 @@ func malformedAuthorityStart(raw string) int {
 			return len(prefix)
 		}
 	}
-	// A "://" that follows no scheme, as in "user:pass@host://", can follow the userinfo.
-	if strings.Contains(lower, "://") {
-		return 0
+	if separator >= 0 {
+		return separator + len("://")
 	}
 	return -1
-}
-
-// isURLScheme reports whether s is an RFC 3986 scheme: a letter, then letters, digits, "+", "-" or ".".
-func isURLScheme(s string) bool {
-	for i, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z':
-		case i > 0 && (r >= '0' && r <= '9' || r == '+' || r == '-' || r == '.'):
-		default:
-			return false
-		}
-	}
-	return s != ""
 }
 
 func isHTTPRemoteLike(raw string, scheme string) bool {
@@ -289,7 +277,8 @@ func userinfoLikeBeforePath(candidate string) bool {
 }
 
 func schemeLessUserinfoStart(raw string) int {
-	if before, _, ok := strings.Cut(raw, "://"); ok && isURLScheme(before) {
+	// Userinfo follows a "://" unless every "@" precedes it, as in "user:pass@host://".
+	if _, after, ok := strings.Cut(raw, "://"); ok && strings.Contains(after, "@") {
 		return -1
 	}
 	if isSCPStyleRemote(raw) {
