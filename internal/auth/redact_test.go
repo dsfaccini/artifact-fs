@@ -671,38 +671,41 @@ func FuzzRedactionHidesPassword(f *testing.F) {
 		if !onlyRunes(user, "-._~%") || password == "" || !onlyRunes(password, "-._~%") || !onlyRunes(rest, "-._~%:/@") {
 			t.Skip()
 		}
-		// An "@" after a later "://", as in "alice:pw@host/a://b@c", puts the
-		// userinfo after that "://", and the userinfo before it is left as is.
-		if _, after, ok := strings.Cut(rest, "://"); ok && strings.Contains(after, "@") {
-			t.Skip()
-		}
 		prefix := tokenPrefixes[int(prefixIndex)%len(tokenPrefixes)]
 		form := remoteForms[int(formIndex)%len(remoteForms)]
 		end := userinfoEnds[int(endIndex)%len(userinfoEnds)]
+		// Behind a form without "://", an "@" after a later "://" in rest makes the
+		// redaction take the userinfo to follow that "://", so RedactString keeps
+		// the password in "https:/alice:pw@host/a://b@c".
+		if _, after, ok := strings.Cut(rest, "://"); ok && strings.Contains(after, "@") && !strings.HasSuffix(form, "://") {
+			t.Skip()
+		}
 		// A lead puts the userinfo after a later "://", as in "https:/example.com/a://u:pw@z".
 		// The authority follows the first "://", so the lead holds one, at its end.
-		if !onlyRunes(lead, "-._~%:/") || lead != "" && strings.Index(lead, "://") != len(lead)-len("://") {
+		if !onlyRunes(lead, "-._~%:/") || lead != "" && (!strings.HasSuffix(lead, "://") || strings.Index(lead, "://") != len(lead)-len("://")) {
 			t.Skip()
 		}
-		// After a "://" form, or one that a lead's leading ":" or "/" turns into
-		// "://" ("https:" + "//x://"), the lead is a host and path, and the
+		// A "://" form, a form and lead that join into a "://" before the lead's
+		// own, as in "https:" + "//x://", or a leading "//", as in "//./://",
+		// starts the authority there. The lead is then a host and path, and the
 		// userinfo slot sits in the path.
-		if lead != "" && (strings.HasSuffix(form, "://") || strings.IndexAny(lead, ":/") == 0) {
+		if lead != "" && (strings.Index(form+lead, "://") < len(form+lead)-len("://") || strings.HasPrefix(form+lead, "//")) {
 			t.Skip()
 		}
-		// Without an http form the lead can parse as a scheme or an ssh URL path,
-		// as in "B:://u:pw@h" and "ssh:/x://u:pw@h", and the redaction leaves the
-		// userinfo as is.
-		if lead != "" && (form == "" || form == "ssh:/") {
+		// Without a form, a ":" before the lead's "://" can make a scheme, as in
+		// "B:://u:pw@h". Behind "ssh:/" the lead sits in an ssh URL's path, as in
+		// "ssh:/x://u:pw@h". RedactString returns both unchanged.
+		if beforeSeparator, _, _ := strings.Cut(lead, "://"); lead != "" && (form == "" && strings.Contains(beforeSeparator, ":") || form == "ssh:/") {
 			t.Skip()
 		}
-		// "?" and "#" end the userinfo only when an "@" follows, as in "u:pw?q@z".
-		// An ssh or git URL reads "u:pw?q@z" as a host and port instead.
+		// The heuristics take the text before a "?" or "#" as userinfo only when an
+		// "@" follows, as in "u:pw?q@z". An ssh:// or git:// URL ends its authority
+		// at the "?" or "#", so "u:pw" there is a host and port.
 		if end != "@" && (!strings.Contains(rest, "@") || form == "ssh://" || form == "git://") {
 			t.Skip()
 		}
 		// In "0:1?git:@", a remote marker between the "?" and the "@" starts the
-		// remote, and the userinfo before it is left as is.
+		// remote, and RedactString keeps the "0:1" before it.
 		if form == "" && end != "@" && containsRemoteMarker(rest[:strings.Index(rest, "@")]) {
 			t.Skip()
 		}
