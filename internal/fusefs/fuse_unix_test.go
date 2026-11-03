@@ -346,15 +346,27 @@ func TestCanceledDestinationHydrationInterruptsRenameBeforeMutation(t *testing.T
 	destination := model.BaseNode{RepoID: repo.ID, Path: "renamed.txt", Type: "file", Mode: 0o100644, ObjectOID: "destination-blob", SizeState: "known", SizeBytes: 4}
 	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{source.Path: source, destination.Path: destination}}, Overlay: store}
 	resolver.SetGeneration(1)
-	// The source blob is cached; the destination fetch observes the canceled request.
-	hydrator := &fakeBatchHydrator{
-		pathsByOID:  map[string]string{source.ObjectOID: sourceBlob},
-		errorsByOID: map[string]error{destination.ObjectOID: context.Canceled},
+	destinationBlob := filepath.Join(tmp, "destination-blob")
+	if err := os.WriteFile(destinationBlob, []byte("dest"), 0o644); err != nil {
+		t.Fatal(err)
 	}
+	hydrator := &fakeBatchHydrator{pathsByOID: map[string]string{source.ObjectOID: sourceBlob, destination.ObjectOID: destinationBlob}}
 	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: store, Hydrator: hydrator}
 	fs := NewArtifactFuse(repo, engine)
-	// A handle still open on the destination makes Rename copy it into the overlay.
-	fs.fileHandles[1] = &FileHandle{path: destination.Path}
+	// A handle open on the destination makes Rename copy the destination into the overlay.
+	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: destination.Path}
+	if err := fs.LookUpInode(context.Background(), lookup); err != nil {
+		t.Fatal(err)
+	}
+	open := &fuseops.OpenFileOp{Inode: lookup.Entry.Child}
+	if err := fs.OpenFile(context.Background(), open); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: open.Handle})
+	})
+	// The source blob is cached; the destination fetch observes the canceled request.
+	hydrator.errorsByOID = map[string]error{destination.ObjectOID: context.Canceled}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	err = fs.Rename(ctx, &fuseops.RenameOp{

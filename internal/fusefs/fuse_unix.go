@@ -525,7 +525,7 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 		childPath := cleanChildPath(parent.Path, op.Name)
 
 		// Synthesize .git gitfile in root
-		if parent.IsRoot && op.Name == ".git" {
+		if isGitfile(parent, op.Name) {
 			fs.mu.Lock()
 			ref := fs.allocInode(".git", "file", 0o644, fs.engine.Generation())
 			fs.mu.Unlock()
@@ -958,9 +958,12 @@ func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
 
 func (fs *ArtifactFuse) RmDir(ctx context.Context, op *fuseops.RmDirOp) error {
 	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
-		_, childPath, err := fs.childPath(op.Parent, op.Name)
+		parent, childPath, err := fs.childPath(op.Parent, op.Name)
 		if err != nil {
 			return err
+		}
+		if isGitfile(parent, op.Name) {
+			return syscall.EPERM
 		}
 		return fs.engine.Rmdir(ctx, childPath)
 	})
@@ -968,9 +971,12 @@ func (fs *ArtifactFuse) RmDir(ctx context.Context, op *fuseops.RmDirOp) error {
 
 func (fs *ArtifactFuse) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error {
 	return fs.exclusive(ctx, func(ctx context.Context, b *Blobs) error {
-		_, childPath, err := fs.childPath(op.Parent, op.Name)
+		parent, childPath, err := fs.childPath(op.Parent, op.Name)
 		if err != nil {
 			return err
+		}
+		if isGitfile(parent, op.Name) {
+			return syscall.EPERM
 		}
 		if err := fs.engine.Unlink(ctx, b, childPath, fs); err != nil {
 			return err
@@ -990,6 +996,9 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 		if err != nil {
 			return err
 		}
+		if isGitfile(oldParent, op.OldName) || isGitfile(newParent, op.NewName) {
+			return syscall.EPERM
+		}
 		oldPath := cleanChildPath(oldParent.Path, op.OldName)
 		newPath := cleanChildPath(newParent.Path, op.NewName)
 		if err := fs.engine.Rename(ctx, b, oldPath, newPath, fs); err != nil {
@@ -1003,6 +1012,12 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 		fs.moveOpenHandles(oldPath, newPath)
 		return nil
 	})
+}
+
+// isGitfile reports whether name in parent is the synthesized .git gitfile,
+// which the overlay cannot remove or replace.
+func isGitfile(parent *InodeRef, name string) bool {
+	return parent.IsRoot && name == ".git"
 }
 
 // ReadSymlink holds no lock: it changes no bookkeeping, and a base target can

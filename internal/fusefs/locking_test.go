@@ -5,6 +5,7 @@ package fusefs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -561,13 +562,12 @@ func TestRenameCopiesReplacedDestinationOnlyForOpenHandles(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newTrackedFixture(t)
+			f.snapshot.nodes[1]["file.txt"] = withKnownSize(f.snapshot.nodes[1]["file.txt"], 8)
+			inode := f.lookup(t, fuseops.RootInodeID, "file.txt")
 			dir := f.lookup(t, fuseops.RootInodeID, "dir")
 			var handle fuseops.HandleID
 			if tc.open {
-				f.snapshot.nodes[1]["file.txt"] = withKnownSize(f.snapshot.nodes[1]["file.txt"], 8)
-				inode := f.lookup(t, fuseops.RootInodeID, "file.txt")
-				handle = f.fs.nextHandleID
-				f.fs.fileHandles[handle] = &FileHandle{inode: &InodeRef{ID: inode, Path: "file.txt"}, path: "file.txt"}
+				handle = f.open(t, inode)
 			}
 			before := f.hydrator.fetches()
 
@@ -582,11 +582,203 @@ func TestRenameCopiesReplacedDestinationOnlyForOpenHandles(t *testing.T) {
 				t.Fatalf("file.txt after rename = (%q, %v), want inner", got, err)
 			}
 			if tc.open {
-				fh := f.fs.fileHandles[handle]
-				if got, err := handleRead(context.Background(), f.engine, fh, 0, 0, make([]byte, 16)); err != nil || string(got) != "file one" {
-					t.Fatalf("replaced handle reads (%q, %v), want file one", got, err)
+				if got := f.read(t, inode, handle); got != "file one" {
+					t.Fatalf("replaced handle reads %q, want file one", got)
+				}
+				if err := f.fs.WriteFile(context.Background(), &fuseops.WriteFileOp{Inode: inode, Handle: handle, Data: []byte("FILE")}); err != nil {
+					t.Fatalf("WriteFile through the replaced handle: %v", err)
+				}
+				if got := f.read(t, inode, handle); got != "FILE one" {
+					t.Fatalf("replaced handle reads %q after a write, want FILE one", got)
 				}
 			}
 		})
+	}
+}
+
+// TestRenameLargeDirectoryUnderFDLimit renames a directory with more tracked
+// files than the free descriptor budget. A rename that held every blob open
+// until it finished would fail with EMFILE.
+func TestRenameLargeDirectoryUnderFDLimit(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	repo := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	store, err := overlaystore.New(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	blobs := filepath.Join(tmp, "blobs")
+	if err := os.Mkdir(blobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const files = 200
+	big := model.BaseNode{RepoID: repo.ID, Path: "big", Type: "dir", Mode: 0o40000, SizeState: "known"}
+	nodes := map[string]model.BaseNode{".": {Path: ".", Type: "dir", Mode: 0o40000}, big.Path: big}
+	var kids []model.BaseNode
+	for i := range files {
+		oid := fmt.Sprintf("oid-%03d", i)
+		if err := os.WriteFile(filepath.Join(blobs, oid), []byte(oid), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		node := model.BaseNode{RepoID: repo.ID, Path: fmt.Sprintf("big/f%03d", i), Type: "file", Mode: 0o100644, ObjectOID: oid, SizeState: "known", SizeBytes: int64(len(oid))}
+		nodes[node.Path] = node
+		kids = append(kids, node)
+	}
+	snapshot := &generationSnapshot{
+		nodes: map[int64]map[string]model.BaseNode{1: nodes},
+		kids:  map[int64]map[string][]model.BaseNode{1: {".": {big}, big.Path: kids}},
+	}
+	resolver := &Resolver{Snapshot: snapshot, Overlay: store}
+	resolver.SetGeneration(1)
+	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: store, Hydrator: &gatedHydrator{dir: blobs}}
+	fs := NewArtifactFuse(repo, engine)
+
+	var limit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
+		t.Fatal(err)
+	}
+	restore := limit
+	t.Cleanup(func() { _ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &restore) })
+	open, err := os.ReadDir("/dev/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	limit.Cur = uint64(len(open) + 64)
+	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
+		t.Fatal(err)
+	}
+
+	err = fs.Rename(ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "big", NewParent: fuseops.RootInodeID, NewName: "moved"})
+	if restoreErr := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &restore); restoreErr != nil {
+		t.Fatal(restoreErr)
+	}
+	if err != nil {
+		t.Fatalf("Rename big -> moved: %v", err)
+	}
+	got, err := engineRead(ctx, engine, "moved/f199", 0, make([]byte, 16))
+	if err != nil || string(got) != "oid-199" {
+		t.Fatalf("moved/f199 = (%q, %v), want oid-199", got, err)
+	}
+}
+
+// lockProbeOverlay records each overlay lookup and sync that ran while the
+// transition write lock was free.
+type lockProbeOverlay struct {
+	model.OverlayStore
+	resolver *Resolver
+
+	mu       sync.Mutex
+	calls    int
+	unlocked []string
+}
+
+func (o *lockProbeOverlay) probe(call string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.calls++
+	if o.resolver.transition.TryLock() {
+		o.resolver.transition.Unlock()
+		o.unlocked = append(o.unlocked, call)
+	}
+}
+
+func (o *lockProbeOverlay) Lookup(ctx context.Context, path string) (model.OverlayEntry, bool, error) {
+	o.probe("Lookup " + path)
+	return o.OverlayStore.Lookup(ctx, path)
+}
+
+func (o *lockProbeOverlay) SyncFile(ctx context.Context, path string) error {
+	o.probe("SyncFile " + path)
+	return o.OverlayStore.SyncFile(ctx, path)
+}
+
+// HEAD reconciliation removes overlay entries and their backing files under the
+// transition write lock, so opening or syncing an overlay file must hold the
+// read lock from the lookup through the file access.
+func TestOverlayFileOpsHoldTransitionReadLock(t *testing.T) {
+	f := newTrackedFixture(t)
+	inode := f.lookup(t, fuseops.RootInodeID, "other.txt")
+	probe := &lockProbeOverlay{OverlayStore: f.store, resolver: f.resolver}
+	f.resolver.Overlay = probe
+	f.engine.Overlay = probe
+
+	handle := f.open(t, inode)
+	if err := f.fs.SyncFile(context.Background(), &fuseops.SyncFileOp{Inode: inode, Handle: handle}); err != nil {
+		t.Fatalf("SyncFile: %v", err)
+	}
+
+	if probe.calls == 0 {
+		t.Fatal("OpenFile and SyncFile made no overlay calls")
+	}
+	if len(probe.unlocked) != 0 {
+		t.Fatalf("overlay calls without the transition read lock: %v", probe.unlocked)
+	}
+}
+
+func TestSyntheticGitFileRejectsRemoval(t *testing.T) {
+	f := newTrackedFixture(t)
+	f.lookup(t, fuseops.RootInodeID, ".git")
+	ctx := context.Background()
+	for name, op := range map[string]func() error{
+		"unlink": func() error {
+			return f.fs.Unlink(ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: ".git"})
+		},
+		"rmdir": func() error {
+			return f.fs.RmDir(ctx, &fuseops.RmDirOp{Parent: fuseops.RootInodeID, Name: ".git"})
+		},
+		"rename away": func() error {
+			return f.fs.Rename(ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: ".git", NewParent: fuseops.RootInodeID, NewName: "moved"})
+		},
+		"rename over": func() error {
+			return f.fs.Rename(ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "other.txt", NewParent: fuseops.RootInodeID, NewName: ".git"})
+		},
+	} {
+		if got := kernelErrno(op()); got != syscall.EPERM {
+			t.Errorf("%s .git: kernel errno = %v, want EPERM", name, got)
+		}
+	}
+	for _, path := range []string{".git", "moved"} {
+		if entry, ok, err := f.store.Lookup(ctx, path); err != nil || ok {
+			t.Fatalf("overlay %s = (%+v, %t, %v), want no entry", path, entry, ok, err)
+		}
+	}
+	if _, err := f.resolver.ResolvePath("other.txt"); err != nil {
+		t.Fatalf("other.txt after the rejected rename: %v", err)
+	}
+	f.lookup(t, fuseops.RootInodeID, ".git")
+}
+
+func TestHandleOpenedDuringUnlinkHydrationKeepsContent(t *testing.T) {
+	f := newTrackedFixture(t)
+	f.snapshot.nodes[1]["file.txt"] = withKnownSize(f.snapshot.nodes[1]["file.txt"], 8)
+	inode := f.lookup(t, fuseops.RootInodeID, "file.txt")
+	f.open(t, inode)
+	started, release := f.hydrator.arm()
+	done := make(chan error, 1)
+	go func() {
+		done <- f.fs.Unlink(context.Background(), &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"})
+	}()
+	select {
+	case <-started:
+	case err := <-done:
+		t.Fatalf("Unlink returned before hydration: %v", err)
+	}
+
+	// Unlink holds no lock while it hydrates, so this open completes meanwhile.
+	second := f.open(t, inode)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("Unlink: %v", err)
+	}
+
+	if got := f.read(t, inode, second); got != "file one" {
+		t.Fatalf("second handle reads %q, want file one", got)
+	}
+	if err := f.fs.WriteFile(context.Background(), &fuseops.WriteFileOp{Inode: inode, Handle: second, Data: []byte("FILE")}); err != nil {
+		t.Fatalf("WriteFile through the second handle: %v", err)
+	}
+	if got := f.read(t, inode, second); got != "FILE one" {
+		t.Fatalf("second handle reads %q after a write, want FILE one", got)
 	}
 }

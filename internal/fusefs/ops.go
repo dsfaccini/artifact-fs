@@ -36,10 +36,18 @@ type Engine struct {
 	Hydrator model.Hydrator
 }
 
-// Blobs holds the base blobs that Engine.Do hydrated for one op.
+// Blobs holds the base blobs that Engine.Do hydrated for one op. It holds no
+// open file: an op opens each blob when it reads it, so a directory rename over
+// many files keeps one blob open at a time.
 type Blobs struct {
-	files map[string]*os.File // open blob files by object ID
-	sizes map[string]int64    // blob sizes by object ID
+	files map[string]hydratedBlob // hydrated blob files by object ID
+	sizes map[string]int64        // blob sizes by object ID
+}
+
+// hydratedBlob is a blob file the hydrator verified, by path and identity.
+type hydratedBlob struct {
+	path string
+	info os.FileInfo
 }
 
 // notHydratedError names the base blobs an op needs and its Blobs lacks: files
@@ -53,21 +61,33 @@ func (e *notHydratedError) Error() string {
 	return fmt.Sprintf("%d base blobs are not hydrated", len(e.files)+len(e.sizes))
 }
 
-// file returns the open blob of n. b keeps ownership of the file.
-func (b *Blobs) file(n model.BaseNode) (*os.File, error) {
-	if f := b.files[n.ObjectOID]; f != nil {
-		return f, nil
+// open opens n's blob for the caller to close. A blob file that changed on
+// disk since the hydrator verified it counts as not hydrated.
+func (b *Blobs) open(n model.BaseNode) (*os.File, error) {
+	missing := &notHydratedError{files: []model.BaseNode{n}}
+	blob, ok := b.files[n.ObjectOID]
+	if !ok {
+		return nil, missing
 	}
-	return nil, &notHydratedError{files: []model.BaseNode{n}}
-}
-
-// take returns the open blob of n and hands closing it to the caller.
-func (b *Blobs) take(n model.BaseNode) (*os.File, error) {
-	f, err := b.file(n)
-	if err == nil {
+	f, err := os.Open(blob.path)
+	if errors.Is(err, fs.ErrNotExist) {
 		delete(b.files, n.ObjectOID)
+		return nil, missing
 	}
-	return f, err
+	if err != nil {
+		return nil, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if !os.SameFile(st, blob.info) || st.Size() != blob.info.Size() || !st.ModTime().Equal(blob.info.ModTime()) {
+		_ = f.Close()
+		delete(b.files, n.ObjectOID)
+		return nil, missing
+	}
+	return f, nil
 }
 
 // requireFiles names every blob of nodes that b lacks, so that an op copying
@@ -75,7 +95,7 @@ func (b *Blobs) take(n model.BaseNode) (*os.File, error) {
 func (b *Blobs) requireFiles(nodes []model.BaseNode) error {
 	var missing []model.BaseNode
 	for _, n := range nodes {
-		if b.files[n.ObjectOID] == nil {
+		if _, ok := b.files[n.ObjectOID]; !ok {
 			missing = append(missing, n)
 		}
 	}
@@ -93,19 +113,12 @@ func (b *Blobs) size(n model.BaseNode) (int64, error) {
 	return 0, &notHydratedError{sizes: []model.BaseNode{n}}
 }
 
-func (b *Blobs) close() {
-	for _, f := range b.files {
-		_ = f.Close()
-	}
-}
-
 // Do runs op holding lock, or no lock when lock is nil. op's context is never
 // canceled, so an op that started to change the overlay finishes. When op
 // returns a *notHydratedError, Do releases lock, hydrates the blobs the error
 // names under ctx, and runs op again.
 func (e *Engine) Do(ctx context.Context, lock sync.Locker, op func(context.Context, *Blobs) error) error {
 	b := &Blobs{}
-	defer b.close()
 	opCtx := context.WithoutCancel(ctx)
 	for {
 		if lock != nil {
@@ -127,18 +140,25 @@ func (e *Engine) Do(ctx context.Context, lock sync.Locker, op func(context.Conte
 
 func (e *Engine) hydrate(ctx context.Context, b *Blobs, missing *notHydratedError) error {
 	if b.files == nil {
-		b.files = map[string]*os.File{}
+		b.files = map[string]hydratedBlob{}
 		b.sizes = map[string]int64{}
 	}
 	for _, n := range missing.files {
-		if b.files[n.ObjectOID] != nil {
+		if _, ok := b.files[n.ObjectOID]; ok {
 			continue
 		}
+		// OpenHydrated returns the file the hydrator verified. Its identity lets
+		// Blobs.open reopen that same file once the op holds its locks.
 		f, size, err := e.Hydrator.OpenHydrated(ctx, e.Repo, n)
 		if err != nil {
 			return err
 		}
-		b.files[n.ObjectOID] = f
+		info, err := f.Stat()
+		_ = f.Close()
+		if err != nil {
+			return err
+		}
+		b.files[n.ObjectOID] = hydratedBlob{path: f.Name(), info: info}
 		b.sizes[n.ObjectOID] = size
 	}
 	for _, n := range missing.sizes {
@@ -239,10 +259,11 @@ func (e *Engine) ensureOverlay(ctx context.Context, b *Blobs, path string) error
 		return err
 	}
 	if n.Base.ObjectOID != "" {
-		src, err := b.file(n.Base)
+		src, err := b.open(n.Base)
 		if err != nil {
 			return err
 		}
+		defer src.Close()
 		_, err = e.Overlay.EnsureCopyOnWriteFrom(ctx, e.Repo, path, n.Base, src)
 		return err
 	}
@@ -252,23 +273,24 @@ func (e *Engine) ensureOverlay(ctx context.Context, b *Blobs, path string) error
 
 // OpenFile opens path's content for a new file handle: the overlay file, as
 // generation -1, or else the base blob of generation gen, or of the current
-// generation when gen is 0, with the generation it opened. It returns no file
-// when the handle reads through Read.
+// generation when gen is 0, with the generation it opened.
 func (e *Engine) OpenFile(ctx context.Context, b *Blobs, path string, gen int64) (*os.File, int64, error) {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
+	path = model.CleanPath(path)
 	if ov, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
 		return nil, 0, err
-	} else if ok && !ov.IsDeleted() {
+	} else if ok {
+		if ov.IsDeleted() {
+			return nil, 0, os.ErrNotExist
+		}
 		f, err := os.OpenFile(ov.BackingPath, os.O_RDWR, 0)
 		if err != nil {
 			f, err = os.Open(ov.BackingPath)
 		}
 		return f, -1, err
 	}
-	f, gen, base, err := e.BaseCacheFile(ctx, b, path, gen)
-	if err != nil || !base {
-		return nil, 0, err
-	}
-	return f, gen, nil
+	return e.openBase(ctx, b, path, gen)
 }
 
 // Read fills dst from path at off and returns the filled prefix of dst.
@@ -287,10 +309,11 @@ func (e *Engine) Read(ctx context.Context, b *Blobs, path string, off int64, dst
 	if err != nil {
 		return nil, err
 	}
-	f, err := b.file(n.Base)
+	f, err := b.open(n.Base)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
 	return readFileChunkFrom(f, off, dst)
 }
 
@@ -309,6 +332,17 @@ func (e *Engine) BaseCacheFile(ctx context.Context, b *Blobs, path string, gen i
 		}
 		return nil, 0, false, nil
 	}
+	f, gen, err := e.openBase(ctx, b, path, gen)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return f, gen, true, nil
+}
+
+// openBase opens the base blob of path at generation gen, or at the current
+// generation when gen is 0 or HEAD reconciliation pruned gen, and returns the
+// generation it opened. The caller holds the transition read lock.
+func (e *Engine) openBase(ctx context.Context, b *Blobs, path string, gen int64) (*os.File, int64, error) {
 	current := e.Resolver.Generation()
 	if gen == 0 {
 		gen = current
@@ -320,16 +354,16 @@ func (e *Engine) BaseCacheFile(ctx context.Context, b *Blobs, path string, gen i
 		n, ok, err = e.Resolver.Snapshot.LookupNode(ctx, gen, path)
 	}
 	if err != nil {
-		return nil, 0, false, err
+		return nil, 0, err
 	}
 	if !ok {
-		return nil, 0, false, fs.ErrNotExist
+		return nil, 0, fs.ErrNotExist
 	}
-	f, err := b.take(n)
+	f, err := b.open(n)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, 0, err
 	}
-	return f, gen, true, nil
+	return f, gen, nil
 }
 
 func (e *Engine) Write(ctx context.Context, b *Blobs, path string, off int64, data []byte) (int, error) {
@@ -348,6 +382,8 @@ func (e *Engine) Write(ctx context.Context, b *Blobs, path string, off int64, da
 }
 
 func (e *Engine) Sync(ctx context.Context, path string) error {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
 	return e.Overlay.SyncFile(ctx, path)
 }
 

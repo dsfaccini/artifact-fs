@@ -35,7 +35,7 @@ Repository-specific guidance for `artifact-fs`.
 - SQLite is `modernc.org/sqlite` in WAL mode via `internal/meta`.
 - The FUSE adapter calls only `Engine` methods, one per operation. Do not reach into `engine.Overlay`, `engine.Hydrator`, or the `Resolver` from the adapter.
 - Hold no lock while a blob hydrates. An `Engine` method that needs base content takes a `*Blobs` and returns a `notHydratedError` before it changes anything. `Engine.Do` then hydrates with no lock held and reruns the method.
-- Take the FUSE locks in this order: `handleOps`, the resolver's `transition`, `ArtifactFuse.mu`, `FileHandle.mu`.
+- Take the FUSE locks in this order: `handleOps`, `DirHandle.mu`, the resolver's `transition`, `ArtifactFuse.mu`, `FileHandle.mu`.
 - Wrap an operation error's cause with `%w`, and let `toErrno` map it for the kernel. Do not return `syscall.EIO` for a failure that carries an errno.
 
 ## Writing tests

@@ -415,14 +415,14 @@ func TestRenameRecreatedTrackedEntryHidesSource(t *testing.T) {
 			engine := &Engine{Repo: cfg, Resolver: resolver, Overlay: ov, Hydrator: &fakeBatchHydrator{path: cachePath}}
 
 			if tc.sourceType == "symlink" {
-				if err := engine.Unlink(ctx, nil, "README.md", nil); err != nil {
+				if err := engineUnlink(ctx, engine, "README.md"); err != nil {
 					t.Fatal(err)
 				}
 			} else {
 				if err := engineRename(ctx, engine, "README.md", "first.md"); err != nil {
 					t.Fatal(err)
 				}
-				if err := engine.Unlink(ctx, nil, "first.md", nil); err != nil {
+				if err := engineUnlink(ctx, engine, "first.md"); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -578,13 +578,13 @@ func TestRenameReplacedTrackedEntryHidesSource(t *testing.T) {
 			engine := &Engine{Repo: cfg, Resolver: resolver, Overlay: ov, Hydrator: &fakeBatchHydrator{path: cachePath}}
 
 			if tc.sourceType == "dir" {
-				if err := engine.Unlink(ctx, nil, "entry/child.txt", nil); err != nil {
+				if err := engineUnlink(ctx, engine, "entry/child.txt"); err != nil {
 					t.Fatal(err)
 				}
 				if err := engine.Rmdir(ctx, "entry"); err != nil {
 					t.Fatal(err)
 				}
-			} else if err := engine.Unlink(ctx, nil, "entry", nil); err != nil {
+			} else if err := engineUnlink(ctx, engine, "entry"); err != nil {
 				t.Fatal(err)
 			}
 			if tc.replacementType == "symlink" {
@@ -668,7 +668,7 @@ func TestRenameChainHidesReplacedTrackedIntermediate(t *testing.T) {
 			engine := &Engine{Repo: cfg, Resolver: resolver, Overlay: ov, Hydrator: &fakeBatchHydrator{path: cachePath}}
 
 			if tc.unlinkIntermediate {
-				if err := engine.Unlink(ctx, nil, intermediate.Path, nil); err != nil {
+				if err := engineUnlink(ctx, engine, intermediate.Path); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -922,6 +922,12 @@ func TestRenameDirectoryRejectsDestinationChildCreatedDuringHydration(t *testing
 func engineRename(ctx context.Context, e *Engine, oldPath, newPath string) error {
 	return e.Do(ctx, nil, func(ctx context.Context, b *Blobs) error {
 		return e.Rename(ctx, b, oldPath, newPath, nil)
+	})
+}
+
+func engineUnlink(ctx context.Context, e *Engine, path string) error {
+	return e.Do(ctx, nil, func(ctx context.Context, b *Blobs) error {
+		return e.Unlink(ctx, b, path, nil)
 	})
 }
 
