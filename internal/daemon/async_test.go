@@ -643,11 +643,14 @@ func TestMountRepoPreparationTimesOutAndReleasesLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitStarted := filepath.Join(tmp, "git-started")
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\n: > \"$AFS_GIT_STARTED\"\nexec sleep 10\n"), 0o755); err != nil {
+	gitFinished := filepath.Join(tmp, "git-finished")
+	// The git call finishes only if the prepare deadline fails to kill it.
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\n: > \"$AFS_GIT_STARTED\"\nsleep 60\n: > \"$AFS_GIT_FINISHED\"\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("AFS_GIT_STARTED", gitStarted)
+	t.Setenv("AFS_GIT_FINISHED", gitFinished)
 
 	var logs bytes.Buffer
 	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewJSONHandler(&logs, nil)))
@@ -675,6 +678,9 @@ func TestMountRepoPreparationTimesOutAndReleasesLock(t *testing.T) {
 
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatalf("syncRepos: %v", err)
+	}
+	if _, err := os.Stat(gitFinished); err == nil {
+		t.Fatal("git ran to completion; the prepare deadline did not interrupt it")
 	}
 	failure := findJSONLogRecord(t, logs.Bytes(), "repo mount failed")
 	if got := failure["repo"]; got != "repo" {

@@ -89,8 +89,8 @@ func assertEscapedGitCancellationIsBounded(t *testing.T, call func(context.Conte
 	}
 	defer syscall.Kill(helperPID, syscall.SIGKILL)
 
-	// The helper holds the descriptors until it is killed, so the call can
-	// return only by not waiting for them.
+	// The helper holds the descriptors until it is killed or its minute ends,
+	// so the call returns with the helper alive only if it did not wait for them.
 	cancel()
 	if err := <-errCh; !errors.Is(err, context.Canceled) {
 		t.Fatalf("runGit error = %v, want context canceled", err)
@@ -118,5 +118,7 @@ func TestRunGitEscapedDescriptorHelper(t *testing.T) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	time.Sleep(time.Hour)
+	// Setsid puts the helper beyond the process-group kill, and a timeout panic
+	// skips the test's kill, so the sleep bounds how long an orphan lives.
+	time.Sleep(time.Minute)
 }
