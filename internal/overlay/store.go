@@ -3,7 +3,6 @@ package overlay
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1126,13 +1125,20 @@ func resumeChangeLog(ctx context.Context, tx *sql.Tx, paths ...string) error {
 	if len(paths) == 0 {
 		return nil
 	}
-	list, err := json.Marshal(paths)
+	// REPLACE moves a path that is already logged to a new sequence number.
+	// Each path is bound as is: a name need not be valid UTF-8, which a JSON
+	// list would replace.
+	stmt, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO overlay_changes(path) VALUES (?)`)
 	if err != nil {
 		return err
 	}
-	// REPLACE moves a path that is already logged to a new sequence number.
-	_, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO overlay_changes(path) SELECT value FROM json_each(?)`, string(list))
-	return err
+	defer stmt.Close()
+	for _, path := range paths {
+		if _, err := stmt.ExecContext(ctx, path); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // changesSinceQuery sorts with a unary + so SQLite searches the seq range and

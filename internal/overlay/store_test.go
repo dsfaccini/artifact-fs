@@ -1570,6 +1570,28 @@ func TestRenameTreeLogsBothRootsAndOnePathPerDirectory(t *testing.T) {
 	}
 }
 
+// Linux allows a name that is not valid UTF-8, and Git reports it byte for byte.
+func TestRenameTreeLogsNonUTF8PathsVerbatim(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	for _, dir := range []string{"src\xff", "src\xff/sub\xfe"} {
+		if err := s.Mkdir(ctx, dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.CreateFile(ctx, "src\xff/sub\xfe/a.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := changesSince(t, cfg, 0).Seq
+	if err := s.Rename(ctx, "src\xff", "dst\xfd", false); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"dst\xfd", "dst\xfd/sub\xfe", "dst\xfd/sub\xfe/a.txt", "src\xff", "src\xff/sub\xfe", "src\xff/sub\xfe/a.txt"}
+	if got := changesSince(t, cfg, before).Paths; !slices.Equal(got, want) {
+		t.Fatalf("changed paths = %q, want %q", got, want)
+	}
+}
+
 func TestReconcileLogsOnlyDeleteMarkersOverBasePaths(t *testing.T) {
 	s, cfg := testStore(t)
 	ctx := context.Background()
