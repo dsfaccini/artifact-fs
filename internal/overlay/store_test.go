@@ -1643,3 +1643,14 @@ func TestChangesSinceQuerySearchesTheSequenceRange(t *testing.T) {
 		t.Fatalf("query plan = %q, want a search of the seq range", plan)
 	}
 }
+
+func TestReadChangesSinceDistrustsALogMissingATrigger(t *testing.T) {
+	s, cfg := testStore(t)
+	changesSince(t, cfg, 0)
+	if _, err := s.db.Exec(`DROP TRIGGER overlay_entries_delete_change`); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := ReadChangesSince(context.Background(), cfg, 0); err != nil || ok {
+		t.Fatalf("ReadChangesSince without the delete trigger = %v, %v; want false, nil", ok, err)
+	}
+}

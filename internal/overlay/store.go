@@ -18,7 +18,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
-var migrations = []string{
+var migrations = slices.Concat([]string{
 	`CREATE TABLE IF NOT EXISTS overlay_entries (
 	  path TEXT PRIMARY KEY,
 	  kind TEXT NOT NULL,
@@ -44,27 +44,27 @@ var migrations = []string{
 	// database's sequence never matches.
 	`CREATE TABLE IF NOT EXISTS overlay_instance (id TEXT NOT NULL);`,
 	`INSERT INTO overlay_instance(id) SELECT lower(hex(randomblob(16))) WHERE NOT EXISTS (SELECT 1 FROM overlay_instance);`,
-	// A bulk operation holds a row here inside its transaction, so the
-	// triggers skip its entries and it logs one change instead.
-	`CREATE TABLE IF NOT EXISTS overlay_changes_suspended (id INTEGER PRIMARY KEY);`,
-	// CREATE TRIGGER IF NOT EXISTS keeps an existing trigger's body, so a
-	// change to a trigger must DROP TRIGGER IF EXISTS first.
-	`CREATE TRIGGER IF NOT EXISTS overlay_entries_insert_change AFTER INSERT ON overlay_entries
-	WHEN NOT EXISTS (SELECT 1 FROM overlay_changes_suspended) BEGIN
+}, changeLogTriggers)
+
+// changeLogTriggers feed overlay_changes from every write to overlay_entries.
+// CREATE TRIGGER IF NOT EXISTS keeps an existing trigger's body, so a change
+// to a trigger must DROP TRIGGER IF EXISTS first.
+var changeLogTriggers = []string{
+	`CREATE TRIGGER IF NOT EXISTS overlay_entries_insert_change AFTER INSERT ON overlay_entries BEGIN
 	  DELETE FROM overlay_changes WHERE path = NEW.path;
 	  INSERT INTO overlay_changes(path) VALUES (NEW.path);
 	END;`,
-	`CREATE TRIGGER IF NOT EXISTS overlay_entries_update_change AFTER UPDATE ON overlay_entries
-	WHEN NOT EXISTS (SELECT 1 FROM overlay_changes_suspended) BEGIN
+	`CREATE TRIGGER IF NOT EXISTS overlay_entries_update_change AFTER UPDATE ON overlay_entries BEGIN
 	  DELETE FROM overlay_changes WHERE path IN (OLD.path, NEW.path);
 	  INSERT INTO overlay_changes(path) SELECT OLD.path UNION SELECT NEW.path;
 	END;`,
-	`CREATE TRIGGER IF NOT EXISTS overlay_entries_delete_change AFTER DELETE ON overlay_entries
-	WHEN NOT EXISTS (SELECT 1 FROM overlay_changes_suspended) BEGIN
+	`CREATE TRIGGER IF NOT EXISTS overlay_entries_delete_change AFTER DELETE ON overlay_entries BEGIN
 	  DELETE FROM overlay_changes WHERE path = OLD.path;
 	  INSERT INTO overlay_changes(path) VALUES (OLD.path);
 	END;`,
 }
+
+var changeLogTriggerNames = []string{"overlay_entries_insert_change", "overlay_entries_update_change", "overlay_entries_delete_change"}
 
 type Store struct {
 	db       *sql.DB
@@ -1042,16 +1042,26 @@ func (s *Store) DirtyCount(ctx context.Context) (int64, error) {
 	return c, err
 }
 
-// suspendChangeLog stops the triggers from logging tx's entry changes. The
-// caller logs them with resumeChangeLog before it commits.
+// suspendChangeLog drops the triggers for the rest of tx, so a bulk operation
+// pays no per-row trigger cost. SQLite runs a trigger's program for each row
+// even when a WHEN clause skips its body. Other connections keep seeing the
+// triggers, because the drop commits only together with resumeChangeLog.
 func suspendChangeLog(ctx context.Context, tx *sql.Tx) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO overlay_changes_suspended DEFAULT VALUES`)
-	return err
+	for _, name := range changeLogTriggerNames {
+		if _, err := tx.ExecContext(ctx, `DROP TRIGGER IF EXISTS `+name); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
+// resumeChangeLog recreates the triggers and logs paths in place of the
+// changes made while they were dropped.
 func resumeChangeLog(ctx context.Context, tx *sql.Tx, paths ...string) error {
-	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_changes_suspended`); err != nil {
-		return err
+	for _, stmt := range changeLogTriggers {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
 	}
 	for _, path := range paths {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_changes WHERE path = ?`, path); err != nil {
@@ -1081,7 +1091,8 @@ type Changes struct {
 
 // ReadChangesSince reads the change log of an existing overlay database
 // without the schema setup and backfill that New runs, so it never takes the
-// write lock. ok is false when the database or its change log is missing.
+// write lock. ok is false when the database, its change log or a trigger that
+// feeds the log is missing.
 func ReadChangesSince(ctx context.Context, cfg model.RepoConfig, since int64) (changes Changes, ok bool, err error) {
 	if _, err := os.Stat(cfg.OverlayDBPath); errors.Is(err, os.ErrNotExist) {
 		return Changes{}, false, nil
@@ -1098,11 +1109,12 @@ func ReadChangesSince(ctx context.Context, cfg model.RepoConfig, since int64) (c
 		return Changes{}, false, err
 	}
 	defer tx.Rollback()
-	var tables int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('overlay_changes', 'overlay_instance')`).Scan(&tables); err != nil {
+	// Without every trigger, the log misses writes.
+	var objects int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE (type = 'table' AND name IN ('overlay_changes', 'overlay_instance')) OR (type = 'trigger' AND name IN (?, ?, ?))`, changeLogTriggerNames[0], changeLogTriggerNames[1], changeLogTriggerNames[2]).Scan(&objects); err != nil {
 		return Changes{}, false, err
 	}
-	if tables != 2 {
+	if objects != 2+len(changeLogTriggerNames) {
 		return Changes{}, false, nil
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT id FROM overlay_instance`).Scan(&changes.Instance); err != nil {
