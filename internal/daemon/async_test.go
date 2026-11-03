@@ -12,9 +12,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
+	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/registry"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
@@ -127,7 +130,7 @@ func TestSyncRegistrationIsNotMountedWhilePreparing(t *testing.T) {
 	go func() {
 		errCh <- svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", Enabled: true})
 	}()
-	waitFor(t, time.Second, func() bool {
+	waitFor(t, errCh, func() bool {
 		_, err := os.Stat(started)
 		return err == nil
 	})
@@ -211,7 +214,7 @@ func TestSupersededPrepareDoesNotMutateExistingClone(t *testing.T) {
 	go func() {
 		prepareErr <- svc.Prepare(ctx, cfg.Name)
 	}()
-	waitFor(t, time.Second, func() bool {
+	waitFor(t, prepareErr, func() bool {
 		current, err := svc.registry.GetRepo(ctx, cfg.Name)
 		return err == nil && current.PrepareState == model.PrepareStateSyncPreparing && current.ConfigVersion != cfg.ConfigVersion
 	})
@@ -251,46 +254,48 @@ func TestRepoPrepareLockSerializesServices(t *testing.T) {
 	}
 	defer second.Close()
 
-	firstEntered := make(chan struct{})
-	releaseFirst := make(chan struct{})
-	firstDone := make(chan error, 1)
-	go func() {
-		firstDone <- first.withRepoPrepareLock(ctx, "repo", func() error {
-			close(firstEntered)
-			<-releaseFirst
-			return nil
-		})
-	}()
-	<-firstEntered
+	// The lock retries on a timer, so in a synctest bubble the second service
+	// is durably blocked once it has found the lock held.
+	synctest.Test(t, func(t *testing.T) {
+		firstEntered := make(chan struct{})
+		releaseFirst := make(chan struct{})
+		firstDone := make(chan error, 1)
+		go func() {
+			firstDone <- first.withRepoPrepareLock(ctx, "repo", func() error {
+				close(firstEntered)
+				<-releaseFirst
+				return nil
+			})
+		}()
+		<-firstEntered
 
-	secondEntered := make(chan struct{})
-	secondStarted := make(chan struct{})
-	secondDone := make(chan error, 1)
-	go func() {
-		close(secondStarted)
-		secondDone <- second.withRepoPrepareLock(ctx, "repo", func() error {
-			close(secondEntered)
-			return nil
-		})
-	}()
-	<-secondStarted
-	select {
-	case <-secondEntered:
-		t.Fatal("second service entered preparation while the first held the repo lock")
-	case <-time.After(50 * time.Millisecond):
-	}
-	close(releaseFirst)
-	if err := <-firstDone; err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-secondEntered:
-	case <-time.After(time.Second):
-		t.Fatal("second service did not enter preparation after the lock was released")
-	}
-	if err := <-secondDone; err != nil {
-		t.Fatal(err)
-	}
+		secondEntered := make(chan struct{})
+		secondDone := make(chan error, 1)
+		go func() {
+			secondDone <- second.withRepoPrepareLock(ctx, "repo", func() error {
+				close(secondEntered)
+				return nil
+			})
+		}()
+		synctest.Wait()
+		select {
+		case <-secondEntered:
+			t.Fatal("second service entered preparation while the first held the repo lock")
+		default:
+		}
+		close(releaseFirst)
+		if err := <-firstDone; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-secondDone; err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-secondEntered:
+		default:
+			t.Fatal("second service did not enter preparation after the lock was released")
+		}
+	})
 }
 
 func TestAddRepoAsyncRejectsInlineCredentials(t *testing.T) {
@@ -579,18 +584,19 @@ func TestStartPrepareWorkerTimesOutAndPersistsFailed(t *testing.T) {
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	gitPath := filepath.Join(bin, "git")
-	if err := os.WriteFile(gitPath, []byte("#!/bin/sh\nexec sleep 10\n"), 0o755); err != nil {
+	cloneStarted := filepath.Join(t.TempDir(), "clone-started")
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(markCloneStartScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AFS_CLONE_STARTED", cloneStarted)
 
 	var logs bytes.Buffer
 	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewJSONHandler(&logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc.prepareTimeout = 20 * time.Millisecond
+	expirePrepareOnFile(svc, cloneStarted)
 	defer svc.Close()
 
 	cfg := model.RepoConfig{
@@ -613,7 +619,7 @@ func TestStartPrepareWorkerTimesOutAndPersistsFailed(t *testing.T) {
 	if got.PrepareError != "prepare timed out" {
 		t.Fatalf("PrepareError = %q, want timeout", got.PrepareError)
 	}
-	waitFor(t, time.Second, func() bool {
+	waitFor(t, nil, func() bool {
 		svc.mu.Lock()
 		defer svc.mu.Unlock()
 		_, preparing := svc.preparing[got.ID]
@@ -637,17 +643,22 @@ func TestMountRepoPreparationTimesOutAndReleasesLock(t *testing.T) {
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nexec sleep 10\n"), 0o755); err != nil {
+	gitStarted := filepath.Join(tmp, "git-started")
+	gitFinished := filepath.Join(tmp, "git-finished")
+	// The git call finishes only if the prepare deadline fails to kill it.
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\n: > \"$AFS_GIT_STARTED\"\nsleep 60\n: > \"$AFS_GIT_FINISHED\"\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AFS_GIT_STARTED", gitStarted)
+	t.Setenv("AFS_GIT_FINISHED", gitFinished)
 
 	var logs bytes.Buffer
 	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewJSONHandler(&logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc.prepareTimeout = 20 * time.Millisecond
+	expirePrepareOnFile(svc, gitStarted)
 	svc.SetMountRoot(filepath.Join(tmp, "mnt"))
 	defer svc.Close()
 
@@ -666,12 +677,11 @@ func TestMountRepoPreparationTimesOutAndReleasesLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	started := time.Now()
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatalf("syncRepos: %v", err)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("syncRepos took %v, want bounded mount preparation", elapsed)
+	if _, err := os.Stat(gitFinished); err == nil {
+		t.Fatal("git ran to completion; the prepare deadline did not interrupt it")
 	}
 	failure := findJSONLogRecord(t, logs.Bytes(), "repo mount failed")
 	if got := failure["repo"]; got != "repo" {
@@ -754,17 +764,19 @@ func TestAddRepoSyncTimeoutIsLoggedAndPersisted(t *testing.T) {
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nexec sleep 10\n"), 0o755); err != nil {
+	cloneStarted := filepath.Join(tmp, "clone-started")
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(markCloneStartScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AFS_CLONE_STARTED", cloneStarted)
 
 	var logs bytes.Buffer
 	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewJSONHandler(&logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc.prepareTimeout = 20 * time.Millisecond
+	expirePrepareOnFile(svc, cloneStarted)
 	defer svc.Close()
 
 	err = svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", Enabled: true})
@@ -812,7 +824,7 @@ func TestAddRepoSyncCancellationIsLoggedAndPersisted(t *testing.T) {
 	go func() {
 		errCh <- svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", Enabled: true})
 	}()
-	waitFor(t, time.Second, func() bool {
+	waitFor(t, errCh, func() bool {
 		_, err := os.Stat(started)
 		return err == nil
 	})
@@ -849,13 +861,18 @@ func TestAddRepoSyncBuildTreeCancellationIsPersisted(t *testing.T) {
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
 	started := filepath.Join(tmp, "ls-tree-started")
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" = 'ls-tree' ]; then : > \"$AFS_GIT_STARTED\"; exec sleep 10; fi\n" +
-		"exec /usr/bin/git \"$@\"\n"
+		"exec \"$AFS_REAL_GIT\" \"$@\"\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("AFS_REAL_GIT", realGit)
 	t.Setenv("AFS_GIT_STARTED", started)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
@@ -870,7 +887,7 @@ func TestAddRepoSyncBuildTreeCancellationIsPersisted(t *testing.T) {
 	go func() {
 		errCh <- svc.AddRepo(ctx, model.RepoConfig{Name: "repo", GitDir: filepath.Join(repo, ".git"), Branch: "master", Enabled: true})
 	}()
-	waitFor(t, time.Second, func() bool {
+	waitFor(t, errCh, func() bool {
 		_, err := os.Stat(started)
 		return err == nil
 	})
@@ -993,7 +1010,7 @@ func TestAddRepoSyncFailureDoesNotOverwriteNewerConfig(t *testing.T) {
 	go func() {
 		errCh <- svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", Enabled: true})
 	}()
-	waitFor(t, time.Second, func() bool {
+	waitFor(t, errCh, func() bool {
 		_, err := os.Stat(started)
 		return err == nil
 	})
@@ -1238,15 +1255,20 @@ func TestRunPrepareFreshCloneSkipsSecondFetchForBranchFetchRef(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			realGit, err := exec.LookPath("git")
+			if err != nil {
+				t.Fatal(err)
+			}
 			bin := filepath.Join(t.TempDir(), "bin")
 			if err := os.Mkdir(bin, 0o755); err != nil {
 				t.Fatal(err)
 			}
 			logPath := filepath.Join(t.TempDir(), "git.log")
 			fakeGit := filepath.Join(bin, "git")
-			if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_COMMAND_LOG\"\nexec /usr/bin/git \"$@\"\n"), 0o755); err != nil {
+			if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_COMMAND_LOG\"\nexec \"$AFS_REAL_GIT\" \"$@\"\n"), 0o755); err != nil {
 				t.Fatal(err)
 			}
+			t.Setenv("AFS_REAL_GIT", realGit)
 			t.Setenv("GIT_COMMAND_LOG", logPath)
 			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
@@ -1279,7 +1301,8 @@ func TestRunPrepareDoesNotOpenGateWhenReadyPersistenceFails(t *testing.T) {
 	tmp := t.TempDir()
 	preparedGitDir := createPreparedGitDir(t, tmp)
 
-	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	root := filepath.Join(tmp, "artifact-fs")
+	svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1312,17 +1335,30 @@ func TestRunPrepareDoesNotOpenGateWhenReadyPersistenceFails(t *testing.T) {
 	if gate == nil {
 		t.Fatal("runtime gate is nil")
 	}
-	if err := svc.registry.Close(); err != nil {
+	// Reject only the ready write, so preparation runs every step before it.
+	const writeErr = "ready state write failed"
+	db, err := meta.OpenDB(filepath.Join(root, "config", "repos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `CREATE TRIGGER reject_ready BEFORE UPDATE OF prepare_state ON repos
+		WHEN NEW.prepare_state = '`+model.PrepareStateReady+`' BEGIN SELECT RAISE(ABORT, '`+writeErr+`'); END`); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := svc.runPrepare(ctx, got); err == nil {
-		t.Fatal("expected ready state persistence failure")
+	if err := svc.runPrepare(ctx, got); err == nil || !strings.Contains(err.Error(), writeErr) {
+		t.Fatalf("runPrepare = %v, want the ready state write failure", err)
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
-	defer cancel()
-	if err := gate.Wait(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("gate wait = %v, want deadline because ready was not durably persisted", err)
+	// Wait reports an open or failed gate before it checks the context, so a
+	// canceled context reads the gate's state without waiting.
+	probeCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := gate.Wait(probeCtx); err == nil || !strings.Contains(err.Error(), writeErr) {
+		t.Fatalf("gate wait = %v, want the gate failed with the ready state write failure", err)
+	}
+	if stored, err := svc.registry.GetRepo(ctx, "repo"); err != nil || stored.PrepareState != model.PrepareStateFailed {
+		t.Fatalf("persisted prepare state = %q, %v; want failed", stored.PrepareState, err)
 	}
 }
 
@@ -1529,10 +1565,22 @@ func createPreparedGitDir(t *testing.T, tmp string) string {
 	return preparedGitDir
 }
 
+// markCloneStartScript is a fake git that marks AFS_CLONE_STARTED when a clone
+// starts, and never finishes.
+const markCloneStartScript = "#!/bin/sh\ncase \" $* \" in *' clone '*) : > \"$AFS_CLONE_STARTED\";; esac\nexec sleep 10\n"
+
+// expirePrepareOnFile makes svc's preparation deadline pass once the fake git
+// creates path, so the timeout interrupts the step the test names.
+func expirePrepareOnFile(svc *Service, path string) {
+	svc.prepareContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		return gittest.ExpireOnFile(ctx, path)
+	}
+}
+
 func waitForPrepareState(t *testing.T, svc *Service, name string, state string) model.RepoConfig {
 	t.Helper()
 	var got model.RepoConfig
-	waitFor(t, 2*time.Second, func() bool {
+	waitFor(t, nil, func() bool {
 		var err error
 		got, err = svc.registry.GetRepo(context.Background(), name)
 		return err == nil && got.PrepareState == state
@@ -1540,16 +1588,18 @@ func waitForPrepareState(t *testing.T, svc *Service, name string, state string) 
 	return got
 }
 
-func waitFor(t *testing.T, timeout time.Duration, ready func() bool) {
+// waitFor polls ready until it holds, and fails with the operation's error if
+// done delivers first. Only go test -timeout bounds the wait: a fixed budget
+// fails a loaded machine, not a broken code path.
+func waitFor(t *testing.T, done <-chan error, ready func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if ready() {
-			return
+	for !ready() {
+		select {
+		case err := <-done:
+			t.Fatalf("operation returned before the awaited step: %v", err)
+		case <-time.After(10 * time.Millisecond):
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("condition was not met before timeout")
 }
 
 func findJSONLogRecord(t *testing.T, data []byte, message string) map[string]any {

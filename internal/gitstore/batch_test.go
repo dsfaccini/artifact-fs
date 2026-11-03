@@ -250,17 +250,15 @@ func TestCloneBloblessNonInteractiveSkipsSSHAskpass(t *testing.T) {
 	assertAskpassDidNotRun(t, askpassRuns)
 }
 
-// isolateLazyFetchEnv keeps the machine's Git config and prompt programs out of
-// a test's Git commands. It sets SSH_ASKPASS to a program that records each run
-// in the returned file.
+// isolateLazyFetchEnv keeps the machine's prompt programs and SSH settings out
+// of a test's Git commands; TestMain already isolates Git config. It sets
+// SSH_ASKPASS to a program that records each run in the returned file.
 func isolateLazyFetchEnv(t *testing.T) string {
 	t.Helper()
 	for _, key := range []string{"GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "SSH_ASKPASS_REQUIRE"} {
 		t.Setenv(key, "")
 		os.Unsetenv(key)
 	}
-	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	dir := t.TempDir()
 	runs := filepath.Join(dir, "askpass-runs")
 	askpass := filepath.Join(dir, "askpass")

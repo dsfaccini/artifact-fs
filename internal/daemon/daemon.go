@@ -77,7 +77,11 @@ type Service struct {
 	mountRoot            string
 	mount                mountFunc
 	hydrationConcurrency int
-	prepareTimeout       time.Duration
+	// prepareContext bounds one preparation attempt; nil means defaultPrepareTimeout.
+	prepareContext func(context.Context) (context.Context, context.CancelFunc)
+	// headReconcileBackoff is the first retry delay after a failed HEAD
+	// reconcile; zero means headReconcileMinBackoff.
+	headReconcileBackoff time.Duration
 	logger               *slog.Logger
 	registry             *registry.Store
 	git                  *gitstore.Store
@@ -106,7 +110,6 @@ func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error
 		logger:          logger,
 		registry:        reg,
 		git:             gitstore.New(logger),
-		prepareTimeout:  defaultPrepareTimeout,
 		running:         map[model.RepoID]*repoRuntime{},
 		preparing:       map[model.RepoID]int64{},
 		prepareAttempts: map[model.RepoID]int64{},

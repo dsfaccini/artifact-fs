@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
-	"time"
+	"testing/synctest"
 
 	"github.com/jacobsa/fuse/fuseops"
 	"github.com/jacobsa/fuse/fuseutil"
@@ -25,31 +25,34 @@ func (fs *recordingFS) LookUpInode(context.Context, *fuseops.LookUpInodeOp) erro
 }
 
 func TestGatedFileSystemBlocksUntilReady(t *testing.T) {
-	next := &recordingFS{}
-	gate := NewReadyGate(false)
-	fs := NewGatedFileSystem(next, gate)
+	synctest.Test(t, func(t *testing.T) {
+		next := &recordingFS{}
+		gate := NewReadyGate(false)
+		fs := NewGatedFileSystem(next, gate)
 
-	done := make(chan error, 1)
-	go func() {
-		done <- fs.LookUpInode(context.Background(), &fuseops.LookUpInodeOp{})
-	}()
+		done := make(chan error, 1)
+		go func() {
+			done <- fs.LookUpInode(context.Background(), &fuseops.LookUpInodeOp{})
+		}()
 
-	select {
-	case err := <-done:
-		t.Fatalf("LookUpInode returned before ready: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
-	if got := next.lookups.Load(); got != 0 {
-		t.Fatalf("lookups before ready = %d, want 0", got)
-	}
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("LookUpInode returned before ready: %v", err)
+		default:
+		}
+		if got := next.lookups.Load(); got != 0 {
+			t.Fatalf("lookups before ready = %d, want 0", got)
+		}
 
-	gate.MarkReady()
-	if err := <-done; err != nil {
-		t.Fatalf("LookUpInode after ready: %v", err)
-	}
-	if got := next.lookups.Load(); got != 1 {
-		t.Fatalf("lookups after ready = %d, want 1", got)
-	}
+		gate.MarkReady()
+		if err := <-done; err != nil {
+			t.Fatalf("LookUpInode after ready: %v", err)
+		}
+		if got := next.lookups.Load(); got != 1 {
+			t.Fatalf("lookups after ready = %d, want 1", got)
+		}
+	})
 }
 
 func TestGatedFileSystemFailedGateReturnsEIO(t *testing.T) {

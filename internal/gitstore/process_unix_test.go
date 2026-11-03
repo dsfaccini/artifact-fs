@@ -92,6 +92,69 @@ func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
 	}
 }
 
+func TestRunGitCancellationKillsDescendants(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	started := filepath.Join(tmp, "started")
+	finished := filepath.Join(tmp, "child-finished")
+	fifo := filepath.Join(tmp, "child.fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Without O_NONBLOCK, opening the read end would wait for the child to open
+	// the write end. Reads then block, because Go does not poll FIFOs on macOS.
+	childOpen, err := os.OpenFile(fifo, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer childOpen.Close()
+	if err := syscall.SetNonblock(int(childOpen.Fd()), false); err != nil {
+		t.Fatal(err)
+	}
+	// The child marks git started only once its sleep runs, so the cancel cannot race the fork.
+	script := "#!/bin/sh\n(exec 3>\"$AFS_CHILD_FIFO\"; sleep 60 & : > \"$AFS_GIT_STARTED\"; wait; : > \"$AFS_CHILD_FINISHED\") &\nwait\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AFS_GIT_STARTED", started)
+	t.Setenv("AFS_CHILD_FIFO", fifo)
+	t.Setenv("AFS_CHILD_FINISHED", finished)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := runGit(ctx, "", "version")
+		errCh <- err
+	}()
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("runGit returned before git started: %v", err)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("runGit error = %v, want context canceled", err)
+	}
+	// The child and its sleep hold the only write end, so the read ends when they
+	// exit, whether or not anything reaps them. A child that survives
+	// cancellation exits only after its sleep, so it writes the marker.
+	if _, err := io.ReadAll(childOpen); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(finished); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("git descendant survived cancellation")
+	}
+}
+
 func TestRunGitCancellationClosesEscapedDescriptorPipes(t *testing.T) {
 	assertEscapedGitCancellationIsBounded(t, func(ctx context.Context) error {
 		_, err := runGit(ctx, "", "version")
@@ -140,6 +203,7 @@ func assertEscapedGitCancellationIsBounded(t *testing.T, call func(context.Conte
 		t.Fatal(err)
 	}
 	marker := filepath.Join(tmp, "escaped")
+	finished := filepath.Join(tmp, "escaped-finished")
 	script := "#!/bin/sh\n\"$AFS_TEST_BINARY\" -test.run '^TestRunGitEscapedDescriptorHelper$' &\nwait\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -148,13 +212,13 @@ func assertEscapedGitCancellationIsBounded(t *testing.T, call func(context.Conte
 	t.Setenv("AFS_TEST_BINARY", executable)
 	t.Setenv("AFS_ESCAPED_HELPER", "1")
 	t.Setenv("AFS_ESCAPED_MARKER", marker)
+	t.Setenv("AFS_ESCAPED_FINISHED", finished)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- call(ctx)
 	}()
-	deadline := time.Now().Add(time.Second)
 	var helperPID int
 	for {
 		data, err := os.ReadFile(marker)
@@ -168,27 +232,23 @@ func assertEscapedGitCancellationIsBounded(t *testing.T, call func(context.Conte
 		if !errors.Is(err, os.ErrNotExist) {
 			t.Fatal(err)
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("escaped helper did not start")
+		select {
+		case err := <-errCh:
+			t.Fatalf("Git call returned before the escaped helper started: %v", err)
+		case <-time.After(5 * time.Millisecond):
 		}
-		time.Sleep(5 * time.Millisecond)
 	}
-	if helper, err := os.FindProcess(helperPID); err == nil {
-		defer helper.Kill()
-	}
+	defer syscall.Kill(helperPID, syscall.SIGKILL)
 
-	started := time.Now()
+	// The helper holds the descriptors until it is killed or marks its minute
+	// finished, so the call returns before that mark only if it did not wait
+	// for the descriptors.
 	cancel()
-	select {
-	case err := <-errCh:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("runGit error = %v, want context canceled", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("runGit remained blocked by escaped descriptor holder")
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("runGit error = %v, want context canceled", err)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("Git cancellation took %v, want bounded descriptor wait", elapsed)
+	if _, err := os.Stat(finished); err == nil {
+		t.Fatal("Git call waited for the escaped helper to finish")
 	}
 }
 
@@ -210,5 +270,11 @@ func TestRunGitEscapedDescriptorHelper(t *testing.T) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	time.Sleep(10 * time.Second)
+	// Setsid puts the helper beyond the process-group kill, and a timeout panic
+	// skips the test's kill, so the sleep bounds how long an orphan lives.
+	time.Sleep(time.Minute)
+	if err := os.WriteFile(os.Getenv("AFS_ESCAPED_FINISHED"), nil, 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 }

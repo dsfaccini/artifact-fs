@@ -34,12 +34,6 @@ func skipIfNoFUSE(t *testing.T) {
 // mountsThroughFSKit reports false: FSKit is a macOS backend.
 func mountsThroughFSKit() bool { return false }
 
-// configGitSafeDir adds a safe.directory entry for the mount path.
-func configGitSafeDir(t *testing.T, path string) {
-	t.Helper()
-	exec.Command("git", "config", "--global", "--add", "safe.directory", path).Run()
-}
-
 // isMounted checks whether the given path is a FUSE mount point by reading /proc/mounts.
 func isMounted(path string) bool {
 	data, err := os.ReadFile("/proc/mounts")

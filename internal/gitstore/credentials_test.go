@@ -20,15 +20,20 @@ func TestPrepareExistingCloneRejectsCredentialedRemoteBeforeSetURL(t *testing.T)
 	run(t, "git", "init", "--separate-git-dir", gitDir, "--initial-branch", "master", worktree)
 	run(t, "git", "-C", worktree, "remote", "add", "origin", "https://github.com/org/repo.git")
 
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
 	bin := filepath.Join(tmp, "bin")
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	marker := filepath.Join(tmp, "set-url-invoked")
 	fakeGit := filepath.Join(bin, "git")
-	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\ncase \"$*\" in *\"remote set-url\"*) : > \"$GIT_SET_URL_MARKER\";; esac\nexec /usr/bin/git \"$@\"\n"), 0o755); err != nil {
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\ncase \"$*\" in *\"remote set-url\"*) : > \"$GIT_SET_URL_MARKER\";; esac\nexec \"$AFS_REAL_GIT\" \"$@\"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("AFS_REAL_GIT", realGit)
 	t.Setenv("GIT_SET_URL_MARKER", marker)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 

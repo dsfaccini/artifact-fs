@@ -333,7 +333,7 @@ func (s *Service) startPrepareWorker(ctx context.Context, cfg model.RepoConfig) 
 			}
 			s.mu.Unlock()
 		}()
-		prepareCtx, cancel := context.WithTimeout(workerCtx, s.prepareTimeoutDuration())
+		prepareCtx, cancel := s.withPrepareTimeout(workerCtx)
 		defer cancel()
 		_ = s.runPrepareAttempt(prepareCtx, cfg, attempt)
 	}()
@@ -345,11 +345,11 @@ func (s *Service) supersedePrepare(id model.RepoID) {
 	s.mu.Unlock()
 }
 
-func (s *Service) prepareTimeoutDuration() time.Duration {
-	if s.prepareTimeout > 0 {
-		return s.prepareTimeout
+func (s *Service) withPrepareTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if s.prepareContext != nil {
+		return s.prepareContext(ctx)
 	}
-	return defaultPrepareTimeout
+	return context.WithTimeout(ctx, defaultPrepareTimeout)
 }
 
 func (s *Service) resetRunningPrepareState(cfg model.RepoConfig) bool {

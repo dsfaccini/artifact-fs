@@ -3,20 +3,32 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
 // TestMain makes a real mount panic: unit tests must never mount, because e2e tests own all mounts.
 func TestMain(m *testing.M) {
+	// The FSMonitor hook that the daemon installs runs this binary, which
+	// would otherwise run the tests inside Git. FSMonitorHook answers "/" for
+	// a worktree that is not mounted, and package tests never mount.
+	if len(os.Args) > 1 && os.Args[1] == "fsmonitor-hook" {
+		fmt.Print("artifact-fs:package-test\x00/\x00")
+		os.Exit(0)
+	}
 	defaultMount = func(cfg model.RepoConfig, _ *fusefs.Resolver, _ *fusefs.Engine, _ *fusefs.ReadyGate) (fusefs.MountedFS, error) {
 		panic(fmt.Sprintf("daemon unit test tried to mount %q; set Service.mount to fakeMount", cfg.MountPath))
 	}
+	gittest.IsolateConfig()
 	m.Run()
 }
+
+func TestGitIgnoresMachineConfig(t *testing.T) { gittest.RequireConfigIsolated(t) }
 
 // fakeMount stands in for a successful mount.
 func fakeMount(model.RepoConfig, *fusefs.Resolver, *fusefs.Engine, *fusefs.ReadyGate) (fusefs.MountedFS, error) {
