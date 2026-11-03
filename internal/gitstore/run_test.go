@@ -42,13 +42,15 @@ func TestRunGitCancellationKillsDescendants(t *testing.T) {
 	}
 	started := filepath.Join(tmp, "started")
 	childPID := filepath.Join(tmp, "child.pid")
-	script := "#!/bin/sh\nsleep 60 &\necho $! > \"$AFS_CHILD_PID\"\n: > \"$AFS_GIT_STARTED\"\nwait\n"
+	finished := filepath.Join(tmp, "child-finished")
+	script := "#!/bin/sh\n(sleep 60; : > \"$AFS_CHILD_FINISHED\") &\necho $! > \"$AFS_CHILD_PID\"\n: > \"$AFS_GIT_STARTED\"\nwait\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("AFS_GIT_STARTED", started)
 	t.Setenv("AFS_CHILD_PID", childPID)
+	t.Setenv("AFS_CHILD_FINISHED", finished)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -78,20 +80,16 @@ func TestRunGitCancellationKillsDescendants(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if t.Failed() {
-			_ = child.Kill()
-		}
-	})
 	cancel()
 	if err := <-errCh; !errors.Is(err, context.Canceled) {
 		t.Fatalf("runGit error = %v, want context canceled", err)
 	}
-	// The child sleeps far longer than this wait, so it is gone only if cancellation killed it.
-	for deadline := time.Now().Add(10 * time.Second); child.Signal(syscall.Signal(0)) == nil; time.Sleep(5 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("git descendant %d survived cancellation", pid)
-		}
+	// A child that survives cancellation exits only after its sleep, so it writes the marker.
+	for child.Signal(syscall.Signal(0)) == nil {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, err := os.Stat(finished); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("git descendant %d survived cancellation", pid)
 	}
 }
 
