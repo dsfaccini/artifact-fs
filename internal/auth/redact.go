@@ -8,6 +8,9 @@ import (
 	"strings"
 )
 
+// remoteHelperPrefix matches Git's "<transport>::" remote helper syntax, as in "gcrypt::".
+var remoteHelperPrefix = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*::`)
+
 var tokenLike = regexp.MustCompile(`(?i)(access_token|token|password|passwd|secret|key|authorization|x-token-auth)=([^&\s]+)`)
 
 const (
@@ -113,9 +116,10 @@ func HasInlineCredentials(raw string) bool {
 	if u.User == nil && userinfoAfterLaterSeparator(raw, u) {
 		// A username alone, as in "codecommit::us-east-1://profile@Repo", names
 		// an ambient profile unless the address is http(s).
-		before, _, _ := strings.Cut(raw, "://")
+		before, address, _ := strings.Cut(raw, "://")
 		lower := strings.ToLower(before)
-		return RawUserinfoHasPassword(raw) || strings.HasSuffix(lower, "http") || strings.HasSuffix(lower, "https")
+		username, _ := addressUserinfo(address)
+		return RawUserinfoHasPassword(raw) || username != "" && (strings.HasSuffix(lower, "http") || strings.HasSuffix(lower, "https"))
 	}
 	if u.User == nil {
 		return false
@@ -156,7 +160,9 @@ func malformedAuthorityStart(raw string) int {
 // first "://" when an "@" follows that "://", as in "alice:pw@host/a://b@c".
 // The heuristics take the userinfo to follow the "://", but either side can
 // hold it. Before the "://", userinfo can end at any "@" or at the first "?" or
-// "#", as in "u:pw?x://y@z". The bounds cover every candidate that holds a ":".
+// "#", as in "u:pw?x://y@z". It starts after the last "/", a remote helper's
+// "<transport>::" or a typo scheme. The bounds cover every candidate that holds
+// a ":".
 func userinfoBeforeSeparator(raw string) (start int, end int, ok bool) {
 	separator := strings.Index(raw, "://")
 	if separator < 0 || !strings.Contains(raw[separator:], "@") {
@@ -180,6 +186,9 @@ func userinfoBeforeSeparator(raw string) (start int, end int, ok bool) {
 				candidateStart = len(marker)
 			}
 		}
+		if helper := remoteHelperPrefix.FindStringIndex(raw); candidateStart == 0 && helper != nil && helper[1] <= candidateEnd {
+			candidateStart = helper[1]
+		}
 		if !strings.Contains(raw[candidateStart:candidateEnd], ":") {
 			continue
 		}
@@ -194,12 +203,71 @@ func userinfoBeforeSeparator(raw string) (start int, end int, ok bool) {
 	return start, end, ok
 }
 
-// userinfoAfterLaterSeparator reports an "@" after a "://" that does not end
+// userinfoAfterLaterSeparator reports userinfo after a "://" that does not end
 // the parsed scheme, as in "ssh:/x://u:pw@h" or "gcrypt::https://u:pw@h". The
 // parser keeps that userinfo in the path or opaque part.
 func userinfoAfterLaterSeparator(raw string, u *url.URL) bool {
 	separator := strings.Index(raw, "://")
-	return u.Scheme != "" && separator >= 0 && separator != len(u.Scheme) && strings.Contains(raw[separator:], "@")
+	if u.Scheme == "" || separator < 0 || separator == len(u.Scheme) {
+		return false
+	}
+	// A real host after this "://" can precede a further "://" and its userinfo,
+	// as in "gcrypt::https://host:8443/a://u:pw@h".
+	for address := raw[separator+len("://"):]; ; {
+		if hasAddressUserinfo(address) {
+			return true
+		}
+		next := strings.Index(address, "://")
+		if next < 0 {
+			return false
+		}
+		address = address[next+len("://"):]
+	}
+}
+
+// addressUserinfo returns the userinfo of the address after a "://": the
+// text before the last "@" of the authority, which ends at the first "/".
+// Without such an "@", it is the text before the last "@" in the address,
+// because a password can hold a "/", as in "user:pa/ss@host". A real host
+// before the "/", as in "host.example.com:22/org/repo@v1.git", rules that out:
+// the "@" is then in the path.
+func addressUserinfo(address string) (userinfo string, ok bool) {
+	authority, _, _ := strings.Cut(address, "/")
+	if at := strings.LastIndex(authority, "@"); at >= 0 {
+		return authority[:at], true
+	}
+	if isRealHostPort(authority) {
+		return "", false
+	}
+	at := strings.LastIndex(address, "@")
+	if at < 0 {
+		return "", false
+	}
+	return address[:at], true
+}
+
+func hasAddressUserinfo(address string) bool {
+	_, ok := addressUserinfo(address)
+	return ok
+}
+
+// isRealHostPort reports whether authority is a real host with an optional
+// numeric port, as validParsedHostPort judges a parsed one.
+func isRealHostPort(authority string) bool {
+	host, port := authority, ""
+	if rest, ok := strings.CutPrefix(authority, "["); ok {
+		bracketed, after, closed := strings.Cut(rest, "]")
+		if !closed || after != "" && !strings.HasPrefix(after, ":") {
+			return false
+		}
+		host, port = bracketed, strings.TrimPrefix(after, ":")
+	} else if before, after, ok := strings.Cut(authority, ":"); ok {
+		host, port = before, after
+	}
+	if strings.ContainsAny(host, "?#%[]") || strings.Trim(port, "0123456789") != "" {
+		return false
+	}
+	return !isUserLikeHost(host) && (isRealHost(host) || isKnownSingleLabelGitHost(host))
 }
 
 func isHTTPRemoteLike(raw string, scheme string) bool {
@@ -388,23 +456,19 @@ func RawUserinfoHasPassword(raw string) bool {
 	return authorityUserinfoHasPassword(raw) || delimitedUserinfoHasPassword(raw)
 }
 
-// authorityUserinfoHasPassword checks the authority malformedAuthorityStart
-// finds, up to the last "@" before any "?" or "#".
+// authorityUserinfoHasPassword checks the userinfo of the address that starts
+// where malformedAuthorityStart finds the authority, before any "?" or "#".
 func authorityUserinfoHasPassword(raw string) bool {
 	authorityStart := malformedAuthorityStart(raw)
 	if authorityStart < 0 {
 		return false
 	}
-	userinfoEnd := len(raw)
-	if relEnd := strings.IndexAny(raw[authorityStart:], "?#"); relEnd >= 0 {
-		userinfoEnd = authorityStart + relEnd
+	address := raw[authorityStart:]
+	if end := strings.IndexAny(address, "?#"); end >= 0 {
+		address = address[:end]
 	}
-	at := strings.LastIndex(raw[authorityStart:userinfoEnd], "@")
-	if at < 0 {
-		return false
-	}
-	candidate := raw[authorityStart : authorityStart+at]
-	return strings.Contains(candidate, ":")
+	userinfo, ok := addressUserinfo(address)
+	return ok && strings.Contains(userinfo, ":")
 }
 
 // delimitedUserinfoHasPassword checks the text after the last "://", or else

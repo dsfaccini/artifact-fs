@@ -266,6 +266,9 @@ func TestAdoptGitDirWarnsAboutCredentialedOriginOncePerPrepare(t *testing.T) {
 	if strings.Contains(logs.String(), "s3cret") {
 		t.Fatalf("warning leaked the password: %s", logs.String())
 	}
+	if strings.Contains(logs.String(), "example.invalid/repository.git") {
+		t.Fatalf("warning kept the remote's location: %s", logs.String())
+	}
 	if got := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "remote", "get-url", "origin")); got != origin {
 		t.Fatalf("adoption changed origin to %q", got)
 	}

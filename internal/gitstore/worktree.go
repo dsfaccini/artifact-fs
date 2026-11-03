@@ -63,7 +63,7 @@ func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfi
 // worktree would. ArtifactFS redacts all Git output it logs.
 func (s *Store) WarnAdoptedOriginCredentials(ctx context.Context, repo model.RepoConfig) {
 	if remote, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin"); err == nil && remoteHasInlineCredentials(remote) {
-		s.logger.WarnContext(ctx, "adopted worktree origin embeds credentials; Git's lazy fetches use them", "repo", repo.Name, "origin", auth.RedactRemoteURL(remote))
+		s.logger.WarnContext(ctx, "adopted worktree origin embeds credentials; Git's lazy fetches use them", "repo", repo.Name, "origin", auth.RedactLogString(remote))
 	}
 }
 

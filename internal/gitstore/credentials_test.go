@@ -732,3 +732,53 @@ func TestNonInteractiveGitEnvPreservesEscapedDollar(t *testing.T) {
 	}
 	t.Fatalf("expected forced GIT_SSH_COMMAND, got %v", env)
 }
+
+func TestCloneBloblessAcceptsAtSignInPathAfterHostAndPort(t *testing.T) {
+	commit, _ := serveSSHFromLocalRepo(t)
+	const remote = "ssh://host.example.com:22/org/repo@v1.git"
+	gitDir := filepath.Join(t.TempDir(), "repo.git")
+	if err := New(nil).CloneBlobless(context.Background(), model.RepoConfig{Name: "repo", GitDir: gitDir, RemoteURL: remote, Branch: "main"}); err != nil {
+		t.Fatalf("CloneBlobless(%q): %v", remote, err)
+	}
+	if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", "HEAD")); got != commit {
+		t.Fatalf("clone HEAD = %s, want %s", got, commit)
+	}
+}
+
+func TestCloneBloblessRejectsPasswordHoldingSlashBeforeGit(t *testing.T) {
+	_, contacted := serveSSHFromLocalRepo(t)
+	// url.Parse reads host "user" and port "1234", but no real host precedes
+	// the "/", so "user:1234/secret" is userinfo.
+	const remote = "ssh://user:1234/secret@host/repo"
+	gitDir := filepath.Join(t.TempDir(), "repo.git")
+	if err := New(nil).CloneBlobless(context.Background(), model.RepoConfig{Name: "repo", GitDir: gitDir, RemoteURL: remote, Branch: "main"}); err == nil {
+		t.Fatalf("CloneBlobless(%q) succeeded", remote)
+	}
+	if _, err := os.Stat(contacted); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("git ran SSH for %q, which holds a password", remote)
+	}
+}
+
+// serveSSHFromLocalRepo makes Git's SSH transport serve every remote from a new
+// one-commit repository, whatever the URL's host, port or path. It returns the
+// commit and a file the transport creates when Git runs it.
+func serveSSHFromLocalRepo(t *testing.T) (commit, contacted string) {
+	t.Helper()
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	run(t, "git", "init", "--initial-branch", "main", src)
+	if err := os.WriteFile(filepath.Join(src, "file.txt"), []byte("data\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", src, "add", "file.txt")
+	run(t, "git", "-C", src, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+	run(t, "git", "-C", src, "config", "uploadpack.allowFilter", "true")
+	contacted = filepath.Join(tmp, "contacted")
+	ssh := filepath.Join(tmp, "ssh")
+	if err := os.WriteFile(ssh, []byte("#!/bin/sh\n: > '"+contacted+"'\nexec git-upload-pack '"+src+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_SSH_COMMAND", ssh)
+	t.Setenv("GIT_SSH_VARIANT", "ssh")
+	return strings.TrimSpace(runOutput(t, "git", "-C", src, "rev-parse", "HEAD")), contacted
+}

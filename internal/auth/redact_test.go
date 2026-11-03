@@ -324,6 +324,16 @@ func TestRedactRemoteURL(t *testing.T) {
 	if containsAny(out, []string{"ghp_secret"}) {
 		t.Fatalf("userinfo ending at a query after a later scheme separator leaked in redacted string: %s", out)
 	}
+
+	const helperPath = "gcrypt::https://github.com/org/repo@v1.git"
+	if out = RedactRemoteURL(helperPath); out != helperPath {
+		t.Fatalf("remote helper URL without userinfo changed to %s", out)
+	}
+
+	out = RedactRemoteURL("gcrypt::https://host.example.com:8443/a://u:pwzq@h")
+	if containsAny(out, []string{"pwzq"}) {
+		t.Fatalf("userinfo after a further separator behind a remote helper leaked in output: %s", out)
+	}
 }
 
 func TestHasInlineCredentials(t *testing.T) {
@@ -602,6 +612,26 @@ func TestHasInlineCredentials(t *testing.T) {
 			raw:  "ssh:/x://u:pw@h",
 			want: true,
 		},
+		{
+			name: "remote helper over https with an at sign in the path",
+			raw:  "gcrypt::https://github.com/org/repo@v1.git",
+			want: false,
+		},
+		{
+			name: "remote helper over ssh with a port and an at sign in the path",
+			raw:  "gcrypt::ssh://git@host.example.com:22/org/repo@v1.git",
+			want: false,
+		},
+		{
+			name: "remote helper over https with an empty username",
+			raw:  "gcrypt::https://@github.com/org/repo.git",
+			want: false,
+		},
+		{
+			name: "remote helper prefix before a username",
+			raw:  "codecommit::alice@host/a://b@c",
+			want: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -625,6 +655,9 @@ func TestRedactionHidesLeftoverPasswords(t *testing.T) {
 		{"remotes=https://example.com/a.git,remote=https//user:s3cret@host/x", "s3cret"},
 		{"remotes=https://example.com/a.git,remote=1:pa?ssqgit:/repo", "ssqgit"},
 		{"remotes=https://example.com/a.git,ghp_tokq:pa?ssqgit:22:org/repo.git,", "ssqgit"},
+		{"gcrypt::ssh://a.b:s3cretq[::1]:8443:/a://u:pw@h", "s3cretq"},
+		{"ssh:alice:pwzq@host.example.com:22:/a://u:pw#f@z", "pw#"},
+		{"http::pwzq@host.example.com:22/a://u:pw@h", "pwzq"},
 	} {
 		for name, redact := range map[string]func(string) string{"RedactRemoteURL": RedactRemoteURL, "RedactString": RedactString, "RedactLogString": func(s string) string { return RedactLogString(s) }} {
 			if got := redact(tt.raw); strings.Contains(got, tt.password) {
@@ -650,9 +683,11 @@ func TestRawUserinfoHasPassword(t *testing.T) {
 		raw  string
 		want bool
 	}{
-		// The authority check finds these.
-		{"https://user@example.com/a:b@c", true},
+		// The authority check finds these. A password can hold a "/" when no
+		// real host precedes it.
 		{"https:user:pw@host", true},
+		{"ssh://user:1234/secret@host/repo", true},
+		{"git://alice:22/s3cret@host", true},
 		// The delimited check finds userinfo behind a path or a "?".
 		{"x/alice:pw@[::1]/a@b", true},
 		{"a//1:pw@examplehost.com:22:repo", true},
@@ -660,6 +695,11 @@ func TestRawUserinfoHasPassword(t *testing.T) {
 		{"git@github.com:org/repo.git", false},
 		{"https://example.com/org/repo.git", false},
 		{"gcrypt::ssh://git@github.com/org/repo.git", false},
+		// An "@" after a real host and port, or after the authority's own "@",
+		// is in the path.
+		{"ssh://host.example.com:22/org/repo@v1.git", false},
+		{"gcrypt::ssh://git@host.example.com:22/org/repo@v1.git", false},
+		{"https://user@example.com/a:b@c", false},
 	} {
 		if got := RawUserinfoHasPassword(tt.raw); got != tt.want {
 			t.Errorf("RawUserinfoHasPassword(%q) = %v, want %v", tt.raw, got, tt.want)
