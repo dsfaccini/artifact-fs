@@ -437,7 +437,7 @@ Unit tests:
 go test ./...
 ```
 
-End-to-end tests mount a git repo via FUSE and exercise filesystem + git operations (including commit and overlay reconciliation). They require a FUSE implementation (macFUSE on macOS, `fuse3` on Linux) and are off by default. On macOS they skip when the selected `ARTIFACT_FS_FUSE_BACKEND` transport cannot mount without prompting to load the macFUSE kernel extension. The commands below pass `-tags fskit`, which macOS needs to mount through FSKit and Linux ignores.
+End-to-end tests mount a git repo via FUSE and exercise filesystem + git operations (including commit and overlay reconciliation). They require a FUSE implementation (macFUSE on macOS, `fuse3` on Linux) and are off by default. On macOS they skip when the selected `ARTIFACT_FS_FUSE_BACKEND` transport cannot mount without prompting to load the macFUSE kernel extension. The commands below pass `-tags fskit`, which macOS needs to mount through FSKit and Linux ignores. A run that mounts through FSKit starts at most 8 mounts, and its tests that move HEAD or change the shared mount skip ([macfuse#1231](https://github.com/macfuse/macfuse/issues/1231)).
 
 By default, e2e tests create a local bare repo -- no network required. Set `AFS_E2E_REPO` to test against a real remote.
 

@@ -31,6 +31,9 @@ func skipIfNoFUSE(t *testing.T) {
 	}
 }
 
+// mountsThroughFSKit reports false: FSKit is a macOS backend.
+func mountsThroughFSKit() bool { return false }
+
 // isMounted checks whether the given path is a FUSE mount point by reading /proc/mounts.
 func isMounted(path string) bool {
 	data, err := os.ReadFile("/proc/mounts")
