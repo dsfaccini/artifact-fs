@@ -54,6 +54,7 @@ func TestStateRootDirectoriesArePrivate(t *testing.T) {
 	}
 
 	// Git creates the clone's own directories; mount points are not state.
+	root = svc.root
 	skip := map[string]bool{cfg.GitDir: true, filepath.Join(root, "mnt"): true}
 	visited := map[string]bool{}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -131,5 +132,79 @@ func TestNewRefusesStateRootOwnedByAnotherUser(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "owned by another user") {
 		t.Fatalf("New error = %v, want ownership rejection", err)
+	}
+}
+
+func TestNewKeepsResolvedStateRootAfterLinkRetarget(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	original, attacker := filepath.Join(tmp, "original"), filepath.Join(tmp, "attacker")
+	for _, dir := range []string{original, attacker} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(tmp, "state")
+	if err := os.Symlink(original, link); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := New(ctx, link, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+
+	// Whoever owns the link can repoint it after New checks the target.
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(attacker, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AddRepoWithOptions(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.invalid/repo.git", Enabled: true}, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath} {
+		if !strings.HasPrefix(path, resolved+string(filepath.Separator)) {
+			t.Errorf("repo path %s is not under the state root New resolved, %s", path, resolved)
+		}
+	}
+	if entries, err := os.ReadDir(attacker); err != nil || len(entries) != 0 {
+		t.Fatalf("the service wrote through the retargeted link: %v, %v", entries, err)
+	}
+}
+
+func TestNewNarrowsExistingStateDirectories(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	// Earlier versions created the root and its subdirectories 0755.
+	if err := os.MkdirAll(filepath.Join(root, "config"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{root, filepath.Join(root, "config")} {
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	svc, err := New(context.Background(), root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.Close()
+	for dir, want := range map[string]os.FileMode{root: 0o755, filepath.Join(root, "config"): 0o700} {
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != want {
+			t.Errorf("%s mode = %04o, want %04o", dir, got, want)
+		}
 	}
 }

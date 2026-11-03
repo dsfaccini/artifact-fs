@@ -120,10 +120,12 @@ git -C "$MOUNT_ROOT/workers-sdk" log --oneline -5
 kill $DAEMON_PID
 ```
 
-ArtifactFS creates the state root and its subdirectories with mode `0700`. It
-refuses a state root, or one of its subdirectories, that another user owns or
-that group or others can write: the state root holds each clone's fsmonitor
-hook, which Git runs on every `git status`.
+ArtifactFS creates the state root and its subdirectories with mode `0700`, and
+narrows existing subdirectories to `0700`. It refuses a state root, or one of
+its subdirectories, that another user owns or that group or others can write:
+the state root holds each clone's fsmonitor hook, which Git runs on every
+`git status`. ArtifactFS resolves a symlinked state root once at startup and
+uses the resolved path from then on.
 
 ## Monitoring hydration and repo status
 
@@ -263,7 +265,7 @@ watching remains active, including shared loose and packed branch refs, so
 commits and branch changes reconcile normally. Run ordinary Git fetch/push
 commands when needed; the worktree's original remote configuration is retained.
 If `origin` embeds credentials, adoption logs a redacted warning and proceeds:
-Git's lazy blob fetches use that URL.
+Git's lazy fetches of missing blobs and trees use that URL.
 
 ArtifactFS enables `extensions.worktreeConfig`, migrating shared `core.worktree`
 and `core.bare=true` settings into the primary worktree's config when necessary.

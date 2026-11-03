@@ -51,7 +51,7 @@ func TestAddRepoAsyncRegistersWithoutClone(t *testing.T) {
 	if got.FetchRef != "master" {
 		t.Fatalf("FetchRef = %q, want master", got.FetchRef)
 	}
-	if got.GitDir != filepath.Join(root, "repos", "repo", "git") {
+	if got.GitDir != filepath.Join(svc.root, "repos", "repo", "git") {
 		t.Fatalf("GitDir = %q", got.GitDir)
 	}
 }

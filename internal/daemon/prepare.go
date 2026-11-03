@@ -208,6 +208,8 @@ func (s *Service) prepareSource(ctx context.Context, cfg model.RepoConfig) (mode
 		if err := s.git.ConfigureAdoptedWorktree(ctx, cfg); err != nil {
 			return model.PreparedSource{}, err
 		}
+		// prepareSource runs once per prepare and once per mount.
+		s.git.WarnAdoptedOriginCredentials(ctx, cfg)
 		headOID, headRef, err := s.git.ResolveHEAD(ctx, cfg)
 		if err != nil {
 			return model.PreparedSource{}, err

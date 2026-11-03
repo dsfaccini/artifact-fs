@@ -12,21 +12,38 @@ import (
 // directory under the root sits inside one of them.
 var stateRootDirs = []string{"config", filepath.Join("config", "locks"), "repos", "overlays", "cache", "meta"}
 
-// ensureStateRoot creates the state root and its fixed subdirectories 0700.
-// It refuses any of them that another user owns or that group or others can
-// write: whoever can write there can replace the fsmonitor hook that Git runs
-// on every status, or the cached blobs that reads serve.
-func ensureStateRoot(root string) error {
-	for _, dir := range append([]string{"."}, stateRootDirs...) {
-		path := filepath.Join(root, dir)
+// ensureStateRoot creates the state root and its fixed subdirectories 0700, and
+// returns the root with its symlinks resolved. Use only the resolved root: a
+// link that is retargeted after this check then redirects nothing.
+// It refuses the root or a subdirectory that another user owns or that group
+// or others can write: whoever can write there can replace the fsmonitor hook
+// that Git runs on every status, or the cached blobs that reads serve.
+// It narrows each existing subdirectory to 0700. The root keeps its mode,
+// because the user chose it.
+func ensureStateRoot(root string) (string, error) {
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	if err := checkPrivateDir(resolved); err != nil {
+		return "", err
+	}
+	for _, dir := range stateRootDirs {
+		path := filepath.Join(resolved, dir)
 		if err := os.MkdirAll(path, 0o700); err != nil {
-			return err
+			return "", err
 		}
 		if err := checkPrivateDir(path); err != nil {
-			return err
+			return "", err
+		}
+		if err := os.Chmod(path, 0o700); err != nil {
+			return "", err
 		}
 	}
-	return nil
+	return resolved, nil
 }
 
 func checkPrivateDir(path string) error {

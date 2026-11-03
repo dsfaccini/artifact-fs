@@ -217,8 +217,21 @@ func isSCPStyleRemote(raw string) bool {
 	return at > 0 && colon > at
 }
 
+// nonInteractiveGitEnv keeps Git and SSH from prompting. An empty SSH_ASKPASS
+// stops Git from falling back to a desktop askpass program; one the user set
+// through GIT_ASKPASS or core.askPass still runs.
 func nonInteractiveGitEnv() []string {
-	return []string{"GIT_TERMINAL_PROMPT=0", "GIT_SSH_COMMAND=" + sshBatchModeCommand(os.Getenv("GIT_SSH_COMMAND"))}
+	return []string{"GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS=", "GIT_SSH_COMMAND=" + sshBatchModeCommand(os.Getenv("GIT_SSH_COMMAND"))}
+}
+
+// lazyFetchEnv keeps a lazy fetch, which reading a missing object starts, from
+// prompting. Run the command with configureCommandSession too. Unlike
+// nonInteractiveGitEnv, it leaves GIT_SSH_COMMAND unset, because that would
+// override the repo's core.sshCommand, which an adopted worktree keeps.
+// Without a controlling terminal SSH cannot prompt, and SSH_ASKPASS_REQUIRE
+// keeps it from opening an askpass dialog instead.
+func lazyFetchEnv() []string {
+	return []string{"GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS=", "SSH_ASKPASS_REQUIRE=never"}
 }
 
 func sshBatchModeCommand(existing string) string {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -203,35 +204,16 @@ func TestBatchPoolBoundsConcurrentProcesses(t *testing.T) {
 }
 
 func TestBlobToCacheLogsLazyFetchStderrWithoutPrompting(t *testing.T) {
-	// Keep the machine's credential helpers out of the lazy fetch.
-	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	askpassRuns := isolateLazyFetchEnv(t)
 	tmp := t.TempDir()
-	src := filepath.Join(tmp, "src")
-	run(t, "git", "init", "--initial-branch", "main", src)
-	if err := os.WriteFile(filepath.Join(src, "file.txt"), []byte("data\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	run(t, "git", "-C", src, "add", "file.txt")
-	run(t, "git", "-C", src, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
-	run(t, "git", "-C", src, "config", "uploadpack.allowFilter", "true")
-	clone := filepath.Join(tmp, "clone")
-	run(t, "git", "clone", "--filter=blob:none", "--no-checkout", "file://"+src, clone)
-	blobOID := strings.TrimSpace(runOutput(t, "git", "-C", src, "rev-parse", "HEAD:file.txt"))
-
-	// The promisor remote asks for credentials, which a lazy fetch must not prompt for.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("WWW-Authenticate", `Basic realm="test"`)
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer server.Close()
-	run(t, "git", "-C", clone, "remote", "set-url", "origin", server.URL+"/repo.git")
+	gitDir, _, blobOID := partialClone(t, tmp, "blob:none")
+	run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", unauthorizedRemote(t))
 
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(clone, ".git")}
+	cfg := model.RepoConfig{ID: "x", GitDir: gitDir}
 	if _, err := store.BlobToCache(ctx, cfg, blobOID, filepath.Join(tmp, "cache", blobOID)); err == nil {
 		t.Fatal("BlobToCache fetched a blob the promisor remote refused")
 	}
@@ -239,6 +221,91 @@ func TestBlobToCacheLogsLazyFetchStderrWithoutPrompting(t *testing.T) {
 	if !strings.Contains(logs.String(), `"msg":"git cat-file stderr"`) || !strings.Contains(logs.String(), "terminal prompts disabled") {
 		t.Fatalf("logs = %s, want the lazy fetch's non-interactive failure", logs.String())
 	}
+	assertAskpassDidNotRun(t, askpassRuns)
+}
+
+func TestBuildTreeIndexLazyTreeFetchDoesNotPrompt(t *testing.T) {
+	askpassRuns := isolateLazyFetchEnv(t)
+	tmp := t.TempDir()
+	gitDir, commit, _ := partialClone(t, tmp, "tree:0")
+	run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", unauthorizedRemote(t))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := New(nil).BuildTreeIndex(ctx, model.RepoConfig{ID: "x", GitDir: gitDir}, commit)
+	if err == nil || !strings.Contains(err.Error(), "terminal prompts disabled") {
+		t.Fatalf("BuildTreeIndex error = %v, want the lazy tree fetch's non-interactive failure", err)
+	}
+	assertAskpassDidNotRun(t, askpassRuns)
+}
+
+func TestCloneBloblessNonInteractiveSkipsSSHAskpass(t *testing.T) {
+	askpassRuns := isolateLazyFetchEnv(t)
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{Name: "repo", GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: unauthorizedRemote(t), Branch: "main"}
+	err := New(slog.New(slog.NewTextHandler(io.Discard, nil))).CloneBloblessNonInteractive(context.Background(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "terminal prompts disabled") {
+		t.Fatalf("CloneBloblessNonInteractive error = %v, want a non-interactive failure", err)
+	}
+	assertAskpassDidNotRun(t, askpassRuns)
+}
+
+// isolateLazyFetchEnv keeps the machine's Git config and prompt programs out of
+// a test's Git commands. It sets SSH_ASKPASS to a program that records each run
+// in the returned file.
+func isolateLazyFetchEnv(t *testing.T) string {
+	t.Helper()
+	for _, key := range []string{"GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "SSH_ASKPASS_REQUIRE"} {
+		t.Setenv(key, "")
+		os.Unsetenv(key)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	dir := t.TempDir()
+	runs := filepath.Join(dir, "askpass-runs")
+	askpass := filepath.Join(dir, "askpass")
+	if err := os.WriteFile(askpass, []byte("#!/bin/sh\necho \"$*\" >> '"+runs+"'\necho guessed\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SSH_ASKPASS", askpass)
+	return runs
+}
+
+func assertAskpassDidNotRun(t *testing.T, runs string) {
+	t.Helper()
+	if data, err := os.ReadFile(runs); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Git ran SSH_ASKPASS: %q, %v", data, err)
+	}
+}
+
+// unauthorizedRemote returns an HTTP remote that answers every request with 401.
+func unauthorizedRemote(t *testing.T) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="test"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL + "/repo.git"
+}
+
+// partialClone clones a one-file repository with filter into dir and returns
+// the clone's Git dir, its HEAD commit and the file's blob.
+func partialClone(t *testing.T, dir string, filter string) (gitDir, commit, blob string) {
+	t.Helper()
+	src := filepath.Join(dir, "src")
+	run(t, "git", "init", "--initial-branch", "main", src)
+	if err := os.WriteFile(filepath.Join(src, "file.txt"), []byte("data\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", src, "add", "file.txt")
+	run(t, "git", "-C", src, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+	run(t, "git", "-C", src, "config", "uploadpack.allowFilter", "true")
+	clone := filepath.Join(dir, "clone")
+	run(t, "git", "clone", "--filter="+filter, "--no-checkout", "file://"+src, clone)
+	commit = strings.TrimSpace(runOutput(t, "git", "-C", src, "rev-parse", "HEAD"))
+	blob = strings.TrimSpace(runOutput(t, "git", "-C", src, "rev-parse", "HEAD:file.txt"))
+	return filepath.Join(clone, ".git"), commit, blob
 }
 
 func TestBlobToCacheRedactsBatchStderr(t *testing.T) {
@@ -250,6 +317,18 @@ func TestBlobToCacheRedactsBatchStderr(t *testing.T) {
 	}
 	if strings.Contains(logs, "s3cret") {
 		t.Fatalf("logs leaked the password: %s", logs)
+	}
+}
+
+func TestBlobToCacheRedactsBatchStderrBeforeBoundingLine(t *testing.T) {
+	// The logged bound falls inside the password.
+	prefix := strings.Repeat("x", maxGitErrorBytes-len("https://alice:s3cr"))
+	logs := batchStderrLogs(t, "echo '"+prefix+"https://alice:s3cretpassword@example.com/repo.git' >&2")
+	if !strings.Contains(logs, `"truncated":true`) {
+		t.Fatalf("logs = %.200s, want a truncated line", logs)
+	}
+	if strings.Contains(logs, "s3cr") {
+		t.Fatalf("logs leaked part of the password: %s", logs[len(logs)-300:])
 	}
 }
 

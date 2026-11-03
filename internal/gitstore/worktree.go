@@ -51,6 +51,22 @@ func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfi
 	return s.ReadTreeHEAD(ctx, repo)
 }
 
+// WarnAdoptedOriginCredentials logs a redacted warning when an adopted
+// worktree's origin embeds credentials.
+//
+// add-repo never persists inline credentials: a sync clone uses them once
+// and stores the URL without them, and async and prepared repos reject them,
+// because the daemon would store the URL and fetch with it on its own
+// schedule. Adoption only warns. It stores no URL and never clones, fetches or
+// refreshes. Origin stays the user's existing Git config, which only Git's
+// lazy fetches of missing blobs and trees use, as any Git command in the
+// worktree would. ArtifactFS redacts all Git output it logs.
+func (s *Store) WarnAdoptedOriginCredentials(ctx context.Context, repo model.RepoConfig) {
+	if remote, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin"); err == nil && remoteHasInlineCredentials(remote) {
+		s.logger.WarnContext(ctx, "adopted worktree origin embeds credentials; Git's lazy fetches use them", "repo", repo.Name, "origin", auth.RedactRemoteURL(remote))
+	}
+}
+
 // ConfigureAdoptedWorktree preserves Git's refs, remotes, tracking and index.
 // Filesystem settings belong to the adopted worktree, never its native siblings.
 func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoConfig) error {
@@ -114,16 +130,6 @@ func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoCon
 	}
 	if filepath.Base(registeredGitfile) != ".git" || registeredMount != requestedMount {
 		return errors.New("adopted mount path must match the registered worktree path")
-	}
-	// add-repo never persists inline credentials: a sync clone uses them once
-	// and stores the URL without them, and async and prepared repos reject
-	// them, because the daemon would store the URL and fetch with it on its
-	// own schedule. Adoption only warns. It stores no URL and never clones,
-	// fetches or refreshes. Origin stays the user's existing Git config, which
-	// only Git's lazy blob fetches use, as any Git command in the worktree
-	// would. ArtifactFS redacts all Git output it logs.
-	if remote, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin"); err == nil && remoteHasInlineCredentials(remote) {
-		s.logger.WarnContext(ctx, "adopted worktree origin embeds credentials; Git's lazy blob fetches use them", "repo", repo.Name, "origin", auth.RedactRemoteURL(remote))
 	}
 	commonConfig := filepath.Join(commonDir, "config")
 	mainConfig := filepath.Join(commonDir, "config.worktree")

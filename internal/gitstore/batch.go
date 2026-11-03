@@ -328,14 +328,12 @@ type batchCatFile struct {
 
 func newBatchCatFile(gitDir string, logger *slog.Logger) (*batchCatFile, error) {
 	cmd := exec.Command("git", "cat-file", "--batch")
-	// A lazy fetch must not prompt. nonInteractiveGitEnv's GIT_SSH_COMMAND would
-	// override the repo's core.sshCommand, which an adopted worktree keeps.
-	// Without a controlling terminal, SSH cannot prompt either, and
-	// SSH_ASKPASS_REQUIRE=never keeps it from opening an askpass dialog.
-	cmd.Env = append(os.Environ(), "GIT_DIR="+gitDir, "GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS_REQUIRE=never")
+	cmd.Env = append(append(os.Environ(), "GIT_DIR="+gitDir), lazyFetchEnv()...)
 	stderr := &gitStderrLogger{logger: logger, gitDir: gitDir}
 	cmd.Stderr = stderr
 	configureCommandSession(cmd)
+	// A lazy fetch's descendant can keep the stderr pipe open after a kill.
+	cmd.WaitDelay = gitCommandWaitDelay
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -372,7 +370,9 @@ func (w *gitStderrLogger) Write(p []byte) (int, error) {
 	n := len(p)
 	for len(p) > 0 {
 		chunk, rest, found := bytes.Cut(p, []byte{'\n'})
-		if room := maxGitErrorBytes - len(w.line); len(chunk) > room {
+		// Buffer more than flush logs, so a credential that straddles the
+		// logged bound is redacted before the line is cut.
+		if room := 4*maxGitErrorBytes - len(w.line); len(chunk) > room {
 			chunk = chunk[:room]
 			w.truncated = true
 		}
@@ -387,8 +387,13 @@ func (w *gitStderrLogger) Write(p []byte) (int, error) {
 }
 
 func (w *gitStderrLogger) flush() {
-	if line := strings.TrimSpace(string(w.line)); line != "" {
-		w.logger.Warn("git cat-file stderr", "git_dir", w.gitDir, "line", auth.RedactString(line), "truncated", w.truncated)
+	line := auth.RedactString(strings.TrimSpace(string(w.line)))
+	truncated := w.truncated
+	if len(line) > maxGitErrorBytes {
+		line, truncated = line[:maxGitErrorBytes], true
+	}
+	if line != "" {
+		w.logger.Warn("git cat-file stderr", "git_dir", w.gitDir, "line", line, "truncated", truncated)
 	}
 	w.line, w.truncated = w.line[:0], false
 }
