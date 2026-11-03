@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestRunGitClassifiesBeforeCredentialRedaction(t *testing.T) {
@@ -29,48 +28,6 @@ func TestRunGitClassifiesBeforeCredentialRedaction(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "HTTP 500") {
 		t.Fatalf("command error leaked credential value: %v", err)
-	}
-}
-
-func TestRunGitCancellationKillsDescendants(t *testing.T) {
-	tmp := t.TempDir()
-	bin := filepath.Join(tmp, "bin")
-	if err := os.Mkdir(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	started := filepath.Join(tmp, "started")
-	survived := filepath.Join(tmp, "survived")
-	script := "#!/bin/sh\n(sleep 0.2; : > \"$AFS_CHILD_SURVIVED\") &\n: > \"$AFS_GIT_STARTED\"\nwait\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("AFS_GIT_STARTED", started)
-	t.Setenv("AFS_CHILD_SURVIVED", survived)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := runGit(ctx, "", "version")
-		errCh <- err
-	}()
-	for {
-		if _, err := os.Stat(started); err == nil {
-			break
-		}
-		select {
-		case err := <-errCh:
-			t.Fatalf("runGit returned before git started: %v", err)
-		case <-time.After(5 * time.Millisecond):
-		}
-	}
-	cancel()
-	if err := <-errCh; !errors.Is(err, context.Canceled) {
-		t.Fatalf("runGit error = %v, want context canceled", err)
-	}
-	time.Sleep(300 * time.Millisecond)
-	if _, err := os.Stat(survived); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("git descendant survived cancellation")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,6 +17,69 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
+
+func TestRunGitCancellationKillsDescendants(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	started := filepath.Join(tmp, "started")
+	finished := filepath.Join(tmp, "child-finished")
+	fifo := filepath.Join(tmp, "child.fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Without O_NONBLOCK, opening the read end would wait for the child to open
+	// the write end. Reads then block, because Go does not poll FIFOs on macOS.
+	childOpen, err := os.OpenFile(fifo, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer childOpen.Close()
+	if err := syscall.SetNonblock(int(childOpen.Fd()), false); err != nil {
+		t.Fatal(err)
+	}
+	// The child marks git started only once its sleep runs, so the cancel cannot race the fork.
+	script := "#!/bin/sh\n(exec 3>\"$AFS_CHILD_FIFO\"; sleep 60 & : > \"$AFS_GIT_STARTED\"; wait; : > \"$AFS_CHILD_FINISHED\") &\nwait\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AFS_GIT_STARTED", started)
+	t.Setenv("AFS_CHILD_FIFO", fifo)
+	t.Setenv("AFS_CHILD_FINISHED", finished)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := runGit(ctx, "", "version")
+		errCh <- err
+	}()
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("runGit returned before git started: %v", err)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("runGit error = %v, want context canceled", err)
+	}
+	// The child and its sleep hold the only write end, so the read ends when they
+	// exit, whether or not anything reaps them. A child that survives
+	// cancellation exits only after its sleep, so it writes the marker.
+	if _, err := io.ReadAll(childOpen); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(finished); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("git descendant survived cancellation")
+	}
+}
 
 func TestRunGitCancellationClosesEscapedDescriptorPipes(t *testing.T) {
 	assertEscapedGitCancellationIsBounded(t, func(ctx context.Context) error {
