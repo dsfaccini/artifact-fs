@@ -6,10 +6,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -49,6 +51,58 @@ func TestBlobToCacheBinarySafe(t *testing.T) {
 	if string(data) != "line\n" {
 		t.Fatalf("expected 'line\\n', got %q", data)
 	}
+}
+
+func TestFetchMissingBlobsRequestsOnlyMissingObjects(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	files := map[string]string{"a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n", "d.txt": "d\n"}
+	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: gittest.PartialCloneRemote(t, files), Branch: "main"}
+	store := New(nil)
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.CloneBlobless(ctx, cfg); err != nil {
+		t.Fatalf("CloneBlobless: %v", err)
+	}
+	var oids []string
+	for _, name := range []string{"a.txt", "b.txt", "c.txt", "d.txt"} {
+		oids = append(oids, strings.TrimSpace(runOutput(t, "git", "--git-dir", cfg.GitDir, "rev-parse", "HEAD:"+name)))
+	}
+	if err := store.FetchMissingBlobs(ctx, cfg, oids[:2]); err != nil {
+		t.Fatalf("FetchMissingBlobs(a, b): %v", err)
+	}
+	packed := packedObjects(t, cfg.GitDir)
+
+	if err := store.FetchMissingBlobs(ctx, cfg, oids); err != nil {
+		t.Fatalf("FetchMissingBlobs(a, b, c, d): %v", err)
+	}
+	// A fetch that also asked for a and b would download them again.
+	if got := packedObjects(t, cfg.GitDir); got != packed+2 {
+		t.Fatalf("packed objects = %d, want %d: only c and d were missing", got, packed+2)
+	}
+	out := runOutput(t, "env", "GIT_NO_LAZY_FETCH=1", "git", "--git-dir", cfg.GitDir, "cat-file", "--batch-check", "--batch-all-objects")
+	for _, oid := range oids {
+		if !strings.Contains(out, oid+" blob") {
+			t.Fatalf("blob %s missing after FetchMissingBlobs:\n%s", oid, out)
+		}
+	}
+}
+
+// packedObjects counts the objects in gitDir's packs, a duplicate once per pack.
+func packedObjects(t *testing.T, gitDir string) int {
+	t.Helper()
+	out := runOutput(t, "git", "--git-dir", gitDir, "count-objects", "-v")
+	for line := range strings.Lines(out) {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), "in-pack: "); ok {
+			n, err := strconv.Atoi(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return n
+		}
+	}
+	t.Fatalf("count-objects printed no in-pack count:\n%s", out)
+	return 0
 }
 
 func TestVerifyBlobHashesWithoutGit(t *testing.T) {

@@ -431,8 +431,9 @@ func (e *Engine) Truncate(ctx context.Context, path string, size int64) error {
 	return e.Overlay.Truncate(ctx, path, size)
 }
 
-// PrefetchDir enqueues file children of a directory for speculative hydration.
-// Called from OpenDir in a goroutine so it doesn't block the FUSE operation.
+// PrefetchDir enqueues the base file children of a directory for speculative
+// hydration. OpenDir calls it; enqueueing only queues, so the open does not
+// wait for any fetch.
 func (e *Engine) PrefetchDir(dirPath string, entries []ReaddirEntry) {
 	tasks := make([]model.HydrationTask, 0, len(entries))
 	for _, entry := range entries {
@@ -460,6 +461,9 @@ func (e *Engine) PrefetchDir(dirPath string, entries []ReaddirEntry) {
 			return tasks[i].Priority > tasks[j].Priority
 		})
 		tasks = tasks[:maxPrefetchTasksPerDir]
+	}
+	if len(tasks) == 0 {
+		return
 	}
 	e.Hydrator.EnqueueBatch(tasks)
 }

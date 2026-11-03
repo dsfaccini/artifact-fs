@@ -3,15 +3,20 @@ package hydrator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -385,6 +390,156 @@ func TestQueuedHydrationWakesWorkersForBacklog(t *testing.T) {
 	waitForHydratorIdle(t, h, cfg.ID)
 }
 
+func TestQueuedPrefetchFetchesBlobsInOnePack(t *testing.T) {
+	t.Parallel()
+	files := map[string]string{}
+	for i := range 8 {
+		files[fmt.Sprintf("src/file-%d.go", i)] = fmt.Sprintf("package src // %d\n", i)
+	}
+	cfg, git, nodes := newBloblessRepo(t, files)
+	packs := packCount(t, cfg.GitDir)
+
+	h := New(git)
+	h.EnqueueBatch(prefetchTasks(cfg.ID, nodes))
+	h.Start(4, cfg)
+	defer h.Stop()
+	waitForHydratorIdle(t, h, cfg.ID)
+
+	assertCachedFiles(t, cfg, nodes, files)
+	// A lazy fetch per blob would add one pack per blob.
+	if got := packCount(t, cfg.GitDir); got != packs+1 {
+		t.Fatalf("packs = %d after hydrating %d blobs, want %d", got, len(nodes), packs+1)
+	}
+}
+
+func TestQueuedPrefetchFetchesEachBlobWhenBatchFetchFails(t *testing.T) {
+	t.Parallel()
+	files := map[string]string{"a.go": "package a\n", "b.go": "package b\n", "c.go": "package c\n"}
+	cfg, git, nodes := newBloblessRepo(t, files)
+	// The remote refuses an object it lacks, which fails the whole batch fetch.
+	tasks := append(prefetchTasks(cfg.ID, nodes), model.HydrationTask{
+		RepoID:     cfg.ID,
+		Path:       "unknown.go",
+		ObjectOID:  strings.Repeat("1", 40),
+		Priority:   PriorityLikelyText,
+		Reason:     "prefetch",
+		EnqueuedAt: time.Now(),
+	})
+
+	h := New(git)
+	h.EnqueueBatch(tasks)
+	h.Start(4, cfg)
+	defer h.Stop()
+	waitForHydratorIdle(t, h, cfg.ID)
+
+	assertCachedFiles(t, cfg, nodes, files)
+}
+
+func TestExplicitReadsDoNotShareBatchWithPrefetch(t *testing.T) {
+	t.Parallel()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	fetcher := &fakeBlobFetcher{payload: []byte("content")}
+	h := New(fetcher)
+	var prefetch []model.HydrationTask
+	for _, oid := range []string{"prefetch-1", "prefetch-2", "prefetch-3"} {
+		prefetch = append(prefetch, model.HydrationTask{RepoID: cfg.ID, Path: oid, ObjectOID: oid, Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()})
+	}
+	h.EnqueueBatch(prefetch)
+	reads := []string{"read-1", "read-2"}
+	errs := make(chan error, len(reads))
+	for _, oid := range reads {
+		go func() {
+			_, _, err := h.EnsureHydrated(context.Background(), cfg, model.BaseNode{RepoID: cfg.ID, Path: oid, ObjectOID: oid})
+			errs <- err
+		}()
+	}
+	for h.QueueDepth(cfg.ID) < len(prefetch)+len(reads) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	h.Start(1, cfg)
+	defer h.Stop()
+	for range reads {
+		if err := <-errs; err != nil {
+			t.Fatalf("EnsureHydrated: %v", err)
+		}
+	}
+	waitForHydratorIdle(t, h, cfg.ID)
+
+	got := fetcher.Batches()
+	for _, batch := range got {
+		slices.Sort(batch)
+	}
+	want := [][]string{reads, {"prefetch-1", "prefetch-2", "prefetch-3"}}
+	if !slices.EqualFunc(got, want, slices.Equal) {
+		t.Fatalf("fetch batches = %v, want %v", got, want)
+	}
+}
+
+func TestQueuedHydrationCapsFetchBatch(t *testing.T) {
+	t.Parallel()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	fetcher := &fakeBlobFetcher{payload: []byte("content")}
+	h := New(fetcher)
+	start := time.Now()
+	tasks := make([]model.HydrationTask, maxFetchBatch+1)
+	for i := range tasks {
+		oid := fmt.Sprintf("%040x", i+1)
+		tasks[i] = model.HydrationTask{RepoID: cfg.ID, Path: oid, ObjectOID: oid, Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: start.Add(time.Duration(i))}
+	}
+	h.EnqueueBatch(tasks)
+	h.Start(1, cfg)
+	defer h.Stop()
+	waitForHydratorIdle(t, h, cfg.ID)
+
+	// The task left over after a full batch fetches on its own.
+	batches := fetcher.Batches()
+	if len(batches) != 1 || len(batches[0]) != maxFetchBatch {
+		sizes := make([]int, len(batches))
+		for i, batch := range batches {
+			sizes[i] = len(batch)
+		}
+		t.Fatalf("fetch batch sizes = %v, want [%d]", sizes, maxFetchBatch)
+	}
+	if got := fetcher.Calls(); got != len(tasks) {
+		t.Fatalf("copies = %d, want %d", got, len(tasks))
+	}
+}
+
+func TestExplicitReadCopiesBeforeFetchedPrefetch(t *testing.T) {
+	t.Parallel()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	copyStarted := make(chan struct{})
+	releaseCopy := make(chan struct{})
+	fetcher := &fakeBlobFetcher{payload: []byte("content"), fetchStarted: copyStarted, fetchWait: releaseCopy}
+	h := New(fetcher)
+	start := time.Now()
+	var prefetch []model.HydrationTask
+	for i, oid := range []string{"prefetch-1", "prefetch-2", "prefetch-3"} {
+		prefetch = append(prefetch, model.HydrationTask{RepoID: cfg.ID, Path: oid, ObjectOID: oid, Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: start.Add(time.Duration(i))})
+	}
+	h.EnqueueBatch(prefetch)
+	h.Start(1, cfg)
+	defer h.Stop()
+	<-copyStarted
+	// The batch is fetched and its first copy is running; a read arrives.
+	errs := make(chan error, 1)
+	go func() {
+		_, _, err := h.EnsureHydrated(context.Background(), cfg, model.BaseNode{RepoID: cfg.ID, Path: "read", ObjectOID: "read"})
+		errs <- err
+	}()
+	waitForQueued(t, h, taskKey(cfg.ID, "read"))
+	close(releaseCopy)
+	if err := <-errs; err != nil {
+		t.Fatalf("EnsureHydrated: %v", err)
+	}
+	waitForHydratorIdle(t, h, cfg.ID)
+
+	want := []string{"prefetch-1", "read", "prefetch-2", "prefetch-3"}
+	if got := fetcher.Copied(); !slices.Equal(got, want) {
+		t.Fatalf("copy order = %v, want %v", got, want)
+	}
+}
+
 func TestEnsureHydratedVerificationIgnoresLeaderTimeout(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -703,6 +858,90 @@ func TestReadBlobSkipsVerificationForOversizedCache(t *testing.T) {
 	}
 }
 
+// newBloblessRepo makes a blobless clone of a remote holding files and returns
+// it with its store and its file nodes.
+func newBloblessRepo(t *testing.T, files map[string]string) (model.RepoConfig, *gitstore.Store, []model.BaseNode) {
+	t.Helper()
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{
+		ID:           "repo",
+		Name:         "repo",
+		GitDir:       filepath.Join(tmp, "repo.git"),
+		RemoteURL:    gittest.PartialCloneRemote(t, files),
+		Branch:       "main",
+		BlobCacheDir: filepath.Join(tmp, "cache"),
+	}
+	git := gitstore.New(nil)
+	t.Cleanup(git.Close)
+	ctx := context.Background()
+	if err := git.CloneBlobless(ctx, cfg); err != nil {
+		t.Fatalf("CloneBlobless: %v", err)
+	}
+	head, _, err := git.ResolveHEAD(ctx, cfg)
+	if err != nil {
+		t.Fatalf("ResolveHEAD: %v", err)
+	}
+	all, err := git.BuildTreeIndex(ctx, cfg, head)
+	if err != nil {
+		t.Fatalf("BuildTreeIndex: %v", err)
+	}
+	var nodes []model.BaseNode
+	for _, n := range all {
+		if n.Type == "file" {
+			nodes = append(nodes, n)
+		}
+	}
+	if len(nodes) != len(files) {
+		t.Fatalf("file nodes = %d, want %d", len(nodes), len(files))
+	}
+	return cfg, git, nodes
+}
+
+func prefetchTasks(repoID model.RepoID, nodes []model.BaseNode) []model.HydrationTask {
+	tasks := make([]model.HydrationTask, len(nodes))
+	for i, n := range nodes {
+		tasks[i] = model.HydrationTask{RepoID: repoID, Path: n.Path, ObjectOID: n.ObjectOID, SizeState: n.SizeState, SizeBytes: n.SizeBytes, Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()}
+	}
+	return tasks
+}
+
+func assertCachedFiles(t *testing.T, cfg model.RepoConfig, nodes []model.BaseNode, files map[string]string) {
+	t.Helper()
+	for _, n := range nodes {
+		data, err := os.ReadFile(cachePathFor(cfg, n.ObjectOID))
+		if err != nil {
+			t.Fatalf("cached %s: %v", n.Path, err)
+		}
+		if string(data) != files[n.Path] {
+			t.Fatalf("cached %s = %q, want %q", n.Path, data, files[n.Path])
+		}
+	}
+}
+
+func packCount(t *testing.T, gitDir string) int {
+	t.Helper()
+	packs, err := filepath.Glob(filepath.Join(gitDir, "objects", "pack", "*.pack"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(packs)
+}
+
+// waitForQueued polls until key waits in the queue; go test -timeout is its
+// only bound.
+func waitForQueued(t *testing.T, h *Service, key string) {
+	t.Helper()
+	for {
+		h.mu.Lock()
+		_, ok := h.queued[key]
+		h.mu.Unlock()
+		if ok {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // waitForFetchCalls polls until fetcher has seen want calls; go test -timeout
 // is its only bound.
 func waitForFetchCalls(t *testing.T, fetcher *fakeBlobFetcher, want int) {
@@ -747,11 +986,14 @@ type fakeBlobFetcher struct {
 	verifyWait    <-chan struct{}
 	fetchOnce     sync.Once
 	verifyOnce    sync.Once
+	batches       [][]string
+	copied        []string
 }
 
-func (f *fakeBlobFetcher) BlobToCache(_ context.Context, _ model.RepoConfig, _ string, dstPath string) (int64, error) {
+func (f *fakeBlobFetcher) BlobToCache(_ context.Context, _ model.RepoConfig, objectOID string, dstPath string) (int64, error) {
 	f.mu.Lock()
 	f.calls++
+	f.copied = append(f.copied, objectOID)
 	f.mu.Unlock()
 	if f.fetchStarted != nil {
 		f.fetchOnce.Do(func() { close(f.fetchStarted) })
@@ -769,6 +1011,25 @@ func (f *fakeBlobFetcher) BlobToCache(_ context.Context, _ model.RepoConfig, _ s
 		return 0, err
 	}
 	return int64(len(f.payload)), nil
+}
+
+func (f *fakeBlobFetcher) FetchMissingBlobs(_ context.Context, _ model.RepoConfig, objectOIDs []string) error {
+	f.mu.Lock()
+	f.batches = append(f.batches, append([]string(nil), objectOIDs...))
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeBlobFetcher) Copied() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.copied...)
+}
+
+func (f *fakeBlobFetcher) Batches() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][]string(nil), f.batches...)
 }
 
 func (f *fakeBlobFetcher) ReadBlob(_ context.Context, _ model.RepoConfig, _ string, maxBytes int64) ([]byte, error) {

@@ -16,6 +16,7 @@ import (
 
 type BlobFetcher interface {
 	BlobToCache(ctx context.Context, repo model.RepoConfig, objectOID string, dstPath string) (size int64, err error)
+	FetchMissingBlobs(ctx context.Context, repo model.RepoConfig, objectOIDs []string) error
 	ReadBlob(ctx context.Context, repo model.RepoConfig, objectOID string, maxBytes int64) ([]byte, error)
 	VerifyBlob(ctx context.Context, repo model.RepoConfig, objectOID string, cachePath string) (ok bool, err error)
 }
@@ -41,6 +42,10 @@ type Service struct {
 	verified   map[string]os.FileInfo
 	active     map[string]struct{}
 }
+
+// maxFetchBatch caps the blobs one fetch requests. It matches the fusefs
+// per-directory prefetch cap, so one listing's prefetch is one fetch.
+const maxFetchBatch = 256
 
 var ErrStopped = errors.New("hydrator stopped")
 
@@ -512,63 +517,120 @@ func (s *Service) worker(repo model.RepoConfig) {
 	}
 }
 
-// step pops and processes one item from the queue. Returns true if an item
-// was processed, false if the queue was empty.
+// step processes the top of the queue: it copies a fetched task into the
+// cache, or pops a batch and fetches its missing blobs together. Returns true
+// if it popped an item, false if the queue was empty.
 func (s *Service) step(repo model.RepoConfig) bool {
 	s.mu.Lock()
 	if len(s.pq) == 0 {
 		s.mu.Unlock()
 		return false
 	}
-	item := heap.Pop(&s.pq).(*taskItem)
-	key := taskKey(item.task.RepoID, item.task.ObjectOID)
-	delete(s.queued, key)
-	if _, ok := s.active[key]; ok {
+	if s.pq[0].fetched {
+		item := heap.Pop(&s.pq).(*taskItem)
+		more := len(s.pq) > 0
 		s.mu.Unlock()
+		if more {
+			s.signalWork()
+		}
+		s.hydrate(repo, item.task)
 		return true
 	}
-	s.active[key] = struct{}{}
+	batch := s.popBatchLocked()
 	more := len(s.pq) > 0
 	s.mu.Unlock()
 	if more {
 		s.signalWork()
 	}
+	s.fetchBatch(repo, batch)
+	return true
+}
 
-	cachePath := cachePathFor(repo, item.task.ObjectOID)
-	node := taskBaseNode(item.task)
-	if size, ok, err := s.validateCachedBlob(context.Background(), repo, cachePath, node); err != nil {
-		s.finishHydration(key, result{err: err})
-		return true
-	} else if ok {
-		s.finishHydration(key, result{cachePath: cachePath, size: size})
-		s.notifyHydrated(item.task.RepoID, item.task.ObjectOID, size)
-		return true
+// popBatchLocked pops up to maxFetchBatch unfetched tasks. Explicit reads and
+// speculative prefetches never share a batch, so a read does not wait for a
+// directory's prefetch to download.
+func (s *Service) popBatchLocked() []model.HydrationTask {
+	var batch []model.HydrationTask
+	for len(s.pq) > 0 && len(batch) < maxFetchBatch && !s.pq[0].fetched {
+		if len(batch) > 0 && isExplicitRead(s.pq[0].task) != isExplicitRead(batch[0]) {
+			break
+		}
+		item := heap.Pop(&s.pq).(*taskItem)
+		key := taskKey(item.task.RepoID, item.task.ObjectOID)
+		delete(s.queued, key)
+		if _, ok := s.active[key]; ok {
+			continue
+		}
+		s.active[key] = struct{}{}
+		batch = append(batch, item.task)
 	}
+	return batch
+}
+
+// fetchBatch finishes the batch's tasks whose blobs are already cached, fetches
+// the rest with one fetch, and requeues them so every worker can copy them into
+// the cache in priority order.
+func (s *Service) fetchBatch(repo model.RepoConfig, batch []model.HydrationTask) {
+	var uncached []model.HydrationTask
+	for _, task := range batch {
+		key := taskKey(task.RepoID, task.ObjectOID)
+		cachePath := cachePathFor(repo, task.ObjectOID)
+		if size, ok, err := s.validateCachedBlob(context.Background(), repo, cachePath, taskBaseNode(task)); err != nil {
+			s.finishHydration(key, result{err: err})
+		} else if ok {
+			s.finishHydration(key, result{cachePath: cachePath, size: size})
+			s.notifyHydrated(task.RepoID, task.ObjectOID, size)
+		} else {
+			uncached = append(uncached, task)
+		}
+	}
+	if len(uncached) == 0 {
+		return
+	}
+	// A single blob's own lazy fetch costs the same as a batch fetch.
+	if len(uncached) > 1 {
+		oids := make([]string, len(uncached))
+		for i, task := range uncached {
+			oids[i] = task.ObjectOID
+		}
+		ctx, cancel := s.fetchContext()
+		// A failed batch leaves each blob to its own lazy fetch, so an object
+		// the remote refuses fails only its own task.
+		_ = s.fetcher.FetchMissingBlobs(ctx, repo, oids)
+		cancel()
+	}
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	for _, task := range uncached {
+		heap.Push(&s.pq, &taskItem{task: task, fetched: true})
+	}
+	s.mu.Unlock()
+	s.signalWork()
+}
+
+// hydrate copies task's blob into the cache, fetching it if it is still missing.
+func (s *Service) hydrate(repo model.RepoConfig, task model.HydrationTask) {
+	key := taskKey(task.RepoID, task.ObjectOID)
+	cachePath := cachePathFor(repo, task.ObjectOID)
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
 		s.finishHydration(key, result{err: err})
-		return true
+		return
 	}
-	// Use a timeout context derived from stopCh so stuck blob fetches don't
-	// block a worker forever.
-	fetchCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := s.fetchContext()
 	defer cancel()
-	go func() {
-		select {
-		case <-s.stopCh:
-			cancel()
-		case <-fetchCtx.Done():
-		}
-	}()
-	size, err := s.fetcher.BlobToCache(fetchCtx, repo, item.task.ObjectOID, cachePath)
+	size, err := s.fetcher.BlobToCache(ctx, repo, task.ObjectOID, cachePath)
 	if err != nil {
-		s.finishHydration(key, result{err: fmt.Errorf("hydrate %s: %w", item.task.Path, err)})
-		return true
+		s.finishHydration(key, result{err: fmt.Errorf("hydrate %s: %w", task.Path, err)})
+		return
 	}
 	s.mu.Lock()
 	if s.stopped {
 		delete(s.active, key)
 		s.mu.Unlock()
-		return true
+		return
 	}
 	if st, statErr := os.Stat(cachePath); statErr == nil {
 		s.verified[key] = st
@@ -577,8 +639,25 @@ func (s *Service) step(repo model.RepoConfig) bool {
 	delete(s.active, key)
 	s.mu.Unlock()
 	notifyWaiters(waits, result{cachePath: cachePath, size: size, err: nil})
-	s.notifyHydrated(item.task.RepoID, item.task.ObjectOID, size)
-	return true
+	s.notifyHydrated(task.RepoID, task.ObjectOID, size)
+}
+
+// fetchContext bounds a fetch so a stuck one cannot block a worker forever,
+// and cancels it when the service stops.
+func (s *Service) fetchContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	go func() {
+		select {
+		case <-s.stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
+func isExplicitRead(task model.HydrationTask) bool {
+	return task.Priority >= PriorityExplicitRead
 }
 
 func taskBaseNode(task model.HydrationTask) model.BaseNode {
@@ -668,6 +747,9 @@ func isCodeExtension(ext string) bool {
 type taskItem struct {
 	task  model.HydrationTask
 	index int
+	// fetched marks a task whose batch fetch already ran. It stays active, so
+	// Enqueue never finds it, and a worker copies it into the cache alone.
+	fetched bool
 }
 
 type priorityQueue []*taskItem

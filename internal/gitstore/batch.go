@@ -83,6 +83,40 @@ func (s *Store) BlobToCache(ctx context.Context, repo model.RepoConfig, objectOI
 	return size, err
 }
 
+// FetchMissingBlobs fetches the objects in objectOIDs that the object store
+// lacks in one fetch from origin. It runs the fetch that a lazy fetch runs for
+// one missing object, so N blobs cost one fetch and one pack instead of N.
+func (s *Store) FetchMissingBlobs(ctx context.Context, repo model.RepoConfig, objectOIDs []string) error {
+	missing, err := missingObjects(ctx, repo.GitDir, objectOIDs)
+	if err != nil || len(missing) == 0 {
+		return err
+	}
+	// The fetch downloads every wanted object again, present or not, so it
+	// asks only for the missing ones.
+	_, err = runGitInput(ctx, repo.GitDir, nil, []byte(strings.Join(missing, "\n")+"\n"),
+		"-c", "fetch.negotiationAlgorithm=noop", "fetch", "origin", "--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--filter=blob:none", "--stdin")
+	if err != nil {
+		s.logger.Warn("batch blob fetch failed, blobs will fetch one at a time", "repo", repo.Name, "blobs", len(missing), "error", err)
+	}
+	return err
+}
+
+// missingObjects returns the objects in oids that the object store lacks.
+// GIT_NO_LAZY_FETCH keeps the check from fetching them one at a time.
+func missingObjects(ctx context.Context, gitDir string, oids []string) ([]string, error) {
+	out, err := runGitInput(ctx, gitDir, []string{"GIT_NO_LAZY_FETCH=1"}, []byte(strings.Join(oids, "\n")+"\n"), "cat-file", "--batch-check")
+	if err != nil {
+		return nil, err
+	}
+	var missing []string
+	for line := range strings.Lines(out) {
+		if oid, ok := strings.CutSuffix(strings.TrimSuffix(line, "\n"), " missing"); ok {
+			missing = append(missing, oid)
+		}
+	}
+	return missing, nil
+}
+
 func fetchBatchToFile(ctx context.Context, batch *batchCatFile, objectOID string, dstPath string) (int64, error) {
 	ch := make(chan fetchBlobResult, 1)
 	go func() {

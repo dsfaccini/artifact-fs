@@ -1005,6 +1005,28 @@ func TestLookUpInodeResolvesUnknownBaseAttributeSizes(t *testing.T) {
 	}
 }
 
+func TestOpenDirPrefetchesBaseFiles(t *testing.T) {
+	repo := model.RepoConfig{ID: "repo"}
+	r := newResolver(
+		&fakeSnapshot{kids: map[string][]model.BaseNode{
+			".": {
+				{Path: "main.go", Type: "file", Mode: 0o100644, ObjectOID: "main", SizeState: "unknown"},
+				{Path: "src", Type: "dir", Mode: 0o40755},
+			},
+		}},
+		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
+	)
+	h := &fakeBatchHydrator{}
+	fs := NewArtifactFuse(repo, r, &Engine{Resolver: r, Repo: repo, Hydrator: h})
+	open := &fuseops.OpenDirOp{Inode: fuseops.RootInodeID}
+	if err := fs.OpenDir(context.Background(), open); err != nil {
+		t.Fatalf("OpenDir: %v", err)
+	}
+	if len(h.tasks) != 1 || h.tasks[0].Path != "main.go" || h.tasks[0].ObjectOID != "main" || h.tasks[0].Reason != "prefetch" {
+		t.Fatalf("prefetch tasks = %+v, want one for main.go", h.tasks)
+	}
+}
+
 func TestReadDirPlusUsesReaddirMetadataWithoutHydration(t *testing.T) {
 	repo := model.RepoConfig{ID: "repo", GitDir: "/tmp/repo.git"}
 	r := newResolver(

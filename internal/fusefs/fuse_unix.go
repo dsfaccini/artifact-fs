@@ -651,6 +651,7 @@ func (fs *ArtifactFuse) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) erro
 	if err != nil {
 		return syscall.EIO
 	}
+	fs.engine.PrefetchDir(ref.Path, entries)
 
 	dh := &DirHandle{inode: ref, gen: gen, commitTime: commitTime, entries: entries}
 	fs.mu.Lock()
