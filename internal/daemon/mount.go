@@ -35,7 +35,7 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 	var ov *overlay.Store
 	var headOID, headRef string
 	var gen int64
-	prepareCtx, cancel := context.WithTimeout(ctx, s.prepareTimeoutDuration())
+	prepareCtx, cancel := s.withPrepareTimeout(ctx)
 	defer cancel()
 	err := s.withRepoPrepareLock(prepareCtx, cfg.Name, func() error {
 		latest, err := s.registry.GetRepo(prepareCtx, cfg.Name)

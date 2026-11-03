@@ -894,21 +894,16 @@ func TestRenameDirectoryRejectsDestinationChildCreatedDuringHydration(t *testing
 	}()
 	select {
 	case <-hydrator.started:
-	case <-time.After(time.Second):
-		t.Fatal("rename did not reach hydration")
+	case err := <-renameDone:
+		t.Fatalf("rename returned before hydration: %v", err)
 	}
 
 	if err := engine.Mkdir(context.Background(), "dst/concurrent", 0o755); err != nil {
 		t.Fatalf("concurrent destination mkdir: %v", err)
 	}
 	close(hydrator.proceed)
-	select {
-	case err := <-renameDone:
-		if !os.IsExist(err) {
-			t.Fatalf("Rename error = %v, want os.ErrExist", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("rename did not finish")
+	if err := <-renameDone; !os.IsExist(err) {
+		t.Fatalf("Rename error = %v, want os.ErrExist", err)
 	}
 
 	for _, path := range []string{"src", "src/a.txt", "dst", "dst/concurrent"} {

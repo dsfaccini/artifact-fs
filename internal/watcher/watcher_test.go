@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -25,31 +26,32 @@ func TestWatchTriggersOnHeadChange(t *testing.T) {
 		t.Fatalf("write feature ref: %v", err)
 	}
 
-	p := New(5 * time.Millisecond)
-	ctx := t.Context()
-	changed := make(chan struct{}, 1)
-	go p.Watch(ctx, gitDir, func() {
+	synctest.Test(t, func(t *testing.T) {
+		p := New(5 * time.Millisecond)
+		ctx := t.Context()
+		changed := make(chan struct{}, 1)
+		go p.Watch(ctx, gitDir, func() {
+			select {
+			case changed <- struct{}{}:
+			default:
+			}
+		})
 		select {
-		case changed <- struct{}{}:
-		default:
+		case <-changed:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("expected initial reconciliation")
+		}
+
+		if err := os.WriteFile(headPath, []byte("ref: refs/heads/feature\n"), 0o644); err != nil {
+			t.Fatalf("update HEAD: %v", err)
+		}
+
+		select {
+		case <-changed:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("expected HEAD change notification")
 		}
 	})
-	select {
-	case <-changed:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("expected initial reconciliation")
-	}
-
-	time.Sleep(15 * time.Millisecond)
-	if err := os.WriteFile(headPath, []byte("ref: refs/heads/feature\n"), 0o644); err != nil {
-		t.Fatalf("update HEAD: %v", err)
-	}
-
-	select {
-	case <-changed:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("expected HEAD change notification")
-	}
 }
 
 func TestWatchTriggersOnCurrentBranchAdvance(t *testing.T) {
@@ -66,31 +68,32 @@ func TestWatchTriggersOnCurrentBranchAdvance(t *testing.T) {
 		t.Fatalf("write ref: %v", err)
 	}
 
-	p := New(5 * time.Millisecond)
-	ctx := t.Context()
-	changed := make(chan struct{}, 1)
-	go p.Watch(ctx, gitDir, func() {
+	synctest.Test(t, func(t *testing.T) {
+		p := New(5 * time.Millisecond)
+		ctx := t.Context()
+		changed := make(chan struct{}, 1)
+		go p.Watch(ctx, gitDir, func() {
+			select {
+			case changed <- struct{}{}:
+			default:
+			}
+		})
 		select {
-		case changed <- struct{}{}:
-		default:
+		case <-changed:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("expected initial reconciliation")
+		}
+
+		if err := os.WriteFile(refPath, []byte("commit-2"), 0o644); err != nil {
+			t.Fatalf("update ref: %v", err)
+		}
+
+		select {
+		case <-changed:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("expected branch advance notification")
 		}
 	})
-	select {
-	case <-changed:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("expected initial reconciliation")
-	}
-
-	time.Sleep(15 * time.Millisecond)
-	if err := os.WriteFile(refPath, []byte("commit-2"), 0o644); err != nil {
-		t.Fatalf("update ref: %v", err)
-	}
-
-	select {
-	case <-changed:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("expected branch advance notification")
-	}
 }
 
 func TestHeadChangedPrimesNewBranchRef(t *testing.T) {
@@ -116,7 +119,6 @@ func TestHeadChangedPrimesNewBranchRef(t *testing.T) {
 		t.Fatal("initial poll should only prime state")
 	}
 
-	time.Sleep(15 * time.Millisecond)
 	if err := os.WriteFile(headPath, []byte("ref: refs/heads/feature\n"), 0o644); err != nil {
 		t.Fatalf("switch HEAD: %v", err)
 	}
@@ -124,7 +126,6 @@ func TestHeadChangedPrimesNewBranchRef(t *testing.T) {
 		t.Fatal("expected HEAD switch to be detected")
 	}
 
-	time.Sleep(15 * time.Millisecond)
 	if err := os.WriteFile(featureRef, []byte("commit-b"), 0o644); err != nil {
 		t.Fatalf("advance feature ref: %v", err)
 	}
@@ -153,7 +154,6 @@ func TestHeadChangedTreatsFirstLooseRefAppearanceAsChange(t *testing.T) {
 		t.Fatal("initial poll should only prime state")
 	}
 
-	time.Sleep(15 * time.Millisecond)
 	if err := os.WriteFile(headPath, []byte("ref: refs/heads/feature\n"), 0o644); err != nil {
 		t.Fatalf("switch HEAD: %v", err)
 	}
@@ -161,7 +161,6 @@ func TestHeadChangedTreatsFirstLooseRefAppearanceAsChange(t *testing.T) {
 		t.Fatal("expected HEAD switch to be detected")
 	}
 
-	time.Sleep(15 * time.Millisecond)
 	if err := os.WriteFile(featureRef, []byte("commit-a"), 0o644); err != nil {
 		t.Fatalf("create feature ref: %v", err)
 	}
@@ -186,7 +185,6 @@ func TestHeadChangedTreatsPackedStartupRefAppearanceAsChange(t *testing.T) {
 		t.Fatal("initial poll should only prime state")
 	}
 
-	time.Sleep(15 * time.Millisecond)
 	if err := os.WriteFile(refPath, []byte("commit-1"), 0o644); err != nil {
 		t.Fatalf("create main ref: %v", err)
 	}
@@ -238,29 +236,30 @@ func TestWatchIgnoresIndexOnlyChanges(t *testing.T) {
 		t.Fatalf("write index: %v", err)
 	}
 
-	p := New(5 * time.Millisecond)
-	ctx := t.Context()
-	changed := make(chan struct{}, 1)
-	go p.Watch(ctx, gitDir, func() {
+	synctest.Test(t, func(t *testing.T) {
+		p := New(5 * time.Millisecond)
+		ctx := t.Context()
+		changed := make(chan struct{}, 1)
+		go p.Watch(ctx, gitDir, func() {
+			select {
+			case changed <- struct{}{}:
+			default:
+			}
+		})
 		select {
-		case changed <- struct{}{}:
-		default:
+		case <-changed:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("expected initial reconciliation")
+		}
+
+		if err := os.WriteFile(indexPath, []byte("index updated"), 0o644); err != nil {
+			t.Fatalf("update index: %v", err)
+		}
+
+		select {
+		case <-changed:
+			t.Fatal("unexpected callback for index-only change")
+		case <-time.After(100 * time.Millisecond):
 		}
 	})
-	select {
-	case <-changed:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("expected initial reconciliation")
-	}
-
-	time.Sleep(15 * time.Millisecond)
-	if err := os.WriteFile(indexPath, []byte("index updated"), 0o644); err != nil {
-		t.Fatalf("update index: %v", err)
-	}
-
-	select {
-	case <-changed:
-		t.Fatal("unexpected callback for index-only change")
-	case <-time.After(100 * time.Millisecond):
-	}
 }

@@ -42,6 +42,10 @@ Repository-specific guidance for `artifact-fs`.
 - Use real Git repositories in `t.TempDir()`. Fake the `git` binary only to inject failures a local repository cannot produce, such as HTTP errors.
 - Assert the observable outcome: what `git status` reports, the resolved entry, or the persisted state. A nil error or a log line is not an outcome.
 - Assert a result that only the code path under test produces. `TestBootstrapCleanStatusIndexSkipsDeleteOnlyOverlay` checks only that the index is unchanged, so it passes whichever check skips the bootstrap.
+- Call `gittest.IsolateConfig` from `TestMain` in every package whose tests run git. Prove it with a `TestGitIgnoresMachineConfig` that calls `gittest.RequireConfigIsolated`. The machine's global and system git config must not change a result.
+- Wait for an event, not for a fixed duration. Poll for the marker the fake git writes, and fail with the operation's error if it returns first. Only `go test -timeout` bounds the wait.
+- Expire a deadline under test with `gittest.ExpireOnFile` once the fake git reaches the step under test. A short timeout can expire in an earlier step on a loaded machine.
+- Assert that something has not happened yet inside `synctest.Test`, after `synctest.Wait`. Drive ticker-based code there too. `synctest.Wait` does not treat a goroutine blocked on a `sync.Mutex` or a subprocess as idle, so those tests cannot use it.
 - Never mount in a package test. Only the root-package e2e tests mount.
 - Run a new e2e test as a `TestE2ESharedMount` subtest. Give it its own mount only when its subject is mounting, a daemon restart, or a fresh mount's state. macFUSE's FSKit extension can stop loading after a series of mounts in one session.
 

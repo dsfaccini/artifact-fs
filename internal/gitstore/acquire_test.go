@@ -895,9 +895,10 @@ func TestFetchStartsBeforeRemoteLookupCompletes(t *testing.T) {
 		t.Fatal(err)
 	}
 	fetchStarted := filepath.Join(tmp, "fetch-started")
+	lookupRelease := filepath.Join(tmp, "lookup-release")
 	script := "#!/bin/sh\n" +
 		"case \"$*\" in\n" +
-		"  'remote get-url origin') exec sleep 10;;\n" +
+		"  'remote get-url origin') while [ ! -f \"$AFS_LOOKUP_RELEASE\" ]; do sleep 0.01; done;;\n" +
 		"  'fetch --no-tags origin') : > \"$AFS_FETCH_STARTED\"; printf '%s\\n' 'HTTP 503 transport failure' >&2; exit 1;;\n" +
 		"esac\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
@@ -905,15 +906,17 @@ func TestFetchStartsBeforeRemoteLookupCompletes(t *testing.T) {
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("AFS_FETCH_STARTED", fetchStarted)
+	t.Setenv("AFS_LOOKUP_RELEASE", lookupRelease)
+	t.Cleanup(func() { _ = os.WriteFile(lookupRelease, nil, 0o644) })
 
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	store.gitRetryDelays = nil
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	err := store.Fetch(ctx, model.RepoConfig{Name: "repo", GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "/private/configured/repo.git"})
-	if err == nil || errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Fetch error = %v, want immediate transport failure", err)
+	// The remote lookup stays blocked until cleanup, so Fetch returns only if it
+	// does not wait for the lookup.
+	err := store.Fetch(context.Background(), model.RepoConfig{Name: "repo", GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "/private/configured/repo.git"})
+	if err == nil {
+		t.Fatal("Fetch error = nil, want transport failure")
 	}
 	if _, statErr := os.Stat(fetchStarted); statErr != nil {
 		t.Fatalf("fetch did not start while remote lookup was blocked: %v", statErr)
@@ -936,7 +939,6 @@ func TestRemoteLookupIncludesConfiguredAndActualOrigin(t *testing.T) {
 	run(t, "git", "--git-dir", gitDir, "remote", "add", "origin", actual)
 	remotesForLogging, cancel := New(nil).startRemotesForLogging(context.Background(), model.RepoConfig{GitDir: gitDir, RemoteURL: configured})
 	defer cancel()
-	deadline := time.Now().Add(time.Second)
 	for {
 		remotes, complete := remotesForLogging()
 		if complete {
@@ -944,9 +946,6 @@ func TestRemoteLookupIncludesConfiguredAndActualOrigin(t *testing.T) {
 				t.Fatalf("remotesForLogging = %q, want configured and actual remotes", remotes)
 			}
 			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("remote lookup did not complete")
 		}
 		time.Sleep(time.Millisecond)
 	}

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"time"
 
@@ -122,7 +123,8 @@ func (s *Service) signalHEADReconcile(rt *repoRuntime) {
 }
 
 func (s *Service) headReconcileLoop(rt *repoRuntime) {
-	backoff := headReconcileMinBackoff
+	minBackoff := cmp.Or(s.headReconcileBackoff, headReconcileMinBackoff)
+	backoff := minBackoff
 	for {
 		select {
 		case <-rt.ctx.Done():
@@ -132,7 +134,7 @@ func (s *Service) headReconcileLoop(rt *repoRuntime) {
 
 		for {
 			if err := s.reconcileHEAD(rt.ctx, rt); err == nil {
-				backoff = headReconcileMinBackoff
+				backoff = minBackoff
 				break
 			}
 			if rt.ctx.Err() != nil {
