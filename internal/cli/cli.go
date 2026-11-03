@@ -198,19 +198,11 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				return nil
 			}),
 		},
-		nameCommand("remount", "remount a repo", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Service, name string, w io.Writer) error {
-			if err := svc.Remount(c, name); err != nil {
-				return err
-			}
-			fmt.Fprintf(w, "remounted %s\n", name)
-			return nil
+		unsupportedMountCommand("remount", func(string) string {
+			return "stop the daemon and start it again to remount every repo"
 		}),
-		nameCommand("unmount", "unmount a repo", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Service, name string, w io.Writer) error {
-			if err := svc.Unmount(c, name); err != nil {
-				return err
-			}
-			fmt.Fprintf(w, "unmounted %s\n", name)
-			return nil
+		unsupportedMountCommand("unmount", func(repo string) string {
+			return "run remove-repo --name " + repo + " and the daemon unmounts the repo at its next registry poll, or stop the daemon to unmount every repo"
 		}),
 		{
 			Name:   "fsmonitor-hook",
@@ -303,6 +295,24 @@ func nameCommand(name, usage string, ctx context.Context, root string, stderr io
 			}
 			return fn(ctx, svc, n, stdout)
 		}),
+	}
+}
+
+// unsupportedMountCommand rejects a mount command: the daemon owns every mount
+// and reads only the registry, so a CLI process cannot reach its mounts.
+// instead names the alternative for a repo.
+func unsupportedMountCommand(name string, instead func(repo string) string) ucli.Command {
+	return ucli.Command{
+		Name:  name,
+		Usage: "unsupported: a running daemon owns the mounts",
+		Flags: []ucli.Flag{ucli.StringFlag{Name: "name", Usage: "repo name"}},
+		Action: func(c *ucli.Context) error {
+			repo := strings.TrimSpace(c.String("name"))
+			if repo == "" {
+				repo = "<name>"
+			}
+			return fmt.Errorf("%s cannot reach the running daemon's mounts; %s", name, instead(repo))
+		},
 	}
 }
 
