@@ -895,25 +895,24 @@ func TestFetchStartsBeforeRemoteLookupCompletes(t *testing.T) {
 		t.Fatal(err)
 	}
 	fetchStarted := filepath.Join(tmp, "fetch-started")
-	lookupRelease := filepath.Join(tmp, "lookup-release")
+	// The fetch marks its start only while the lookup still runs. A passing
+	// Fetch kills the lookup on return; the sleep bound limits how long the
+	// lookup outlives a timeout panic.
 	script := "#!/bin/sh\n" +
 		"case \"$*\" in\n" +
-		"  'remote get-url origin') while [ ! -f \"$AFS_LOOKUP_RELEASE\" ]; do sleep 0.01; done;;\n" +
-		"  'fetch --no-tags origin') : > \"$AFS_FETCH_STARTED\"; printf '%s\\n' 'HTTP 503 transport failure' >&2; exit 1;;\n" +
+		"  'remote get-url origin') sleep 60; : > \"$AFS_LOOKUP_FINISHED\";;\n" +
+		"  'fetch --no-tags origin') [ -f \"$AFS_LOOKUP_FINISHED\" ] || : > \"$AFS_FETCH_STARTED\"; printf '%s\\n' 'HTTP 503 transport failure' >&2; exit 1;;\n" +
 		"esac\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("AFS_FETCH_STARTED", fetchStarted)
-	t.Setenv("AFS_LOOKUP_RELEASE", lookupRelease)
-	t.Cleanup(func() { _ = os.WriteFile(lookupRelease, nil, 0o644) })
+	t.Setenv("AFS_LOOKUP_FINISHED", filepath.Join(tmp, "lookup-finished"))
 
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	store.gitRetryDelays = nil
-	// The remote lookup stays blocked until cleanup, so Fetch returns only if it
-	// does not wait for the lookup.
 	err := store.Fetch(context.Background(), model.RepoConfig{Name: "repo", GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "/private/configured/repo.git"})
 	if err == nil {
 		t.Fatal("Fetch error = nil, want transport failure")

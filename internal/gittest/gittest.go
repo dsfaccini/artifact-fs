@@ -41,14 +41,16 @@ func RequireConfigIsolated(t *testing.T) {
 
 // ExpireOnFile returns a context whose deadline passes once path exists, so a
 // test chooses the step a deadline interrupts instead of racing a timer. The
-// context reports a deadline, as a real timeout does.
+// context reports a deadline, as a real timeout does, and ends early when
+// parent ends or cancel is called.
 func ExpireOnFile(parent context.Context, path string) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(parent, time.Hour)
-	expiring := &expiringContext{Context: ctx, expired: make(chan struct{})}
+	expiring := &expiringContext{Context: ctx, done: make(chan struct{})}
 	go func() {
+		defer close(expiring.done)
 		for {
 			if _, err := os.Stat(path); err == nil {
-				close(expiring.expired)
+				expiring.expired = true
 				return
 			}
 			select {
@@ -63,16 +65,21 @@ func ExpireOnFile(parent context.Context, path string) (context.Context, context
 
 type expiringContext struct {
 	context.Context
-	expired chan struct{}
+	done chan struct{}
+	// expired is written before done closes and read only after.
+	expired bool
 }
 
-func (c *expiringContext) Done() <-chan struct{} { return c.expired }
+func (c *expiringContext) Done() <-chan struct{} { return c.done }
 
 func (c *expiringContext) Err() error {
 	select {
-	case <-c.expired:
-		return context.DeadlineExceeded
+	case <-c.done:
 	default:
 		return nil
 	}
+	if c.expired {
+		return context.DeadlineExceeded
+	}
+	return c.Context.Err()
 }
