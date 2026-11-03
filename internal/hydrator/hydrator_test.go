@@ -505,14 +505,22 @@ func TestQueuedHydrationCapsFetchBatch(t *testing.T) {
 	}
 }
 
-func TestQueuedHydrationFetchesOnlyUnknownSizes(t *testing.T) {
+func TestQueuedHydrationBatchFetchesOnlyMissingBlobs(t *testing.T) {
 	t.Parallel()
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
-	fetcher := &fakeBlobFetcher{payload: []byte("content")}
+	payload := []byte("content")
+	fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true}
 	h := New(fetcher)
 	var tasks []model.HydrationTask
+	// A known size means the object store holds the blob.
 	for _, oid := range []string{"local-1", "local-2", "local-3"} {
-		tasks = append(tasks, model.HydrationTask{RepoID: cfg.ID, Path: oid, ObjectOID: oid, SizeState: "known", SizeBytes: 7, Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()})
+		tasks = append(tasks, model.HydrationTask{RepoID: cfg.ID, Path: oid, ObjectOID: oid, SizeState: "known", SizeBytes: int64(len(payload)), Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()})
+	}
+	for _, oid := range []string{"cached-1", "cached-2"} {
+		if err := os.WriteFile(cachePathFor(cfg, oid), payload, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		tasks = append(tasks, model.HydrationTask{RepoID: cfg.ID, Path: oid, ObjectOID: oid, SizeState: "unknown", Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()})
 	}
 	for _, oid := range []string{"missing-1", "missing-2"} {
 		tasks = append(tasks, model.HydrationTask{RepoID: cfg.ID, Path: oid, ObjectOID: oid, SizeState: "unknown", Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()})
@@ -529,8 +537,36 @@ func TestQueuedHydrationFetchesOnlyUnknownSizes(t *testing.T) {
 	if want := [][]string{{"missing-1", "missing-2"}}; !slices.EqualFunc(got, want, slices.Equal) {
 		t.Fatalf("fetch batches = %v, want %v", got, want)
 	}
-	if got := fetcher.Calls(); got != len(tasks) {
-		t.Fatalf("copies = %d, want %d", got, len(tasks))
+	if got, want := fetcher.Calls(), len(tasks)-2; got != want {
+		t.Fatalf("copies = %d, want %d: the cached blobs need none", got, want)
+	}
+}
+
+func TestQueuedHydrationVerifiesCachedBlobsInParallel(t *testing.T) {
+	t.Parallel()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	payload := []byte("content")
+	releaseVerify := make(chan struct{})
+	fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true, verifyWait: releaseVerify}
+	h := New(fetcher)
+	var tasks []model.HydrationTask
+	for _, oid := range []string{"cached-1", "cached-2"} {
+		if err := os.WriteFile(cachePathFor(cfg, oid), payload, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		tasks = append(tasks, model.HydrationTask{RepoID: cfg.ID, Path: oid, ObjectOID: oid, SizeState: "known", SizeBytes: int64(len(payload)), Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()})
+	}
+	h.EnqueueBatch(tasks)
+	h.Start(2, cfg)
+	defer h.Stop()
+
+	// The worker that pops the batch must not verify it alone: both
+	// verifications run before either finishes.
+	waitForVerifyCalls(t, fetcher, len(tasks))
+	close(releaseVerify)
+	waitForHydratorIdle(t, h, cfg.ID)
+	if got := fetcher.Calls(); got != 0 {
+		t.Fatalf("copies = %d, want 0: both blobs were cached", got)
 	}
 }
 
@@ -967,6 +1003,15 @@ func waitForQueued(t *testing.T, h *Service, key string) {
 		if ok {
 			return
 		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// waitForVerifyCalls polls until fetcher has seen want verifications; go test
+// -timeout is its only bound.
+func waitForVerifyCalls(t *testing.T, fetcher *fakeBlobFetcher, want int) {
+	t.Helper()
+	for fetcher.VerifyCalls() < want {
 		time.Sleep(10 * time.Millisecond)
 	}
 }

@@ -517,9 +517,9 @@ func (s *Service) worker(repo model.RepoConfig) {
 	}
 }
 
-// step processes the top of the queue: it copies a fetched task into the
-// cache, or pops a batch and fetches its missing blobs together. Returns true
-// if it popped an item, false if the queue was empty.
+// step processes the top of the queue: it hydrates a fetched task, or pops a
+// batch and fetches its missing blobs together. Returns true if it popped an
+// item, false if the queue was empty.
 func (s *Service) step(repo model.RepoConfig) bool {
 	s.mu.Lock()
 	if len(s.pq) == 0 {
@@ -567,33 +567,20 @@ func (s *Service) popBatchLocked() []model.HydrationTask {
 	return batch
 }
 
-// fetchBatch finishes the batch's tasks whose blobs are already cached, fetches
-// the rest with one fetch, and requeues them so every worker can copy them into
-// the cache in priority order.
+// fetchBatch fetches the batch's missing blobs with one fetch and requeues the
+// batch, so every worker can validate or copy its tasks in priority order.
 func (s *Service) fetchBatch(repo model.RepoConfig, batch []model.HydrationTask) {
-	var uncached []model.HydrationTask
-	for _, task := range batch {
-		key := taskKey(task.RepoID, task.ObjectOID)
-		cachePath := cachePathFor(repo, task.ObjectOID)
-		if size, ok, err := s.validateCachedBlob(context.Background(), repo, cachePath, taskBaseNode(task)); err != nil {
-			s.finishHydration(key, result{err: err})
-		} else if ok {
-			s.finishHydration(key, result{cachePath: cachePath, size: size})
-			s.notifyHydrated(task.RepoID, task.ObjectOID, size)
-		} else {
-			uncached = append(uncached, task)
-		}
-	}
-	if len(uncached) == 0 {
-		return
-	}
-	// A known size means batchResolveSizes or an earlier hydration found the
-	// blob in the object store, so only blobs of unknown size can need a fetch.
 	var oids []string
-	for _, task := range uncached {
-		if task.SizeState != "known" {
-			oids = append(oids, task.ObjectOID)
+	for _, task := range batch {
+		// A known size means batchResolveSizes or an earlier hydration found
+		// the blob in the object store. A cached blob is validated in hydrate.
+		if task.SizeState == "known" {
+			continue
 		}
+		if _, err := os.Stat(cachePathFor(repo, task.ObjectOID)); err == nil {
+			continue
+		}
+		oids = append(oids, task.ObjectOID)
 	}
 	// A single blob's own lazy fetch costs the same as a batch fetch.
 	if len(oids) > 1 {
@@ -608,17 +595,26 @@ func (s *Service) fetchBatch(repo model.RepoConfig, batch []model.HydrationTask)
 		s.mu.Unlock()
 		return
 	}
-	for _, task := range uncached {
+	for _, task := range batch {
 		heap.Push(&s.pq, &taskItem{task: task, fetched: true})
 	}
 	s.mu.Unlock()
 	s.signalWork()
 }
 
-// hydrate copies task's blob into the cache, fetching it if it is still missing.
+// hydrate serves task from a valid cached blob, or else copies the blob into
+// the cache, fetching it if it is still missing.
 func (s *Service) hydrate(repo model.RepoConfig, task model.HydrationTask) {
 	key := taskKey(task.RepoID, task.ObjectOID)
 	cachePath := cachePathFor(repo, task.ObjectOID)
+	if size, ok, err := s.validateCachedBlob(context.Background(), repo, cachePath, taskBaseNode(task)); err != nil {
+		s.finishHydration(key, result{err: err})
+		return
+	} else if ok {
+		s.finishHydration(key, result{cachePath: cachePath, size: size})
+		s.notifyHydrated(task.RepoID, task.ObjectOID, size)
+		return
+	}
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
 		s.finishHydration(key, result{err: err})
 		return
@@ -752,7 +748,7 @@ type taskItem struct {
 	task  model.HydrationTask
 	index int
 	// fetched marks a task whose batch fetch already ran. It stays active, so
-	// Enqueue never finds it, and a worker copies it into the cache alone.
+	// Enqueue never finds it, and a worker hydrates it alone.
 	fetched bool
 }
 
