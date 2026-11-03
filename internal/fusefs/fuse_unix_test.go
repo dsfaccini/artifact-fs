@@ -1148,6 +1148,77 @@ func TestReadsPrefetchEachDirectoryOncePerGeneration(t *testing.T) {
 	}
 }
 
+// newPrefetchFixture serves src/a.go and src/b.go, whose sizes are unknown, from
+// a hydrator that records what is queued.
+func newPrefetchFixture(t *testing.T) (*ArtifactFuse, *Engine, *fakeBatchHydrator) {
+	t.Helper()
+	cachePath := filepath.Join(t.TempDir(), "blob")
+	if err := os.WriteFile(cachePath, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := model.BaseNode{Path: "src", Type: "dir", Mode: 0o40755}
+	a := model.BaseNode{Path: "src/a.go", Type: "file", Mode: 0o100644, ObjectOID: "a", SizeState: "unknown"}
+	b := model.BaseNode{Path: "src/b.go", Type: "file", Mode: 0o100644, ObjectOID: "b", SizeState: "unknown"}
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	r := newResolver(&fakeSnapshot{
+		nodes: map[string]model.BaseNode{src.Path: src, a.Path: a, b.Path: b},
+		kids:  map[string][]model.BaseNode{".": {src}, "src": {a, b}},
+	}, ov)
+	h := &fakeBatchHydrator{path: cachePath}
+	repo := model.RepoConfig{ID: "repo"}
+	engine := &Engine{Resolver: r, Repo: repo, Overlay: ov, Hydrator: h}
+	return NewArtifactFuse(repo, r, engine), engine, h
+}
+
+func TestLookupAndGetattrDoNotPrefetch(t *testing.T) {
+	fs, _, h := newPrefetchFixture(t)
+	src := lookUpInode(t, fs, fuseops.RootInodeID, "src")
+	a := lookUpInode(t, fs, src, "a.go")
+	if err := fs.GetInodeAttributes(context.Background(), &fuseops.GetInodeAttributesOp{Inode: a}); err != nil {
+		t.Fatalf("GetInodeAttributes: %v", err)
+	}
+	if h.calls == 0 {
+		t.Fatal("lookup did not hydrate src/a.go, whose size is unknown")
+	}
+	if len(h.tasks) != 0 {
+		t.Fatalf("lookup and getattr queued %d prefetch tasks for src", len(h.tasks))
+	}
+}
+
+func TestWriteOnlyOpenDoesNotPrefetch(t *testing.T) {
+	fs, _, h := newPrefetchFixture(t)
+	ctx := context.Background()
+	a := lookUpInode(t, fs, lookUpInode(t, fs, fuseops.RootInodeID, "src"), "a.go")
+	open := &fuseops.OpenFileOp{Inode: a, OpenFlags: syscall.O_WRONLY | syscall.O_TRUNC}
+	if err := fs.OpenFile(ctx, open); err != nil {
+		t.Fatalf("OpenFile(O_WRONLY|O_TRUNC): %v", err)
+	}
+	_ = fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: open.Handle})
+	if len(h.tasks) != 0 {
+		t.Fatalf("a write-only open queued %d prefetch tasks for src", len(h.tasks))
+	}
+	readWholeFile(t, fs, a)
+	if len(h.tasks) != 2 {
+		t.Fatalf("a read queued %d prefetch tasks for src, want 2", len(h.tasks))
+	}
+}
+
+func TestReadsAtTwoGenerationsPrefetchADirectoryOnce(t *testing.T) {
+	_, engine, h := newPrefetchFixture(t)
+	engine.Resolver.SetGeneration(2)
+	// A handle opened before a HEAD change reads at the previous generation.
+	for _, gen := range []int64{1, 2, 1, 2} {
+		f, _, _, err := engine.BaseCacheFile(context.Background(), "src/a.go", gen)
+		if err != nil {
+			t.Fatalf("BaseCacheFile at generation %d: %v", gen, err)
+		}
+		_ = f.Close()
+	}
+	if len(h.tasks) != 2 {
+		t.Fatalf("reads at generations 1 and 2 queued %d prefetch tasks, want 2", len(h.tasks))
+	}
+}
+
 // walkListing opens and lists every directory under inode, and looks up only
 // directories, as find and ls -R do.
 func walkListing(t *testing.T, fs *ArtifactFuse, inode fuseops.InodeID, path string) {

@@ -80,17 +80,20 @@ func (e *Engine) Read(ctx context.Context, path string, off int64, dst []byte) (
 		return nil, err
 	}
 	defer f.Close()
-	e.prefetchSiblings(context.WithoutCancel(ctx), path, e.Resolver.Generation())
+	e.prefetchSiblings(context.WithoutCancel(ctx), path)
 	return readFileChunkFrom(f, off, dst)
 }
 
 // BaseCacheFile opens the base content of path at generation gen, or at the
-// current generation when gen is 0, and returns the generation it opened.
+// current generation when gen is 0, for a read, and returns the generation it
+// opened.
 func (e *Engine) BaseCacheFile(ctx context.Context, path string, gen int64) (*os.File, int64, bool, error) {
-	return e.baseCacheFile(ctx, ctx, path, gen)
+	return e.baseCacheFile(ctx, ctx, path, gen, true)
 }
 
-func (e *Engine) baseCacheFile(ctx, metadataCtx context.Context, path string, gen int64) (*os.File, int64, bool, error) {
+// baseCacheFile is BaseCacheFile. forRead says the caller reads the file, so
+// its directory's prefetch is due.
+func (e *Engine) baseCacheFile(ctx, metadataCtx context.Context, path string, gen int64, forRead bool) (*os.File, int64, bool, error) {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
 	path = model.CleanPath(path)
@@ -122,7 +125,9 @@ func (e *Engine) baseCacheFile(ctx, metadataCtx context.Context, path string, ge
 	if err != nil {
 		return nil, 0, false, err
 	}
-	e.prefetchSiblings(metadataCtx, path, gen)
+	if forRead {
+		e.prefetchSiblings(metadataCtx, path)
+	}
 	return f, gen, true, nil
 }
 
@@ -440,12 +445,15 @@ func (e *Engine) Truncate(ctx context.Context, path string, size int64) error {
 }
 
 // prefetchSiblings prefetches the files of path's directory the first time a
-// base file in it is read at generation gen. Listing a directory prefetches
-// nothing, so directory walks stay lazy. It runs after the read's own blob is
-// hydrated, so that read never waits in a speculative batch. The caller holds
-// the transition read lock.
-func (e *Engine) prefetchSiblings(ctx context.Context, path string, gen int64) {
+// base file in it is read at the current generation. A read through a handle
+// still at an older generation counts at the current one, so reads at two
+// generations do not prefetch the directory again and again. Listing a
+// directory prefetches nothing, so directory walks stay lazy. It runs after the
+// read's own blob is hydrated, so that read never waits in a speculative batch.
+// The caller holds the transition read lock.
+func (e *Engine) prefetchSiblings(ctx context.Context, path string) {
 	dir := model.CleanPath(filepath.Dir(path))
+	gen := e.Resolver.Generation()
 	e.prefetchMu.Lock()
 	if prefetchedGen, ok := e.prefetched[dir]; ok && prefetchedGen == gen {
 		e.prefetchMu.Unlock()

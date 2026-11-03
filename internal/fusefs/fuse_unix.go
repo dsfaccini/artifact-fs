@@ -819,7 +819,8 @@ func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) er
 			fh.cacheFile = f
 			fh.cacheGeneration = -1
 		} else {
-			f, gen, base, err := fs.engine.baseCacheFile(ctx, metadataCtx, ref.Path, ref.Gen)
+			// An open for writing only reads nothing, so it prefetches nothing.
+			f, gen, base, err := fs.engine.baseCacheFile(ctx, metadataCtx, ref.Path, ref.Gen, !op.OpenFlags.IsWriteOnly())
 			if err != nil {
 				if isRequestCancellation(ctx, err) {
 					return syscall.EINTR

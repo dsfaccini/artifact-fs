@@ -38,12 +38,12 @@ type Service struct {
 	background sync.WaitGroup
 	stopCh     chan struct{}
 	workReady  chan struct{} // signaled when new work is enqueued
-	onHydrated OnHydratedFunc
-	verified   map[string]os.FileInfo
-	active     map[string]struct{}
-	workers    int
-	// speculativeBatches counts the prefetch batches workers are fetching.
-	speculativeBatches int
+	// reservedReady wakes the reserved worker, which takes only reads and
+	// copies of blobs that are already local.
+	reservedReady chan struct{}
+	onHydrated    OnHydratedFunc
+	verified      map[string]os.FileInfo
+	active        map[string]struct{}
 }
 
 // maxFetchBatch caps the blobs one fetch requests. It matches the fusefs
@@ -71,8 +71,10 @@ func New(fetcher BlobFetcher) *Service {
 		verifying: newInflight[verifyResult](),
 		stopCh:    make(chan struct{}),
 		workReady: make(chan struct{}, 1),
-		verified:  map[string]os.FileInfo{},
-		active:    map[string]struct{}{},
+
+		reservedReady: make(chan struct{}, 1),
+		verified:      map[string]os.FileInfo{},
+		active:        map[string]struct{}{},
 	}
 }
 
@@ -83,11 +85,16 @@ func (s *Service) SetOnHydrated(fn OnHydratedFunc) {
 	s.mu.Unlock()
 }
 
-// signalWork performs a non-blocking send on workReady to wake a worker.
+// signalWork performs a non-blocking send on workReady and reservedReady to
+// wake a worker of each kind.
 func (s *Service) signalWork() {
 	select {
 	case s.workReady <- struct{}{}:
 	default: // already signaled, workers will drain the queue
+	}
+	select {
+	case s.reservedReady <- struct{}{}:
+	default:
 	}
 }
 
@@ -98,13 +105,15 @@ func (s *Service) Start(workers int, repo model.RepoConfig) {
 		return
 	}
 	s.started = true
-	s.workers = workers
 	s.background.Add(workers)
 	s.mu.Unlock()
-	for range workers {
+	for i := range workers {
+		// With more than one worker, one is reserved so a read never waits
+		// for a prefetch download. A single worker has to take everything.
+		reserved := workers > 1 && i == 0
 		go func() {
 			defer s.background.Done()
-			s.worker(repo)
+			s.worker(repo, reserved)
 		}()
 	}
 }
@@ -514,17 +523,21 @@ func (s *Service) QueueDepth(repoID model.RepoID) int {
 	return c
 }
 
-func (s *Service) worker(repo model.RepoConfig) {
+func (s *Service) worker(repo model.RepoConfig, reserved bool) {
+	ready := s.workReady
+	if reserved {
+		ready = s.reservedReady
+	}
 	for {
 		select {
 		case <-s.stopCh:
 			return
-		case <-s.workReady:
+		case <-ready:
 			// Drain the queue: process all available items before waiting
 			// for the next signal. Re-signal if items remain so other
 			// workers can help.
 			for {
-				if !s.step(repo) {
+				if !s.step(repo, reserved) {
 					break
 				}
 				s.signalWork()
@@ -535,11 +548,13 @@ func (s *Service) worker(repo model.RepoConfig) {
 
 // step processes the top of the queue: it hydrates a fetched task, or pops a
 // batch and fetches its missing blobs together. Returns true if it popped an
-// item, false if the queue was empty or held only prefetches this worker must
-// leave for others.
-func (s *Service) step(repo model.RepoConfig) bool {
+// item, false if the queue was empty or, for the reserved worker, held only
+// prefetch work that downloads.
+func (s *Service) step(repo model.RepoConfig, reserved bool) bool {
 	s.mu.Lock()
-	if len(s.pq) == 0 {
+	// Everything the reserved worker may take ranks above prefetch downloads,
+	// so the top of the queue decides.
+	if len(s.pq) == 0 || reserved && s.pq[0].rank() == rankDownload {
 		s.mu.Unlock()
 		return false
 	}
@@ -554,29 +569,13 @@ func (s *Service) step(repo model.RepoConfig) bool {
 		s.hydrate(repo, item.task)
 		return true
 	}
-	// One worker never takes a prefetch batch, so a read never waits for an
-	// unrelated prefetch download. A single worker has to take them.
-	if !isExplicitRead(s.pq[0].task) && s.workers > 1 && s.speculativeBatches >= s.workers-1 {
-		s.mu.Unlock()
-		return false
-	}
 	batch := s.popBatchLocked()
-	speculative := len(batch) > 0 && !isExplicitRead(batch[0])
-	if speculative {
-		s.speculativeBatches++
-	}
 	more := len(s.pq) > 0
 	s.mu.Unlock()
 	if more {
 		s.signalWork()
 	}
 	s.fetchBatch(repo, batch)
-	if speculative {
-		s.mu.Lock()
-		s.speculativeBatches--
-		s.mu.Unlock()
-		s.signalWork()
-	}
 	return true
 }
 
@@ -601,9 +600,9 @@ func (s *Service) popBatchLocked() []model.HydrationTask {
 	return batch
 }
 
-// fetchBatch finishes the batch's verified cache hits, requeues the tasks that
-// need no fetch, then fetches the missing blobs with one fetch and requeues
-// those, so every worker can validate or copy them in priority order.
+// fetchBatch finishes the batch's verified cache hits and handles the tasks
+// that need no fetch, then fetches the missing blobs with one fetch and
+// requeues them, so every worker can copy them in priority order.
 func (s *Service) fetchBatch(repo model.RepoConfig, batch []model.HydrationTask) {
 	var local, missing []model.HydrationTask
 	for _, task := range batch {
@@ -625,13 +624,21 @@ func (s *Service) fetchBatch(repo model.RepoConfig, batch []model.HydrationTask)
 			missing = append(missing, task)
 		}
 	}
+	// A read of a blob that needs no fetch must not wait for its siblings'
+	// fetch. Every other worker may be downloading prefetches, so the worker
+	// that took a read batch serves those reads itself first.
+	if len(batch) > 0 && isExplicitRead(batch[0]) {
+		for _, task := range local {
+			s.hydrate(repo, task)
+		}
+	} else {
+		s.requeueFetched(local, true)
+	}
 	// A single blob's own lazy fetch costs the same as a batch fetch.
 	if len(missing) < 2 {
-		s.requeueFetched(append(local, missing...))
+		s.requeueFetched(missing, false)
 		return
 	}
-	// A read of a blob that needs no fetch must not wait for this one.
-	s.requeueFetched(local)
 	oids := make([]string, len(missing))
 	for i, task := range missing {
 		oids[i] = task.ObjectOID
@@ -639,14 +646,15 @@ func (s *Service) fetchBatch(repo model.RepoConfig, batch []model.HydrationTask)
 	ctx, cancel := s.fetchContext()
 	// A failed batch leaves each blob to its own lazy fetch, so an object the
 	// remote refuses fails only its own task.
-	_ = s.fetcher.FetchMissingBlobs(ctx, repo, oids)
+	err := s.fetcher.FetchMissingBlobs(ctx, repo, oids)
 	cancel()
-	s.requeueFetched(missing)
+	s.requeueFetched(missing, err == nil)
 }
 
 // requeueFetched queues tasks whose batch fetch ran, or that needed none, for
-// any worker to hydrate. A task a read waits on goes ahead of speculative work.
-func (s *Service) requeueFetched(tasks []model.HydrationTask) {
+// a worker to hydrate. local says their blobs need no download. A task a read
+// waits on goes ahead of speculative work.
+func (s *Service) requeueFetched(tasks []model.HydrationTask, local bool) {
 	if len(tasks) == 0 {
 		return
 	}
@@ -660,7 +668,7 @@ func (s *Service) requeueFetched(tasks []model.HydrationTask) {
 		if len(s.wait[key]) > 0 && !isExplicitRead(task) {
 			task.Priority = PriorityExplicitRead
 		}
-		item := &taskItem{task: task, fetched: true}
+		item := &taskItem{task: task, fetched: true, local: local}
 		heap.Push(&s.pq, item)
 		s.queued[key] = item
 	}
@@ -816,12 +824,37 @@ type taskItem struct {
 	// fetched marks a task whose batch fetch already ran. It stays active, so
 	// Enqueue ignores it, and a worker hydrates it alone.
 	fetched bool
+	// local marks a fetched task whose blob is cached, of known size, or
+	// downloaded by its batch fetch, so hydrating it downloads nothing.
+	local bool
+}
+
+const (
+	rankDownload = iota
+	rankLocalCopy
+	rankRead
+)
+
+// rank orders the queue ahead of priority: reads, then copies of prefetch
+// blobs that are already local, then prefetch work that downloads. A blob a
+// batch fetch already downloaded is copied before more prefetches download.
+func (item *taskItem) rank() int {
+	switch {
+	case isExplicitRead(item.task):
+		return rankRead
+	case item.local:
+		return rankLocalCopy
+	}
+	return rankDownload
 }
 
 type priorityQueue []*taskItem
 
 func (p priorityQueue) Len() int { return len(p) }
 func (p priorityQueue) Less(i, j int) bool {
+	if ri, rj := p[i].rank(), p[j].rank(); ri != rj {
+		return ri > rj
+	}
 	if p[i].task.Priority == p[j].task.Priority {
 		return p[i].task.EnqueuedAt.Before(p[j].task.EnqueuedAt)
 	}
