@@ -61,7 +61,7 @@ if [ "$(uname)" = Darwin ]; then diskutil unmount /tmp/workers-sdk; else fusermo
 
 ## Mount Semantics
 
-- Base view = branch `HEAD` from the blobless clone. File contents hydrate on first read.
+- Base view = branch `HEAD` from the blobless clone. File contents hydrate on first read; opening a directory also hydrates its files in the background.
 - Dirty files are overlay state, not part of the base commit. `./artifact-fs status --name <repo>` reports this as `overlay_dirty=true`.
 - `git add` and `git commit` inside the mount are supported. After commit or checkout, the watcher re-indexes the new `HEAD` and reconciles stale overlay entries.
 

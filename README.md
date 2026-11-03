@@ -131,11 +131,11 @@ Check the state of a mounted repo with `status`:
 | `overlay_dirty` | `true` if the overlay contains created or modified files; delete-only overlays are not counted |
 | `last_fetch` / `result` | `FETCH_HEAD` modification time and `ok` when present; otherwise `never` |
 
-Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The daemon prioritizes code and manifests (`package.json`, `go.mod`, `README.md`) over binary files.
+Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. Opening a directory queues up to 256 of its files for background hydration, ranking code and manifests (`package.json`, `go.mod`, `README.md`) ahead of binary files. Reads go ahead of these prefetches. A worker takes up to 256 queued blobs at a time and fetches the missing ones with one `git fetch`, so a blobless clone pays one fetch per batch, not one per blob. Reads and prefetches never share a fetch.
 
 When the Git index matches the published snapshot and the overlay is empty, startup marks snapshot entries valid for Git's filesystem monitor before opening the mount. This lets the first `git status` use the daemon's change list instead of reading every tracked blob. ArtifactFS skips this baseline when the index or attributes are uncertain, when `core.attributesFile` is configured, or when staged work or overlay changes exist; Git then performs its normal status scan.
 
-Use `--hydration-concurrency` to control the number of parallel blob-fetch workers (default 4). Each worker maintains a persistent `git cat-file --batch` process, so higher values trade memory for faster bulk hydration:
+Use `--hydration-concurrency` to control the number of parallel blob-fetch workers (default 4). Each worker maintains a persistent `git cat-file --batch` process that copies fetched blobs into the cache, so higher values trade memory for faster bulk hydration:
 
 ```bash
 ./artifact-fs daemon --root /tmp --hydration-concurrency 8
@@ -340,7 +340,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 
 3. **Mount** -- The FUSE layer exposes the tree immediately. A synthesized `.git` gitfile points at the real gitdir so git commands work inside the mount.
 
-4. **Read** -- The Resolver merges the snapshot (base tree) with the overlay (local writes). For base files, reads block until the Hydrator fetches the blob via a persistent `git cat-file --batch` process and streams it to the blob cache.
+4. **Read** -- The Resolver merges the snapshot (base tree) with the overlay (local writes). For base files, reads block until the Hydrator fetches the blob and streams it to the blob cache through a persistent `git cat-file --batch` process. Blobs queued together are fetched with one `git fetch --stdin`; opening a directory queues its files the same way.
 
 5. **Write** -- The Engine promotes base files to the overlay via copy-on-write (hydrate, then copy to the `upper/` directory). Subsequent reads come from the overlay. Deletes are recorded as whiteouts.
 
@@ -355,7 +355,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 | `gitstore` | Git CLI wrapper: clone, fetch, ls-tree, batch pool for `cat-file --batch` |
 | `snapshot` | SQLite store for `base_nodes` keyed by `(generation, path)` |
 | `overlay` | SQLite metadata + `upper/` directory for local writes, whiteouts, reconciliation |
-| `hydrator` | Priority queue with deduped waiters; workers block on a `workReady` channel |
+| `hydrator` | Priority queue with deduped waiters; workers fetch queued blobs in batches and block on a `workReady` channel |
 | `watcher` | Polls gitdir mtimes (HEAD, index, refs) at 500ms intervals |
 | `registry` | SQLite-backed repo config persistence |
 | `model` | Shared types and canonical interfaces (`GitStore`, `SnapshotStore`, `OverlayStore`, `Hydrator`) |
@@ -368,7 +368,7 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 
 | Operation | Status | Notes |
 |-----------|--------|-------|
-| `ls` (root and subdirectories) | Supported | Includes synthesized `.git` gitfile |
+| `ls` (root and subdirectories) | Supported | Includes synthesized `.git` gitfile; queues the directory's files for background hydration |
 | `cat` / read file | Supported | Triggers on-demand hydration for unhydrated blobs |
 | `stat` (file size, mode) | Supported | Sizes resolved via `git cat-file --batch-check` |
 | `mkdir` | Supported | Persisted in writable overlay |
