@@ -8,6 +8,7 @@ Repository-specific guidance for `artifact-fs`.
 - Keep adoption's inline-credential check in `WarnAdoptedOriginCredentials` a redacted warning, not a rejection. Adoption stores no URL and never clones, fetches or refreshes. Only Git's lazy fetches of missing blobs and trees use the user's existing origin. Flag any other path that persists inline credentials or lets the daemon fetch with them.
 - Flag blob bytes converted to `string`. Keep `BlobToCache` binary-safe by streaming `git cat-file --batch` output to disk.
 - Keep `GIT_NO_LAZY_FETCH=1` on `git cat-file --batch-check` in `batchResolveSizes`. Removing it turns size resolution in blobless clones into network round-trips.
+- Run a Git command that can lazy-fetch missing objects with `lazyFetchEnv()` and `configureCommandSession`, never `nonInteractiveGitEnv()`. `nonInteractiveGitEnv()` sets `GIT_SSH_COMMAND`, which overrides the repo's `core.sshCommand`, and an adopted worktree keeps that setting.
 - Normalize paths only with `model.CleanPath()`. Do not add local wrappers.
 - Use the canonical `model.*` interfaces for snapshot, overlay, hydrator, and gitstore access. Do not add subset interfaces around them.
 

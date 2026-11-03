@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
+	"golang.org/x/sys/unix"
 )
 
 func TestStateRootDirectoriesArePrivate(t *testing.T) {
@@ -206,5 +207,39 @@ func TestNewNarrowsExistingStateDirectories(t *testing.T) {
 		if got := info.Mode().Perm(); got != want {
 			t.Errorf("%s mode = %04o, want %04o", dir, got, want)
 		}
+	}
+}
+
+func TestNewRefusesStateRootLinkOwnedByAnotherUser(t *testing.T) {
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(tmp, "state")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	// Only root can chown a symlink, so report the link as another user's.
+	realLstat := lstat
+	t.Cleanup(func() { lstat = realLstat })
+	lstat = func(path string, st *unix.Stat_t) error {
+		err := realLstat(path, st)
+		if path == link {
+			st.Uid++
+		}
+		return err
+	}
+
+	svc, err := New(context.Background(), link, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil {
+		svc.Close()
+		t.Fatal("New accepted a state root link another user owns")
+	}
+	if !strings.Contains(err.Error(), "owned by another user") {
+		t.Fatalf("New error = %v, want ownership rejection", err)
+	}
+	if entries, err := os.ReadDir(target); err != nil || len(entries) != 0 {
+		t.Fatalf("New wrote into the link's target: %v, %v", entries, err)
 	}
 }

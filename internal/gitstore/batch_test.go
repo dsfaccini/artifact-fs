@@ -332,6 +332,26 @@ func TestBlobToCacheRedactsBatchStderrBeforeBoundingLine(t *testing.T) {
 	}
 }
 
+func TestBlobToCacheDropsPartialTokenAtBatchStderrBufferBound(t *testing.T) {
+	// The buffer bound falls inside the password, and redacting the token
+	// before it shrinks the line below the logged bound.
+	head := "token=" + strings.Repeat("a", 4*maxGitErrorBytes-25) + " https://alice:s3cr"
+	logs := batchStderrLogs(t, "printf '%s' '"+head+"' >&2; echo 'etpassword@example.com/repo.git' >&2")
+	if !strings.Contains(logs, `"truncated":true`) {
+		t.Fatalf("logs = %.300s, want a truncated line", logs)
+	}
+	if strings.Contains(logs, "s3cr") {
+		t.Fatalf("logs leaked part of the password: %.300s", logs)
+	}
+}
+
+func TestBlobToCacheLogsBatchStderrWithoutTrailingNewline(t *testing.T) {
+	logs := batchStderrLogs(t, "printf 'fatal: last line has no newline' >&2")
+	if !strings.Contains(logs, "fatal: last line has no newline") {
+		t.Fatalf("logs = %s, want the unterminated last line", logs)
+	}
+}
+
 func TestBlobToCacheBoundsBatchStderrLine(t *testing.T) {
 	logs := batchStderrLogs(t, `printf '%040000d\n' 0 >&2`)
 	decoder := json.NewDecoder(strings.NewReader(logs))

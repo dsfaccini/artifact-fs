@@ -124,8 +124,9 @@ ArtifactFS creates the state root and its subdirectories with mode `0700`, and
 narrows existing subdirectories to `0700`. It refuses a state root, or one of
 its subdirectories, that another user owns or that group or others can write:
 the state root holds each clone's fsmonitor hook, which Git runs on every
-`git status`. ArtifactFS resolves a symlinked state root once at startup and
-uses the resolved path from then on.
+`git status`. A state root may be a symlink the current user owns. ArtifactFS
+resolves it at startup and builds the paths of repos it registers from the
+resolved path. Repos registered before that keep the paths they stored.
 
 ## Monitoring hydration and repo status
 
@@ -153,6 +154,8 @@ Check the state of a mounted repo with `status`:
 | `last_fetch` / `result` | `FETCH_HEAD` modification time and `ok` when present; otherwise `never` |
 
 Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The daemon prioritizes code and manifests (`package.json`, `go.mod`, `README.md`) over binary files.
+
+For every repo, ArtifactFS reads blobs (`git cat-file --batch`) and trees (`git ls-tree`) without a controlling terminal, with `GIT_TERMINAL_PROMPT=0` and an empty `SSH_ASKPASS`. When one of these reads lazily fetches a missing object, a remote that needs an interactive password or passphrase prompt makes the fetch fail instead of prompting. The repo's `core.sshCommand`, credential helpers, and any program set through `GIT_ASKPASS` or `core.askPass` still run. Git Credential Manager can still show its GUI prompt unless `GCM_INTERACTIVE=never` is set.
 
 When the Git index matches the published snapshot and the overlay is empty, startup marks snapshot entries valid for Git's filesystem monitor before opening the mount. This lets the first `git status` use the daemon's change list instead of reading every tracked blob. ArtifactFS skips this baseline when the index or attributes are uncertain, when `core.attributesFile` is configured, or when staged work or overlay changes exist; Git then performs its normal status scan.
 

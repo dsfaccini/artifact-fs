@@ -8,6 +8,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// lstat is unix.Lstat. Tests replace it, because only root can create a
+// symlink that another user owns.
+var lstat = unix.Lstat
+
 // stateRootDirs are the state root's fixed subdirectories. Every per-repo
 // directory under the root sits inside one of them.
 var stateRootDirs = []string{"config", filepath.Join("config", "locks"), "repos", "overlays", "cache", "meta"}
@@ -15,14 +19,26 @@ var stateRootDirs = []string{"config", filepath.Join("config", "locks"), "repos"
 // ensureStateRoot creates the state root and its fixed subdirectories 0700, and
 // returns the root with its symlinks resolved. Use only the resolved root: a
 // link that is retargeted after this check then redirects nothing.
-// It refuses the root or a subdirectory that another user owns or that group
-// or others can write: whoever can write there can replace the fsmonitor hook
-// that Git runs on every status, or the cached blobs that reads serve.
+//
+// It refuses the root as given when another user owns it, even as a symlink to
+// a directory of the current user, because that user chose the target. It
+// refuses the resolved root or a subdirectory that another user owns or that
+// group or others can write: whoever can write there can replace the fsmonitor
+// hook that Git runs on every status, or the cached blobs that reads serve.
+// Ancestors of the root are not checked.
+//
 // It narrows each existing subdirectory to 0700. The root keeps its mode,
 // because the user chose it.
 func ensureStateRoot(root string) (string, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return "", err
+	}
+	var link unix.Stat_t
+	if err := lstat(filepath.Clean(root), &link); err != nil {
+		return "", &os.PathError{Op: "lstat", Path: root, Err: err}
+	}
+	if link.Uid != uint32(os.Geteuid()) {
+		return "", fmt.Errorf("refusing state root %s: owned by another user", root)
 	}
 	resolved, err := filepath.EvalSymlinks(root)
 	if err != nil {

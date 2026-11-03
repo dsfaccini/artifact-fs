@@ -387,7 +387,14 @@ func (w *gitStderrLogger) Write(p []byte) (int, error) {
 }
 
 func (w *gitStderrLogger) flush() {
-	line := auth.RedactString(strings.TrimSpace(string(w.line)))
+	text := string(w.line)
+	if w.truncated {
+		// Buffering stopped inside the last token, which can hold a partial
+		// credential that redaction does not recognize. RedactString splits
+		// tokens on spaces, so every earlier token is whole.
+		text = text[:max(strings.LastIndexByte(text, ' '), 0)]
+	}
+	line := auth.RedactString(strings.TrimSpace(text))
 	truncated := w.truncated
 	if len(line) > maxGitErrorBytes {
 		line, truncated = line[:maxGitErrorBytes], true
