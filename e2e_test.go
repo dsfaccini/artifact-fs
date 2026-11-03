@@ -134,6 +134,7 @@ func TestE2E(t *testing.T) {
 		t.Skip("skipping e2e tests (set AFS_RUN_E2E_TESTS=1 to run)")
 	}
 	skipIfNoFUSE(t)
+	skipIfOverMountBudget(t, 1)
 
 	remoteURL := os.Getenv("AFS_E2E_REPO")
 	if remoteURL == "" {
@@ -440,6 +441,7 @@ func TestE2E(t *testing.T) {
 	// entries -> new snapshot generation is visible to FUSE.
 
 	t.Run("git/commit", func(t *testing.T) {
+		skipIfFSKitHEADMove(t, "this test")
 		preCommitHEAD := strings.TrimSpace(gitCmd(t, mountPath, "rev-parse", "HEAD"))
 
 		// Create and stage a new file (isolated from prior dirty state).
@@ -514,6 +516,7 @@ func testE2EFilesystemDirectoryMoveWorkflows(t *testing.T, shared *sharedE2ERepo
 }
 
 func TestE2EFilesystemDirectoryRenamePersistsAcrossRestart(t *testing.T) {
+	skipIfOverMountBudget(t, 2)
 	repo := newMountedE2ERepo(t)
 
 	renamedRoot := filepath.Join(repo.mountPath, "packages", "wrangler-pending")
@@ -1076,6 +1079,7 @@ func TestE2EVerifiedSource(t *testing.T) {
 		t.Skip("skipping e2e tests (set AFS_RUN_E2E_TESTS=1 to run)")
 	}
 	skipIfNoFUSE(t)
+	skipIfOverMountBudget(t, 2)
 
 	repoRoot := t.TempDir()
 	remoteDir := filepath.Join(repoRoot, "verified.git")
