@@ -347,32 +347,120 @@ func TestBootstrapCleanIndexForFSMonitorSkipsStagedIndexAndExistingLock(t *testi
 	}
 }
 
-func TestBootstrapCleanIndexForFSMonitorSkipsConversionAttributes(t *testing.T) {
+func TestBootstrapCleanIndexForFSMonitorLeavesCRLFNormalizingPathsToGit(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "repo")
 	run(t, "git", "init", repo)
 	run(t, "git", "-C", repo, "config", "user.name", "test")
 	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
-	if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("tracked.txt text\n"), 0o644); err != nil {
+	// The blobs keep CRLF because the attributes arrive in a later commit, and
+	// the worktree files hold the blob bytes, as the mount serves them.
+	names := []string{"auto.txt", "auto-lf.txt", "binary.dat", "untext-lf.txt", "unset-lf.txt", "text.txt", "input.txt", "eol-lf.txt"}
+	for _, name := range names {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte("a\r\nb\r\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run(t, "git", "-C", repo, "add", ".")
+	run(t, "git", "-C", repo, "commit", "-m", "crlf blobs")
+	// check-attr prints -text and the literal text=unset alike, but Git
+	// converts the second under eol=lf.
+	attributes := "auto.txt text=auto\nauto-lf.txt text=auto eol=lf\nbinary.dat binary\nuntext-lf.txt -text eol=lf\nunset-lf.txt text=unset eol=lf\ntext.txt text\ninput.txt text=input\neol-lf.txt eol=lf\n"
+	if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte(attributes), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	run(t, "git", "-C", repo, "add", ".gitattributes")
+	run(t, "git", "-C", repo, "commit", "-m", "attributes")
+	oid := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+
+	// Without stat data Git compares every file, which is the answer the
+	// bootstrap must not change.
+	run(t, "git", "-C", repo, "read-tree", "HEAD")
+	want := runOutput(t, "git", "-C", repo, "-c", "core.fsmonitor=false", "status", "--porcelain")
+	if want != " M eol-lf.txt\n M input.txt\n M text.txt\n M unset-lf.txt\n" {
+		t.Fatalf("status without the bootstrap = %q, want the four CRLF-normalizing paths modified", want)
+	}
+
+	run(t, "git", "-C", repo, "read-tree", "HEAD")
+	hook := filepath.Join(t.TempDir(), "fsmonitor")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "config", "core.fsmonitor", hook)
+	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, oid, nil); err != nil || !bootstrapped {
+		t.Fatalf("BootstrapCleanIndexForFSMonitor = %v, %v; want true, nil", bootstrapped, err)
+	}
+	wantEntries := "h .gitattributes\nh auto-lf.txt\nh auto.txt\nh binary.dat\nH eol-lf.txt\nH input.txt\nH text.txt\nH unset-lf.txt\nH untext-lf.txt"
+	if got := strings.TrimSpace(runOutput(t, "git", "-C", repo, "ls-files", "-f")); got != wantEntries {
+		t.Fatalf("fsmonitor-valid entries = %q, want %q", got, wantEntries)
+	}
+	if got := runOutput(t, "git", "-C", repo, "status", "--porcelain"); got != want {
+		t.Fatalf("status after the bootstrap = %q, want %q", got, want)
+	}
+}
+
+// The bootstrap runs before the mount, where the hook issues a token it
+// trusts later only for the bootstrap's own query.
+func TestBootstrapCleanIndexForFSMonitorMarksItsHookQuery(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
 	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	run(t, "git", "-C", repo, "add", ".gitattributes", "tracked.txt")
+	run(t, "git", "-C", repo, "add", "tracked.txt")
 	run(t, "git", "-C", repo, "commit", "-m", "base")
 	oid := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
 	run(t, "git", "-C", repo, "read-tree", "HEAD")
-	indexPath := filepath.Join(repo, ".git", "index")
-	before, err := os.ReadFile(indexPath)
-	if err != nil {
+	dir := t.TempDir()
+	marker, hook := filepath.Join(dir, "marker"), filepath.Join(dir, "fsmonitor")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf '%s' \"$"+FSMonitorBootstrapEnv+"\" > '"+marker+"'\nprintf 'token\\0/\\0'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	run(t, "git", "-C", repo, "config", "core.fsmonitor", hook)
 	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
-	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, oid, nil); err != nil || bootstrapped {
-		t.Fatalf("conversion attribute bootstrap = %v, %v; want false, nil", bootstrapped, err)
+	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, oid, nil); err != nil || !bootstrapped {
+		t.Fatalf("BootstrapCleanIndexForFSMonitor = %v, %v; want true, nil", bootstrapped, err)
 	}
-	if after, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(after, before) {
-		t.Fatalf("conversion attribute changed index: err=%v", err)
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "1" {
+		t.Fatalf("%s in the bootstrap's hook query = %q, %v; want 1", FSMonitorBootstrapEnv, got, err)
+	}
+}
+
+func TestBootstrapCleanIndexForFSMonitorSkipsConversionAttributes(t *testing.T) {
+	for _, attribute := range []string{"eol=crlf", "crlf", "filter=convert", "ident", "working-tree-encoding=UTF-16"} {
+		t.Run(attribute, func(t *testing.T) {
+			repo := filepath.Join(t.TempDir(), "repo")
+			run(t, "git", "init", repo)
+			run(t, "git", "-C", repo, "config", "user.name", "test")
+			run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+			if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			run(t, "git", "-C", repo, "add", "tracked.txt")
+			run(t, "git", "-C", repo, "commit", "-m", "base")
+			// The attribute arrives after the blob, so adding it converts nothing.
+			if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("tracked.txt "+attribute+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			run(t, "git", "-C", repo, "add", ".gitattributes")
+			run(t, "git", "-C", repo, "commit", "-m", "attributes")
+			oid := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+			run(t, "git", "-C", repo, "read-tree", "HEAD")
+			indexPath := filepath.Join(repo, ".git", "index")
+			before, err := os.ReadFile(indexPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+			if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, oid, nil); err != nil || bootstrapped {
+				t.Fatalf("conversion attribute bootstrap = %v, %v; want false, nil", bootstrapped, err)
+			}
+			if after, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(after, before) {
+				t.Fatalf("conversion attribute changed index: err=%v", err)
+			}
+		})
 	}
 }
 
