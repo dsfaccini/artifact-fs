@@ -624,20 +624,21 @@ func (s *Service) fetchBatch(repo model.RepoConfig, batch []model.HydrationTask)
 			missing = append(missing, task)
 		}
 	}
+	// A single blob's own lazy fetch costs the same as a batch fetch.
+	if len(missing) < 2 {
+		s.requeueFetched(local, true)
+		s.requeueFetched(missing, false)
+		return
+	}
 	// A read of a blob that needs no fetch must not wait for its siblings'
 	// fetch. Every other worker may be downloading prefetches, so the worker
-	// that took a read batch serves those reads itself first.
-	if len(batch) > 0 && isExplicitRead(batch[0]) {
+	// that took a read batch serves those reads itself before it fetches.
+	if isExplicitRead(batch[0]) {
 		for _, task := range local {
 			s.hydrate(repo, task)
 		}
 	} else {
 		s.requeueFetched(local, true)
-	}
-	// A single blob's own lazy fetch costs the same as a batch fetch.
-	if len(missing) < 2 {
-		s.requeueFetched(missing, false)
-		return
 	}
 	oids := make([]string, len(missing))
 	for i, task := range missing {

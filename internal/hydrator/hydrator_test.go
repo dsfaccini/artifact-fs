@@ -735,6 +735,40 @@ func TestReadBatchServesBlobsNeedingNoFetchBeforeItsFetch(t *testing.T) {
 	})
 }
 
+func TestReadBatchWithoutAFetchCopiesInParallel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+		payload := []byte("content")
+		fetcher := &fakeBlobFetcher{payload: payload}
+		releaseCopies := make(chan struct{})
+		fetcher.blobToCache = func(ctx context.Context, _ string) error {
+			select {
+			case <-releaseCopies:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		h := New(fetcher)
+		h.Start(2, cfg)
+		defer func() {
+			close(releaseCopies)
+			h.Stop()
+		}()
+		// Both blobs are in the object store, as in a full clone.
+		var reads []model.HydrationTask
+		for _, oid := range []string{"local-0", "local-1"} {
+			reads = append(reads, model.HydrationTask{RepoID: cfg.ID, Path: oid, ObjectOID: oid, SizeState: "known", SizeBytes: int64(len(payload)), Priority: PriorityExplicitRead, Reason: "explicit read", EnqueuedAt: time.Now()})
+		}
+		h.EnqueueBatch(reads)
+		synctest.Wait()
+
+		if got := fetcher.Calls(); got != len(reads) {
+			t.Fatalf("copies running = %d, want %d: a read batch with nothing to fetch copies in parallel", got, len(reads))
+		}
+	})
+}
+
 func TestReservedWorkerCopiesLocalPrefetchBlobsDuringADownload(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
