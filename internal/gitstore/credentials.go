@@ -143,7 +143,7 @@ func malformedUserinfoInRemote(rawURL string, u *url.URL) bool {
 	if isHTTPRemote(rawURL, u.Scheme) && strings.Contains(u.Hostname(), ".") {
 		return false
 	}
-	return auth.RawUserinfoHasPassword(rawURL)
+	return auth.MisparsedUserinfoHasPassword(rawURL, u)
 }
 
 func schemeLessUserinfoHasPassword(raw string) bool {

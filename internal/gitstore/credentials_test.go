@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -756,6 +757,26 @@ func TestCloneBloblessRejectsPasswordHoldingSlashBeforeGit(t *testing.T) {
 	}
 	if _, err := os.Stat(contacted); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("git ran SSH for %q, which holds a password", remote)
+	}
+}
+
+func TestCredentialChecksAgreeOnPasswordURLParseMisreads(t *testing.T) {
+	t.Parallel()
+	// url.Parse reads host "user" and port "1234", and a path holding the "@".
+	for _, tt := range []struct{ remote, password string }{
+		{"ssh://user:1234/secret@host/repo", "1234/secret"},
+		{"git://alice:22/s3cret@host", "22/s3cret"},
+		{"ssh://hostzz:22/org/repo@v1.git", "22/org/repo"},
+	} {
+		if _, _, err := credentialEnv(tt.remote); err == nil {
+			t.Errorf("credentialEnv accepted %q", tt.remote)
+		}
+		if !auth.HasInlineCredentials(tt.remote) {
+			t.Errorf("HasInlineCredentials(%q) = false", tt.remote)
+		}
+		if got := auth.RedactRemoteURL(tt.remote); strings.Contains(got, tt.password) {
+			t.Errorf("RedactRemoteURL(%q) = %q shows %q", tt.remote, got, tt.password)
+		}
 	}
 }
 

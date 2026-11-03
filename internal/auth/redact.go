@@ -34,7 +34,7 @@ func RedactRemoteURL(raw string) string {
 	if err != nil {
 		return redactMalformedURL(raw)
 	}
-	if u.User == nil && strings.Contains(raw, "@") && (isMalformedHTTPUserinfo(raw, u) || schemeLessUserinfoStart(raw) >= 0 || userinfoAfterLaterSeparator(raw, u)) {
+	if MisparsedUserinfoHasPassword(raw, u) || u.User == nil && strings.Contains(raw, "@") && (isMalformedHTTPUserinfo(raw, u) || schemeLessUserinfoStart(raw) >= 0 || userinfoAfterLaterSeparator(raw, u)) {
 		return redactMalformedURL(raw)
 	}
 	if u.User != nil {
@@ -104,7 +104,7 @@ func HasInlineCredentials(raw string) bool {
 		}
 		return tokenLike.MatchString(raw)
 	}
-	if u.User == nil && strings.Contains(raw, "@") && (isMalformedHTTPUserinfo(raw, u) || schemeLessUserinfoStart(raw) >= 0) {
+	if MisparsedUserinfoHasPassword(raw, u) || u.User == nil && strings.Contains(raw, "@") && (isMalformedHTTPUserinfo(raw, u) || schemeLessUserinfoStart(raw) >= 0) {
 		return true
 	}
 	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(raw, "#") {
@@ -447,6 +447,14 @@ func isSCPStyleRemote(raw string) bool {
 	at := strings.Index(prefix, "@")
 	colon := strings.Index(prefix, ":")
 	return at > 0 && colon > at
+}
+
+// MisparsedUserinfoHasPassword reports whether raw, which url.Parse read as u
+// without userinfo, holds a password in text url.Parse took for the host or
+// path, as in "ssh://user:1234/secret@host/repo". Every check that decides
+// whether a parsed remote holds a password uses it, so they agree.
+func MisparsedUserinfoHasPassword(raw string, u *url.URL) bool {
+	return u.User == nil && strings.Contains(raw, "@") && RawUserinfoHasPassword(raw)
 }
 
 // RawUserinfoHasPassword reports whether a remote that url.Parse misreads or
