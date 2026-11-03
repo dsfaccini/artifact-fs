@@ -670,6 +670,71 @@ func TestReadOfVerifiedBlobDoesNotWaitForSiblingFetch(t *testing.T) {
 	release <- struct{}{}
 }
 
+func TestBlobsNeedingNoFetchDoNotWaitForTheirSiblingsFetch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+		payload := []byte("content")
+		fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true}
+		started, release := gateBatchFetches(fetcher)
+		// After a daemon restart a cached blob is not verified yet.
+		if err := os.WriteFile(cachePathFor(cfg, "cached"), payload, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		h := New(fetcher)
+		h.Start(2, cfg)
+		defer func() {
+			close(release)
+			h.Stop()
+		}()
+		tasks := prefetchTasksFor(cfg.ID, PriorityLikelyText, "cached", "sib-0", "sib-1")
+		tasks = append(tasks, model.HydrationTask{RepoID: cfg.ID, Path: "local", ObjectOID: "local", SizeState: "known", SizeBytes: int64(len(payload)), Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()})
+		h.EnqueueBatch(tasks)
+		// One worker waits in the siblings' fetch; the other is free.
+		synctest.Wait()
+		if got := len(started); got != 1 {
+			t.Fatalf("batch fetches = %d, want 1", got)
+		}
+
+		for _, oid := range []string{"cached", "local"} {
+			h.mu.Lock()
+			_, active := h.active[taskKey(cfg.ID, oid)]
+			h.mu.Unlock()
+			if active {
+				t.Fatalf("a read of %s would wait for its siblings' fetch", oid)
+			}
+		}
+	})
+}
+
+func TestOneWorkerStaysFreeForReadsDuringPrefetch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const workers = 4
+		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+		fetcher := &fakeBlobFetcher{payload: []byte("content")}
+		started, release := gateBatchFetches(fetcher)
+		h := New(fetcher)
+		h.Start(workers, cfg)
+		defer func() {
+			close(release)
+			h.Stop()
+		}()
+		oids := make([]string, workers*maxFetchBatch)
+		for i := range oids {
+			oids[i] = fmt.Sprintf("prefetch-%d", i)
+		}
+		h.EnqueueBatch(prefetchTasksFor(cfg.ID, PriorityLikelyText, oids...))
+		synctest.Wait()
+		if got := len(started); got != workers-1 {
+			t.Fatalf("prefetch batch fetches = %d, want %d: one worker stays free for reads", got, workers-1)
+		}
+
+		// The free worker serves an unrelated read while the prefetches download.
+		if _, _, err := h.EnsureHydrated(context.Background(), cfg, model.BaseNode{RepoID: cfg.ID, Path: "read", ObjectOID: "read"}); err != nil {
+			t.Fatalf("EnsureHydrated: %v", err)
+		}
+	})
+}
+
 func TestStopCancelsBatchFetch(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}

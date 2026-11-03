@@ -131,7 +131,7 @@ Check the state of a mounted repo with `status`:
 | `overlay_dirty` | `true` if the overlay contains created or modified files; delete-only overlays are not counted |
 | `last_fetch` / `result` | `FETCH_HEAD` modification time and `ok` when present; otherwise `never` |
 
-Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. Opening a directory queues up to 256 of its files for background hydration, ranking code and manifests (`package.json`, `go.mod`, `README.md`) ahead of binary files. A worker takes up to 256 queued blobs, all reads or all prefetches, and fetches the missing ones with one `git fetch` from the promisor remote, so a blobless clone pays one fetch per batch, not one per blob. Reads go ahead of prefetches. A read of a file whose prefetch is already downloading waits for that one download, then goes ahead of the remaining prefetches.
+Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The first read of a file in a directory also queues up to 256 of that directory's files for background hydration, ranking code and manifests (`package.json`, `go.mod`, `README.md`) ahead of binary files. Listing or walking directories queues nothing. A blobless clone knows a file's size only once its blob is local, so the first `stat` of a file hydrates that one file. A worker takes up to 256 queued blobs, all reads or all prefetches, and fetches the missing ones with one `git fetch` from the promisor remote, so a blobless clone pays one fetch per batch, not one per blob. Queued reads go ahead of queued prefetches. With more than one worker, one worker never takes a prefetch batch, so a read never waits for an unrelated prefetch download; a single worker can make it wait. A read of a file whose own prefetch is downloading waits for that download.
 
 When the Git index matches the published snapshot and the overlay is empty, startup marks snapshot entries valid for Git's filesystem monitor before opening the mount. This lets the first `git status` use the daemon's change list instead of reading every tracked blob. ArtifactFS skips this baseline when the index or attributes are uncertain, when `core.attributesFile` is configured, or when staged work or overlay changes exist; Git then performs its normal status scan.
 
@@ -340,7 +340,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 
 3. **Mount** -- The FUSE layer exposes the tree immediately. A synthesized `.git` gitfile points at the real gitdir so git commands work inside the mount.
 
-4. **Read** -- The Resolver merges the snapshot (base tree) with the overlay (local writes). For base files, reads block until the Hydrator fetches the blob and streams it to the blob cache through a persistent `git cat-file --batch` process. Blobs queued together are fetched with one `git fetch --stdin`; opening a directory queues its files the same way.
+4. **Read** -- The Resolver merges the snapshot (base tree) with the overlay (local writes). For base files, reads block until the Hydrator fetches the blob and streams it to the blob cache through a persistent `git cat-file --batch` process. Blobs queued together are fetched with one `git fetch --stdin`; the first read in a directory queues its other files the same way.
 
 5. **Write** -- The Engine promotes base files to the overlay via copy-on-write (hydrate, then copy to the `upper/` directory). Subsequent reads come from the overlay. Deletes are recorded as whiteouts.
 
@@ -368,9 +368,9 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 
 | Operation | Status | Notes |
 |-----------|--------|-------|
-| `ls` (root and subdirectories) | Supported | Includes synthesized `.git` gitfile; queues the directory's files for background hydration |
+| `ls` (root and subdirectories) | Supported | Includes synthesized `.git` gitfile; hydrates nothing |
 | `cat` / read file | Supported | Triggers on-demand hydration for unhydrated blobs |
-| `stat` (file size, mode) | Supported | Sizes resolved via `git cat-file --batch-check` |
+| `stat` (file size, mode) | Supported | Sizes resolved via `git cat-file --batch-check` when the blob is local; otherwise the first `stat` hydrates the file |
 | `mkdir` | Supported | Persisted in writable overlay |
 | Create new file | Supported | Persisted in writable overlay |
 | Write / append to file | Supported | Copy-on-write for tracked files |

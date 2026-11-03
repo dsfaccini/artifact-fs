@@ -12,8 +12,12 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
+	"github.com/cloudflare/artifact-fs/internal/hydrator"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	overlaystore "github.com/cloudflare/artifact-fs/internal/overlay"
+	"github.com/cloudflare/artifact-fs/internal/snapshot"
 	"github.com/dsfaccini/fuse/fuseops"
 )
 
@@ -79,7 +83,9 @@ func TestCanceledContextOpensOverlayFile(t *testing.T) {
 	if open.Handle == 0 {
 		t.Fatal("OpenFile returned an empty handle")
 	}
-	t.Cleanup(func() { _ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: open.Handle}) })
+	t.Cleanup(func() {
+		_ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: open.Handle})
+	})
 	read := &fuseops.ReadFileOp{Handle: open.Handle, Size: 64}
 	if err := f.fs.ReadFile(context.Background(), read); err != nil {
 		t.Fatalf("ReadFile after OpenFile: %v", err)
@@ -121,7 +127,9 @@ func TestCanceledContextOpensOverlayDirectory(t *testing.T) {
 	if open.Handle == 0 {
 		t.Fatal("OpenDir returned an empty handle")
 	}
-	t.Cleanup(func() { _ = f.fs.ReleaseDirHandle(context.Background(), &fuseops.ReleaseDirHandleOp{Handle: open.Handle}) })
+	t.Cleanup(func() {
+		_ = f.fs.ReleaseDirHandle(context.Background(), &fuseops.ReleaseDirHandleOp{Handle: open.Handle})
+	})
 	dir, err := f.fs.dirHandle(open.Handle)
 	if err != nil {
 		t.Fatal(err)
@@ -139,12 +147,16 @@ func TestCanceledContextRenamesOverlayDirectory(t *testing.T) {
 	if err := f.fs.OpenFile(context.Background(), fileOpen); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: fileOpen.Handle}) })
+	t.Cleanup(func() {
+		_ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: fileOpen.Handle})
+	})
 	dirOpen := &fuseops.OpenDirOp{Inode: f.nestInode}
 	if err := f.fs.OpenDir(context.Background(), dirOpen); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = f.fs.ReleaseDirHandle(context.Background(), &fuseops.ReleaseDirHandleOp{Handle: dirOpen.Handle}) })
+	t.Cleanup(func() {
+		_ = f.fs.ReleaseDirHandle(context.Background(), &fuseops.ReleaseDirHandleOp{Handle: dirOpen.Handle})
+	})
 	op := &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "src", NewParent: fuseops.RootInodeID, NewName: "dst"}
 	if err := f.fs.Rename(ctx, op); err != nil {
 		t.Fatalf("Rename with canceled request context: %v", err)
@@ -218,12 +230,16 @@ func TestCanceledDuringRenameTreeKeepsNamespaceAndHandlesInSync(t *testing.T) {
 	if err := f.fs.OpenFile(context.Background(), fileOpen); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: fileOpen.Handle}) })
+	t.Cleanup(func() {
+		_ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: fileOpen.Handle})
+	})
 	dirOpen := &fuseops.OpenDirOp{Inode: f.nestInode}
 	if err := f.fs.OpenDir(context.Background(), dirOpen); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = f.fs.ReleaseDirHandle(context.Background(), &fuseops.ReleaseDirHandleOp{Handle: dirOpen.Handle}) })
+	t.Cleanup(func() {
+		_ = f.fs.ReleaseDirHandle(context.Background(), &fuseops.ReleaseDirHandleOp{Handle: dirOpen.Handle})
+	})
 	op := &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "src", NewParent: fuseops.RootInodeID, NewName: "dst"}
 	if err := f.fs.Rename(ctx, op); err != nil {
 		t.Fatalf("Rename: %v", err)
@@ -1005,26 +1021,208 @@ func TestLookUpInodeResolvesUnknownBaseAttributeSizes(t *testing.T) {
 	}
 }
 
-func TestOpenDirPrefetchesBaseFiles(t *testing.T) {
-	repo := model.RepoConfig{ID: "repo"}
-	r := newResolver(
-		&fakeSnapshot{kids: map[string][]model.BaseNode{
-			".": {
-				{Path: "main.go", Type: "file", Mode: 0o100644, ObjectOID: "main", SizeState: "unknown"},
-				{Path: "src", Type: "dir", Mode: 0o40755},
-			},
-		}},
-		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
-	)
-	h := &fakeBatchHydrator{}
-	fs := NewArtifactFuse(repo, r, &Engine{Resolver: r, Repo: repo, Hydrator: h})
-	open := &fuseops.OpenDirOp{Inode: fuseops.RootInodeID}
-	if err := fs.OpenDir(context.Background(), open); err != nil {
-		t.Fatalf("OpenDir: %v", err)
+func TestFirstFileReadPrefetchesItsDirectoryAndListingPrefetchesNothing(t *testing.T) {
+	ctx := context.Background()
+	files := map[string]string{
+		"src/a.go":      "package a\n",
+		"src/b.go":      "package b\n",
+		"src/c.go":      "package c\n",
+		"docs/guide.md": "# guide\n",
+		"top.txt":       "top\n",
 	}
-	if len(h.tasks) != 1 || h.tasks[0].Path != "main.go" || h.tasks[0].ObjectOID != "main" || h.tasks[0].Reason != "prefetch" {
-		t.Fatalf("prefetch tasks = %+v, want one for main.go", h.tasks)
+	tmp := t.TempDir()
+	repo := model.RepoConfig{
+		ID:            "repo",
+		Name:          "repo",
+		GitDir:        filepath.Join(tmp, "repo.git"),
+		RemoteURL:     gittest.PartialCloneRemote(t, files),
+		Branch:        "main",
+		BlobCacheDir:  filepath.Join(tmp, "cache"),
+		OverlayDir:    filepath.Join(tmp, "overlay"),
+		OverlayDBPath: filepath.Join(tmp, "overlay.db"),
 	}
+	git := gitstore.New(nil)
+	t.Cleanup(git.Close)
+	if err := git.CloneBlobless(ctx, repo); err != nil {
+		t.Fatalf("CloneBlobless: %v", err)
+	}
+	head, ref, err := git.ResolveHEAD(ctx, repo)
+	if err != nil {
+		t.Fatalf("ResolveHEAD: %v", err)
+	}
+	nodes, err := git.BuildTreeIndex(ctx, repo, head)
+	if err != nil {
+		t.Fatalf("BuildTreeIndex: %v", err)
+	}
+	oids := map[string]string{}
+	for _, n := range nodes {
+		oids[n.Path] = n.ObjectOID
+	}
+	snap, err := snapshot.New(ctx, filepath.Join(tmp, "snapshot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = snap.Close() })
+	gen, err := snap.PublishGeneration(ctx, head, ref, nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ov, err := overlaystore.New(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ov.Close() })
+	h := hydrator.New(git)
+	t.Cleanup(h.Stop)
+	resolver := &Resolver{Snapshot: snap, Overlay: ov}
+	resolver.SetGeneration(gen)
+	fs := NewArtifactFuse(repo, resolver, &Engine{Resolver: resolver, Repo: repo, Overlay: ov, Hydrator: h})
+	packs := packCount(t, repo.GitDir)
+
+	// The hydrator has not started, so anything a listing queued would still
+	// be queued.
+	walkListing(t, fs, fuseops.RootInodeID, ".")
+	if got := h.QueueDepth(repo.ID); got != 0 {
+		t.Fatalf("a listing-only walk queued %d blobs for hydration", got)
+	}
+
+	h.Start(4, repo)
+	src := lookUpInode(t, fs, fuseops.RootInodeID, "src")
+	if got := readWholeFile(t, fs, lookUpInode(t, fs, src, "a.go")); got != files["src/a.go"] {
+		t.Fatalf("src/a.go = %q, want %q", got, files["src/a.go"])
+	}
+	for _, path := range []string{"src/b.go", "src/c.go"} {
+		waitForCachedBlob(t, repo, oids[path])
+	}
+	// One fetch for a.go itself and one for its siblings.
+	if got := packCount(t, repo.GitDir); got != packs+2 {
+		t.Fatalf("packs = %d after reading src/a.go, want %d", got, packs+2)
+	}
+	for _, name := range []string{"b.go", "c.go"} {
+		if got := readWholeFile(t, fs, lookUpInode(t, fs, src, name)); got != files["src/"+name] {
+			t.Fatalf("src/%s = %q, want %q", name, got, files["src/"+name])
+		}
+	}
+	if got := packCount(t, repo.GitDir); got != packs+2 {
+		t.Fatalf("packs = %d after reading the prefetched siblings, want %d", got, packs+2)
+	}
+	for _, path := range []string{"docs/guide.md", "top.txt"} {
+		if _, err := os.Stat(filepath.Join(repo.BlobCacheDir, oids[path])); err == nil {
+			t.Fatalf("%s was hydrated though nothing in its directory was read", path)
+		}
+	}
+}
+
+func TestReadsPrefetchEachDirectoryOncePerGeneration(t *testing.T) {
+	ctx := context.Background()
+	cachePath := filepath.Join(t.TempDir(), "blob")
+	if err := os.WriteFile(cachePath, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := model.BaseNode{Path: "src/a.go", Type: "file", Mode: 0o100644, ObjectOID: "a", SizeState: "unknown"}
+	b := model.BaseNode{Path: "src/b.go", Type: "file", Mode: 0o100644, ObjectOID: "b", SizeState: "unknown"}
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	r := newResolver(&fakeSnapshot{
+		nodes: map[string]model.BaseNode{"src": {Path: "src", Type: "dir", Mode: 0o40755}, a.Path: a, b.Path: b},
+		kids:  map[string][]model.BaseNode{"src": {a, b}},
+	}, ov)
+	h := &fakeBatchHydrator{path: cachePath}
+	engine := &Engine{Resolver: r, Repo: model.RepoConfig{ID: "repo"}, Overlay: ov, Hydrator: h}
+	dst := make([]byte, 16)
+
+	for _, path := range []string{a.Path, b.Path} {
+		if _, err := engine.Read(ctx, path, 0, dst); err != nil {
+			t.Fatalf("Read(%s): %v", path, err)
+		}
+	}
+	if len(h.tasks) != 2 {
+		t.Fatalf("prefetch tasks after two reads in src = %d, want 2", len(h.tasks))
+	}
+	// A new generation can hold new blobs.
+	r.SetGeneration(2)
+	if _, err := engine.Read(ctx, a.Path, 0, dst); err != nil {
+		t.Fatalf("Read(%s) at generation 2: %v", a.Path, err)
+	}
+	if len(h.tasks) != 4 {
+		t.Fatalf("prefetch tasks after a read at a new generation = %d, want 4", len(h.tasks))
+	}
+}
+
+// walkListing opens and lists every directory under inode, and looks up only
+// directories, as find and ls -R do.
+func walkListing(t *testing.T, fs *ArtifactFuse, inode fuseops.InodeID, path string) {
+	t.Helper()
+	ctx := context.Background()
+	open := &fuseops.OpenDirOp{Inode: inode}
+	if err := fs.OpenDir(ctx, open); err != nil {
+		t.Fatalf("OpenDir(%s): %v", path, err)
+	}
+	if err := fs.ReadDir(ctx, &fuseops.ReadDirOp{Handle: open.Handle, Dst: make([]byte, 64*1024)}); err != nil {
+		t.Fatalf("ReadDir(%s): %v", path, err)
+	}
+	plus := &fuseops.ReadDirPlusOp{}
+	plus.Handle = open.Handle
+	plus.Dst = make([]byte, 64*1024)
+	if err := fs.ReadDirPlus(ctx, plus); err != nil {
+		t.Fatalf("ReadDirPlus(%s): %v", path, err)
+	}
+	if err := fs.ReleaseDirHandle(ctx, &fuseops.ReleaseDirHandleOp{Handle: open.Handle}); err != nil {
+		t.Fatalf("ReleaseDirHandle(%s): %v", path, err)
+	}
+	entries, _, _, err := fs.resolver.ReaddirSnapshot(ctx, path)
+	if err != nil {
+		t.Fatalf("ReaddirSnapshot(%s): %v", path, err)
+	}
+	for _, e := range entries {
+		if e.Type == "dir" {
+			walkListing(t, fs, lookUpInode(t, fs, inode, e.Name), model.CleanPath(filepath.Join(path, e.Name)))
+		}
+	}
+}
+
+func lookUpInode(t *testing.T, fs *ArtifactFuse, parent fuseops.InodeID, name string) fuseops.InodeID {
+	t.Helper()
+	op := &fuseops.LookUpInodeOp{Parent: parent, Name: name}
+	if err := fs.LookUpInode(context.Background(), op); err != nil {
+		t.Fatalf("LookUpInode(%s): %v", name, err)
+	}
+	return op.Entry.Child
+}
+
+func readWholeFile(t *testing.T, fs *ArtifactFuse, inode fuseops.InodeID) string {
+	t.Helper()
+	ctx := context.Background()
+	open := &fuseops.OpenFileOp{Inode: inode}
+	if err := fs.OpenFile(ctx, open); err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer func() { _ = fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: open.Handle}) }()
+	read := &fuseops.ReadFileOp{Handle: open.Handle, Size: 4096, Dst: make([]byte, 4096)}
+	if err := fs.ReadFile(ctx, read); err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	return string(read.Dst[:read.BytesRead])
+}
+
+// waitForCachedBlob polls until oid's blob is in repo's cache; go test
+// -timeout is its only bound.
+func waitForCachedBlob(t *testing.T, repo model.RepoConfig, oid string) {
+	t.Helper()
+	for {
+		if _, err := os.Stat(filepath.Join(repo.BlobCacheDir, oid)); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func packCount(t *testing.T, gitDir string) int {
+	t.Helper()
+	packs, err := filepath.Glob(filepath.Join(gitDir, "objects", "pack", "*.pack"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(packs)
 }
 
 func TestReadDirPlusUsesReaddirMetadataWithoutHydration(t *testing.T) {

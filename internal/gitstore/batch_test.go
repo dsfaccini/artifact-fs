@@ -68,6 +68,7 @@ func TestFetchMissingBlobsRequestsOnlyMissingObjects(t *testing.T) {
 	for _, name := range []string{"a.txt", "b.txt", "c.txt", "d.txt"} {
 		oids = append(oids, strings.TrimSpace(runOutput(t, "git", "--git-dir", cfg.GitDir, "rev-parse", "HEAD:"+name)))
 	}
+	config := runOutput(t, "git", "--git-dir", cfg.GitDir, "config", "--list", "--local")
 	if err := store.FetchMissingBlobs(ctx, cfg, oids[:2]); err != nil {
 		t.Fatalf("FetchMissingBlobs(a, b): %v", err)
 	}
@@ -79,6 +80,9 @@ func TestFetchMissingBlobsRequestsOnlyMissingObjects(t *testing.T) {
 	// A fetch that also asked for a and b would download them again.
 	if got := packedObjects(t, cfg.GitDir); got != packed+2 {
 		t.Fatalf("packed objects = %d, want %d: only c and d were missing", got, packed+2)
+	}
+	if got := runOutput(t, "git", "--git-dir", cfg.GitDir, "config", "--list", "--local"); got != config {
+		t.Fatalf("repo config changed:\nbefore:\n%s\nafter:\n%s", config, got)
 	}
 	out := runOutput(t, "env", "GIT_NO_LAZY_FETCH=1", "git", "--git-dir", cfg.GitDir, "cat-file", "--batch-check", "--batch-all-objects")
 	for _, oid := range oids {
@@ -116,6 +120,87 @@ func TestFetchMissingBlobsKeepsRemoteConfigWhenOriginIsNotThePromisor(t *testing
 		if !strings.Contains(out, oid+" blob") {
 			t.Fatalf("blob %s missing after FetchMissingBlobs:\n%s", oid, out)
 		}
+	}
+}
+
+func TestPromisorRemoteFollowsLazyFetchOrder(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		config string
+		want   string
+	}{
+		{name: "none", config: "", want: ""},
+		{name: "promisor true", config: "[remote \"a\"]\n\tpromisor = true\n", want: "a"},
+		{name: "empty promisor value is false", config: "[remote \"a\"]\n\tpromisor = \n[remote \"b\"]\n\tpromisor = true\n", want: "b"},
+		{name: "promisor false", config: "[remote \"a\"]\n\tpromisor = off\n[remote \"b\"]\n\tpromisor = yes\n", want: "b"},
+		{name: "nonzero number is true", config: "[remote \"a\"]\n\tpromisor = 2\n", want: "a"},
+		{name: "partial clone filter alone", config: "[remote \"a\"]\n\tpartialclonefilter = blob:none\n[remote \"b\"]\n\tpromisor = true\n", want: "a"},
+		{name: "partialClone remote goes last", config: "[extensions]\n\tpartialClone = a\n[remote \"a\"]\n\tpromisor = true\n[remote \"b\"]\n\tpromisor = true\n", want: "b"},
+		{name: "partialClone remote alone", config: "[extensions]\n\tpartialClone = a\n", want: "a"},
+		{name: "dotted remote name", config: "[remote \"up.stream\"]\n\tpromisor = true\n", want: "up.stream"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gitDir := filepath.Join(t.TempDir(), "repo.git")
+			run(t, "git", "init", "-q", "--bare", gitDir)
+			f, err := os.OpenFile(filepath.Join(gitDir, "config"), os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.WriteString(tt.config); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			got, err := promisorRemote(context.Background(), gitDir)
+			if err != nil {
+				t.Fatalf("promisorRemote: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("promisorRemote = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFetchMissingBlobsKeepsRemoteConfigWhenAnEarlierRemoteIsNotAPromisor(t *testing.T) {
+	t.Parallel()
+	remote := gittest.PartialCloneRemote(t, map[string]string{"a.txt": "a\n", "b.txt": "b\n"})
+	gitDir := filepath.Join(t.TempDir(), "repo.git")
+	run(t, "git", "clone", "-q", "--bare", "--filter=blob:none", "--origin", "upstream", remote, gitDir)
+	run(t, "git", "--git-dir", gitDir, "remote", "add", "a", remote)
+	// Git reads the empty value as false, so upstream, listed after a, is the
+	// promisor.
+	run(t, "git", "--git-dir", gitDir, "config", "remote.a.promisor", "")
+	run(t, "git", "--git-dir", gitDir, "config", "--unset", "remote.upstream.promisor")
+	run(t, "git", "--git-dir", gitDir, "config", "--unset", "remote.upstream.partialclonefilter")
+	f, err := os.OpenFile(filepath.Join(gitDir, "config"), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("[remote \"upstream\"]\n\tpromisor = true\n\tpartialclonefilter = blob:none\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	config := runOutput(t, "git", "--git-dir", gitDir, "config", "--list", "--local")
+	var oids []string
+	for _, name := range []string{"a.txt", "b.txt"} {
+		oids = append(oids, strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", "HEAD:"+name)))
+	}
+	store := New(nil)
+	defer store.Close()
+
+	if err := store.FetchMissingBlobs(context.Background(), model.RepoConfig{ID: "x", Name: "x", GitDir: gitDir}, oids); err != nil {
+		t.Fatalf("FetchMissingBlobs: %v", err)
+	}
+	// A filtered fetch from a would record a as a promisor.
+	if got := runOutput(t, "git", "--git-dir", gitDir, "config", "--list", "--local"); got != config {
+		t.Fatalf("repo config changed:\nbefore:\n%s\nafter:\n%s", config, got)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -110,30 +111,79 @@ func (s *Store) FetchMissingBlobs(ctx context.Context, repo model.RepoConfig, ob
 	return err
 }
 
-// promisorRemote returns the remote a lazy fetch tries first: the first remote
-// with remote.<name>.promisor set, else the one extensions.partialClone names,
-// which git moves to the end of its list. It returns "" when there is none.
+// promisorRemote returns the remote git's lazy fetch tries first, following
+// promisor_remote_config in git's promisor-remote.c. In config order, a remote
+// is a promisor when remote.<name>.promisor is true or
+// remote.<name>.partialclonefilter is set, and the remote that
+// extensions.partialClone names goes last. It returns "" when there is none.
 func promisorRemote(ctx context.Context, gitDir string) (string, error) {
-	out, err := runGit(ctx, gitDir, "config", "--get-regexp", `^(remote\..+\.promisor|extensions\.partialclone)$`)
+	entries, err := configEntries(ctx, gitDir, `^(remote\..+\.(promisor|partialclonefilter)|extensions\.partialclone)$`)
 	if err != nil {
-		if exitErr, ok := errors.AsType[*gitCommandError](err); ok && exitErr.exitCode == 1 {
-			return "", nil
-		}
 		return "", err
 	}
+	// Git reads promisor as a boolean, so git parses it here too: an empty
+	// value is false and a nonzero number is true.
+	flags, err := configEntries(ctx, gitDir, `^remote\..+\.promisor$`, "--type=bool")
+	if err != nil {
+		return "", err
+	}
+	var remotes []string
 	partialClone := ""
-	for line := range strings.Lines(out) {
-		key, value, _ := strings.Cut(strings.TrimSpace(line), " ")
-		if key == "extensions.partialclone" {
-			partialClone = value
+	for _, entry := range entries {
+		if entry.key == "extensions.partialclone" {
+			partialClone = entry.value
 			continue
 		}
-		switch strings.ToLower(value) {
-		case "", "true", "yes", "on", "1":
-			return strings.TrimSuffix(strings.TrimPrefix(key, "remote."), ".promisor"), nil
+		rest := strings.TrimPrefix(entry.key, "remote.")
+		dot := strings.LastIndexByte(rest, '.')
+		name, subkey := rest[:dot], rest[dot+1:]
+		if subkey == "promisor" {
+			if len(flags) == 0 {
+				return "", errors.New("git config listed fewer promisor flags than promisor keys")
+			}
+			promisor := flags[0].value == "true"
+			flags = flags[1:]
+			if !promisor {
+				continue
+			}
+		}
+		if !slices.Contains(remotes, name) {
+			remotes = append(remotes, name)
 		}
 	}
-	return partialClone, nil
+	if partialClone != "" {
+		remotes = append(slices.DeleteFunc(remotes, func(r string) bool { return r == partialClone }), partialClone)
+	}
+	if len(remotes) == 0 {
+		return "", nil
+	}
+	return remotes[0], nil
+}
+
+type configEntry struct {
+	key, value string
+}
+
+// configEntries returns, in config order, the config entries whose names
+// match pattern.
+func configEntries(ctx context.Context, gitDir string, pattern string, typeArgs ...string) ([]configEntry, error) {
+	args := append(append([]string{"config", "--null"}, typeArgs...), "--get-regexp", pattern)
+	out, err := runGit(ctx, gitDir, args...)
+	if err != nil {
+		if exitErr, ok := errors.AsType[*gitCommandError](err); ok && exitErr.exitCode == 1 {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var entries []configEntry
+	for record := range strings.SplitSeq(out, "\x00") {
+		if record == "" {
+			continue
+		}
+		key, value, _ := strings.Cut(record, "\n")
+		entries = append(entries, configEntry{key: key, value: value})
+	}
+	return entries, nil
 }
 
 // missingObjects returns the objects in oids that the object store lacks.

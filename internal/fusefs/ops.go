@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
@@ -22,6 +23,11 @@ type Engine struct {
 	Repo     model.RepoConfig
 	Overlay  model.OverlayStore
 	Hydrator model.Hydrator
+
+	prefetchMu sync.Mutex
+	// prefetched maps a directory to the generation at which a read last
+	// prefetched its files.
+	prefetched map[string]int64
 }
 
 // ensureOverlay promotes a base file to the overlay (hydrate → copy-on-write).
@@ -74,6 +80,7 @@ func (e *Engine) Read(ctx context.Context, path string, off int64, dst []byte) (
 		return nil, err
 	}
 	defer f.Close()
+	e.prefetchSiblings(context.WithoutCancel(ctx), path, e.Resolver.Generation())
 	return readFileChunkFrom(f, off, dst)
 }
 
@@ -115,6 +122,7 @@ func (e *Engine) baseCacheFile(ctx, metadataCtx context.Context, path string, ge
 	if err != nil {
 		return nil, 0, false, err
 	}
+	e.prefetchSiblings(metadataCtx, path, gen)
 	return f, gen, true, nil
 }
 
@@ -431,9 +439,35 @@ func (e *Engine) Truncate(ctx context.Context, path string, size int64) error {
 	return e.Overlay.Truncate(ctx, path, size)
 }
 
+// prefetchSiblings prefetches the files of path's directory the first time a
+// base file in it is read at generation gen. Listing a directory prefetches
+// nothing, so directory walks stay lazy. It runs after the read's own blob is
+// hydrated, so that read never waits in a speculative batch. The caller holds
+// the transition read lock.
+func (e *Engine) prefetchSiblings(ctx context.Context, path string, gen int64) {
+	dir := model.CleanPath(filepath.Dir(path))
+	e.prefetchMu.Lock()
+	if prefetchedGen, ok := e.prefetched[dir]; ok && prefetchedGen == gen {
+		e.prefetchMu.Unlock()
+		return
+	}
+	if e.prefetched == nil {
+		e.prefetched = map[string]int64{}
+	}
+	e.prefetched[dir] = gen
+	e.prefetchMu.Unlock()
+	entries, err := e.Resolver.readdirTypedAt(ctx, dir, gen)
+	if err != nil {
+		e.prefetchMu.Lock()
+		delete(e.prefetched, dir)
+		e.prefetchMu.Unlock()
+		return
+	}
+	e.PrefetchDir(dir, entries)
+}
+
 // PrefetchDir enqueues the base file children of a directory for speculative
-// hydration. OpenDir calls it; enqueueing only queues, so the open does not
-// wait for any fetch.
+// hydration. Enqueueing only queues, so the caller does not wait for a fetch.
 func (e *Engine) PrefetchDir(dirPath string, entries []ReaddirEntry) {
 	tasks := make([]model.HydrationTask, 0, len(entries))
 	for _, entry := range entries {

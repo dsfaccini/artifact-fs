@@ -41,6 +41,9 @@ type Service struct {
 	onHydrated OnHydratedFunc
 	verified   map[string]os.FileInfo
 	active     map[string]struct{}
+	workers    int
+	// speculativeBatches counts the prefetch batches workers are fetching.
+	speculativeBatches int
 }
 
 // maxFetchBatch caps the blobs one fetch requests. It matches the fusefs
@@ -95,6 +98,7 @@ func (s *Service) Start(workers int, repo model.RepoConfig) {
 		return
 	}
 	s.started = true
+	s.workers = workers
 	s.background.Add(workers)
 	s.mu.Unlock()
 	for range workers {
@@ -531,7 +535,8 @@ func (s *Service) worker(repo model.RepoConfig) {
 
 // step processes the top of the queue: it hydrates a fetched task, or pops a
 // batch and fetches its missing blobs together. Returns true if it popped an
-// item, false if the queue was empty.
+// item, false if the queue was empty or held only prefetches this worker must
+// leave for others.
 func (s *Service) step(repo model.RepoConfig) bool {
 	s.mu.Lock()
 	if len(s.pq) == 0 {
@@ -549,13 +554,29 @@ func (s *Service) step(repo model.RepoConfig) bool {
 		s.hydrate(repo, item.task)
 		return true
 	}
+	// One worker never takes a prefetch batch, so a read never waits for an
+	// unrelated prefetch download. A single worker has to take them.
+	if !isExplicitRead(s.pq[0].task) && s.workers > 1 && s.speculativeBatches >= s.workers-1 {
+		s.mu.Unlock()
+		return false
+	}
 	batch := s.popBatchLocked()
+	speculative := len(batch) > 0 && !isExplicitRead(batch[0])
+	if speculative {
+		s.speculativeBatches++
+	}
 	more := len(s.pq) > 0
 	s.mu.Unlock()
 	if more {
 		s.signalWork()
 	}
 	s.fetchBatch(repo, batch)
+	if speculative {
+		s.mu.Lock()
+		s.speculativeBatches--
+		s.mu.Unlock()
+		s.signalWork()
+	}
 	return true
 }
 
@@ -580,12 +601,11 @@ func (s *Service) popBatchLocked() []model.HydrationTask {
 	return batch
 }
 
-// fetchBatch finishes the batch's verified cache hits, fetches its missing
-// blobs with one fetch, and requeues the rest, so every worker can validate or
-// copy them in priority order.
+// fetchBatch finishes the batch's verified cache hits, requeues the tasks that
+// need no fetch, then fetches the missing blobs with one fetch and requeues
+// those, so every worker can validate or copy them in priority order.
 func (s *Service) fetchBatch(repo model.RepoConfig, batch []model.HydrationTask) {
-	var pending []model.HydrationTask
-	var oids []string
+	var local, missing []model.HydrationTask
 	for _, task := range batch {
 		key := taskKey(task.RepoID, task.ObjectOID)
 		cachePath := cachePathFor(repo, task.ObjectOID)
@@ -597,28 +617,45 @@ func (s *Service) fetchBatch(repo model.RepoConfig, batch []model.HydrationTask)
 			s.notifyHydrated(task.RepoID, task.ObjectOID, st.Size())
 			continue
 		}
-		pending = append(pending, task)
 		// A known size means batchResolveSizes or an earlier hydration found
 		// the blob in the object store.
 		if err == nil || task.SizeState == "known" {
-			continue
+			local = append(local, task)
+		} else {
+			missing = append(missing, task)
 		}
-		oids = append(oids, task.ObjectOID)
 	}
 	// A single blob's own lazy fetch costs the same as a batch fetch.
-	if len(oids) > 1 {
-		ctx, cancel := s.fetchContext()
-		// A failed batch leaves each blob to its own lazy fetch, so an object
-		// the remote refuses fails only its own task.
-		_ = s.fetcher.FetchMissingBlobs(ctx, repo, oids)
-		cancel()
+	if len(missing) < 2 {
+		s.requeueFetched(append(local, missing...))
+		return
+	}
+	// A read of a blob that needs no fetch must not wait for this one.
+	s.requeueFetched(local)
+	oids := make([]string, len(missing))
+	for i, task := range missing {
+		oids[i] = task.ObjectOID
+	}
+	ctx, cancel := s.fetchContext()
+	// A failed batch leaves each blob to its own lazy fetch, so an object the
+	// remote refuses fails only its own task.
+	_ = s.fetcher.FetchMissingBlobs(ctx, repo, oids)
+	cancel()
+	s.requeueFetched(missing)
+}
+
+// requeueFetched queues tasks whose batch fetch ran, or that needed none, for
+// any worker to hydrate. A task a read waits on goes ahead of speculative work.
+func (s *Service) requeueFetched(tasks []model.HydrationTask) {
+	if len(tasks) == 0 {
+		return
 	}
 	s.mu.Lock()
 	if s.stopped {
 		s.mu.Unlock()
 		return
 	}
-	for _, task := range pending {
+	for _, task := range tasks {
 		key := taskKey(task.RepoID, task.ObjectOID)
 		if len(s.wait[key]) > 0 && !isExplicitRead(task) {
 			task.Priority = PriorityExplicitRead
