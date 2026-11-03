@@ -328,10 +328,14 @@ type batchCatFile struct {
 
 func newBatchCatFile(gitDir string, logger *slog.Logger) (*batchCatFile, error) {
 	cmd := exec.Command("git", "cat-file", "--batch")
-	cmd.Env = append(append(os.Environ(), "GIT_DIR="+gitDir), nonInteractiveGitEnv()...)
+	// A lazy fetch must not prompt. nonInteractiveGitEnv's GIT_SSH_COMMAND would
+	// override the repo's core.sshCommand, which an adopted worktree keeps.
+	// Without a controlling terminal, SSH cannot prompt either, and
+	// SSH_ASKPASS_REQUIRE=never keeps it from opening an askpass dialog.
+	cmd.Env = append(os.Environ(), "GIT_DIR="+gitDir, "GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS_REQUIRE=never")
 	stderr := &gitStderrLogger{logger: logger, gitDir: gitDir}
 	cmd.Stderr = stderr
-	configureCommandProcessGroup(cmd)
+	configureCommandSession(cmd)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
