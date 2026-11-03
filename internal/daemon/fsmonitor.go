@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
@@ -73,41 +75,44 @@ func (s *Service) configureStatusOptimization(ctx context.Context, cfg model.Rep
 
 // FSMonitorHook answers Git's fsmonitor hook protocol version 2 from the
 // overlay, which records changes made through the mount. Its token carries the
-// overlay's change sequence, so Git receives only the paths changed since its
-// last query. It trusts only tokens issued for this registration and this
-// overlay, and only while the worktree is mounted. Otherwise native edits may
-// have bypassed the overlay, and "/" makes Git rescan the worktree.
+// overlay database's id and change sequence, so Git receives only the paths
+// changed since its last query. It trusts only tokens issued for this
+// registration and this database while the worktree is mounted. Otherwise
+// native edits may have bypassed the overlay, and "/" makes Git rescan the
+// worktree.
 func (s *Service) FSMonitorHook(ctx context.Context, name string, since string, w io.Writer) error {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
 		return err
 	}
 	s.fillPaths(&cfg)
-	ov, err := overlay.New(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	defer ov.Close()
 	prefix := fmt.Sprintf("artifact-fs:%s:%s:", cfg.ID, cfg.ConfigVersion)
-	seqText, trusted := strings.CutPrefix(since, prefix)
+	rest, trusted := strings.CutPrefix(since, prefix)
+	sinceInstance, seqText, ok := strings.Cut(rest, ":")
 	sinceSeq, err := strconv.ParseInt(seqText, 10, 64)
 	// The mount table check sends no request to the mount, which stays gated
 	// while the daemon runs Git during preparation.
-	trusted = trusted && err == nil && sinceSeq >= 0 && isMounted(cfg.MountPath)
+	mounted := isMounted(cfg.MountPath)
+	trusted = trusted && ok && err == nil && sinceSeq >= 0 && mounted
 	if !trusted {
 		sinceSeq = math.MaxInt64
 	}
-	seq, changed, err := ov.ChangesSince(ctx, sinceSeq)
+	changes, logged, err := overlay.ReadChangesSince(ctx, cfg, sinceSeq)
 	if err != nil {
 		return err
 	}
 	paths := []string{"/"}
-	// A sequence past the overlay's latest comes from another overlay database
-	// or an earlier token format.
-	if trusted && sinceSeq <= seq {
-		paths = changed
+	if logged && trusted && sinceInstance == changes.Instance && sinceSeq <= changes.Seq {
+		paths = changes.Paths
 	}
-	if err := writeHookField(w, fmt.Sprintf("%s%d", prefix, seq)); err != nil {
+	// Git run while unmounted caches the empty mountpoint's listing, which the
+	// mount's later answers would not correct. The bootstrap marks entries from
+	// the snapshot instead, so its token may carry into the mount.
+	token := prefix + "rescan"
+	if logged && (mounted || os.Getenv(gitstore.FSMonitorBootstrapEnv) != "") {
+		token = fmt.Sprintf("%s%s:%d", prefix, changes.Instance, changes.Seq)
+	}
+	if err := writeHookField(w, token); err != nil {
 		return err
 	}
 	for _, p := range paths {

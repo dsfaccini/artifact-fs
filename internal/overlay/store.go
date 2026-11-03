@@ -35,19 +35,32 @@ var migrations = []string{
 	// overlay_changes keeps one row per path ever changed, renumbered on each
 	// change. AUTOINCREMENT never reuses a sequence number, so the FSMonitor
 	// hook can answer "changed since sequence N" without scanning the overlay.
+	// A path ending in "/" stands for every entry below it.
 	`CREATE TABLE IF NOT EXISTS overlay_changes (
 	  seq INTEGER PRIMARY KEY AUTOINCREMENT,
 	  path TEXT NOT NULL UNIQUE
 	);`,
-	`CREATE TRIGGER IF NOT EXISTS overlay_entries_insert_change AFTER INSERT ON overlay_entries BEGIN
+	// A recreated database gets a new id, so a token that names another
+	// database's sequence never matches.
+	`CREATE TABLE IF NOT EXISTS overlay_instance (id TEXT NOT NULL);`,
+	`INSERT INTO overlay_instance(id) SELECT lower(hex(randomblob(16))) WHERE NOT EXISTS (SELECT 1 FROM overlay_instance);`,
+	// A bulk operation holds a row here inside its transaction, so the
+	// triggers skip its entries and it logs one change instead.
+	`CREATE TABLE IF NOT EXISTS overlay_changes_suspended (id INTEGER PRIMARY KEY);`,
+	// CREATE TRIGGER IF NOT EXISTS keeps an existing trigger's body, so a
+	// change to a trigger must DROP TRIGGER IF EXISTS first.
+	`CREATE TRIGGER IF NOT EXISTS overlay_entries_insert_change AFTER INSERT ON overlay_entries
+	WHEN NOT EXISTS (SELECT 1 FROM overlay_changes_suspended) BEGIN
 	  DELETE FROM overlay_changes WHERE path = NEW.path;
 	  INSERT INTO overlay_changes(path) VALUES (NEW.path);
 	END;`,
-	`CREATE TRIGGER IF NOT EXISTS overlay_entries_update_change AFTER UPDATE ON overlay_entries BEGIN
+	`CREATE TRIGGER IF NOT EXISTS overlay_entries_update_change AFTER UPDATE ON overlay_entries
+	WHEN NOT EXISTS (SELECT 1 FROM overlay_changes_suspended) BEGIN
 	  DELETE FROM overlay_changes WHERE path IN (OLD.path, NEW.path);
 	  INSERT INTO overlay_changes(path) SELECT OLD.path UNION SELECT NEW.path;
 	END;`,
-	`CREATE TRIGGER IF NOT EXISTS overlay_entries_delete_change AFTER DELETE ON overlay_entries BEGIN
+	`CREATE TRIGGER IF NOT EXISTS overlay_entries_delete_change AFTER DELETE ON overlay_entries
+	WHEN NOT EXISTS (SELECT 1 FROM overlay_changes_suspended) BEGIN
 	  DELETE FROM overlay_changes WHERE path = OLD.path;
 	  INSERT INTO overlay_changes(path) VALUES (OLD.path);
 	END;`,
@@ -598,6 +611,9 @@ func (s *Store) renameTreeLocked(ctx context.Context, oldPath, newPath string, s
 		return err
 	}
 	defer tx.Rollback()
+	if err := suspendChangeLog(ctx, tx); err != nil {
+		return err
+	}
 	deleteTree := func(path string) error {
 		prefix := path + "/"
 		_, err := tx.ExecContext(ctx, `DELETE FROM overlay_entries WHERE path=? OR substr(path, 1, length(?))=?`, path, prefix, prefix)
@@ -631,6 +647,9 @@ func (s *Store) renameTreeLocked(ctx context.Context, oldPath, newPath string, s
 		if _, err := insert.ExecContext(ctx, path, model.OverlayKindDelete, "", 0, 0, now, now, "", 0, path); err != nil {
 			return err
 		}
+	}
+	if err := resumeChangeLog(ctx, tx, oldPath+"/", newPath+"/"); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
@@ -817,6 +836,7 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 	}
 	var toUpdate []reconcileUpdate
 	staleRenameSources := map[string]bool{}
+	revealsBase := map[string]bool{}
 	for _, e := range entries {
 		base, baseExists, err := baseLookup(e.Path)
 		if err != nil {
@@ -901,6 +921,7 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 		case model.OverlayKindDelete:
 			if (e.TargetPath != "" && e.Path != e.TargetPath) || staleRenameSources[e.Path] || staleRenameSources[e.TargetPath] || !baseExists {
 				toRemove = append(toRemove, e)
+				revealsBase[e.Path] = baseExists
 			}
 		case model.OverlayKindCreate:
 			if baseExists {
@@ -949,6 +970,13 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 		return err
 	}
 	defer tx.Rollback()
+	// Removing an entry the new base matches, rebasing an entry, and removing
+	// a delete marker for a path the new base lacks leave the merged view as
+	// it was. Only a removed delete marker over a base path is a change for Git.
+	if err := suspendChangeLog(ctx, tx); err != nil {
+		return err
+	}
+	var revealed []string
 	// Guard the mutations so a concurrent FUSE write or chmod between our read
 	// and this transaction is not lost.
 	stmt, err := tx.PrepareContext(ctx, `DELETE FROM overlay_entries WHERE path=? AND kind=? AND source_oid=? AND source_mode=? AND mode=? AND mtime_unix_ns=? AND ctime_unix_ns=?`)
@@ -964,6 +992,9 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 		}
 		if n, err := res.RowsAffected(); err == nil && n > 0 {
 			deleted = append(deleted, e)
+			if e.Kind == model.OverlayKindDelete && revealsBase[e.Path] {
+				revealed = append(revealed, e.Path)
+			}
 		}
 	}
 	updateStmt, err := tx.PrepareContext(ctx, `UPDATE overlay_entries SET kind=?, source_oid=?, source_mode=?, target_path=? WHERE path=? AND kind=? AND source_oid=? AND source_mode=? AND mode=? AND mtime_unix_ns=? AND ctime_unix_ns=?`)
@@ -975,6 +1006,9 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 		if _, err := updateStmt.ExecContext(ctx, update.after.Kind, update.after.SourceOID, update.after.SourceMode, update.after.TargetPath, update.before.Path, update.before.Kind, update.before.SourceOID, update.before.SourceMode, update.before.Mode, update.before.MtimeUnixNs, update.before.CtimeUnixNs); err != nil {
 			return err
 		}
+	}
+	if err := resumeChangeLog(ctx, tx, revealed...); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
@@ -1008,33 +1042,119 @@ func (s *Store) DirtyCount(ctx context.Context) (int64, error) {
 	return c, err
 }
 
-// ChangesSince returns the latest change sequence and the paths whose entries
-// were inserted, updated or deleted after sequence since, read in one snapshot
-// so the sequence covers exactly the paths returned.
-func (s *Store) ChangesSince(ctx context.Context, since int64) (int64, []string, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+// suspendChangeLog stops the triggers from logging tx's entry changes. The
+// caller logs them with resumeChangeLog before it commits.
+func suspendChangeLog(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO overlay_changes_suspended DEFAULT VALUES`)
+	return err
+}
+
+func resumeChangeLog(ctx context.Context, tx *sql.Tx, paths ...string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_changes_suspended`); err != nil {
+		return err
+	}
+	for _, path := range paths {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_changes WHERE path = ?`, path); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_changes(path) VALUES (?)`, path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// changesSinceQuery sorts with a unary + so SQLite searches the seq range and
+// sorts only the delta, instead of walking the whole path index in order.
+const changesSinceQuery = `SELECT path FROM overlay_changes WHERE seq > ? ORDER BY +path`
+
+// Changes is one consistent read of an overlay database's change log.
+type Changes struct {
+	// Instance identifies the database.
+	Instance string
+	// Seq is the latest change sequence.
+	Seq int64
+	// Paths changed after the sequence the caller asked about, sorted. Each
+	// changed directory, which ends in "/", comes with every entry below it.
+	Paths []string
+}
+
+// ReadChangesSince reads the change log of an existing overlay database
+// without the schema setup and backfill that New runs, so it never takes the
+// write lock. ok is false when the database or its change log is missing.
+func ReadChangesSince(ctx context.Context, cfg model.RepoConfig, since int64) (changes Changes, ok bool, err error) {
+	if _, err := os.Stat(cfg.OverlayDBPath); errors.Is(err, os.ErrNotExist) {
+		return Changes{}, false, nil
+	} else if err != nil {
+		return Changes{}, false, err
+	}
+	db, err := meta.OpenDB(cfg.OverlayDBPath)
 	if err != nil {
-		return 0, nil, err
+		return Changes{}, false, err
+	}
+	defer db.Close()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return Changes{}, false, err
 	}
 	defer tx.Rollback()
-	var seq int64
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM overlay_changes`).Scan(&seq); err != nil {
-		return 0, nil, err
+	var tables int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('overlay_changes', 'overlay_instance')`).Scan(&tables); err != nil {
+		return Changes{}, false, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT path FROM overlay_changes WHERE seq > ? ORDER BY path`, since)
+	if tables != 2 {
+		return Changes{}, false, nil
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM overlay_instance`).Scan(&changes.Instance); err != nil {
+		return Changes{}, false, err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM overlay_changes`).Scan(&changes.Seq); err != nil {
+		return Changes{}, false, err
+	}
+	rows, err := tx.QueryContext(ctx, changesSinceQuery, since)
 	if err != nil {
-		return 0, nil, err
+		return Changes{}, false, err
 	}
+	if changes.Paths, err = scanPaths(rows); err != nil {
+		return Changes{}, false, err
+	}
+	// Git clears the valid bit of every index entry below "dir/", but its
+	// untracked cache drops only the listing of dir's parent. Each entry below
+	// dir drops the listing of the directory that holds it.
+	var below []string
+	for _, path := range changes.Paths {
+		if !strings.HasSuffix(path, "/") {
+			continue
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT path FROM overlay_entries WHERE path >= ? AND path < ?`, path, strings.TrimSuffix(path, "/")+"0")
+		if err != nil {
+			return Changes{}, false, err
+		}
+		entries, err := scanPaths(rows)
+		if err != nil {
+			return Changes{}, false, err
+		}
+		below = append(below, entries...)
+	}
+	if len(below) != 0 {
+		changes.Paths = append(changes.Paths, below...)
+		slices.Sort(changes.Paths)
+		changes.Paths = slices.Compact(changes.Paths)
+	}
+	return changes, true, nil
+}
+
+func scanPaths(rows *sql.Rows) ([]string, error) {
 	defer rows.Close()
 	var paths []string
 	for rows.Next() {
 		var path string
 		if err := rows.Scan(&path); err != nil {
-			return 0, nil, err
+			return nil, err
 		}
 		paths = append(paths, path)
 	}
-	return seq, paths, rows.Err()
+	return paths, rows.Err()
 }
 
 func (s *Store) ListAll(ctx context.Context) ([]model.OverlayEntry, error) {

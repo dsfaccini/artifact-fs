@@ -12,6 +12,7 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/model"
+	"github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/registry"
 )
 
@@ -280,14 +281,27 @@ func TestFSMonitorHookCLIAnswersGitToken(t *testing.T) {
 	if closeErr := svc.Close(); err != nil || closeErr != nil || len(repos) != 1 {
 		t.Fatalf("list repos: %v, %v, %d", err, closeErr, len(repos))
 	}
-	var stdout, stderr bytes.Buffer
-	since := "artifact-fs:repo:" + repos[0].ConfigVersion + ":0"
-	if code := Run(ctx, []string{"fsmonitor-hook", "--name", "repo", "2", since}, &stdout, &stderr); code != 0 {
-		t.Fatalf("fsmonitor-hook exit = %d, stderr=%q", code, stderr.String())
+	ov, err := overlay.New(ctx, repos[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ov.Close(); err != nil {
+		t.Fatal(err)
+	}
+	hook := func(since string) []string {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		if code := Run(ctx, []string{"fsmonitor-hook", "--name", "repo", "2", since}, &stdout, &stderr); code != 0 {
+			t.Fatalf("fsmonitor-hook exit = %d, stderr=%q", code, stderr.String())
+		}
+		return strings.Split(stdout.String(), "\x00")
+	}
+	fields := hook("other-hook:1")
+	if len(fields) != 3 || !strings.HasPrefix(fields[0], "artifact-fs:repo:") || fields[1] != "/" {
+		t.Fatalf("fsmonitor-hook output for a foreign token = %q, want a token and a rescan", fields)
 	}
 	// A new token and no paths: the empty overlay answers the current token.
-	fields := strings.Split(stdout.String(), "\x00")
-	if len(fields) != 2 || !strings.HasPrefix(fields[0], "artifact-fs:repo:") || fields[1] != "" {
-		t.Fatalf("fsmonitor-hook output = %q", stdout.String())
+	if fields := hook(fields[0]); len(fields) != 2 || !strings.HasPrefix(fields[0], "artifact-fs:repo:") || fields[1] != "" {
+		t.Fatalf("fsmonitor-hook output for its own token = %q", fields)
 	}
 }

@@ -1534,3 +1534,112 @@ func TestSetMtime(t *testing.T) {
 		t.Fatal("ctime should be non-zero")
 	}
 }
+
+func changesSince(t *testing.T, cfg model.RepoConfig, since int64) Changes {
+	t.Helper()
+	changes, ok, err := ReadChangesSince(context.Background(), cfg, since)
+	if err != nil || !ok {
+		t.Fatalf("ReadChangesSince = %v, %v", ok, err)
+	}
+	return changes
+}
+
+func TestRenameTreeLogsEachEndpointDirectoryOnce(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	for _, dir := range []string{"src", "src/sub"} {
+		if err := s.Mkdir(ctx, dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{"src/a.txt", "src/sub/b.txt"} {
+		if _, err := s.CreateFile(ctx, path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := changesSince(t, cfg, 0).Seq
+	if err := s.Rename(ctx, "src", "dst", false); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT path FROM overlay_changes WHERE seq > ? ORDER BY path`, before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logged, err := scanPaths(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"dst/", "src/"}; !slices.Equal(logged, want) {
+		t.Fatalf("change log rows for the tree rename = %q, want %q", logged, want)
+	}
+	want := []string{"dst/", "dst/a.txt", "dst/sub", "dst/sub/b.txt", "src/"}
+	if got := changesSince(t, cfg, before).Paths; !slices.Equal(got, want) {
+		t.Fatalf("changed paths = %q, want %q", got, want)
+	}
+}
+
+func TestReconcileLogsOnlyDeleteMarkersOverBasePaths(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	base := model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
+	cacheTestBlob(t, cfg, base.ObjectOID)
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "a.txt", base); err != nil {
+		t.Fatal(err)
+	}
+	// The chain leaves a delete marker at the untracked b.txt that names a.txt.
+	if err := s.Rename(ctx, "a.txt", "b.txt", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, "b.txt", "c.txt", false); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		if err := s.Remove(ctx, fmt.Sprintf("gone/%d.txt", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := changesSince(t, cfg, 0).Seq
+	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+		switch path {
+		case "a.txt":
+			return model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "bbb"}, true
+		case "b.txt":
+			return model.BaseNode{Path: "b.txt", Type: "file", Mode: 0o644, ObjectOID: "new-b"}, true
+		}
+		return model.BaseNode{}, false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Get("gone/0.txt"); ok {
+		t.Fatal("delete marker for a path the base lacks survived reconcile")
+	}
+	// Dropping the gone/ markers and rebasing c.txt leave the merged view as
+	// it was. Dropping b.txt's marker shows the new base file.
+	if got := changesSince(t, cfg, before).Paths; !slices.Equal(got, []string{"b.txt"}) {
+		t.Fatalf("changed paths after reconcile = %q, want [b.txt]", got)
+	}
+}
+
+func TestChangesSinceQuerySearchesTheSequenceRange(t *testing.T) {
+	s, _ := testStore(t)
+	rows, err := s.db.Query(`EXPLAIN QUERY PLAN `+changesSinceQuery, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) == 0 || !strings.HasPrefix(plan[0], "SEARCH overlay_changes USING INTEGER PRIMARY KEY") {
+		t.Fatalf("query plan = %q, want a search of the seq range", plan)
+	}
+}
