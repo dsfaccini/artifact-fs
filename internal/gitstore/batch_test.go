@@ -1,10 +1,12 @@
 package gitstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -90,6 +92,85 @@ func TestFetchMissingBlobsRequestsOnlyMissingObjects(t *testing.T) {
 			t.Fatalf("blob %s missing after FetchMissingBlobs:\n%s", oid, out)
 		}
 	}
+}
+
+func TestFetchMissingBlobsLogsEveryFailureButACancel(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		// mode tells the fake git what its fetch does.
+		mode    string
+		context func(marker string) (context.Context, context.CancelFunc)
+		wantErr error
+		wantLog bool
+	}{
+		{name: "hydrator stop cancels the fetch", mode: "block", context: cancelOnFile, wantErr: context.Canceled},
+		{name: "fetch times out", mode: "block", context: func(marker string) (context.Context, context.CancelFunc) {
+			return gittest.ExpireOnFile(context.Background(), marker)
+		}, wantErr: context.DeadlineExceeded, wantLog: true},
+		{name: "remote refuses the fetch", mode: "fail", context: func(string) (context.Context, context.CancelFunc) {
+			return context.WithCancel(context.Background())
+		}, wantLog: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: gittest.PartialCloneRemote(t, map[string]string{"a.txt": "a\n", "b.txt": "b\n"}), Branch: "main"}
+			var logs bytes.Buffer
+			store := New(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			defer store.Close()
+			if err := store.CloneBlobless(context.Background(), cfg); err != nil {
+				t.Fatalf("CloneBlobless: %v", err)
+			}
+			var oids []string
+			for _, name := range []string{"a.txt", "b.txt"} {
+				oids = append(oids, strings.TrimSpace(runOutput(t, "git", "--git-dir", cfg.GitDir, "rev-parse", "HEAD:"+name)))
+			}
+			// The fake runs every git command but fetch. Its fetch blocks,
+			// bounded by sleep 60, or fails.
+			bin := filepath.Join(tmp, "bin")
+			if err := os.Mkdir(bin, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(tmp, "fetch-started")
+			script := "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = fetch ]; then\n" +
+				"    if [ " + tt.mode + " = fail ]; then echo 'fatal: remote refused' >&2; exit 128; fi\n" +
+				"    : > " + marker + "; exec sleep 60\n  fi\ndone\nexec " + realGit + " \"$@\"\n"
+			if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			ctx, cancel := tt.context(marker)
+			defer cancel()
+
+			err := store.FetchMissingBlobs(ctx, cfg, oids)
+			if err == nil || tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Fatalf("FetchMissingBlobs error = %v, want %v", err, tt.wantErr)
+			}
+			if got := strings.Contains(logs.String(), "batch blob fetch failed"); got != tt.wantLog {
+				t.Fatalf("warning logged = %t, want %t; logs:\n%s", got, tt.wantLog, logs.String())
+			}
+		})
+	}
+}
+
+// cancelOnFile returns a context that is cancelled once path exists, as the
+// hydrator's Stop cancels a batch fetch.
+func cancelOnFile(path string) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for ctx.Err() == nil {
+			if _, err := os.Stat(path); err == nil {
+				cancel()
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	return ctx, cancel
 }
 
 func TestFetchMissingBlobsKeepsRemoteConfigWhenOriginIsNotThePromisor(t *testing.T) {

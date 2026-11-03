@@ -105,7 +105,9 @@ func (s *Store) FetchMissingBlobs(ctx context.Context, repo model.RepoConfig, ob
 		_, err = runGitInput(ctx, repo.GitDir, nil, []byte(strings.Join(missing, "\n")+"\n"),
 			"-c", "fetch.negotiationAlgorithm=noop", "fetch", "--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--filter=blob:none", "--stdin", "--", remote)
 	}
-	if err != nil {
+	// The hydrator cancels a batch fetch only when it stops, which is not a
+	// fetch failure. A timeout still logs.
+	if err != nil && !errors.Is(ctx.Err(), context.Canceled) {
 		s.logger.Warn("batch blob fetch failed, blobs will fetch one at a time", "repo", repo.Name, "blobs", len(missing), "error", err)
 	}
 	return err
