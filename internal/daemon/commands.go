@@ -1,0 +1,318 @@
+package daemon
+
+import (
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/cloudflare/artifact-fs/internal/auth"
+	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/model"
+	"github.com/cloudflare/artifact-fs/internal/registry"
+)
+
+type AddRepoOptions struct {
+	Async bool
+}
+
+func (s *Service) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
+	return s.AddRepoWithOptions(ctx, cfg, AddRepoOptions{})
+}
+
+func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, opts AddRepoOptions) error {
+	if err := model.ValidateRepoName(cfg.Name); err != nil {
+		return err
+	}
+	if cfg.AdoptGitDir && opts.Async {
+		return errors.New("--adopt-gitdir cannot be combined with --async")
+	}
+	if err := normalizeSourceConfig(&cfg); err != nil {
+		return err
+	}
+	if cfg.ID == "" {
+		cfg.ID = model.RepoID(cfg.Name)
+	}
+	cfg.RemoteURLRedacted = auth.RedactRemoteURL(cfg.RemoteURL)
+	if cfg.RefreshInterval <= 0 {
+		cfg.RefreshInterval = 30 * time.Second
+	}
+	explicitGitDir := strings.TrimSpace(cfg.GitDir) != ""
+	s.fillPaths(&cfg)
+	if cfg.AdoptGitDir {
+		var err error
+		cfg.GitDir, err = filepath.Abs(cfg.GitDir)
+		if err != nil {
+			return err
+		}
+		cfg.MountPath, err = filepath.Abs(cfg.MountPath)
+		if err != nil {
+			return err
+		}
+	}
+	if !cfg.AdoptGitDir && strings.TrimSpace(cfg.FetchRef) == "" {
+		cfg.FetchRef = defaultFetchRef(cfg.Branch)
+	}
+	cfg.ConfigVersion = rand.Text()
+	cloneURL := cfg.RemoteURL
+	if cfg.PreparedGitDir && !opts.Async {
+		return fmt.Errorf("--prepared-gitdir requires --async")
+	}
+	if cfg.PreparedGitDir && cfg.RequiredCommit != "" {
+		return fmt.Errorf("--prepared-gitdir is not supported with --require-commit")
+	}
+	if opts.Async {
+		if strings.TrimSpace(cfg.RemoteURL) == "" && !cfg.PreparedGitDir {
+			return fmt.Errorf("--remote is required unless --prepared-gitdir is set")
+		}
+		if cfg.PreparedGitDir && !explicitGitDir {
+			return fmt.Errorf("--git-dir is required with --prepared-gitdir")
+		}
+		if auth.HasInlineCredentials(cfg.RemoteURL) {
+			return fmt.Errorf("async repositories must use ambient credentials; remove credentials from --remote")
+		}
+		cfg.PrepareState = model.PrepareStatePreparing
+		cfg.PrepareError = ""
+	} else {
+		cfg.PrepareState = model.PrepareStateSyncPreparing
+		cfg.PrepareError = ""
+		if auth.HasInlineCredentials(cfg.RemoteURL) {
+			cfg.RemoteURL = ""
+		}
+	}
+	registeredCfg := cfg
+	if err := s.withRepoConfigLock(ctx, cfg.Name, func() error {
+		return s.registry.AddRepo(ctx, cfg)
+	}); err != nil {
+		return err
+	}
+	if opts.Async {
+		return nil
+	}
+	// Clone and build snapshot so the repo is ready to mount, but don't start
+	// the FUSE server -- that's the daemon's job.
+	cfg.RemoteURL = cloneURL
+	prepareCtx, cancel := context.WithTimeout(ctx, s.prepareTimeoutDuration())
+	err := s.prepareRepo(prepareCtx, cfg)
+	prepareContextErr := prepareCtx.Err()
+	cancel()
+	if err == nil {
+		return s.persistSyncPrepareSuccess(ctx, registeredCfg)
+	}
+	if prepareContextErr != nil && !errors.Is(err, prepareContextErr) {
+		err = errors.Join(err, prepareContextErr)
+	}
+	return s.persistSyncPrepareFailure(ctx, cfg, registeredCfg, err)
+}
+
+func (s *Service) persistSyncPrepareFailure(ctx context.Context, cfg model.RepoConfig, registeredCfg model.RepoConfig, prepareErr error) error {
+	stateErr := prepareErr
+	if errors.Is(prepareErr, context.DeadlineExceeded) {
+		stateErr = errors.New("prepare timed out")
+	} else if errors.Is(prepareErr, context.Canceled) {
+		stateErr = errors.New("prepare canceled")
+	}
+	stateCtx, stateCancel := context.WithTimeout(context.WithoutCancel(ctx), prepareStateWriteTimeout)
+	defer stateCancel()
+	if stateWriteErr := s.registry.UpdatePrepareStateForConfig(stateCtx, registeredCfg, "", auth.RedactLogString(stateErr.Error(), cfg.RemoteURL)); stateWriteErr != nil {
+		if errors.Is(stateWriteErr, registry.ErrRepoChanged) {
+			return prepareErr
+		}
+		s.logger.ErrorContext(stateCtx, logRepoPrepareStatusWriteErr, "repo", auth.RedactLogString(cfg.Name), "mode", prepareModeSync, "phase", preparationFailurePhase(prepareErr), "target_state", "", "error", auth.RedactLogString(stateWriteErr.Error()))
+		return errors.Join(prepareErr, fmt.Errorf("persist failed prepare state: %w", stateWriteErr))
+	}
+	return prepareErr
+}
+
+func (s *Service) persistSyncPrepareSuccess(ctx context.Context, cfg model.RepoConfig) error {
+	stateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prepareStateWriteTimeout)
+	defer cancel()
+	if err := s.registry.UpdatePrepareStateForConfig(stateCtx, cfg, "", ""); err != nil {
+		s.logger.ErrorContext(stateCtx, logRepoPrepareStatusWriteErr, "repo", auth.RedactLogString(cfg.Name), "mode", prepareModeSync, "phase", preparePhaseComplete, "target_state", "", "error", auth.RedactLogString(err.Error()))
+		return err
+	}
+	return nil
+}
+
+func (s *Service) RemoveRepo(ctx context.Context, name string) error {
+	cfg, err := s.registry.GetRepo(ctx, name)
+	if err != nil {
+		return err
+	}
+	if err := s.unmount(cfg.ID); err != nil {
+		return err
+	}
+	return s.withRepoConfigLock(ctx, cfg.Name, func() error {
+		latest, err := s.registry.GetRepo(ctx, name)
+		if err != nil {
+			return err
+		}
+		if latest.ConfigVersion != cfg.ConfigVersion {
+			return registry.ErrRepoChanged
+		}
+		if latest.AdoptGitDir {
+			if err := s.git.RemoveAdoptedFSMonitorHook(ctx, latest); err != nil {
+				return err
+			}
+		}
+		return s.registry.RemoveRepo(ctx, name)
+	})
+}
+
+func (s *Service) ListRepos(ctx context.Context) ([]model.RepoConfig, error) {
+	return s.registry.ListRepos(ctx)
+}
+
+func (s *Service) SetRefresh(ctx context.Context, name string, interval time.Duration, disabled bool) error {
+	if interval <= 0 && !disabled {
+		return errors.New("refresh interval must be positive")
+	}
+	cfg, err := s.registry.GetRepo(ctx, name)
+	if err != nil {
+		return err
+	}
+	if cfg.AdoptGitDir && !disabled {
+		return errors.New("remote refresh cannot be enabled for an adopted worktree")
+	}
+	cfg.RefreshInterval = interval
+	cfg.RemoteRefreshDisabled = disabled
+	if err := s.registry.UpdateRefresh(ctx, cfg.ID, interval, disabled); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	rt := s.running[cfg.ID]
+	s.mu.Unlock()
+	s.updateRuntimeRefresh(rt, interval, disabled)
+	return nil
+}
+
+func (s *Service) updateRuntimeRefresh(rt *repoRuntime, interval time.Duration, disabled bool) {
+	if rt == nil {
+		return
+	}
+	s.mu.Lock()
+	if rt.cfg.RefreshInterval == interval && rt.cfg.RemoteRefreshDisabled == disabled {
+		s.mu.Unlock()
+		return
+	}
+	rt.cfg.RefreshInterval = interval
+	rt.cfg.RemoteRefreshDisabled = disabled
+	refresh := rt.refresh
+	s.mu.Unlock()
+	if refresh != nil && interval > 0 {
+		select {
+		case refresh <- interval:
+		default:
+			select {
+			case <-refresh:
+			default:
+			}
+			select {
+			case refresh <- interval:
+			default:
+			}
+		}
+	}
+}
+
+func (s *Service) FetchNow(ctx context.Context, name string) error {
+	cfg, err := s.registry.GetRepo(ctx, name)
+	if err != nil {
+		return err
+	}
+	if cfg.PrepareState == model.PrepareStatePreparing || cfg.PrepareState == model.PrepareStateSyncPreparing {
+		return fusefs.ErrRepoNotReady
+	}
+	if cfg.PrepareState == model.PrepareStateFailed {
+		return fmt.Errorf("repo prepare failed: %s", cfg.PrepareError)
+	}
+	if cfg.RemoteRefreshDisabled {
+		return errors.New("remote refresh is disabled for this repository")
+	}
+	if err := s.git.Fetch(ctx, cfg); err != nil {
+		return err
+	}
+	state, err := s.fetchState(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if rt, ok := s.running[cfg.ID]; ok {
+		markFetchSuccess(&rt.state, time.Now(), state, rt.mfs != nil)
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Service) Prepare(ctx context.Context, name string) error {
+	cfg, err := s.registry.GetRepo(ctx, name)
+	if err != nil {
+		return err
+	}
+	async := isAsyncRepo(cfg)
+	if async && cfg.PrepareState == model.PrepareStateReady && cfg.RequiredCommit == "" {
+		return nil
+	}
+	nextVersion := rand.Text()
+	nextState := model.PrepareStateSyncPreparing
+	if async {
+		nextState = model.PrepareStatePreparing
+	}
+	if err := s.registry.BeginPrepare(ctx, cfg, nextState, nextVersion); err != nil {
+		return err
+	}
+	cfg.ConfigVersion = nextVersion
+	cfg.PrepareState = nextState
+	cfg.PrepareError = ""
+	if !async {
+		prepareCtx, cancel := context.WithTimeout(ctx, s.prepareTimeoutDuration())
+		err := s.prepareRepo(prepareCtx, cfg)
+		prepareContextErr := prepareCtx.Err()
+		cancel()
+		if err != nil {
+			if prepareContextErr != nil && !errors.Is(err, prepareContextErr) {
+				err = errors.Join(err, prepareContextErr)
+			}
+			return s.persistSyncPrepareFailure(ctx, cfg, cfg, err)
+		}
+		return s.persistSyncPrepareSuccess(ctx, cfg)
+	}
+	if !cfg.AdoptGitDir && strings.TrimSpace(cfg.FetchRef) == "" {
+		cfg.FetchRef = defaultFetchRef(cfg.Branch)
+	}
+	if s.resetRunningPrepareState(cfg) {
+		s.startPrepareWorker(ctx, cfg)
+	}
+	return nil
+}
+
+func (s *Service) Remount(ctx context.Context, name string) error {
+	cfg, err := s.registry.GetRepo(ctx, name)
+	if err != nil {
+		return err
+	}
+	if err := s.unmount(cfg.ID); err != nil {
+		return err
+	}
+	if shouldMountAsync(cfg) {
+		if err := s.mountAsyncRepo(ctx, cfg); err != nil {
+			return err
+		}
+		if cfg.PrepareState == model.PrepareStatePreparing {
+			s.startPrepareWorker(ctx, cfg)
+		}
+		return nil
+	}
+	return s.mountRepo(ctx, cfg)
+}
+
+func (s *Service) Unmount(ctx context.Context, name string) error {
+	cfg, err := s.registry.GetRepo(ctx, name)
+	if err != nil {
+		return err
+	}
+	return s.unmount(cfg.ID)
+}
