@@ -6,11 +6,13 @@ import (
 	iofs "io/fs"
 	"maps"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
+	overlaystore "github.com/cloudflare/artifact-fs/internal/overlay"
 )
 
 type fakeSnapshot struct {
@@ -665,6 +667,73 @@ func TestReaddirTypedReturnsTypes(t *testing.T) {
 		}
 	}
 	t.Fatal("file.txt entry not found")
+}
+
+type countingLookupOverlay struct {
+	model.OverlayStore
+	lookups int
+}
+
+func (o *countingLookupOverlay) Lookup(ctx context.Context, path string) (model.OverlayEntry, bool, error) {
+	o.lookups++
+	return o.OverlayStore.Lookup(ctx, path)
+}
+
+func TestReaddirTypedDerivesOverlayChildrenFromOneListing(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	store, err := overlaystore.New(ctx, model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Remove(ctx, "src/gone.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Mkdir(ctx, "src/made", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"src/made/inner.txt", "src/new.txt", "src/implicit/deep/x.txt", "src/basedir/added.txt"} {
+		if _, err := store.CreateFile(ctx, p, 0o644); err != nil {
+			t.Fatalf("CreateFile(%q): %v", p, err)
+		}
+	}
+	ov := &countingLookupOverlay{OverlayStore: store}
+	r := &Resolver{
+		Snapshot: &fakeSnapshot{kids: map[string][]model.BaseNode{"src": {
+			{Path: "src/kept.txt", Type: "file"},
+			{Path: "src/gone.txt", Type: "file"},
+			{Path: "src/basedir", Type: "dir"},
+		}}},
+		Overlay: ov,
+	}
+	r.SetGeneration(1)
+
+	entries, err := r.ReaddirTyped(ctx, "src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type kind struct {
+		typ         string
+		fromOverlay bool
+	}
+	got := map[string]kind{}
+	for _, e := range entries {
+		got[e.Name] = kind{e.Type, e.FromOverlay}
+	}
+	want := map[string]kind{
+		"kept.txt": {"file", false},
+		"basedir":  {"dir", false},
+		"made":     {"dir", true},
+		"new.txt":  {"file", true},
+		"implicit": {"dir", false},
+	}
+	if !maps.Equal(got, want) {
+		t.Fatalf("ReaddirTyped(src) = %v, want %v", got, want)
+	}
+	if ov.lookups != 0 {
+		t.Fatalf("ReaddirTyped made %d overlay Lookup calls, want 0", ov.lookups)
+	}
 }
 
 func TestChildName(t *testing.T) {

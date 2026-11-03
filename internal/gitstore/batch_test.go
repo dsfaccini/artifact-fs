@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +48,41 @@ func TestBlobToCacheBinarySafe(t *testing.T) {
 	data, _ := os.ReadFile(dst)
 	if string(data) != "line\n" {
 		t.Fatalf("expected 'line\\n', got %q", data)
+	}
+}
+
+func TestVerifyBlobHashesWithoutGit(t *testing.T) {
+	for _, objectFormat := range []string{"sha1", "sha256"} {
+		t.Run(objectFormat, func(t *testing.T) {
+			tmp := t.TempDir()
+			repo := filepath.Join(tmp, "repo")
+			run(t, "git", "init", "--object-format="+objectFormat, repo)
+			cachePath := filepath.Join(tmp, "blob")
+			if err := os.WriteFile(cachePath, []byte("cached\r\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			oid := strings.TrimSpace(runOutput(t, "git", "-C", repo, "hash-object", "-w", "--no-filters", cachePath))
+			cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+			trace := filepath.Join(tmp, "git-trace")
+			t.Setenv("GIT_TRACE", trace)
+			store := New(nil)
+			defer store.Close()
+
+			ok, err := store.VerifyBlob(context.Background(), cfg, oid, cachePath)
+			if err != nil || !ok {
+				t.Fatalf("VerifyBlob(matching) = %v, %v; want true", ok, err)
+			}
+			if err := os.WriteFile(cachePath, []byte("changed\r\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			ok, err = store.VerifyBlob(context.Background(), cfg, oid, cachePath)
+			if err != nil || ok {
+				t.Fatalf("VerifyBlob(changed) = %v, %v; want false", ok, err)
+			}
+			if out, err := os.ReadFile(trace); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("VerifyBlob ran git: %s", out)
+			}
+		})
 	}
 }
 

@@ -148,11 +148,15 @@ func (s *Store) LookupNode(ctx context.Context, generation int64, path string) (
 	return n, true, nil
 }
 
-// ListChildren returns direct children of parentPath using a path-based lookup
-// (no inode join, no collision risk).
+// listChildrenQuery has no ORDER BY: sorting by path makes SQLite walk the whole
+// generation through the primary key instead of the parent_path index.
+const listChildrenQuery = `SELECT path, type, mode, object_oid, size_state, size_bytes FROM base_nodes WHERE generation=? AND parent_path=?`
+
+// ListChildren returns direct children of parentPath, unordered, using a
+// path-based lookup (no inode join, no collision risk).
 func (s *Store) ListChildren(generation int64, parentPath string) ([]model.BaseNode, error) {
 	pp := model.CleanPath(parentPath)
-	rows, err := s.db.Query(`SELECT path, type, mode, object_oid, size_state, size_bytes FROM base_nodes WHERE generation=? AND parent_path=? ORDER BY path`, generation, pp)
+	rows, err := s.db.Query(listChildrenQuery, generation, pp)
 	if err != nil {
 		return nil, err
 	}

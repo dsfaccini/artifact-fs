@@ -154,12 +154,13 @@ func readBatchBlob(ctx context.Context, batch *batchCatFile, objectOID string, m
 	}
 }
 
-func (s *Store) VerifyBlob(ctx context.Context, repo model.RepoConfig, objectOID string, cachePath string) (bool, error) {
-	out, err := runGit(ctx, repo.GitDir, "hash-object", "--no-filters", cachePath)
-	if err != nil {
+// VerifyBlob hashes in process instead of spawning git: it runs on the first
+// read of every cached blob after a daemon start.
+func (s *Store) VerifyBlob(ctx context.Context, _ model.RepoConfig, objectOID string, cachePath string) (bool, error) {
+	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	return strings.TrimSpace(out) == objectOID, nil
+	return model.FileMatchesBlobOID(cachePath, objectOID)
 }
 
 func (s *Store) getPool(gitDir string) (*batchPool, error) {
