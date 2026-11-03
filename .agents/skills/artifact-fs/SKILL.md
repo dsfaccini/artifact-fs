@@ -33,7 +33,8 @@ go build -tags fskit -o artifact-fs ./cmd/artifact-fs
 | Mount all registered repos | `./artifact-fs daemon --root <mount-root>` |
 | Check mount and overlay state | `./artifact-fs status --name <name>` |
 | List registered repos | `./artifact-fs list-repos` |
-| Unmount or remove a repo | `./artifact-fs unmount --name <name>` or `./artifact-fs remove-repo --name <name>` |
+| Unmount and remove a repo | `./artifact-fs remove-repo --name <name>`; the running daemon unmounts it at its next registry poll |
+| Remount all repos | Stop the daemon and start it again. `unmount` and `remount` cannot reach a running daemon and exit non-zero |
 
 ## Quick Start: One Repo
 

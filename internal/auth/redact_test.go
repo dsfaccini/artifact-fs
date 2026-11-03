@@ -314,6 +314,16 @@ func TestRedactRemoteURL(t *testing.T) {
 	if containsAny(out, []string{"alice", "ghp_secret"}) {
 		t.Fatalf("scheme-less delimiter-split userinfo leaked in output: %s", out)
 	}
+
+	out = RedactString("fatal: unable to access 'jane@example.com:https:user:ghp_secret@example.com/org/repo.git': HTTP 401")
+	if containsAny(out, []string{"ghp_secret"}) {
+		t.Fatalf("typo-scheme userinfo after an at-sign prefix leaked in redacted string: %s", out)
+	}
+
+	out = RedactString("fatal: unable to access 'https:/example.com/a://user:ghp_secret?q@z': HTTP 401")
+	if containsAny(out, []string{"ghp_secret"}) {
+		t.Fatalf("userinfo ending at a query after a later scheme separator leaked in redacted string: %s", out)
+	}
 }
 
 func TestHasInlineCredentials(t *testing.T) {
@@ -547,6 +557,26 @@ func TestHasInlineCredentials(t *testing.T) {
 			raw:  "https://localhost/team/repo:v1@2026.git",
 			want: false,
 		},
+		{
+			name: "remote helper with ambient profile",
+			raw:  "codecommit::us-east-1://demo-profile@MyRepositoryName",
+			want: false,
+		},
+		{
+			name: "remote helper over ssh username",
+			raw:  "gcrypt::ssh://git@github.com/org/repo.git",
+			want: false,
+		},
+		{
+			name: "userinfo before a trailing scheme separator",
+			raw:  "A:0@://",
+			want: true,
+		},
+		{
+			name: "username before a later scheme separator",
+			raw:  "ssh:/git@host/x://repo",
+			want: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -563,12 +593,18 @@ func TestRedactLogStringRemovesRemoteReferences(t *testing.T) {
 		"fatal: repository 'https://github.example.com/private/repo.git' not found",
 		"clone https://user:secret@example.com/org/repo.git failed",
 		"fetch git@example.com:private/repo.git failed",
+		"fatal: path/x://user:ghp_secret@example.com failed",
+		"fatal: repository 'codecommit::us-east-1://demo-profile@MyRepositoryName' not found",
+		"fatal: repository 'gcrypt::rsync://user@example.com/repo' not found",
+		"fetch remotes=alice:secret@example.com/org/repo.git,https://github.example.com/x.git failed",
+		"fatal: unable to access 'https:/user:pa?ss@host.example.com/a://b;git@mirror.example.com:org/repo.git': HTTP 401",
+		"clone x:y@git:a@b,remote=https//user:secret@mirror.example.com failed",
 	} {
 		got := RedactLogString(input)
 		if !strings.Contains(got, "REDACTED_REMOTE") {
 			t.Fatalf("RedactLogString(%q) = %q, want remote marker", input, got)
 		}
-		for _, secret := range []string{"github.example.com", "private/repo.git", "user", "secret", "example.com", "org/repo.git"} {
+		for _, secret := range []string{"github.example.com", "private/repo.git", "user", "secret", "example.com", "org/repo.git", "MyRepositoryName"} {
 			if strings.Contains(got, secret) {
 				t.Fatalf("RedactLogString(%q) leaked %q in %q", input, secret, got)
 			}
@@ -592,6 +628,148 @@ func TestRedactLogStringBoundsDiagnostics(t *testing.T) {
 	if len(got) > maxLogStringBytes+len(logStringTruncatedLabel)+1 || !strings.Contains(got, logStringTruncatedLabel) {
 		t.Fatalf("RedactLogString returned %d bytes without truncation marker", len(got))
 	}
+}
+
+// remoteForms are the remote prefixes the redaction heuristics recognize,
+// including the typos and the scheme-less form.
+var remoteForms = []string{"https://", "http://", "ssh://", "git://", "https:/", "https//", "https:", "ssh:/", ""}
+
+// tokenPrefixes are text that a log token can carry in front of a remote.
+var tokenPrefixes = []string{"", "jane@example.com:", "HEAD@{1}:", "remote="}
+
+// userinfoEnds are the characters that can end the userinfo of a remote.
+var userinfoEnds = []string{"@", "?", "#"}
+
+func FuzzRedactionHidesPassword(f *testing.F) {
+	for _, seed := range []struct {
+		prefix, form, end    int
+		lead, user, password string
+		rest                 string
+	}{
+		{0, 0, 0, "", "user", "pass", "example.com/org/repo.git/"},
+		{0, 0, 0, "", "ghp_secret%zz", "password", "example.com/org/repo.git"},
+		{0, 0, 0, "", "user.name", "secret", "example.com/org/repo.git"},
+		{0, 2, 0, "", "git", "secret", "github.com/org/repo.git"},
+		{0, 2, 0, "", "git", "sec%zzret", "example.com/org/repo.git"},
+		{0, 4, 0, "", "user", "ghp_secret", "github.com/org/repo.git"},
+		{0, 7, 0, "", "git", "pa", "github.com/org/repo.git"},
+		{0, 8, 0, "", "alice", "ghp_secret", "github.com:org/repo.git"},
+		{0, 8, 0, "", "x-token-auth", "secret", "bitbucket.org/org/repo.git"},
+		{0, 8, 0, "", "1", "000000", "0://"},
+		{0, 8, 0, "", "A", "0", "://"},
+		{0, 8, 0, "", "alice", "ghp_secret", "git:0"},
+		{0, 5, 0, "", "0", "00", "://"},
+		{0, 8, 0, "", "alice", "ghp_secret", "corpgit:org/repo.git"},
+		{1, 6, 0, "", "user", "ghp_secret", "example.com/org/repo.git"},
+		{2, 4, 0, "", "alice", "ghp_secret", "example.com"},
+		{0, 4, 1, "example.com/a://", "u", "pwzq", "q@z"},
+		{0, 6, 2, "example.com/a://", "u", "pwzq", "f@z"},
+	} {
+		f.Add(uint8(seed.prefix), uint8(seed.form), uint8(seed.end), seed.lead, seed.user, seed.password, seed.rest)
+	}
+	f.Fuzz(func(t *testing.T, prefixIndex, formIndex, endIndex uint8, lead, user, password, rest string) {
+		if !onlyRunes(user, "-._~%") || password == "" || !onlyRunes(password, "-._~%") || !onlyRunes(rest, "-._~%:/@") {
+			t.Skip()
+		}
+		prefix := tokenPrefixes[int(prefixIndex)%len(tokenPrefixes)]
+		form := remoteForms[int(formIndex)%len(remoteForms)]
+		end := userinfoEnds[int(endIndex)%len(userinfoEnds)]
+		// Behind a form without "://" and no lead, an "@" after a later "://" in
+		// rest makes the redaction take the userinfo to follow that "://", so
+		// RedactString keeps the password in "https:/alice:pw@host/a://b@c".
+		if _, after, ok := strings.Cut(rest, "://"); ok && strings.Contains(after, "@") && !strings.HasSuffix(form, "://") && lead == "" {
+			t.Skip()
+		}
+		// A lead puts the userinfo after a later "://", as in "https:/example.com/a://u:pw@z".
+		// The authority follows the first "://", so the lead holds one, at its end.
+		if !onlyRunes(lead, "-._~%:/") || lead != "" && (!strings.HasSuffix(lead, "://") || strings.Index(lead, "://") != len(lead)-len("://")) {
+			t.Skip()
+		}
+		// A "://" form, a form and lead that join into a "://" before the lead's
+		// own, as in "https:" + "//x://", or a leading "//", as in "//./://",
+		// starts the authority there. The lead is then a host and path, and the
+		// userinfo slot sits in the path.
+		if lead != "" && (strings.Index(form+lead, "://") < len(form+lead)-len("://") || strings.HasPrefix(form+lead, "//")) {
+			t.Skip()
+		}
+		// Without a form, a lead that opens with a URL scheme and its ":" before
+		// the lead's "://", as in "B:://u:pw@h", parses as a URL of that scheme.
+		// Behind "ssh:/" the lead sits in an ssh URL's path, as in
+		// "ssh:/x://u:pw@h". RedactString keeps the password in both.
+		beforeSeparator, _, _ := strings.Cut(lead, "://")
+		colon := strings.Index(beforeSeparator, ":")
+		if lead != "" && (form == "" && colon > 0 && asciiLetter(lead[0]) && onlyRunes(lead[:colon], "+-.") || form == "ssh:/") {
+			t.Skip()
+		}
+		// The heuristics take the text before a "?" or "#" as userinfo only when an
+		// "@" follows, as in "u:pw?q@z". A non-http URL ends its authority at the
+		// "?" or "#", so "u:pw" there is a host and port. That URL comes from an
+		// ssh:// or git:// form, or, without a form, from a lead that is a non-http
+		// scheme and its "://", as in "A://0:1?@".
+		schemeLead := lead != "" && beforeSeparator != "" && asciiLetter(beforeSeparator[0]) && onlyRunes(beforeSeparator, "+-.")
+		httpLead := strings.EqualFold(beforeSeparator, "http") || strings.EqualFold(beforeSeparator, "https")
+		if end != "@" && (!strings.Contains(rest, "@") || form == "ssh://" || form == "git://" || form == "" && schemeLead && !httpLead) {
+			t.Skip()
+		}
+		// In "0:1?git:@", a remote marker between the "?" and the "@" starts the
+		// remote, and RedactString keeps the "0:1" before it.
+		if form == "" && end != "@" && containsRemoteMarker(rest[:strings.Index(rest, "@")]) {
+			t.Skip()
+		}
+		// "jane@example.com:alice:pw@host" is an scp remote whose path holds "alice:pw@host".
+		if form == "" && strings.Contains(prefix, "@") {
+			t.Skip()
+		}
+		remote := form + lead + user + ":" + password + end + rest
+		if !HasInlineCredentials(remote) {
+			t.Fatalf("HasInlineCredentials(%q) = false", remote)
+		}
+		lines := []string{
+			prefix + remote,
+			"fatal: unable to access '" + prefix + remote + "': HTTP 401",
+			"clone " + prefix + remote + " failed",
+		}
+		// A comma list splits only before a remote marker, so a prefixed
+		// second remote stays joined to the first.
+		if prefix == "" {
+			lines = append(lines, "remotes=https://example.com/a.git,"+remote)
+		}
+		lowerPassword := strings.ToLower(password)
+		for _, line := range lines {
+			if strings.Count(strings.ToLower(line), lowerPassword) != 1 || strings.Contains(lowerPassword, "redacted") {
+				continue
+			}
+			if got := RedactString(line); leaksPassword(got, password) {
+				t.Fatalf("RedactString(%q) = %q leaks the password", line, got)
+			}
+			if got := RedactLogString(line); leaksPassword(got, password) {
+				t.Fatalf("RedactLogString(%q) = %q leaks the password", line, got)
+			}
+		}
+	})
+}
+
+var redactionMarkers = strings.NewReplacer("REDACTED_REMOTE", "\x00", "REDACTED", "\x00")
+
+// leaksPassword masks the redaction markers, which can join with neighboring
+// text into the password, and ignores case, because redaction uppercases
+// percent-encodings.
+func leaksPassword(redacted string, password string) bool {
+	return strings.Contains(strings.ToLower(redactionMarkers.Replace(redacted)), strings.ToLower(password))
+}
+
+func asciiLetter(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+// onlyRunes reports whether s holds only ASCII letters, digits and extra.
+func onlyRunes(s string, extra string) bool {
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune(extra, r)) {
+			return false
+		}
+	}
+	return true
 }
 
 func containsAny(s string, needles []string) bool {

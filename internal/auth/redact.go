@@ -116,7 +116,8 @@ func HasInlineCredentials(raw string) bool {
 
 func malformedAuthorityStart(raw string) int {
 	lower := strings.ToLower(strings.TrimSpace(raw))
-	if i := strings.Index(lower, "://"); i >= 0 {
+	// Userinfo follows a "://" unless every "@" precedes it, as in "user:pass@host://".
+	if i := strings.Index(lower, "://"); i >= 0 && strings.Contains(lower[i:], "@") {
 		return i + len("://")
 	}
 	if schemeLessUserinfoStart(raw) >= 0 {
@@ -126,6 +127,9 @@ func malformedAuthorityStart(raw string) int {
 		if strings.HasPrefix(lower, prefix) {
 			return len(prefix)
 		}
+	}
+	if i := strings.Index(lower, "://"); i >= 0 {
+		return i + len("://")
 	}
 	return -1
 }
@@ -272,7 +276,8 @@ func userinfoLikeBeforePath(candidate string) bool {
 }
 
 func schemeLessUserinfoStart(raw string) int {
-	if strings.Contains(raw, "://") {
+	// Userinfo follows a "://" unless every "@" precedes it, as in "user:pass@host://".
+	if _, after, ok := strings.Cut(raw, "://"); ok && strings.Contains(after, "@") {
 		return -1
 	}
 	if isSCPStyleRemote(raw) {
@@ -354,11 +359,14 @@ func RedactLogString(s string, sensitiveValues ...string) string {
 			s = redactTruncatedSensitivePrefix(s, value)
 		}
 	}
+	// RedactString can strip every remote marker from a token, so the token
+	// before it also decides whether a remote goes. Both split on " ".
+	unredacted := strings.Split(s, " ")
 	s = RedactString(s)
 	if s != "" && (strings.Contains(s, "://") || strings.ContainsAny(s, "@?#")) {
 		parts := strings.Split(s, " ")
 		for i, token := range parts {
-			if !shouldRedactRemoteToken(token) {
+			if !shouldRedactRemoteToken(token) && (i >= len(unredacted) || !shouldRedactRemoteToken(unredacted[i])) {
 				continue
 			}
 			start := strings.IndexFunc(token, func(r rune) bool {
@@ -372,6 +380,11 @@ func RedactLogString(s string, sensitiveValues ...string) string {
 			}
 			core := token[start : end+1]
 			remoteStart := remoteStartIndex(core)
+			// Text with an "@" before the marker is redacted userinfo or an scp
+			// remote, as in "REDACTED@host/x,https://...", so it goes too.
+			if strings.Contains(core[:remoteStart], "@") {
+				remoteStart = 0
+			}
 			parts[i] = token[:start] + core[:remoteStart] + "REDACTED_REMOTE" + token[end+1:]
 		}
 		s = strings.Join(parts, " ")
@@ -525,7 +538,12 @@ func containsRemoteMarker(s string) bool {
 
 func redactSingleRemoteCore(core string) string {
 	remoteStart := remoteStartIndex(core)
-	return core[:remoteStart] + RedactRemoteURL(core[remoteStart:])
+	prefix := core[:remoteStart]
+	// Userinfo can precede a marker inside the host, as in "user:pass@corpgit:repo".
+	if at := strings.LastIndex(prefix, "@"); at >= 0 && strings.Contains(prefix[:at], ":") {
+		prefix = "REDACTED" + prefix[at:]
+	}
+	return prefix + RedactRemoteURL(core[remoteStart:])
 }
 
 func remoteStartIndex(s string) int {

@@ -245,6 +245,40 @@ func TestPrepareCLIReportsQueuedPrepare(t *testing.T) {
 	}
 }
 
+func TestMountCommandsRefuseAndPointToAlternative(t *testing.T) {
+	for _, tt := range []struct {
+		command, name string
+		wants         []string
+	}{
+		{"unmount", "repo", []string{"remove-repo --name repo", "stop the daemon"}},
+		// remount of a registered repo mounted FUSE from the CLI process, and
+		// package tests never mount, so it names an unregistered repo.
+		{"remount", "missing", []string{"stop the daemon and start it again"}},
+	} {
+		t.Run(tt.command, func(t *testing.T) {
+			t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+			ctx := context.Background()
+			var stdout, stderr bytes.Buffer
+			if code := Run(ctx, []string{"add-repo", "--name", "repo", "--remote", "https://github.com/example/repo.git", "--async"}, &stdout, &stderr); code != 0 {
+				t.Fatalf("add-repo exit = %d, stderr=%q", code, stderr.String())
+			}
+			stdout.Reset()
+			stderr.Reset()
+			if code := Run(ctx, []string{tt.command, "--name", tt.name}, &stdout, &stderr); code == 0 {
+				t.Fatalf("%s exit = 0, stdout=%q", tt.command, stdout.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout = %q, want nothing", stdout.String())
+			}
+			for _, want := range tt.wants {
+				if !strings.Contains(stderr.String(), want) {
+					t.Fatalf("stderr = %q, want substring %q", stderr.String(), want)
+				}
+			}
+		})
+	}
+}
+
 func TestStatusCLIPrintsDaemonMountError(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("ARTIFACT_FS_ROOT", root)
