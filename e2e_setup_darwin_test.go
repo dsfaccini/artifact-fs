@@ -31,11 +31,8 @@ func skipIfNoFUSE(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	noFSKit := "FSKit is unavailable; it needs macOS 26 or later and macFUSE 5.3 or later"
-	if !fusefs.FSKitBuilt {
-		noFSKit = "this test binary has no FSKit transport; run go test with -tags fskit"
-	}
-	fskit := fusefs.FSKitBuilt && fskitAvailable()
+	const noFSKit = "FSKit is unavailable; it needs macOS 26 or later and macFUSE 5.3 or later"
+	fskit := fskitAvailable()
 	_, kextErr := unix.SysctlRaw("vfs.generic.macfuse.version.number")
 	switch {
 	case backend == fusefs.BackendKernel && kextErr != nil:
@@ -56,12 +53,11 @@ func skipIfNoFUSE(t *testing.T) {
 	}
 }
 
-// mountsThroughFSKit reports whether e2e mounts here go through FSKit: the
-// test binary has the FSKit transport, and ARTIFACT_FS_FUSE_BACKEND selects it
-// or the auto backend finds it available.
+// mountsThroughFSKit reports whether e2e mounts here go through FSKit:
+// ARTIFACT_FS_FUSE_BACKEND selects it, or the auto backend finds it available.
 func mountsThroughFSKit() bool {
 	backend, err := fusefs.MountBackend()
-	return fusefs.FSKitBuilt && err == nil && (backend == fusefs.BackendFSKit || backend == fusefs.BackendAuto && fskitAvailable())
+	return err == nil && (backend == fusefs.BackendFSKit || backend == fusefs.BackendAuto && fskitAvailable())
 }
 
 // fskitAvailable mirrors the fuse fork's FSKit preflight: the MFMount framework

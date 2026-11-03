@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
-	"github.com/jacobsa/fuse/fuseops"
+	"github.com/dsfaccini/fuse/fuseops"
 )
 
 type fakeSymlinkHydrator struct {
