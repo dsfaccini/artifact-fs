@@ -62,10 +62,24 @@ func TestGatedFileSystemFailedGateReturnsEIO(t *testing.T) {
 	fs := NewGatedFileSystem(next, gate)
 
 	err := fs.LookUpInode(context.Background(), &fuseops.LookUpInodeOp{})
-	if !errors.Is(err, syscall.EIO) {
+	if kernelErrno(err) != syscall.EIO {
 		t.Fatalf("LookUpInode error = %v, want EIO", err)
 	}
 	if got := next.lookups.Load(); got != 0 {
 		t.Fatalf("lookups after failed gate = %d, want 0", got)
+	}
+}
+
+func TestGatedFileSystemCanceledWaitReturnsEINTR(t *testing.T) {
+	next := &recordingFS{}
+	fs := NewGatedFileSystem(next, NewReadyGate(false))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := fs.LookUpInode(ctx, &fuseops.LookUpInodeOp{})
+	if kernelErrno(err) != syscall.EINTR {
+		t.Fatalf("LookUpInode on a canceled wait = %v, want EINTR", err)
+	}
+	if got := next.lookups.Load(); got != 0 {
+		t.Fatalf("lookups passed through = %d, want 0", got)
 	}
 }

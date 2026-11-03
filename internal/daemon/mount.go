@@ -18,7 +18,7 @@ import (
 )
 
 // mountFunc mounts a repo's filesystem. A nil gate mounts it ungated.
-type mountFunc func(model.RepoConfig, *fusefs.Resolver, *fusefs.Engine, *fusefs.ReadyGate) (fusefs.MountedFS, error)
+type mountFunc func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate) (fusefs.MountedFS, error)
 
 // defaultMount is what New installs as Service.mount. Package tests replace it so they cannot mount.
 var defaultMount mountFunc = fusefs.MountRepoWithGate
@@ -126,7 +126,7 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 		Hydrator: h,
 	}
 
-	mfs, err := s.mountFS(ctx, cfg, resolver, engine, nil)
+	mfs, err := s.mountFS(ctx, cfg, engine, nil)
 	if err != nil {
 		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
 		mfs = nil
@@ -158,8 +158,8 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 
 // mountFS mounts cfg through s.mount and logs which backend serves the mount.
 // It persists the mount error that status reports, and clears it on success.
-func (s *Service) mountFS(ctx context.Context, cfg model.RepoConfig, resolver *fusefs.Resolver, engine *fusefs.Engine, gate *fusefs.ReadyGate) (fusefs.MountedFS, error) {
-	mfs, err := s.mount(cfg, resolver, engine, gate)
+func (s *Service) mountFS(ctx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate) (fusefs.MountedFS, error) {
+	mfs, err := s.mount(cfg, engine, gate)
 	mountErr := ""
 	if err != nil {
 		mountErr = auth.RedactLogString(err.Error(), cfg.RemoteURL)
@@ -214,7 +214,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		Hydrator: h,
 	}
 
-	mfs, err := s.mountFS(ctx, cfg, resolver, engine, gate)
+	mfs, err := s.mountFS(ctx, cfg, engine, gate)
 	if err != nil {
 		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
 		mfs = nil
@@ -284,12 +284,12 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 		s.mu.Unlock()
 		return
 	}
-	cfg, resolver, engine, gate := rt.cfg, rt.resolver, rt.engine, rt.gate
+	cfg, engine, gate := rt.cfg, rt.engine, rt.gate
 	rt.mounts.Add(1)
 	s.mu.Unlock()
 	defer rt.mounts.Done()
 
-	mfs, err := s.mountFS(rt.ctx, cfg, resolver, engine, gate)
+	mfs, err := s.mountFS(rt.ctx, cfg, engine, gate)
 	s.mu.Lock()
 	if err != nil {
 		mf = s.mountFailures[cfg.ID]

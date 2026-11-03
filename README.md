@@ -342,7 +342,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 
 4. **Read** -- The Resolver merges the snapshot (base tree) with the overlay (local writes). For base files, reads block until the Hydrator fetches the blob via a persistent `git cat-file --batch` process and streams it to the blob cache.
 
-5. **Write** -- The Engine promotes base files to the overlay via copy-on-write (hydrate, then copy to the `upper/` directory). Subsequent reads come from the overlay. Deletes are recorded as whiteouts.
+5. **Write** -- The Engine promotes base files to the overlay via copy-on-write (hydrate, then copy to the `upper/` directory). Subsequent reads come from the overlay. Deletes are recorded as whiteouts; deleting a file copies it first only while a handle on it is open. No FUSE operation holds a lock while a blob hydrates, so a slow fetch stalls neither a HEAD switch nor other operations. A failed operation returns the errno of its cause, such as `ENOSPC`, and an interrupted one returns `EINTR`.
 
 6. **Background** -- For ordinary workspaces, a watcher polls HEAD/refs every 500ms and republishes HEAD changes. Repositories with `--require-commit` do not run this watcher, so their verified base commit remains fixed. Remote polling is controlled separately by `--refresh`.
 
@@ -351,7 +351,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 | Package | Role |
 |---------|------|
 | `daemon` | Orchestrates repo lifecycle, refresh loop, watcher callbacks |
-| `fusefs` | FUSE adapter (inode management, op dispatch), Resolver (merged view), Engine (read/write logic) |
+| `fusefs` | FUSE adapter (inode management, op dispatch), Resolver (merged view), Engine (the adapter's only API: one method per operation) |
 | `gitstore` | Git CLI wrapper: clone, fetch, ls-tree, batch pool for `cat-file --batch` |
 | `snapshot` | SQLite store for `base_nodes` keyed by `(generation, path)` |
 | `overlay` | SQLite metadata + `upper/` directory for local writes, whiteouts, reconciliation |
@@ -376,7 +376,7 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 | Write / append to file | Supported | Copy-on-write for tracked files |
 | Rename file | Supported | Works for both overlay and tracked (snapshot-only) files |
 | Rename directory | Supported | Moves tracked and overlay-created directory trees |
-| Delete file (`rm`) | Supported | Whiteout recorded in overlay |
+| Delete file (`rm`) | Supported | Whiteout recorded in overlay; fetches nothing unless the file is open |
 | `rmdir` | Supported | Checks directory is empty first |
 | Truncate | Supported | Hydrates blob before truncating |
 | `chmod` | Supported | Preserves executable-bit changes across commits |

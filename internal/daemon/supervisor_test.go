@@ -23,11 +23,11 @@ type resolverMount struct {
 	resolved *fusefs.Resolver
 }
 
-func (m *resolverMount) mount(cfg model.RepoConfig, resolver *fusefs.Resolver, engine *fusefs.Engine, gate *fusefs.ReadyGate) (fusefs.MountedFS, error) {
+func (m *resolverMount) mount(cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate) (fusefs.MountedFS, error) {
 	m.mu.Lock()
-	m.resolved = resolver
+	m.resolved = engine.Resolver
 	m.mu.Unlock()
-	return fakeMount(cfg, resolver, engine, gate)
+	return fakeMount(cfg, engine, gate)
 }
 
 func (m *resolverMount) resolver() *fusefs.Resolver {
