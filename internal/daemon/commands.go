@@ -95,7 +95,7 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 	// Clone and build snapshot so the repo is ready to mount, but don't start
 	// the FUSE server -- that's the daemon's job.
 	cfg.RemoteURL = cloneURL
-	prepareCtx, cancel := context.WithTimeout(ctx, s.prepareTimeoutDuration())
+	prepareCtx, cancel := s.withPrepareTimeout(ctx)
 	err := s.prepareRepo(prepareCtx, cfg)
 	prepareContextErr := prepareCtx.Err()
 	cancel()
@@ -268,7 +268,7 @@ func (s *Service) Prepare(ctx context.Context, name string) error {
 	cfg.PrepareState = nextState
 	cfg.PrepareError = ""
 	if !async {
-		prepareCtx, cancel := context.WithTimeout(ctx, s.prepareTimeoutDuration())
+		prepareCtx, cancel := s.withPrepareTimeout(ctx)
 		err := s.prepareRepo(prepareCtx, cfg)
 		prepareContextErr := prepareCtx.Err()
 		cancel()

@@ -10,8 +10,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -140,19 +142,22 @@ func TestCloneBloblessPreservesTransportFailureAtCallerDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	countPath := filepath.Join(tmp, "clone-count")
+	stderrWritten := filepath.Join(tmp, "stderr-written")
 	fakeGit := filepath.Join(bin, "git")
 	script := "#!/bin/sh\n" +
 		"count=0; [ -f \"$AFS_CLONE_COUNT\" ] && count=$(cat \"$AFS_CLONE_COUNT\")\n" +
 		"count=$((count + 1)); printf '%s' \"$count\" > \"$AFS_CLONE_COUNT\"\n" +
 		"printf '%s\\n' 'error: RPC failed; HTTP 500 curl 22' >&2\n" +
+		": > \"$AFS_STDERR_WRITTEN\"\n" +
 		"exec sleep 10\n"
 	if err := os.WriteFile(fakeGit, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("AFS_CLONE_COUNT", countPath)
+	t.Setenv("AFS_STDERR_WRITTEN", stderrWritten)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := gittest.ExpireOnFile(context.Background(), stderrWritten)
 	defer cancel()
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
@@ -232,18 +237,21 @@ func TestRetryGitOperationCancellationBeforeNextAttemptPreservesFailure(t *testi
 }
 
 func TestRetryGitOperationLogsCancellationDuringBackoff(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	store.gitRetryDelays = []time.Duration{time.Second}
-	err := store.retryGitOperation(ctx, GitOperationFetch, "repo", func() error {
-		time.AfterFunc(20*time.Millisecond, cancel)
-		return errors.New("HTTP 503 transport failure")
+	// In a synctest bubble the cancel fires 20ms into the backoff, never after it.
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		err := store.retryGitOperation(ctx, GitOperationFetch, "repo", func() error {
+			time.AfterFunc(20*time.Millisecond, cancel)
+			return errors.New("HTTP 503 transport failure")
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want canceled", err)
+		}
 	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("error = %v, want canceled", err)
-	}
 	if logOutput := logs.String(); !strings.Contains(logOutput, `"msg":"`+logGitOperationInterrupted+`"`) ||
 		!strings.Contains(logOutput, `"canceled":true`) || !strings.Contains(logOutput, `"attempts":1`) {
 		t.Fatalf("backoff cancellation terminal log incomplete: %s", logOutput)
