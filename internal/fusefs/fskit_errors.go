@@ -1,11 +1,9 @@
-//go:build fskit
-
 package fusefs
 
 import (
 	"errors"
 
-	"github.com/jacobsa/fuse"
+	"github.com/dsfaccini/fuse"
 )
 
 // fskitUnavailable reports whether err means FSKit cannot serve any mount on this
