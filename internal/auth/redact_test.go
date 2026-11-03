@@ -674,10 +674,10 @@ func FuzzRedactionHidesPassword(f *testing.F) {
 		prefix := tokenPrefixes[int(prefixIndex)%len(tokenPrefixes)]
 		form := remoteForms[int(formIndex)%len(remoteForms)]
 		end := userinfoEnds[int(endIndex)%len(userinfoEnds)]
-		// Behind a form without "://", an "@" after a later "://" in rest makes the
-		// redaction take the userinfo to follow that "://", so RedactString keeps
-		// the password in "https:/alice:pw@host/a://b@c".
-		if _, after, ok := strings.Cut(rest, "://"); ok && strings.Contains(after, "@") && !strings.HasSuffix(form, "://") {
+		// Behind a form without "://" and no lead, an "@" after a later "://" in
+		// rest makes the redaction take the userinfo to follow that "://", so
+		// RedactString keeps the password in "https:/alice:pw@host/a://b@c".
+		if _, after, ok := strings.Cut(rest, "://"); ok && strings.Contains(after, "@") && !strings.HasSuffix(form, "://") && lead == "" {
 			t.Skip()
 		}
 		// A lead puts the userinfo after a later "://", as in "https:/example.com/a://u:pw@z".
@@ -692,16 +692,23 @@ func FuzzRedactionHidesPassword(f *testing.F) {
 		if lead != "" && (strings.Index(form+lead, "://") < len(form+lead)-len("://") || strings.HasPrefix(form+lead, "//")) {
 			t.Skip()
 		}
-		// Without a form, a ":" before the lead's "://" can make a scheme, as in
-		// "B:://u:pw@h". Behind "ssh:/" the lead sits in an ssh URL's path, as in
-		// "ssh:/x://u:pw@h". RedactString returns both unchanged.
-		if beforeSeparator, _, _ := strings.Cut(lead, "://"); lead != "" && (form == "" && strings.Contains(beforeSeparator, ":") || form == "ssh:/") {
+		// Without a form, a lead that opens with a URL scheme and its ":" before
+		// the lead's "://", as in "B:://u:pw@h", parses as a URL of that scheme.
+		// Behind "ssh:/" the lead sits in an ssh URL's path, as in
+		// "ssh:/x://u:pw@h". RedactString keeps the password in both.
+		beforeSeparator, _, _ := strings.Cut(lead, "://")
+		colon := strings.Index(beforeSeparator, ":")
+		if lead != "" && (form == "" && colon > 0 && asciiLetter(lead[0]) && onlyRunes(lead[:colon], "+-.") || form == "ssh:/") {
 			t.Skip()
 		}
 		// The heuristics take the text before a "?" or "#" as userinfo only when an
-		// "@" follows, as in "u:pw?q@z". An ssh:// or git:// URL ends its authority
-		// at the "?" or "#", so "u:pw" there is a host and port.
-		if end != "@" && (!strings.Contains(rest, "@") || form == "ssh://" || form == "git://") {
+		// "@" follows, as in "u:pw?q@z". A non-http URL ends its authority at the
+		// "?" or "#", so "u:pw" there is a host and port. That URL comes from an
+		// ssh:// or git:// form, or, without a form, from a lead that is a non-http
+		// scheme and its "://", as in "A://0:1?@".
+		schemeLead := lead != "" && beforeSeparator != "" && asciiLetter(beforeSeparator[0]) && onlyRunes(beforeSeparator, "+-.")
+		httpLead := strings.EqualFold(beforeSeparator, "http") || strings.EqualFold(beforeSeparator, "https")
+		if end != "@" && (!strings.Contains(rest, "@") || form == "ssh://" || form == "git://" || form == "" && schemeLead && !httpLead) {
 			t.Skip()
 		}
 		// In "0:1?git:@", a remote marker between the "?" and the "@" starts the
@@ -749,6 +756,10 @@ var redactionMarkers = strings.NewReplacer("REDACTED_REMOTE", "\x00", "REDACTED"
 // percent-encodings.
 func leaksPassword(redacted string, password string) bool {
 	return strings.Contains(strings.ToLower(redactionMarkers.Replace(redacted)), strings.ToLower(password))
+}
+
+func asciiLetter(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
 
 // onlyRunes reports whether s holds only ASCII letters, digits and extra.
