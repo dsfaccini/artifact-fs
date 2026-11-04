@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	iofs "io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -70,6 +71,8 @@ type Store struct {
 	repo     model.RepoConfig
 	upperDir string
 	mu       sync.Mutex
+	// reconcileMu serializes reconciles without blocking writes.
+	reconcileMu sync.Mutex
 }
 
 func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
@@ -875,155 +878,49 @@ func (s *Store) Reconcile(ctx context.Context, baseLookup func(path string) (mod
 	return s.ReconcileChecked(ctx, func(path string) (model.BaseNode, bool, error) {
 		n, ok := baseLookup(path)
 		return n, ok, nil
-	})
+	}, nil)
 }
 
-func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path string) (model.BaseNode, bool, error)) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if baseLookup == nil {
-		return nil
+// ReconcileChecked reconciles as Reconcile does, in two phases, so that
+// readers keep working while it compares the overlay with the new base.
+//
+// The plan phase reads every entry, looks up its base and hashes its content
+// with no lock that a reader or an overlay write takes. swap runs the apply
+// phase: it calls apply while it holds the lock its readers take, and switches
+// them to the base baseLookup reads before it releases that lock. apply takes
+// the database write lock, classifies again every entry the change log shows a
+// write changed since the plan read it, and applies the result. A nil swap
+// applies at once.
+func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path string) (model.BaseNode, bool, error), swap func(apply func() error) error) error {
+	// A reconcile's own changes reach the change log only in part, so one
+	// reconcile must not plan while another applies.
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+	r := &reconciler{lookup: baseLookup, bases: map[string]reconcileBase{}, matches: map[model.OverlayEntry]bool{}}
+	// Read the sequence before the entries: a write between the two reads
+	// is then classified again in the apply phase.
+	var seq int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM overlay_changes`).Scan(&seq); err != nil {
+		return fmt.Errorf("reconcile change log: %w", err)
 	}
 	entries, err := s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries ORDER BY path`)
 	if err != nil {
 		return fmt.Errorf("reconcile list: %w", err)
 	}
-	var toRemove []model.OverlayEntry
-	type reconcileUpdate struct {
-		before model.OverlayEntry
-		after  model.OverlayEntry
+	plan, err := r.classify(entries, false)
+	if err != nil {
+		return err
 	}
-	var toUpdate []reconcileUpdate
-	staleRenameSources := map[string]bool{}
-	revealsBase := map[string]bool{}
-	for _, e := range entries {
-		base, baseExists, err := baseLookup(e.Path)
-		if err != nil {
-			return err
-		}
-		switch e.Kind {
-		case model.OverlayKindModify:
-			if !baseExists {
-				before := e
-				e.Kind = model.OverlayKindCreate
-				e.SourceOID = ""
-				e.SourceMode = 0
-				toUpdate = append(toUpdate, reconcileUpdate{before: before, after: e})
-			} else if e.SourceOID != base.ObjectOID || e.SourceMode != base.Mode {
-				matches, err := overlayEntryMatchesBase(e, base)
-				if err != nil {
-					return fmt.Errorf("reconcile hash %s: %w", e.Path, err)
-				}
-				if matches {
-					toRemove = append(toRemove, e)
-				} else {
-					before := e
-					e.SourceOID = base.ObjectOID
-					e.SourceMode = base.Mode
-					toUpdate = append(toUpdate, reconcileUpdate{before: before, after: e})
-				}
-			}
-		case model.OverlayKindRename:
-			destination, destinationExists, err := baseLookup(e.Path)
-			if err != nil {
-				return err
-			}
-			sourcePath := e.TargetPath
-			if sourcePath == "" {
-				sourcePath = e.Path
-			}
-			sourceBase, sourceExists, err := baseLookup(sourcePath)
-			if err != nil {
-				return err
-			}
-			if destinationExists && !sourceExists {
-				matches, err := overlayEntryMatchesBase(e, destination)
-				if err != nil {
-					return fmt.Errorf("reconcile hash %s: %w", e.Path, err)
-				}
-				if matches {
-					toRemove = append(toRemove, e)
-					staleRenameSources[e.TargetPath] = true
-					continue
-				}
-			}
-			if sourceExists {
-				if e.SourceOID != sourceBase.ObjectOID || e.SourceMode != sourceBase.Mode {
-					before := e
-					e.SourceOID = sourceBase.ObjectOID
-					e.SourceMode = sourceBase.Mode
-					toUpdate = append(toUpdate, reconcileUpdate{before: before, after: e})
-				}
-			} else {
-				before := e
-				if destinationExists {
-					e.Kind = model.OverlayKindModify
-					e.SourceOID = destination.ObjectOID
-					e.SourceMode = destination.Mode
-				} else {
-					e.Kind = model.OverlayKindCreate
-					e.SourceOID = ""
-					e.SourceMode = 0
-				}
-				e.TargetPath = ""
-				toUpdate = append(toUpdate, reconcileUpdate{before: before, after: e})
-				staleRenameSources[sourcePath] = true
-			}
-		}
+	apply := func() error { return s.applyReconcile(ctx, r, seq, entries, plan) }
+	if swap == nil {
+		return apply()
 	}
-	for _, e := range entries {
-		base, baseExists, err := baseLookup(e.Path)
-		if err != nil {
-			return err
-		}
-		switch e.Kind {
-		case model.OverlayKindDelete:
-			if (e.TargetPath != "" && e.Path != e.TargetPath) || staleRenameSources[e.Path] || staleRenameSources[e.TargetPath] || !baseExists {
-				toRemove = append(toRemove, e)
-				revealsBase[e.Path] = baseExists
-			}
-		case model.OverlayKindCreate:
-			if baseExists {
-				matches, err := overlayEntryMatchesBase(e, base)
-				if err != nil {
-					return fmt.Errorf("reconcile hash %s: %w", e.Path, err)
-				}
-				if matches {
-					toRemove = append(toRemove, e)
-				} else {
-					before := e
-					e.Kind = model.OverlayKindModify
-					e.SourceOID = base.ObjectOID
-					e.SourceMode = base.Mode
-					toUpdate = append(toUpdate, reconcileUpdate{before: before, after: e})
-				}
-			}
-		case model.OverlayKindMkdir:
-			if baseExists && base.Type == "dir" {
-				toRemove = append(toRemove, e)
-			}
-		case model.OverlayKindSymlink:
-			if baseExists && base.Type == "symlink" {
-				if e.SourceOID != base.ObjectOID || e.SourceMode != base.Mode {
-					matches, err := overlayEntryMatchesBase(e, base)
-					if err != nil {
-						return fmt.Errorf("reconcile hash %s: %w", e.Path, err)
-					}
-					if matches {
-						toRemove = append(toRemove, e)
-					} else {
-						before := e
-						e.SourceOID = base.ObjectOID
-						e.SourceMode = base.Mode
-						toUpdate = append(toUpdate, reconcileUpdate{before: before, after: e})
-					}
-				}
-			}
-		}
-	}
-	if len(toRemove) == 0 && len(toUpdate) == 0 {
-		return nil
-	}
+	return swap(apply)
+}
+
+func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, entries []model.OverlayEntry, plan reconcilePlan) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1032,26 +929,47 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 	// Removing an entry the new base matches, rebasing an entry, and removing
 	// a delete marker for a path the new base lacks leave the merged view as
 	// it was. Only a removed delete marker over a base path is a change for Git.
+	// Suspending the log takes the write lock first, so no write lands between
+	// reading the log and applying the result.
 	if err := suspendChangeLog(ctx, tx); err != nil {
 		return err
 	}
+	rows, err := tx.QueryContext(ctx, changesSinceQuery, seq)
+	if err != nil {
+		return err
+	}
+	changed, err := scanPaths(rows)
+	if err != nil {
+		return err
+	}
+	if len(changed) > 0 || plan.incomplete {
+		if entries, err = s.rereadChanged(ctx, tx, entries, changed); err != nil {
+			return err
+		}
+		if plan, err = r.classify(entries, true); err != nil {
+			return err
+		}
+	}
+	if len(plan.remove) == 0 && len(plan.update) == 0 {
+		return nil
+	}
 	var revealed []string
-	// Guard the mutations so a concurrent FUSE write or chmod between our read
-	// and this transaction is not lost.
+	// Guard the mutations so that a change the log does not show, such as
+	// another Store's reconcile, is not lost.
 	stmt, err := tx.PrepareContext(ctx, `DELETE FROM overlay_entries WHERE path=? AND kind=? AND source_oid=? AND source_mode=? AND mode=? AND mtime_unix_ns=? AND ctime_unix_ns=?`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
-	deleted := make([]model.OverlayEntry, 0, len(toRemove))
-	for _, e := range toRemove {
+	deleted := make([]model.OverlayEntry, 0, len(plan.remove))
+	for _, e := range plan.remove {
 		res, err := stmt.ExecContext(ctx, e.Path, e.Kind, e.SourceOID, e.SourceMode, e.Mode, e.MtimeUnixNs, e.CtimeUnixNs)
 		if err != nil {
 			return err
 		}
 		if n, err := res.RowsAffected(); err == nil && n > 0 {
 			deleted = append(deleted, e)
-			if e.Kind == model.OverlayKindDelete && revealsBase[e.Path] {
+			if e.Kind == model.OverlayKindDelete && plan.revealsBase[e.Path] {
 				revealed = append(revealed, e.Path)
 			}
 		}
@@ -1061,7 +979,7 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 		return err
 	}
 	defer updateStmt.Close()
-	for _, update := range toUpdate {
+	for _, update := range plan.update {
 		if _, err := updateStmt.ExecContext(ctx, update.after.Kind, update.after.SourceOID, update.after.SourceMode, update.after.TargetPath, update.before.Path, update.before.Kind, update.before.SourceOID, update.before.SourceMode, update.before.Mode, update.before.MtimeUnixNs, update.before.CtimeUnixNs); err != nil {
 			return err
 		}
@@ -1082,6 +1000,234 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 		}
 	}
 	return nil
+}
+
+// rereadChanged replaces the entries at each changed path and at every path
+// in [path, path+"0"), which holds the paths below it: a tree rename logs only
+// both roots and one path per directory.
+func (s *Store) rereadChanged(ctx context.Context, tx *sql.Tx, entries []model.OverlayEntry, changed []string) ([]model.OverlayEntry, error) {
+	byPath := make(map[string]model.OverlayEntry, len(entries))
+	for _, e := range entries {
+		byPath[e.Path] = e
+	}
+	comparePath := func(e model.OverlayEntry, path string) int { return strings.Compare(e.Path, path) }
+	for _, path := range changed {
+		end := path + "0"
+		lo, _ := slices.BinarySearchFunc(entries, path, comparePath)
+		hi, _ := slices.BinarySearchFunc(entries, end, comparePath)
+		for _, e := range entries[lo:hi] {
+			delete(byPath, e.Path)
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT `+overlayCols+` FROM overlay_entries WHERE path >= ? AND path < ?`, path, end)
+		if err != nil {
+			return nil, err
+		}
+		current, err := s.scanEntries(rows)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range current {
+			byPath[e.Path] = e
+		}
+	}
+	return slices.SortedFunc(maps.Values(byPath), func(a, b model.OverlayEntry) int { return strings.Compare(a.Path, b.Path) }), nil
+}
+
+type reconcileUpdate struct {
+	before model.OverlayEntry
+	after  model.OverlayEntry
+}
+
+// reconcilePlan is what a reconcile changes in the overlay.
+type reconcilePlan struct {
+	remove []model.OverlayEntry
+	update []reconcileUpdate
+	// revealsBase holds the delete markers in remove whose path the new base has.
+	revealsBase map[string]bool
+	// incomplete is set when an entry's backing file vanished before the plan
+	// hashed it, so the plan left that entry out.
+	incomplete bool
+}
+
+type reconcileBase struct {
+	node   model.BaseNode
+	exists bool
+}
+
+// reconciler classifies overlay entries against one base. It caches each base
+// lookup by path, and each hash by the entry it read, so classifying again
+// under the caller's lock looks up and hashes only what changed.
+type reconciler struct {
+	lookup  func(path string) (model.BaseNode, bool, error)
+	bases   map[string]reconcileBase
+	matches map[model.OverlayEntry]bool
+}
+
+func (r *reconciler) base(path string) (model.BaseNode, bool, error) {
+	if b, ok := r.bases[path]; ok {
+		return b.node, b.exists, nil
+	}
+	n, ok, err := r.lookup(path)
+	if err != nil {
+		return model.BaseNode{}, false, err
+	}
+	r.bases[path] = reconcileBase{node: n, exists: ok}
+	return n, ok, nil
+}
+
+// matchesBase reports whether e's content is base's. Unless final, known is
+// false when e's backing file is gone: a write removes a backing file only
+// after it changed the entry, so the apply phase classifies the new entry.
+func (r *reconciler) matchesBase(e model.OverlayEntry, base model.BaseNode, final bool) (matches, known bool, err error) {
+	if m, ok := r.matches[e]; ok {
+		return m, true, nil
+	}
+	m, err := overlayEntryMatchesBase(e, base)
+	if err != nil {
+		if !final && errors.Is(err, iofs.ErrNotExist) {
+			return false, false, nil
+		}
+		return false, false, fmt.Errorf("reconcile hash %s: %w", e.Path, err)
+	}
+	r.matches[e] = m
+	return m, true, nil
+}
+
+// classify plans the reconcile of entries, which are sorted by path.
+func (r *reconciler) classify(entries []model.OverlayEntry, final bool) (reconcilePlan, error) {
+	p := reconcilePlan{revealsBase: map[string]bool{}}
+	staleRenameSources := map[string]bool{}
+	var deletes []model.OverlayEntry
+	for _, e := range entries {
+		base, baseExists, err := r.base(e.Path)
+		if err != nil {
+			return reconcilePlan{}, err
+		}
+		switch e.Kind {
+		case model.OverlayKindModify:
+			if !baseExists {
+				before := e
+				e.Kind = model.OverlayKindCreate
+				e.SourceOID = ""
+				e.SourceMode = 0
+				p.update = append(p.update, reconcileUpdate{before: before, after: e})
+			} else if e.SourceOID != base.ObjectOID || e.SourceMode != base.Mode {
+				matches, known, err := r.matchesBase(e, base, final)
+				if err != nil {
+					return reconcilePlan{}, err
+				}
+				if !known {
+					p.incomplete = true
+				} else if matches {
+					p.remove = append(p.remove, e)
+				} else {
+					before := e
+					e.SourceOID = base.ObjectOID
+					e.SourceMode = base.Mode
+					p.update = append(p.update, reconcileUpdate{before: before, after: e})
+				}
+			}
+		case model.OverlayKindRename:
+			sourcePath := e.TargetPath
+			if sourcePath == "" {
+				sourcePath = e.Path
+			}
+			sourceBase, sourceExists, err := r.base(sourcePath)
+			if err != nil {
+				return reconcilePlan{}, err
+			}
+			if baseExists && !sourceExists {
+				matches, known, err := r.matchesBase(e, base, final)
+				if err != nil {
+					return reconcilePlan{}, err
+				}
+				if !known {
+					p.incomplete = true
+					continue
+				}
+				if matches {
+					p.remove = append(p.remove, e)
+					staleRenameSources[e.TargetPath] = true
+					continue
+				}
+			}
+			if sourceExists {
+				if e.SourceOID != sourceBase.ObjectOID || e.SourceMode != sourceBase.Mode {
+					before := e
+					e.SourceOID = sourceBase.ObjectOID
+					e.SourceMode = sourceBase.Mode
+					p.update = append(p.update, reconcileUpdate{before: before, after: e})
+				}
+			} else {
+				before := e
+				if baseExists {
+					e.Kind = model.OverlayKindModify
+					e.SourceOID = base.ObjectOID
+					e.SourceMode = base.Mode
+				} else {
+					e.Kind = model.OverlayKindCreate
+					e.SourceOID = ""
+					e.SourceMode = 0
+				}
+				e.TargetPath = ""
+				p.update = append(p.update, reconcileUpdate{before: before, after: e})
+				staleRenameSources[sourcePath] = true
+			}
+		case model.OverlayKindDelete:
+			// A delete marker depends on every rename's source.
+			deletes = append(deletes, e)
+		case model.OverlayKindCreate:
+			if baseExists {
+				matches, known, err := r.matchesBase(e, base, final)
+				if err != nil {
+					return reconcilePlan{}, err
+				}
+				if !known {
+					p.incomplete = true
+				} else if matches {
+					p.remove = append(p.remove, e)
+				} else {
+					before := e
+					e.Kind = model.OverlayKindModify
+					e.SourceOID = base.ObjectOID
+					e.SourceMode = base.Mode
+					p.update = append(p.update, reconcileUpdate{before: before, after: e})
+				}
+			}
+		case model.OverlayKindMkdir:
+			if baseExists && base.Type == "dir" {
+				p.remove = append(p.remove, e)
+			}
+		case model.OverlayKindSymlink:
+			if baseExists && base.Type == "symlink" && (e.SourceOID != base.ObjectOID || e.SourceMode != base.Mode) {
+				matches, known, err := r.matchesBase(e, base, final)
+				if err != nil {
+					return reconcilePlan{}, err
+				}
+				if !known {
+					p.incomplete = true
+				} else if matches {
+					p.remove = append(p.remove, e)
+				} else {
+					before := e
+					e.SourceOID = base.ObjectOID
+					e.SourceMode = base.Mode
+					p.update = append(p.update, reconcileUpdate{before: before, after: e})
+				}
+			}
+		}
+	}
+	for _, e := range deletes {
+		_, baseExists, err := r.base(e.Path)
+		if err != nil {
+			return reconcilePlan{}, err
+		}
+		if (e.TargetPath != "" && e.Path != e.TargetPath) || staleRenameSources[e.Path] || staleRenameSources[e.TargetPath] || !baseExists {
+			p.remove = append(p.remove, e)
+			p.revealsBase[e.Path] = baseExists
+		}
+	}
+	return p, nil
 }
 
 func overlayEntryMatchesBase(e model.OverlayEntry, base model.BaseNode) (bool, error) {
@@ -1235,6 +1381,10 @@ func (s *Store) queryEntries(ctx context.Context, query string, args ...any) ([]
 	if err != nil {
 		return nil, err
 	}
+	return s.scanEntries(rows)
+}
+
+func (s *Store) scanEntries(rows *sql.Rows) ([]model.OverlayEntry, error) {
 	defer rows.Close()
 	var out []model.OverlayEntry
 	for rows.Next() {

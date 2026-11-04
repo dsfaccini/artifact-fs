@@ -233,7 +233,7 @@ type OverlayStore interface {
 	SetMode(ctx context.Context, path string, mode uint32) error
 	SetMtime(ctx context.Context, path string, t time.Time) error
 	Reconcile(ctx context.Context, baseLookup func(path string) (BaseNode, bool)) error
-	ReconcileChecked(ctx context.Context, baseLookup func(path string) (BaseNode, bool, error)) error
+	ReconcileChecked(ctx context.Context, baseLookup func(path string) (BaseNode, bool, error), swap func(apply func() error) error) error
 	DirtyCount(ctx context.Context) (int64, error)
 	ListByPrefix(ctx context.Context, prefix string) ([]OverlayEntry, error)
 }

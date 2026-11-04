@@ -47,10 +47,28 @@ func (r *Resolver) Generation() int64       { return r.generation.Load() }
 func (r *Resolver) SetCommitTime(ts int64)  { r.commitTime.Store(ts) }
 func (r *Resolver) CommitTime() int64       { return r.commitTime.Load() }
 
-func (r *Resolver) Transition(fn func() error) error {
-	r.transition.Lock()
-	defer r.transition.Unlock()
-	return fn()
+// SwitchGeneration reconciles the overlay with generation gen, then makes gen
+// and its commit time commitTime what readers resolve against.
+//
+// A reader never sees the overlay disagree with the generation it resolves
+// against: a read under the transition read lock sees the old overlay with the
+// old generation, or the reconciled overlay with gen. The overlay looks up and
+// hashes its entries before SwitchGeneration takes the transition write lock,
+// which covers only applying the result and the switch.
+func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime int64) error {
+	baseLookup := func(path string) (model.BaseNode, bool, error) {
+		return r.Snapshot.LookupNode(ctx, gen, path)
+	}
+	return r.Overlay.ReconcileChecked(ctx, baseLookup, func(apply func() error) error {
+		r.transition.Lock()
+		defer r.transition.Unlock()
+		if err := apply(); err != nil {
+			return err
+		}
+		r.SetCommitTime(commitTime)
+		r.SetGeneration(gen)
+		return nil
+	})
 }
 
 type ResolvedNode struct {

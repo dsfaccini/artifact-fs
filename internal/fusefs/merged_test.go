@@ -178,8 +178,11 @@ func (f *fakeOverlay) SetMode(_ context.Context, path string, mode uint32) error
 func (f *fakeOverlay) Reconcile(_ context.Context, _ func(string) (model.BaseNode, bool)) error {
 	return nil
 }
-func (f *fakeOverlay) ReconcileChecked(_ context.Context, _ func(string) (model.BaseNode, bool, error)) error {
-	return nil
+func (f *fakeOverlay) ReconcileChecked(_ context.Context, _ func(string) (model.BaseNode, bool, error), swap func(apply func() error) error) error {
+	if swap == nil {
+		return nil
+	}
+	return swap(func() error { return nil })
 }
 func (f *fakeOverlay) DirtyCount(_ context.Context) (int64, error) { return 0, nil }
 

@@ -660,23 +660,13 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	if err := s.bootstrapCleanStatusIndex(ctx, cfg, headOID, gen, rt.snapshot, rt.overlay); err != nil {
 		return err
 	}
-	baseLookup := func(path string) (model.BaseNode, bool, error) {
-		return rt.snapshot.LookupNode(ctx, gen, path)
-	}
 	commitTime := int64(0)
 	if ts, err := s.git.CommitTimestamp(ctx, cfg, headOID); err == nil {
 		commitTime = ts
 	} else {
 		s.logger.Warn("commit timestamp unavailable", "repo", cfg.Name, "error", err)
 	}
-	if err := rt.resolver.Transition(func() error {
-		if err := rt.overlay.ReconcileChecked(ctx, baseLookup); err != nil {
-			return err
-		}
-		rt.resolver.SetCommitTime(commitTime)
-		rt.resolver.SetGeneration(gen)
-		return nil
-	}); err != nil {
+	if err := rt.resolver.SwitchGeneration(ctx, gen, commitTime); err != nil {
 		return err
 	}
 	if !s.prepareConfigStillCurrent(ctx, cfg) {
