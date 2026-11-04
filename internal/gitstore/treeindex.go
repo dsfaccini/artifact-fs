@@ -65,12 +65,16 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 func streamTreeRecords(ctx context.Context, gitDir string, headOID string, fn func(string)) error {
 	cmd := exec.CommandContext(ctx, "git", "ls-tree", "-r", "-t", "-z", headOID)
 	configureCancelableCommand(cmd)
-	cmd.Env = append(os.Environ(), "GIT_DIR="+gitDir)
+	// A treeless clone fetches missing trees here.
+	configureCommandSession(cmd)
+	cmd.Env = append(append(os.Environ(), "GIT_DIR="+gitDir), lazyFetchEnv()...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
 	}
-	errBuf := &bytes.Buffer{}
+	// A lazy fetch's server shapes this stderr, and redaction's cost grows
+	// faster than its length.
+	errBuf := &boundedGitError{limit: maxGitErrorBytes}
 	cmd.Stderr = errBuf
 	if err := cmd.Start(); err != nil {
 		return err

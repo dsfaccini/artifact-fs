@@ -1098,7 +1098,11 @@ func TestE2EVerifiedSource(t *testing.T) {
 	run(t, "", "git", "clone", remoteURL, updateWork)
 	run(t, updateWork, "git", "checkout", "main")
 
-	root := t.TempDir()
+	// daemon.New resolves the state root's symlinks, such as macOS's /var.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	mountDir := newE2EMountDir(t)
 	mountPath := filepath.Join(mountDir, repoName)
 	cfg := model.RepoConfig{

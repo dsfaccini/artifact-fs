@@ -3,8 +3,10 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -143,6 +145,16 @@ func TestAddRepoAsyncCLIFlagValidation(t *testing.T) {
 			want: "async repositories must use ambient credentials",
 		},
 		{
+			name: "async_rejects_password_url_parse_reads_as_host_and_path",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "ssh://user:1234/secret@host/repo"},
+			want: "async repositories must use ambient credentials",
+		},
+		{
+			name: "async_rejects_password_left_after_ssh_username",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "ssh://git@host.example.com/a://u2:pw2zq@h2zz/r"},
+			want: "async repositories must use ambient credentials",
+		},
+		{
 			name: "required_commit_requires_explicit_ref",
 			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--require-commit", "0123456789012345678901234567890123456789"},
 			want: "--require-commit requires an explicit --ref",
@@ -173,6 +185,47 @@ func TestAddRepoAsyncCLIFlagValidation(t *testing.T) {
 			}
 			if !strings.Contains(stderr.String(), tt.want) {
 				t.Fatalf("stderr = %q, want substring %q", stderr.String(), tt.want)
+			}
+		})
+	}
+}
+
+func TestAddRepoCLIRejectsOptionRemoteBeforeGit(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		extra []string
+	}{{"sync", nil}, {"async", []string{"--async"}}} {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			bin := filepath.Join(tmp, "bin")
+			if err := os.Mkdir(bin, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(tmp, "git-invoked")
+			if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\n: > \"$GIT_INVOKED_MARKER\"\nexit 1\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("GIT_INVOKED_MARKER", marker)
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("ARTIFACT_FS_ROOT", filepath.Join(tmp, "state"))
+			var stdout, stderr bytes.Buffer
+
+			args := append([]string{"add-repo", "--name", "repo", "--remote", "--upload-pack=a@b:c", "--ref", "refs/tags/v1"}, tt.extra...)
+			if code := Run(context.Background(), args, &stdout, &stderr); code == 0 {
+				t.Fatalf("add-repo unexpectedly succeeded, stdout=%q", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), "remote URL must not start with '-'") {
+				t.Fatalf("stderr = %q, want leading-dash rejection", stderr.String())
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("git was invoked before rejecting the remote")
+			}
+			stdout.Reset()
+			if code := Run(context.Background(), []string{"list-repos"}, &stdout, &stderr); code != 0 {
+				t.Fatalf("list-repos exit = %d, stderr=%q", code, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("list-repos = %q, want no registered repo", stdout.String())
 			}
 		})
 	}
