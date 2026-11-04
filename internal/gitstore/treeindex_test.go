@@ -143,6 +143,20 @@ done
 	}
 }
 
+func TestBuildTreeIndexBoundsLazyFetchStderr(t *testing.T) {
+	// A lazy tree fetch's server shapes ls-tree's stderr, which redaction reads.
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nprintf 'fatal: %0100000d\\n' 0 >&2\nexit 128\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err := New(nil).BuildTreeIndex(context.Background(), model.RepoConfig{ID: "repo", GitDir: t.TempDir()}, strings.Repeat("a", 40))
+	if err == nil || !strings.HasSuffix(err.Error(), gitErrorTruncatedLabel) || len(err.Error()) > maxGitErrorBytes+len("\n"+gitErrorTruncatedLabel) {
+		t.Fatalf("BuildTreeIndex error has %d bytes, want at most %d and the truncation label", len(fmt.Sprint(err)), maxGitErrorBytes)
+	}
+}
+
 func TestBuildTreeIndexPreservesGitlinkAsDirectory(t *testing.T) {
 	t.Parallel()
 	repo := filepath.Join(t.TempDir(), "repo")

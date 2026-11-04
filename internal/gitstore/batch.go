@@ -359,7 +359,9 @@ func newBatchCatFile(gitDir string, logger *slog.Logger) (*batchCatFile, error) 
 // gitStderrLogger logs each stderr line of a long-lived git process through
 // auth.RedactLogString, like the retry logs of every other Git command. A lazy
 // fetch can print the promisor remote, which may embed credentials or name a
-// private repository; the log keeps Git's error and drops the remote.
+// private repository; the log keeps Git's error and drops the remote. It
+// buffers no more of a line than it logs: the server shapes this stderr, and
+// redaction's cost grows faster than the line's length.
 type gitStderrLogger struct {
 	logger    *slog.Logger
 	gitDir    string
@@ -371,9 +373,7 @@ func (w *gitStderrLogger) Write(p []byte) (int, error) {
 	n := len(p)
 	for len(p) > 0 {
 		chunk, rest, found := bytes.Cut(p, []byte{'\n'})
-		// Buffer more than flush logs, so a credential that straddles the
-		// logged bound is redacted before the line is cut.
-		if room := 4*maxGitErrorBytes - len(w.line); len(chunk) > room {
+		if room := maxGitErrorBytes - len(w.line); len(chunk) > room {
 			chunk = chunk[:room]
 			w.truncated = true
 		}

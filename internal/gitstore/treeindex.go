@@ -72,7 +72,9 @@ func streamTreeRecords(ctx context.Context, gitDir string, headOID string, fn fu
 	if err != nil {
 		return err
 	}
-	errBuf := &bytes.Buffer{}
+	// A lazy fetch's server shapes this stderr, and redaction's cost grows
+	// faster than its length.
+	errBuf := &boundedGitError{limit: maxGitErrorBytes}
 	cmd.Stderr = errBuf
 	if err := cmd.Start(); err != nil {
 		return err

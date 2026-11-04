@@ -219,8 +219,9 @@ func TestAdoptGitDirWarnsAboutCredentialedOriginOncePerPrepare(t *testing.T) {
 	runCmd(t, "git", "-C", source, "add", "README.md")
 	runCmd(t, "git", "-C", source, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
 	// Remote detection starts at the "git//" inside the password, so a redacted
-	// origin field would keep "alice:abc".
-	const origin = "gcrypt::rsync://alice:abcgit//def@example.invalid/repository.git"
+	// origin field would keep "alice:pwq". The password is not hex, so a logged
+	// object ID cannot hold it.
+	const origin = "gcrypt::rsync://alice:pwqgit//xyz@example.invalid/repository.git"
 	runCmd(t, "git", "-C", source, "remote", "add", "origin", origin)
 	// The README's adoption steps leave the mountpoint empty.
 	runCmd(t, "git", "-C", source, "worktree", "add", "--no-checkout", "-b", "topic", worktree)
@@ -265,7 +266,7 @@ func TestAdoptGitDirWarnsAboutCredentialedOriginOncePerPrepare(t *testing.T) {
 	if got := warnings(); got != 2 {
 		t.Fatalf("add-repo and one mount logged %d credentialed-origin warnings, want 2: %s", got, logs.String())
 	}
-	if strings.Contains(logs.String(), "abc") || strings.Contains(logs.String(), `"origin":`) {
+	if strings.Contains(logs.String(), "pwq") || strings.Contains(logs.String(), `"origin":`) {
 		t.Fatalf("warning logged the origin: %s", logs.String())
 	}
 	if strings.Contains(logs.String(), "example.invalid/repository.git") {

@@ -693,6 +693,29 @@ func TestRedactionKeepsTrailingRunesWhole(t *testing.T) {
 	}
 }
 
+func TestRedactionHandlesCaseFoldingTextBeforeRemote(t *testing.T) {
+	// "Ⱥ" lowercases from 2 bytes to 3, so an index into a lowercased copy
+	// points past the input: the first line's in remoteStartIndex, the
+	// second's in authorityStartInCore.
+	for _, line := range []string{"denied " + strings.Repeat("Ⱥ", 15) + "https://u:pw@h here", "denied git:ȺȺȺȺ://x,y here"} {
+		if got := RedactString(line); strings.Contains(got, ":pw@") {
+			t.Errorf("RedactString(%q) = %q keeps the password", line, got)
+		}
+		if got := RedactLogString(line); !strings.Contains(got, "REDACTED_REMOTE") {
+			t.Errorf("RedactLogString(%q) = %q keeps the remote", line, got)
+		}
+	}
+}
+
+func TestRedactLogStringDropsLocationBeforeRedactedUserinfo(t *testing.T) {
+	// RedactString replaces the userinfo before "@", so only the token as it
+	// came in shows that the location before it belongs to the remote.
+	const line = "fetch private.example.com/team/repo?u:pw@,ssh://private.example.com/team/repo failed"
+	if got := RedactLogString(line); strings.Contains(got, "private.example.com") {
+		t.Errorf("RedactLogString(%q) = %q keeps the location", line, got)
+	}
+}
+
 func TestRawUserinfoHasPassword(t *testing.T) {
 	for _, tt := range []struct {
 		raw  string

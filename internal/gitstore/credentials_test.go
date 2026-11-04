@@ -737,13 +737,37 @@ func TestNonInteractiveGitEnvPreservesEscapedDollar(t *testing.T) {
 
 func TestCloneBloblessAcceptsAtSignInPathAfterHostAndPort(t *testing.T) {
 	commit, _ := serveSSHFromLocalRepo(t)
-	for _, remote := range []string{"ssh://host.example.com:22/org/repo@v1.git", "ssh://git@host.example.com:22/org/repo@v1.git"} {
+	for _, remote := range []string{
+		"ssh://host.example.com:22/org/repo@v1.git",
+		"ssh://git@host.example.com:22/org/repo@v1.git",
+		"ssh://git@bücher.example:22/org/repo@v1.git",
+		"ssh://git@[fe80::1%25en0]/org/repo@v1.git",
+		"ssh://[fe80::1%25en0]:22/org/repo@v1.git",
+	} {
 		gitDir := filepath.Join(t.TempDir(), "repo.git")
 		if err := New(nil).CloneBlobless(context.Background(), model.RepoConfig{Name: "repo", GitDir: gitDir, RemoteURL: remote, Branch: "main"}); err != nil {
 			t.Fatalf("CloneBlobless(%q): %v", remote, err)
 		}
 		if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", "HEAD")); got != commit {
 			t.Fatalf("clone of %q HEAD = %s, want %s", remote, got, commit)
+		}
+	}
+}
+
+func TestCredentialEnvAcceptsAtSignInPathAfterIDNOrZonedHost(t *testing.T) {
+	t.Parallel()
+	for _, remote := range []string{
+		"https://tok@bücher.example:8443/org/repo@v1.git",
+		"https://tok@[fe80::1%25en0]:8443/org/repo@v1.git",
+		"https://[fe80::1%25en0]/org/repo@v1.git",
+		"git://[fe80::1%25en0]/org/repo@v1.git",
+	} {
+		safeURL, _, err := credentialEnv(remote)
+		if err != nil {
+			t.Errorf("credentialEnv(%q): %v", remote, err)
+		}
+		if strings.Contains(safeURL, "tok") {
+			t.Errorf("credentialEnv(%q) passes %q to git", remote, safeURL)
 		}
 	}
 }
@@ -775,6 +799,8 @@ func TestCredentialChecksAgreeOnMisparsedCredentials(t *testing.T) {
 		{"ssh://git@host.example.com/a://u2:pw2zq@h2zz/r", "pw2zq"},
 		{"https://user:tok@localhost/a://u2:pw2zq@h2zz/r", "pw2zq"},
 		{"ssh://git@gitserver:2222/org/repo@v1.git", "gitserver:2222/org/repo"},
+		{"https://user:tok@bücher.example/a://u2:pw2zq@h2zz/r", "pw2zq"},
+		{"ssh://git@[fe80::1%25en0]/a://u2:pw2zq@h2zz/r", "pw2zq"},
 	} {
 		if _, _, err := credentialEnv(tt.remote); err == nil {
 			t.Errorf("credentialEnv accepted %q", tt.remote)

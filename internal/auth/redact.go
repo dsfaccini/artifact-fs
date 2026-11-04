@@ -1,7 +1,7 @@
 package auth
 
 import (
-	"net"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"sort"
@@ -276,6 +276,10 @@ func isRealHostPort(authority string) bool {
 			return false
 		}
 		host, port = bracketed, strings.TrimPrefix(after, ":")
+		// An IPv6 zone is percent-escaped, as in "[fe80::1%25en0]".
+		if literal, err := url.PathUnescape(host); err == nil && isIPAddress(literal) {
+			return strings.Trim(port, "0123456789") == ""
+		}
 	} else if before, after, ok := strings.Cut(authority, ":"); ok {
 		host, port = before, after
 	}
@@ -333,7 +337,14 @@ func isMalformedHTTPUserinfo(raw string, u *url.URL) bool {
 }
 
 func isRealHost(host string) bool {
-	return strings.Contains(host, ".") || host == "localhost" || net.ParseIP(host) != nil
+	return strings.Contains(host, ".") || host == "localhost" || isIPAddress(host)
+}
+
+// isIPAddress reports an IP address, including an IPv6 one with a zone, as in
+// "fe80::1%en0", which net.ParseIP rejects.
+func isIPAddress(host string) bool {
+	_, err := netip.ParseAddr(host)
+	return err == nil
 }
 
 func validParsedHostPort(u *url.URL) bool {
@@ -474,11 +485,23 @@ func isSCPStyleRemote(raw string) bool {
 // they agree.
 func HasMisparsedCredentials(raw string, u *url.URL) bool {
 	if u.User != nil {
-		rest := *u
-		rest.User, rest.RawQuery, rest.ForceQuery, rest.Fragment, rest.RawFragment = nil, "", false, "", ""
-		return HasInlineCredentials(rest.String())
+		return HasInlineCredentials(withoutUserinfo(raw))
 	}
 	return strings.Contains(raw, "@") && RawUserinfoHasPassword(raw)
+}
+
+// withoutUserinfo returns raw, which url.Parse read with userinfo, without
+// that userinfo, query and fragment. It keeps raw's own text, because
+// url.URL.String percent-escapes a non-ASCII host, which then no longer reads
+// as a real host.
+func withoutUserinfo(raw string) string {
+	if end := strings.IndexAny(raw, "?#"); end >= 0 {
+		raw = raw[:end]
+	}
+	// The authority follows the first "//" and ends at the next "/".
+	authorityStart := strings.Index(raw, "//") + len("//")
+	authority, _, _ := strings.Cut(raw[authorityStart:], "/")
+	return raw[:authorityStart] + raw[authorityStart+strings.LastIndex(authority, "@")+1:]
 }
 
 // RawUserinfoHasPassword reports whether a remote that url.Parse misreads or
@@ -793,8 +816,14 @@ func authorityStartInCore(core string, remoteStart int) int {
 	return -1
 }
 
+// markerPrefix lowercases only as much of s as the longest remote marker, so a
+// check per comma-list segment stays linear in the segment.
+func markerPrefix(s string) string {
+	return lowerASCII(s[:min(len(s), len("https://"))])
+}
+
 func hasSeparateRemoteMarker(s string) bool {
-	lower := lowerASCII(s)
+	lower := markerPrefix(s)
 	for _, marker := range []string{"https://", "http://", "ssh://", "git://"} {
 		if strings.HasPrefix(lower, marker) {
 			return true
@@ -811,7 +840,7 @@ func hasRemoteMarker(s string) bool {
 	if strings.Contains(s, "://") {
 		return true
 	}
-	lower := lowerASCII(s)
+	lower := markerPrefix(s)
 	for _, marker := range []string{"https:/", "http:/", "ssh:/", "git:/", "https//", "http//", "ssh//", "git//", "https:", "http:", "ssh:", "git:"} {
 		if strings.HasPrefix(lower, marker) {
 			return true

@@ -321,23 +321,23 @@ func TestBlobToCacheRedactsBatchStderr(t *testing.T) {
 	}
 }
 
-func TestBlobToCacheRedactsBatchStderrBeforeBoundingLine(t *testing.T) {
-	// The logged bound falls inside the password. Redaction drops a whole
-	// token that holds "://", so the remote is scheme-less.
-	prefix := strings.Repeat("x", maxGitErrorBytes-len(" alice:s3cr"))
-	logs := batchStderrLogs(t, "echo '"+prefix+" alice:s3cretpassword@example.com/repo.git' >&2")
+func TestBlobToCacheRedactsNoMoreOfBatchStderrLineThanItLogs(t *testing.T) {
+	// The server shapes this stderr, and redaction's cost grows faster than a
+	// line's length. Redacting the token shrinks the line far below the logged
+	// bound, so text after it reaches the log only when redaction saw it.
+	logs := batchStderrLogs(t, `printf 'fatal: token=%030000d unbuffered-tail\n' 0 >&2`)
 	if !strings.Contains(logs, `"truncated":true`) {
-		t.Fatalf("logs = %.200s, want a truncated line", logs)
+		t.Fatalf("logs = %.300s, want a truncated line", logs)
 	}
-	if strings.Contains(logs, "s3cr") {
-		t.Fatalf("logs leaked part of the password: %s", logs[len(logs)-300:])
+	if strings.Contains(logs, "unbuffered-tail") {
+		t.Fatalf("redaction saw text past the logged bound: %.300s", logs)
 	}
 }
 
 func TestBlobToCacheDropsPartialTokenAtBatchStderrBufferBound(t *testing.T) {
 	// The buffer bound falls inside the password, and redacting the token
 	// before it shrinks the line below the logged bound.
-	head := "token=" + strings.Repeat("a", 4*maxGitErrorBytes-len("token=")-len(" alice:s3cr")) + " alice:s3cr"
+	head := "token=" + strings.Repeat("a", maxGitErrorBytes-len("token=")-len(" alice:s3cr")) + " alice:s3cr"
 	logs := batchStderrLogs(t, "printf '%s' '"+head+"' >&2; echo 'etpassword@example.com/repo.git' >&2")
 	if !strings.Contains(logs, `"truncated":true`) {
 		t.Fatalf("logs = %.300s, want a truncated line", logs)
@@ -362,7 +362,7 @@ func TestBlobToCacheLogsBatchStderrWithoutTrailingNewline(t *testing.T) {
 }
 
 func TestBlobToCacheBoundsBatchStderrLine(t *testing.T) {
-	logs := batchStderrLogs(t, `printf '%040000d\n' 0 >&2`)
+	logs := batchStderrLogs(t, `awk 'BEGIN { for (i = 0; i < 10000; i++) printf "word "; print "" }' >&2`)
 	decoder := json.NewDecoder(strings.NewReader(logs))
 	for decoder.More() {
 		var entry struct {
@@ -372,8 +372,8 @@ func TestBlobToCacheBoundsBatchStderrLine(t *testing.T) {
 		if err := decoder.Decode(&entry); err != nil {
 			t.Fatal(err)
 		}
-		if len(entry.Line) != maxGitErrorBytes || !entry.Truncated {
-			t.Fatalf("logged %d bytes, truncated=%v; want %d bytes, truncated", len(entry.Line), entry.Truncated, maxGitErrorBytes)
+		if entry.Line == "" || len(entry.Line) > maxGitErrorBytes || !entry.Truncated {
+			t.Fatalf("logged %d bytes, truncated=%v; want at most %d bytes, truncated", len(entry.Line), entry.Truncated, maxGitErrorBytes)
 		}
 	}
 	if logs == "" {
