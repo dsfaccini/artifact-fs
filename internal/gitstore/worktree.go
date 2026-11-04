@@ -50,6 +50,23 @@ func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfi
 	return s.ReadTreeHEAD(ctx, repo)
 }
 
+// WarnAdoptedOriginCredentials logs a warning when an adopted worktree's origin
+// embeds credentials. The warning leaves the origin out: redaction is
+// heuristic, and this origin is known to hold credentials.
+//
+// add-repo never persists inline credentials: a sync clone uses them once
+// and stores the URL without them, and async and prepared repos reject them,
+// because the daemon would store the URL and fetch with it on its own
+// schedule. Adoption only warns. It stores no URL and never clones, fetches or
+// refreshes. Origin stays the user's existing Git config, which only Git's
+// lazy fetches of missing blobs and trees use, as any Git command in the
+// worktree would. ArtifactFS redacts all Git output it logs.
+func (s *Store) WarnAdoptedOriginCredentials(ctx context.Context, repo model.RepoConfig) {
+	if remote, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin"); err == nil && remoteHasInlineCredentials(remote) {
+		s.logger.WarnContext(ctx, "adopted worktree origin embeds credentials; Git's lazy fetches use them", "repo", repo.Name)
+	}
+}
+
 // ConfigureAdoptedWorktree preserves Git's refs, remotes, tracking and index.
 // Filesystem settings belong to the adopted worktree, never its native siblings.
 func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoConfig) error {

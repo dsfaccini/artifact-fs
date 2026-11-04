@@ -9,11 +9,23 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/auth"
 )
 
+// ValidateRemoteNotOption refuses a remote that git would parse as an option,
+// such as --upload-pack=<command>.
+func ValidateRemoteNotOption(rawURL string) error {
+	if strings.HasPrefix(rawURL, "-") {
+		return errors.New("remote URL must not start with '-'")
+	}
+	return nil
+}
+
 // credentialEnv returns a sanitized URL (safe for ps) and env vars that
 // configure a one-shot git credential helper to supply the real credentials.
 func credentialEnv(rawURL string) (safeURL string, env []string, err error) {
 	if rawURL == "" {
 		return "", nil, nil
+	}
+	if err := ValidateRemoteNotOption(rawURL); err != nil {
+		return "", nil, err
 	}
 	if strings.ContainsAny(rawURL, "?#") {
 		return "", nil, errors.New("remote URL must not include query or fragment")
@@ -23,7 +35,7 @@ func credentialEnv(rawURL string) (safeURL string, env []string, err error) {
 		if remoteHasInlineCredentials(rawURL) {
 			return "", nil, errors.New("malformed remote URL")
 		}
-		if rawUserinfoCandidateHasPassword(rawURL) {
+		if auth.RawUserinfoHasPassword(rawURL) {
 			return "", nil, errors.New("malformed remote URL")
 		}
 		if strings.Contains(rawURL, "://") {
@@ -39,6 +51,9 @@ func credentialEnv(rawURL string) (safeURL string, env []string, err error) {
 	}
 	if u.User == nil {
 		return rawURL, nil, nil
+	}
+	if auth.HasMisparsedCredentials(rawURL, u) {
+		return "", nil, errors.New("malformed remote URL")
 	}
 	if !isHTTPRemote(rawURL, u.Scheme) {
 		if strings.ToLower(u.Scheme) != "ssh" {
@@ -112,7 +127,7 @@ func remoteHasInlineCredentials(rawURL string) bool {
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return auth.HasInlineCredentials(rawURL) || rawUserinfoCandidateHasPassword(rawURL)
+		return auth.HasInlineCredentials(rawURL) || auth.RawUserinfoHasPassword(rawURL)
 	}
 	if u.User != nil {
 		_, hasPassword := u.User.Password()
@@ -131,44 +146,7 @@ func malformedUserinfoInRemote(rawURL string, u *url.URL) bool {
 	if isHTTPRemote(rawURL, u.Scheme) && strings.Contains(u.Hostname(), ".") {
 		return false
 	}
-	return rawUserinfoCandidateHasPassword(rawURL)
-}
-
-func rawUserinfoCandidateHasPassword(raw string) bool {
-	if isSCPStyleRemote(raw) {
-		return false
-	}
-	if schemeLessUserinfoHasPassword(raw) {
-		return true
-	}
-	prefix := raw
-	start := -1
-	if i := strings.LastIndex(prefix, "://"); i >= 0 {
-		start = i + len("://")
-	} else if i := strings.Index(prefix, ":/"); i >= 0 {
-		start = i + len(":/")
-	} else if i := strings.Index(prefix, "//"); i >= 0 {
-		start = i + len("//")
-	} else if i := strings.Index(prefix, ":"); i >= 0 {
-		start = i + len(":")
-	}
-	if start < 0 || start >= len(raw) {
-		return false
-	}
-	endChars := "?#"
-	if strings.Contains(raw, "://") {
-		endChars = "/?#"
-	}
-	end := len(raw)
-	if relEnd := strings.IndexAny(raw[start:], endChars); relEnd >= 0 {
-		end = start + relEnd
-	}
-	at := strings.LastIndex(raw[start:end], "@")
-	if at < 0 {
-		return false
-	}
-	at += start
-	return strings.Contains(raw[start:at], ":")
+	return auth.HasMisparsedCredentials(rawURL, u)
 }
 
 func schemeLessUserinfoHasPassword(raw string) bool {
@@ -205,8 +183,21 @@ func isSCPStyleRemote(raw string) bool {
 	return at > 0 && colon > at
 }
 
+// nonInteractiveGitEnv keeps Git and SSH from prompting. An empty SSH_ASKPASS
+// stops Git from falling back to a desktop askpass program; one the user set
+// through GIT_ASKPASS or core.askPass still runs.
 func nonInteractiveGitEnv() []string {
-	return []string{"GIT_TERMINAL_PROMPT=0", "GIT_SSH_COMMAND=" + sshBatchModeCommand(os.Getenv("GIT_SSH_COMMAND"))}
+	return []string{"GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS=", "GIT_SSH_COMMAND=" + sshBatchModeCommand(os.Getenv("GIT_SSH_COMMAND"))}
+}
+
+// lazyFetchEnv keeps a lazy fetch, which reading a missing object starts, from
+// prompting. Run the command with configureCommandSession too. Unlike
+// nonInteractiveGitEnv, it leaves GIT_SSH_COMMAND unset, because that would
+// override the repo's core.sshCommand, which an adopted worktree keeps.
+// Without a controlling terminal SSH cannot prompt, and SSH_ASKPASS_REQUIRE
+// keeps it from opening an askpass dialog instead.
+func lazyFetchEnv() []string {
+	return []string{"GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS=", "SSH_ASKPASS_REQUIRE=never"}
 }
 
 func sshBatchModeCommand(existing string) string {
