@@ -10,6 +10,41 @@ import (
 	"time"
 )
 
+// PartialCloneRemote commits files on branch main of a bare repository that
+// serves partial clones, and returns its URL. A blobless clone of it holds no
+// blobs, so every read of one fetches from it.
+func PartialCloneRemote(t testing.TB, files map[string]string) string {
+	t.Helper()
+	tmp := t.TempDir()
+	work := filepath.Join(tmp, "work")
+	bare := filepath.Join(tmp, "remote.git")
+	run(t, "", "init", "-q", "-b", "main", work)
+	for name, content := range files {
+		path := filepath.Join(work, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run(t, work, "add", ".")
+	run(t, work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "files")
+	run(t, "", "init", "-q", "--bare", "-b", "main", bare)
+	run(t, bare, "config", "uploadpack.allowFilter", "true")
+	run(t, work, "push", "-q", bare, "main")
+	return "file://" + bare
+}
+
+func run(t testing.TB, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
 // IsolateConfig makes git, in this process and every process it starts, read
 // neither the user's global config nor the system config, so tests see git's
 // defaults on every machine. Call it from TestMain.

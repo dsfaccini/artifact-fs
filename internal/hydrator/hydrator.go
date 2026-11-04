@@ -16,6 +16,7 @@ import (
 
 type BlobFetcher interface {
 	BlobToCache(ctx context.Context, repo model.RepoConfig, objectOID string, dstPath string) (size int64, err error)
+	FetchMissingBlobs(ctx context.Context, repo model.RepoConfig, objectOIDs []string) error
 	ReadBlob(ctx context.Context, repo model.RepoConfig, objectOID string, maxBytes int64) ([]byte, error)
 	VerifyBlob(ctx context.Context, repo model.RepoConfig, objectOID string, cachePath string) (ok bool, err error)
 }
@@ -37,10 +38,17 @@ type Service struct {
 	background sync.WaitGroup
 	stopCh     chan struct{}
 	workReady  chan struct{} // signaled when new work is enqueued
-	onHydrated OnHydratedFunc
-	verified   map[string]os.FileInfo
-	active     map[string]struct{}
+	// reservedReady wakes the reserved worker, which takes only reads and
+	// copies of blobs that are already local.
+	reservedReady chan struct{}
+	onHydrated    OnHydratedFunc
+	verified      map[string]os.FileInfo
+	active        map[string]struct{}
 }
+
+// maxFetchBatch caps the blobs one fetch requests. It matches the fusefs
+// per-directory prefetch cap, so one listing's prefetch is one fetch.
+const maxFetchBatch = 256
 
 var ErrStopped = errors.New("hydrator stopped")
 
@@ -63,8 +71,10 @@ func New(fetcher BlobFetcher) *Service {
 		verifying: newInflight[verifyResult](),
 		stopCh:    make(chan struct{}),
 		workReady: make(chan struct{}, 1),
-		verified:  map[string]os.FileInfo{},
-		active:    map[string]struct{}{},
+
+		reservedReady: make(chan struct{}, 1),
+		verified:      map[string]os.FileInfo{},
+		active:        map[string]struct{}{},
 	}
 }
 
@@ -75,11 +85,16 @@ func (s *Service) SetOnHydrated(fn OnHydratedFunc) {
 	s.mu.Unlock()
 }
 
-// signalWork performs a non-blocking send on workReady to wake a worker.
+// signalWork performs a non-blocking send on workReady and reservedReady to
+// wake a worker of each kind.
 func (s *Service) signalWork() {
 	select {
 	case s.workReady <- struct{}{}:
 	default: // already signaled, workers will drain the queue
+	}
+	select {
+	case s.reservedReady <- struct{}{}:
+	default:
 	}
 }
 
@@ -92,10 +107,13 @@ func (s *Service) Start(workers int, repo model.RepoConfig) {
 	s.started = true
 	s.background.Add(workers)
 	s.mu.Unlock()
-	for range workers {
+	for i := range workers {
+		// With more than one worker, one is reserved so a read never waits
+		// for a prefetch download. A single worker has to take everything.
+		reserved := workers > 1 && i == 0
 		go func() {
 			defer s.background.Done()
-			s.worker(repo)
+			s.worker(repo, reserved)
 		}()
 	}
 }
@@ -176,7 +194,10 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, nod
 		return "", 0, ErrStopped
 	}
 	s.mu.Unlock()
-	if ch, ok := s.joinInflight(key); ok {
+	if ch, raised, ok := s.joinInflight(key); ok {
+		if raised {
+			s.signalWork()
+		}
 		return s.awaitHydration(ctx, key, ch)
 	}
 	if size, ok, err := s.validateCachedBlob(ctx, repo, cachePath, node); err != nil {
@@ -192,7 +213,11 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, nod
 	}
 	if _, ok := s.active[key]; ok || len(s.wait[key]) > 0 {
 		s.wait.add(key, ch)
+		raised := s.raiseForReadLocked(key)
 		s.mu.Unlock()
+		if raised {
+			s.signalWork()
+		}
 		return s.awaitHydration(ctx, key, ch)
 	}
 	first := s.wait.add(key, ch)
@@ -206,15 +231,31 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, nod
 	return s.awaitHydration(ctx, key, ch)
 }
 
-func (s *Service) joinInflight(key string) (chan result, bool) {
+// joinInflight adds a waiter to key's hydration when one is active or queued.
+// raised says it moved key's queued task ahead of speculative work, so the
+// caller must wake the reserved worker.
+func (s *Service) joinInflight(key string) (ch chan result, raised bool, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.active[key]; !ok && len(s.wait[key]) == 0 {
-		return nil, false
+		return nil, false, false
 	}
-	ch := make(chan result, 1)
+	ch = make(chan result, 1)
 	s.wait.add(key, ch)
-	return ch, true
+	return ch, s.raiseForReadLocked(key), true
+}
+
+// raiseForReadLocked moves key's queued task ahead of speculative work, because
+// a read now waits on it, and reports whether it did. A fetched task stays in
+// queued for this, though it is active, so Enqueue still ignores it.
+func (s *Service) raiseForReadLocked(key string) bool {
+	item, ok := s.queued[key]
+	if !ok || isExplicitRead(item.task) {
+		return false
+	}
+	item.task.Priority = PriorityExplicitRead
+	heap.Fix(&s.pq, item.index)
+	return true
 }
 
 func (s *Service) awaitHydration(ctx context.Context, key string, ch chan result) (cachePath string, size int64, err error) {
@@ -493,17 +534,21 @@ func (s *Service) QueueDepth(repoID model.RepoID) int {
 	return c
 }
 
-func (s *Service) worker(repo model.RepoConfig) {
+func (s *Service) worker(repo model.RepoConfig, reserved bool) {
+	ready := s.workReady
+	if reserved {
+		ready = s.reservedReady
+	}
 	for {
 		select {
 		case <-s.stopCh:
 			return
-		case <-s.workReady:
+		case <-ready:
 			// Drain the queue: process all available items before waiting
 			// for the next signal. Re-signal if items remain so other
 			// workers can help.
 			for {
-				if !s.step(repo) {
+				if !s.step(repo, reserved) {
 					break
 				}
 				s.signalWork()
@@ -512,63 +557,184 @@ func (s *Service) worker(repo model.RepoConfig) {
 	}
 }
 
-// step pops and processes one item from the queue. Returns true if an item
-// was processed, false if the queue was empty.
-func (s *Service) step(repo model.RepoConfig) bool {
+// step processes the top of the queue: it hydrates a fetched task, or pops a
+// batch and fetches its missing blobs together. Returns true if it popped an
+// item, false if the queue was empty or, for the reserved worker, held only
+// prefetch work that downloads.
+func (s *Service) step(repo model.RepoConfig, reserved bool) bool {
 	s.mu.Lock()
-	if len(s.pq) == 0 {
+	// Everything the reserved worker may take ranks above prefetch downloads,
+	// so the top of the queue decides.
+	if len(s.pq) == 0 || reserved && s.pq[0].rank() == rankDownload {
 		s.mu.Unlock()
 		return false
 	}
-	item := heap.Pop(&s.pq).(*taskItem)
-	key := taskKey(item.task.RepoID, item.task.ObjectOID)
-	delete(s.queued, key)
-	if _, ok := s.active[key]; ok {
+	if s.pq[0].fetched {
+		item := heap.Pop(&s.pq).(*taskItem)
+		delete(s.queued, taskKey(item.task.RepoID, item.task.ObjectOID))
+		more := len(s.pq) > 0
 		s.mu.Unlock()
+		if more {
+			s.signalWork()
+		}
+		s.hydrate(repo, item.task)
 		return true
 	}
-	s.active[key] = struct{}{}
+	batch := s.popBatchLocked()
 	more := len(s.pq) > 0
 	s.mu.Unlock()
 	if more {
 		s.signalWork()
 	}
+	s.fetchBatch(repo, batch)
+	return true
+}
 
-	cachePath := cachePathFor(repo, item.task.ObjectOID)
-	node := taskBaseNode(item.task)
-	if size, ok, err := s.validateCachedBlob(context.Background(), repo, cachePath, node); err != nil {
+// popBatchLocked pops up to maxFetchBatch unfetched tasks. Explicit reads and
+// speculative prefetches never share a batch, so a read does not wait for a
+// directory's prefetch to download.
+func (s *Service) popBatchLocked() []model.HydrationTask {
+	var batch []model.HydrationTask
+	for len(s.pq) > 0 && len(batch) < maxFetchBatch && !s.pq[0].fetched {
+		if len(batch) > 0 && isExplicitRead(s.pq[0].task) != isExplicitRead(batch[0]) {
+			break
+		}
+		item := heap.Pop(&s.pq).(*taskItem)
+		key := taskKey(item.task.RepoID, item.task.ObjectOID)
+		delete(s.queued, key)
+		if _, ok := s.active[key]; ok {
+			continue
+		}
+		s.active[key] = struct{}{}
+		batch = append(batch, item.task)
+	}
+	return batch
+}
+
+// fetchBatch finishes the batch's verified cache hits and handles the tasks
+// that need no fetch, then fetches the missing blobs with one fetch and
+// requeues them, so every worker can copy them in priority order.
+func (s *Service) fetchBatch(repo model.RepoConfig, batch []model.HydrationTask) {
+	var local, missing []model.HydrationTask
+	for _, task := range batch {
+		key := taskKey(task.RepoID, task.ObjectOID)
+		cachePath := cachePathFor(repo, task.ObjectOID)
+		st, err := os.Stat(cachePath)
+		// A read of a verified blob must not wait for its siblings' fetch.
+		// Verifying an unverified one hashes it, so hydrate does that.
+		if err == nil && (task.SizeState != "known" || st.Size() == task.SizeBytes) && s.isVerified(key, st) {
+			s.finishHydration(key, result{cachePath: cachePath, size: st.Size()})
+			s.notifyHydrated(task.RepoID, task.ObjectOID, st.Size())
+			continue
+		}
+		// A known size means batchResolveSizes or an earlier hydration found
+		// the blob in the object store.
+		if err == nil || task.SizeState == "known" {
+			local = append(local, task)
+		} else {
+			missing = append(missing, task)
+		}
+	}
+	s.requeueFetched(local, true)
+	// A single blob's own lazy fetch costs the same as a batch fetch.
+	if len(missing) < 2 {
+		s.requeueFetched(missing, false)
+		return
+	}
+	// A read of a blob that needs no fetch must not wait for its siblings'
+	// fetch. Free workers copy those blobs in parallel, and the worker that
+	// took the read batch hydrates the ones no other worker has taken before it
+	// fetches. With a single worker, it hydrates them all.
+	if isExplicitRead(batch[0]) {
+		for _, task := range local {
+			if s.takeQueued(taskKey(task.RepoID, task.ObjectOID)) {
+				s.hydrate(repo, task)
+			}
+		}
+	}
+	oids := make([]string, len(missing))
+	for i, task := range missing {
+		oids[i] = task.ObjectOID
+	}
+	ctx, cancel := s.fetchContext()
+	// A failed batch leaves each blob to its own lazy fetch, so an object the
+	// remote refuses fails only its own task.
+	err := s.fetcher.FetchMissingBlobs(ctx, repo, oids)
+	cancel()
+	s.requeueFetched(missing, err == nil)
+}
+
+// requeueFetched queues tasks whose batch fetch ran, or that needed none, for
+// a worker to hydrate. local says their blobs need no download. A task a read
+// waits on goes ahead of speculative work.
+func (s *Service) requeueFetched(tasks []model.HydrationTask, local bool) {
+	if len(tasks) == 0 {
+		return
+	}
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	for _, task := range tasks {
+		key := taskKey(task.RepoID, task.ObjectOID)
+		if len(s.wait[key]) > 0 && !isExplicitRead(task) {
+			task.Priority = PriorityExplicitRead
+		}
+		item := &taskItem{task: task, fetched: true, local: local}
+		heap.Push(&s.pq, item)
+		s.queued[key] = item
+	}
+	s.mu.Unlock()
+	s.signalWork()
+}
+
+// takeQueued removes key's queued task so the caller hydrates it. It reports
+// false when nothing is queued for key: another worker took the task, or the
+// service stopped. If another worker already hydrated the task and a later
+// prefetch queued key again, it takes that newer task, which is harmless:
+// hydrate serves it from the cache.
+func (s *Service) takeQueued(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.queued[key]
+	if !ok {
+		return false
+	}
+	heap.Remove(&s.pq, item.index)
+	delete(s.queued, key)
+	return true
+}
+
+// hydrate serves task from a valid cached blob, or else copies the blob into
+// the cache, fetching it if it is still missing.
+func (s *Service) hydrate(repo model.RepoConfig, task model.HydrationTask) {
+	key := taskKey(task.RepoID, task.ObjectOID)
+	cachePath := cachePathFor(repo, task.ObjectOID)
+	if size, ok, err := s.validateCachedBlob(context.Background(), repo, cachePath, taskBaseNode(task)); err != nil {
 		s.finishHydration(key, result{err: err})
-		return true
+		return
 	} else if ok {
 		s.finishHydration(key, result{cachePath: cachePath, size: size})
-		s.notifyHydrated(item.task.RepoID, item.task.ObjectOID, size)
-		return true
+		s.notifyHydrated(task.RepoID, task.ObjectOID, size)
+		return
 	}
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
 		s.finishHydration(key, result{err: err})
-		return true
+		return
 	}
-	// Use a timeout context derived from stopCh so stuck blob fetches don't
-	// block a worker forever.
-	fetchCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := s.fetchContext()
 	defer cancel()
-	go func() {
-		select {
-		case <-s.stopCh:
-			cancel()
-		case <-fetchCtx.Done():
-		}
-	}()
-	size, err := s.fetcher.BlobToCache(fetchCtx, repo, item.task.ObjectOID, cachePath)
+	size, err := s.fetcher.BlobToCache(ctx, repo, task.ObjectOID, cachePath)
 	if err != nil {
-		s.finishHydration(key, result{err: fmt.Errorf("hydrate %s: %w", item.task.Path, err)})
-		return true
+		s.finishHydration(key, result{err: fmt.Errorf("hydrate %s: %w", task.Path, err)})
+		return
 	}
 	s.mu.Lock()
 	if s.stopped {
 		delete(s.active, key)
 		s.mu.Unlock()
-		return true
+		return
 	}
 	if st, statErr := os.Stat(cachePath); statErr == nil {
 		s.verified[key] = st
@@ -577,8 +743,25 @@ func (s *Service) step(repo model.RepoConfig) bool {
 	delete(s.active, key)
 	s.mu.Unlock()
 	notifyWaiters(waits, result{cachePath: cachePath, size: size, err: nil})
-	s.notifyHydrated(item.task.RepoID, item.task.ObjectOID, size)
-	return true
+	s.notifyHydrated(task.RepoID, task.ObjectOID, size)
+}
+
+// fetchContext bounds a fetch so a stuck one cannot block a worker forever,
+// and cancels it when the service stops.
+func (s *Service) fetchContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	go func() {
+		select {
+		case <-s.stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
+func isExplicitRead(task model.HydrationTask) bool {
+	return task.Priority >= PriorityExplicitRead
 }
 
 func taskBaseNode(task model.HydrationTask) model.BaseNode {
@@ -668,12 +851,40 @@ func isCodeExtension(ext string) bool {
 type taskItem struct {
 	task  model.HydrationTask
 	index int
+	// fetched marks a task whose batch fetch already ran. It stays active, so
+	// Enqueue ignores it, and a worker hydrates it alone.
+	fetched bool
+	// local marks a fetched task whose blob is cached, of known size, or
+	// downloaded by its batch fetch, so hydrating it downloads nothing.
+	local bool
+}
+
+const (
+	rankDownload = iota
+	rankLocalCopy
+	rankRead
+)
+
+// rank orders the queue ahead of priority: reads, then copies of prefetch
+// blobs that are already local, then prefetch work that downloads. A blob a
+// batch fetch already downloaded is copied before more prefetches download.
+func (item *taskItem) rank() int {
+	switch {
+	case isExplicitRead(item.task):
+		return rankRead
+	case item.local:
+		return rankLocalCopy
+	}
+	return rankDownload
 }
 
 type priorityQueue []*taskItem
 
 func (p priorityQueue) Len() int { return len(p) }
 func (p priorityQueue) Less(i, j int) bool {
+	if ri, rj := p[i].rank(), p[j].rank(); ri != rj {
+		return ri > rj
+	}
 	if p[i].task.Priority == p[j].task.Priority {
 		return p[i].task.EnqueuedAt.Before(p[j].task.EnqueuedAt)
 	}
