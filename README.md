@@ -133,7 +133,7 @@ Check the state of a mounted repo with `status`:
 
 Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The first read of a file in a directory also queues up to 256 of that directory's files for background hydration, ranking code and manifests (`package.json`, `go.mod`, `README.md`) ahead of binary files. Listing or walking directories queues nothing. A blobless clone knows a file's size only once its blob is local, so the first `stat` of a file hydrates that one file. A worker takes up to 256 queued blobs, all reads or all prefetches, and fetches the missing ones with one `git fetch` from the promisor remote, so a blobless clone pays one fetch per batch, not one per blob. Queued reads go ahead of queued prefetches, and a blob a prefetch has already downloaded is copied into the cache before more prefetches download. With more than one worker, one worker takes only reads and those copies, so a read never waits for an unrelated prefetch download, though it can wait for one copy of a blob already on disk. With a single worker, a read can wait for a running prefetch download. A read of a file whose own prefetch is downloading waits for that download.
 
-When the Git index matches the published snapshot and the overlay is empty, startup marks snapshot entries valid for Git's filesystem monitor before opening the mount. This lets the first `git status` use the daemon's change list instead of reading every tracked blob. ArtifactFS skips this baseline when the index or attributes are uncertain, when `core.attributesFile` is configured, or when staged work or overlay changes exist; Git then performs its normal status scan.
+When the Git index matches the published snapshot and the overlay is empty, startup marks snapshot entries valid for Git's filesystem monitor before opening the mount. This lets the first `git status` use the daemon's change list instead of reading every tracked blob, and each later `git status` receives only the paths the overlay changed since Git's previous query. Paths under `text=auto` are marked, and so are paths under `-text` or `binary` without `eol=lf`. Paths under `text`, `text=input` or `eol=lf` without `text=auto` stay unmarked, because Git's check-in turns CRLF into LF and a blob that holds CRLF then differs from its file; Git compares those paths itself. `-text eol=lf` stays unmarked too, because `git check-attr` prints it like the literal `text=unset`, which Git converts under `eol=lf`. A `git status` that runs while the worktree is unmounted sees the empty mountpoint, so Git's next query gets a rescan. When startup marks the baseline again, its own query takes that rescan, and the first `git status` after the mount receives only the overlay's changes. ArtifactFS skips this baseline when the index or a `.gitattributes` blob is uncertain, when `core.attributesFile` is configured or `core.autocrlf` is set to anything but false, when an `eol=crlf`, `crlf`, `filter`, `ident` or `working-tree-encoding` attribute applies, or when staged work or overlay changes exist; Git then performs its normal status scan.
 
 Use `--hydration-concurrency` to control the number of parallel blob-fetch workers (default 4). Each worker maintains a persistent `git cat-file --batch` process that copies fetched blobs into the cache, so higher values trade memory for faster bulk hydration:
 
@@ -342,7 +342,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 
 4. **Read** -- The Resolver merges the snapshot (base tree) with the overlay (local writes). For base files, reads block until the Hydrator fetches the blob and streams it to the blob cache through a persistent `git cat-file --batch` process. Blobs queued together are fetched with one `git fetch --stdin`; the first read in a directory queues its other files the same way.
 
-5. **Write** -- The Engine promotes base files to the overlay via copy-on-write (hydrate, then copy to the `upper/` directory). Subsequent reads come from the overlay. Deletes are recorded as whiteouts.
+5. **Write** -- The Engine promotes base files to the overlay via copy-on-write (hydrate, then copy to the `upper/` directory). Subsequent reads come from the overlay. Deletes are recorded as whiteouts; deleting a file copies it first only while a handle on it is open. No FUSE operation holds a lock while a blob hydrates, so a slow fetch stalls neither a HEAD switch nor other operations. A failed operation returns the errno of its cause, such as `ENOSPC`, and an interrupted one returns `EINTR`.
 
 6. **Background** -- For ordinary workspaces, a watcher polls HEAD/refs every 500ms and republishes HEAD changes. Repositories with `--require-commit` do not run this watcher, so their verified base commit remains fixed. Remote polling is controlled separately by `--refresh`.
 
@@ -351,7 +351,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 | Package | Role |
 |---------|------|
 | `daemon` | Orchestrates repo lifecycle, refresh loop, watcher callbacks |
-| `fusefs` | FUSE adapter (inode management, op dispatch), Resolver (merged view), Engine (read/write logic) |
+| `fusefs` | FUSE adapter (inode management, op dispatch), Resolver (merged view), Engine (the adapter's only API: one method per operation) |
 | `gitstore` | Git CLI wrapper: clone, fetch, ls-tree, batch pool for `cat-file --batch` |
 | `snapshot` | SQLite store for `base_nodes` keyed by `(generation, path)` |
 | `overlay` | SQLite metadata + `upper/` directory for local writes, whiteouts, reconciliation |
@@ -376,7 +376,7 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 | Write / append to file | Supported | Copy-on-write for tracked files |
 | Rename file | Supported | Works for both overlay and tracked (snapshot-only) files |
 | Rename directory | Supported | Moves tracked and overlay-created directory trees |
-| Delete file (`rm`) | Supported | Whiteout recorded in overlay |
+| Delete file (`rm`) | Supported | Whiteout recorded in overlay; fetches nothing unless the file is open |
 | `rmdir` | Supported | Checks directory is empty first |
 | Truncate | Supported | Hydrates blob before truncating |
 | `chmod` | Supported | Preserves executable-bit changes across commits |

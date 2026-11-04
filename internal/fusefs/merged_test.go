@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -284,7 +285,7 @@ func TestSetMtimePromotesBaseFileWithSeparateCtime(t *testing.T) {
 	engine := &Engine{Resolver: r, Overlay: ov}
 	target := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
 
-	if err := engine.SetMtime(context.Background(), "b.txt", target); err != nil {
+	if err := engineSetMtime(context.Background(), engine, "b.txt", target); err != nil {
 		t.Fatal(err)
 	}
 	got, ok := ov.entries["b.txt"]
@@ -311,13 +312,13 @@ func TestSetMtimeRejectsRootAndBaseSymlink(t *testing.T) {
 	engine := &Engine{Resolver: r, Overlay: ov}
 	target := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
 
-	if err := engine.SetMtime(context.Background(), ".", target); !errors.Is(err, iofs.ErrInvalid) {
+	if err := engineSetMtime(context.Background(), engine, ".", target); !errors.Is(err, iofs.ErrInvalid) {
 		t.Fatalf("root SetMtime err = %v, want ErrInvalid", err)
 	}
 	if _, ok := ov.entries["."]; ok {
 		t.Fatal("root SetMtime should not create an overlay entry")
 	}
-	if err := engine.SetMtime(context.Background(), "link", target); !errors.Is(err, iofs.ErrInvalid) {
+	if err := engineSetMtime(context.Background(), engine, "link", target); !errors.Is(err, iofs.ErrInvalid) {
 		t.Fatalf("symlink SetMtime err = %v, want ErrInvalid", err)
 	}
 }
@@ -346,7 +347,7 @@ func TestRenameMovesBaseDirectoryTree(t *testing.T) {
 	)
 	engine := &Engine{Resolver: r, Overlay: ov}
 
-	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+	if err := engineRename(context.Background(), engine, "src", "dst"); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{"src", "src/a.txt", "src/nested", "src/nested/b"} {
@@ -371,7 +372,7 @@ func TestRenameMovesNonEmptyOverlayDirectoryTree(t *testing.T) {
 	r := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{}}, ov)
 	engine := &Engine{Resolver: r, Overlay: ov}
 
-	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+	if err := engineRename(context.Background(), engine, "src", "dst"); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{"dst", "dst/a.txt", "dst/nested", "dst/nested/b"} {
@@ -388,8 +389,8 @@ func TestRenameDirectoryRejectsDescendantDestination(t *testing.T) {
 	r := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{}}, ov)
 	engine := &Engine{Resolver: r, Overlay: ov}
 
-	if err := engine.Rename(context.Background(), "src", "src/nested"); !errors.Is(err, iofs.ErrInvalid) {
-		t.Fatalf("err = %v, want ErrInvalid", err)
+	if err := engineRename(context.Background(), engine, "src", "src/nested"); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("err = %v, want EINVAL", err)
 	}
 }
 
@@ -402,8 +403,8 @@ func TestRenameDirectoryRejectsNonEmptyDestination(t *testing.T) {
 	r := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{}}, ov)
 	engine := &Engine{Resolver: r, Overlay: ov}
 
-	if err := engine.Rename(context.Background(), "src", "dst"); !errors.Is(err, os.ErrExist) {
-		t.Fatalf("err = %v, want ErrExist", err)
+	if err := engineRename(context.Background(), engine, "src", "dst"); !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("err = %v, want ENOTEMPTY", err)
 	}
 }
 
@@ -418,8 +419,8 @@ func TestRenameBaseFileRejectsBaseDirectoryDestination(t *testing.T) {
 	)
 	engine := &Engine{Resolver: r, Overlay: ov}
 
-	if err := engine.Rename(context.Background(), "a.txt", "dst"); !errors.Is(err, iofs.ErrInvalid) {
-		t.Fatalf("Rename base file over base dir err = %v, want ErrInvalid", err)
+	if err := engineRename(context.Background(), engine, "a.txt", "dst"); !errors.Is(err, syscall.EISDIR) {
+		t.Fatalf("Rename base file over base dir err = %v, want EISDIR", err)
 	}
 	if _, ok := ov.entries["a.txt"]; ok {
 		t.Fatal("invalid rename should not promote source into overlay")
@@ -436,7 +437,7 @@ func TestRenameAllowsOverlayFileShadowingBaseDirectory(t *testing.T) {
 	)
 	engine := &Engine{Resolver: r, Overlay: ov}
 
-	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+	if err := engineRename(context.Background(), engine, "src", "dst"); err != nil {
 		t.Fatalf("Rename overlay file shadowing base dir: %v", err)
 	}
 }
@@ -451,7 +452,7 @@ func TestRenameCreateOverBaseBecomesModify(t *testing.T) {
 	)
 	engine := &Engine{Resolver: r, Overlay: ov}
 
-	if err := engine.Rename(context.Background(), "tmp.txt", "dst.txt"); err != nil {
+	if err := engineRename(context.Background(), engine, "tmp.txt", "dst.txt"); err != nil {
 		t.Fatalf("Rename create over base: %v", err)
 	}
 	got, ok := ov.entries["dst.txt"]
@@ -473,8 +474,8 @@ func TestRenameModifyRejectsBaseDirectoryDestination(t *testing.T) {
 	)
 	engine := &Engine{Resolver: r, Overlay: ov}
 
-	if err := engine.Rename(context.Background(), "src.txt", "dst"); !errors.Is(err, iofs.ErrInvalid) {
-		t.Fatalf("Rename modify over base dir err = %v, want ErrInvalid", err)
+	if err := engineRename(context.Background(), engine, "src.txt", "dst"); !errors.Is(err, syscall.EISDIR) {
+		t.Fatalf("Rename modify over base dir err = %v, want EISDIR", err)
 	}
 }
 
@@ -488,7 +489,7 @@ func TestRenameAllowsPromotedBaseDirectory(t *testing.T) {
 	)
 	engine := &Engine{Resolver: r, Overlay: ov}
 
-	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+	if err := engineRename(context.Background(), engine, "src", "dst"); err != nil {
 		t.Fatal(err)
 	}
 	if e, ok := ov.entries["src"]; !ok || !e.IsDeleted() {
@@ -509,7 +510,7 @@ func TestRenameAllowsOverlayDirectoryReplacingBaseFileAtSource(t *testing.T) {
 	)
 	engine := &Engine{Resolver: r, Overlay: ov}
 
-	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+	if err := engineRename(context.Background(), engine, "src", "dst"); err != nil {
 		t.Fatal(err)
 	}
 	if e, ok := ov.entries["src"]; !ok || !e.IsDeleted() {
@@ -527,8 +528,8 @@ func TestRenameOverlayMkdirRejectsBaseFileDestination(t *testing.T) {
 	)
 	engine := &Engine{Resolver: r, Overlay: ov}
 
-	if err := engine.Rename(context.Background(), "tmpdir", "dst.txt"); !errors.Is(err, iofs.ErrInvalid) {
-		t.Fatalf("Rename overlay mkdir over base file err = %v, want ErrInvalid", err)
+	if err := engineRename(context.Background(), engine, "tmpdir", "dst.txt"); !errors.Is(err, syscall.ENOTDIR) {
+		t.Fatalf("Rename overlay mkdir over base file err = %v, want ENOTDIR", err)
 	}
 }
 
@@ -543,10 +544,10 @@ func TestRenameSameBasePathNoop(t *testing.T) {
 	)
 	engine := &Engine{Resolver: r, Overlay: ov}
 
-	if err := engine.Rename(context.Background(), "a.txt", "a.txt"); err != nil {
+	if err := engineRename(context.Background(), engine, "a.txt", "a.txt"); err != nil {
 		t.Fatalf("Rename same file path: %v", err)
 	}
-	if err := engine.Rename(context.Background(), "src", "src"); err != nil {
+	if err := engineRename(context.Background(), engine, "src", "src"); err != nil {
 		t.Fatalf("Rename same dir path: %v", err)
 	}
 	if len(ov.entries) != 0 {

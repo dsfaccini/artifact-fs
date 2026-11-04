@@ -4,7 +4,6 @@ package fusefs
 
 import (
 	"context"
-	"syscall"
 
 	"github.com/dsfaccini/fuse/fuseops"
 	"github.com/dsfaccini/fuse/fuseutil"
@@ -23,10 +22,7 @@ func NewGatedFileSystem(next fuseutil.FileSystem, gate *ReadyGate) fuseutil.File
 }
 
 func (fs *gatedFileSystem) wait(ctx context.Context) error {
-	if err := fs.gate.Wait(ctx); err != nil {
-		return syscall.EIO
-	}
-	return nil
+	return toErrno(ctx, fs.gate.Wait(ctx))
 }
 
 func (fs *gatedFileSystem) StatFS(ctx context.Context, op *fuseops.StatFSOp) error {

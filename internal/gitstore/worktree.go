@@ -263,6 +263,11 @@ func (s *Store) RemoveAdoptedFSMonitorHook(ctx context.Context, repo model.RepoC
 	return nil
 }
 
+// FSMonitorBootstrapEnv marks the FSMonitor hook query that
+// BootstrapCleanIndexForFSMonitor's update-index makes, which may run before
+// the worktree is mounted.
+const FSMonitorBootstrapEnv = "ARTIFACT_FS_FSMONITOR_BOOTSTRAP"
+
 // BootstrapCleanIndexForFSMonitor marks snapshot paths valid only while the
 // real index is locked and proven to match the immutable snapshot commit.
 func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.RepoConfig, snapshotOID string, validate func() (bool, error)) (bool, error) {
@@ -388,16 +393,45 @@ func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.
 	if err != nil {
 		return skip()
 	}
+	textAttrs := map[string]string{}
+	eolLF := map[string]bool{}
 	attrFields := strings.Split(attrs, "\x00")
-	for i := 1; i+1 < len(attrFields); i += 3 {
-		if attrFields[i] == "crlf" || attrFields[i] == "ident" || attrFields[i] == "filter" || attrFields[i] == "eol" || attrFields[i] == "text" || attrFields[i] == "working-tree-encoding" {
+	for i := 0; i+2 < len(attrFields); i += 3 {
+		path, name, value := attrFields[i], attrFields[i+1], attrFields[i+2]
+		switch name {
+		case "crlf", "ident", "filter", "working-tree-encoding":
 			return false, nil
+		case "eol":
+			if value == "crlf" {
+				return false, nil
+			}
+			eolLF[path] = value == "lf"
+		case "text":
+			textAttrs[path] = value
 		}
+	}
+	// Status compares Git's check-in conversion of the worktree file, which
+	// holds the blob's bytes, with the blob. -text and text=auto keep those
+	// bytes. text, text=input and eol=lf without text=auto turn CRLF into LF,
+	// so leave those paths for Git to compare. check-attr prints -text and the
+	// literal text=unset alike, and Git converts the second under eol=lf.
+	validPaths := make([]string, 0, len(paths))
+	for _, path := range paths {
+		text := textAttrs[path]
+		if text == "set" || text == "input" || (eolLF[path] && text != "auto") {
+			continue
+		}
+		validPaths = append(validPaths, path)
+	}
+	if len(validPaths) == 0 {
+		return false, nil
 	}
 	if err := verifyGitAttributesPresent(ctx, repo, env); err != nil {
 		return skip()
 	}
-	if _, err := runGitInput(ctx, repo.GitDir, env, pathInput, "-c", "core.hooksPath="+privateHooks, "update-index", "--fsmonitor", "--fsmonitor-valid", "-z", "--stdin"); err != nil {
+	validInput := []byte(strings.Join(validPaths, "\x00") + "\x00")
+	updateEnv := append([]string{FSMonitorBootstrapEnv + "=1"}, env...)
+	if _, err := runGitInput(ctx, repo.GitDir, updateEnv, validInput, "-c", "core.hooksPath="+privateHooks, "update-index", "--fsmonitor", "--fsmonitor-valid", "-z", "--stdin"); err != nil {
 		return skip()
 	}
 	if err := ctx.Err(); err != nil {

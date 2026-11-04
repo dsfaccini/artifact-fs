@@ -33,6 +33,11 @@ Repository-specific guidance for `artifact-fs`.
 - The watcher polls `HEAD` plus the current HEAD ref path. If you change it, preserve branch-switch and packed-ref behavior covered by `internal/watcher/watcher_test.go`.
 - The overlay stores deletes as SQLite entries with `kind='delete'`; there is no on-disk whiteout file layer.
 - SQLite is `modernc.org/sqlite` in WAL mode via `internal/meta`.
+- The FUSE adapter calls only `Engine` methods, one per operation. Do not reach into `engine.Overlay`, `engine.Hydrator`, or the `Resolver` from the adapter.
+- Hold no lock while a blob hydrates. An `Engine` method that needs base content takes a `*Blobs` and returns a `notHydratedError` when a blob is missing. `Engine.Do` then hydrates with no lock held and reruns the method.
+- Open every blob an `Engine` method copies before it changes anything. A directory rename is the one exception: it opens each blob as it copies it, so it may already have promoted some directories and copied some files, all with base content, and the rerun completes it.
+- Take the FUSE locks in this order: `handleOps`, `DirHandle.mu`, the resolver's `transition`, `ArtifactFuse.mu`, `FileHandle.mu`.
+- Wrap an operation error's cause with `%w`, and let `toErrno` map it for the kernel. Do not return `syscall.EIO` for a failure that carries an errno.
 
 ## Writing tests
 
@@ -48,6 +53,8 @@ Repository-specific guidance for `artifact-fs`.
 - Expire a deadline under test with `gittest.ExpireOnFile` once the fake git reaches the step under test. A short timeout can expire in an earlier step on a loaded machine.
 - Assert that something has not happened yet inside `synctest.Test`, after `synctest.Wait`. Drive ticker-based code there too. `synctest.Wait` does not treat a goroutine blocked on a `sync.Mutex` or a subprocess as idle, so those tests cannot use it.
 - Never mount in a package test. Only the root-package e2e tests mount.
+- Call an `Engine` method that takes a `*Blobs` through `Engine.Do`, as the FUSE adapter does. `internal/fusefs/ops_test.go` has `engineRename` and its siblings.
+- Assert the errno the kernel receives with `kernelErrno`, not by comparing error values.
 - Run a new e2e test as a `TestE2ESharedMount` subtest. Give it its own mount only when its subject is mounting, a daemon restart, or a fresh mount's state. macFUSE's FSKit extension can stop loading after a series of mounts in one session.
 - Register a shared-mount test that leaves the mount unchanged with `runReadOnly`, and every other one with `run`. When e2e tests mount through FSKit on macOS, `run` skips the test, because the restore that undoes its changes moves HEAD. A `runReadOnly` test that changes the mount fails.
 - Call `skipIfFSKitHEADMove` in a test that moves HEAD on its own mount. After a HEAD move, FSKit can pad a short read with bytes that are not file data ([macfuse#1231](https://github.com/macfuse/macfuse/issues/1231)).
