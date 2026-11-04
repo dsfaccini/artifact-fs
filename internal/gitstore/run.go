@@ -44,9 +44,12 @@ func runInputCommand(ctx context.Context, cmd *exec.Cmd, gitDir string, extraEnv
 	setGitWorktreeDirectory(cmd, extraEnv)
 	cmd.Env = append(os.Environ(), append([]string{"GIT_DIR=" + gitDir}, extraEnv...)...)
 	cmd.Stdin = bytes.NewReader(input)
-	var stdout, stderr bytes.Buffer
+	var stdout bytes.Buffer
+	// A fetch's server shapes this stderr, and redaction's cost grows faster
+	// than its length.
+	stderr := &boundedGitError{limit: maxGitErrorBytes}
 	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
 			return "", ctx.Err()

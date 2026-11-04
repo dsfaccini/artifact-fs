@@ -110,7 +110,7 @@ func (s *Store) FetchMissingBlobs(ctx context.Context, repo model.RepoConfig, ob
 	// The hydrator cancels a batch fetch only when it stops, which is not a
 	// fetch failure. A timeout still logs.
 	if err != nil && !errors.Is(ctx.Err(), context.Canceled) {
-		s.logger.Warn("batch blob fetch failed, blobs will fetch one at a time", "repo", repo.Name, "blobs", len(missing), "error", err)
+		s.logger.Warn("batch blob fetch failed, blobs will fetch one at a time", "repo", repo.Name, "blobs", len(missing), "error", auth.RedactLogString(err.Error()))
 	}
 	return err
 }

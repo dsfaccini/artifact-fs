@@ -161,6 +161,60 @@ func TestFetchMissingBlobsLogsEveryFailureButACancel(t *testing.T) {
 	}
 }
 
+func TestFetchMissingBlobsRedactsFetchStderr(t *testing.T) {
+	// Git anonymizes HTTP URLs itself, so only a fake git can print a
+	// credentialed URL the way a remote helper or SSH may.
+	logs, _ := failedFetchMissingBlobs(t, `echo "fatal: unable to access 'https://alice:s3cret@example.com/repo.git/': HTTP 401" >&2`)
+	if !strings.Contains(logs, "unable to access") {
+		t.Fatalf("logs = %s, want the fetch's stderr", logs)
+	}
+	if strings.Contains(logs, "s3cret") {
+		t.Fatalf("logs leaked the password: %s", logs)
+	}
+	if strings.Contains(logs, "example.com/repo.git") {
+		t.Fatalf("logs kept the remote's location: %s", logs)
+	}
+}
+
+func TestFetchMissingBlobsBoundsFetchStderr(t *testing.T) {
+	_, err := failedFetchMissingBlobs(t, `awk 'BEGIN { for (i = 0; i < 10000; i++) printf "word "; print "" }' >&2`)
+	msg := err.Error()
+	if !strings.HasSuffix(msg, gitErrorTruncatedLabel) || len(msg) > maxGitErrorBytes+len(gitErrorTruncatedLabel)+1 {
+		t.Fatalf("error holds %d bytes of fetch stderr; want at most %d bytes, truncated", len(msg), maxGitErrorBytes)
+	}
+}
+
+// failedFetchMissingBlobs runs FetchMissingBlobs on two blobs against a fake
+// git whose fetch runs stderrScript and fails, and returns the logs and the
+// error. Its cat-file reports every blob missing, and its config names origin
+// as the promisor remote.
+func failedFetchMissingBlobs(t *testing.T, stderrScript string) (string, error) {
+	t.Helper()
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeGit := "#!/bin/sh\ncase \" $* \" in\n" +
+		"*\" cat-file \"*) while read -r oid; do echo \"$oid missing\"; done ;;\n" +
+		"*\" config \"*) printf 'remote.origin.promisor\\ntrue\\000' ;;\n" +
+		"*\" fetch \"*) " + stderrScript + "; exit 128 ;;\nesac\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(fakeGit), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer store.Close()
+	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: filepath.Join(tmp, "repo.git")}
+	err := store.FetchMissingBlobs(context.Background(), cfg, []string{strings.Repeat("a", 40), strings.Repeat("b", 40)})
+	if err == nil {
+		t.Fatal("FetchMissingBlobs succeeded against a fetch that fails")
+	}
+	return logs.String(), err
+}
+
 // cancelOnFile returns a context that is cancelled once path exists, as the
 // hydrator's Stop cancels a batch fetch.
 func cancelOnFile(path string) (context.Context, context.CancelFunc) {
