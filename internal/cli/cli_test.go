@@ -231,6 +231,31 @@ func TestAddRepoCLIRejectsOptionRemoteBeforeGit(t *testing.T) {
 	}
 }
 
+// The repo name becomes part of the mount's fsname option, so add-repo must
+// refuse it before registration rather than leave the daemon a mount that fails.
+func TestAddRepoCLIRejectsMountOptionSeparatorsInName(t *testing.T) {
+	for _, name := range []string{"repo,name", "repo=name"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+			var stdout, stderr bytes.Buffer
+			args := []string{"add-repo", "--name", name, "--async", "--remote", "https://github.com/example/repo.git"}
+			if code := Run(context.Background(), args, &stdout, &stderr); code == 0 {
+				t.Fatalf("add-repo unexpectedly succeeded, stdout=%q", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), "must not contain ',' or '='") {
+				t.Fatalf("stderr = %q, want the mount option separator rejection", stderr.String())
+			}
+			stdout.Reset()
+			if code := Run(context.Background(), []string{"list-repos"}, &stdout, &stderr); code != 0 {
+				t.Fatalf("list-repos exit = %d, stderr=%q", code, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("list-repos = %q, want no registered repo", stdout.String())
+			}
+		})
+	}
+}
+
 func TestPrepareCLIReportsQueuedPrepare(t *testing.T) {
 	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
 	var stdout, stderr bytes.Buffer

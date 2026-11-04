@@ -75,11 +75,17 @@ any other FSKit failure, because a retry could mount twice. The daemon logs the
 transport that mounted each repo.
 
 FSKit reuses directory handles across enumerations, so this backend refreshes
-entries when enumeration restarts. It rejects extended attributes to prevent
-AppleDouble metadata files; use `cp -X` when copying files with Finder metadata.
+entries when enumeration restarts. Both macOS backends reject extended
+attributes, so macOS writes no AppleDouble `._` files to store them; use `cp -X`
+when copying files with Finder metadata. Both backends serve tracked `._*` and
+`.DS_Store` files. A `.DS_Store` that Finder writes lands in the overlay as an
+untracked file.
 The native mount API has no supported cancellation for a permanently stalled
-system mount service. `umount` from a terminal cannot unmount an FSKit mount;
-use `diskutil unmount <path>`.
+system mount service. macOS treats an FSKit mount as a network volume, so
+`umount <path>` returns `Operation not permitted` unless the terminal app has
+the Network Volumes permission (Privacy & Security → Files & Folders). The daemon
+unmounts through the same `unmount(2)` call. `diskutil unmount <path>` removes an
+FSKit mount that `umount` cannot.
 
 Quick start against a public repo:
 
@@ -157,6 +163,8 @@ Use `--hydration-concurrency` to control the number of parallel blob-fetch worke
 ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the mode, source, attempt, phase, state, duration, and deadline. Clone and fetch operations retry known transient transport failures up to three total attempts. Preparation has a 30-minute timeout. Caller cancellation stops the active Git command and retry backoff; synchronous preparation records a redacted `prepare canceled` status, while daemon shutdown leaves async preparation queued for restart.
 
 Async existing-clone preparation reports remote configuration, fetch, and branch update as separate `configure_remote`, `fetch`, and `update_branch` phases.
+
+The daemon logs a `fuse error` warning for each FUSE op that fails, other than a lookup of a missing name, and for each reply the kernel refuses.
 
 Successful `add-repo`:
 
