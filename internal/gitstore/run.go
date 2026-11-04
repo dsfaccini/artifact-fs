@@ -28,6 +28,19 @@ func runGitDiscardOutputWithEnv(ctx context.Context, gitDir string, extraEnv []s
 func runGitInput(ctx context.Context, gitDir string, extraEnv []string, input []byte, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	configureCancelableCommand(cmd)
+	return runInputCommand(ctx, cmd, gitDir, extraEnv, input)
+}
+
+// runLazyFetchGitInput runs a Git command that fetches objects as a lazy fetch
+// does: with lazyFetchEnv, in its own session, so it cannot prompt.
+func runLazyFetchGitInput(ctx context.Context, gitDir string, input []byte, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	configureCancelableCommand(cmd)
+	configureCommandSession(cmd)
+	return runInputCommand(ctx, cmd, gitDir, lazyFetchEnv(), input)
+}
+
+func runInputCommand(ctx context.Context, cmd *exec.Cmd, gitDir string, extraEnv []string, input []byte) (string, error) {
 	setGitWorktreeDirectory(cmd, extraEnv)
 	cmd.Env = append(os.Environ(), append([]string{"GIT_DIR=" + gitDir}, extraEnv...)...)
 	cmd.Stdin = bytes.NewReader(input)
