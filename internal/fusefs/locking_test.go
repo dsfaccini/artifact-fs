@@ -3,6 +3,7 @@
 package fusefs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -186,6 +187,10 @@ func (f trackedFixture) read(t *testing.T, inode fuseops.InodeID, handle fuseops
 	op := &fuseops.ReadFileOp{Inode: inode, Handle: handle, Size: 64, Dst: make([]byte, 64)}
 	if err := f.fs.ReadFile(context.Background(), op); err != nil {
 		t.Fatalf("ReadFile: %v", err)
+	}
+	// The library ignores Dst when the file system sets Data.
+	if op.Data != nil {
+		return string(bytes.Join(op.Data, nil))
 	}
 	return string(op.Dst[:op.BytesRead])
 }
@@ -792,5 +797,87 @@ func TestHandleOpenedDuringUnlinkHydrationKeepsContent(t *testing.T) {
 	}
 	if got := f.read(t, inode, second); got != "FILE one" {
 		t.Fatalf("second handle reads %q after a write, want FILE one", got)
+	}
+}
+
+// replacingOverlay runs replace once, right after the first copy-on-write, as
+// a re-fetch of another blob would replace its cache file.
+type replacingOverlay struct {
+	model.OverlayStore
+	once    sync.Once
+	replace func()
+}
+
+func (o *replacingOverlay) EnsureCopyOnWriteFrom(ctx context.Context, repo model.RepoConfig, path string, base model.BaseNode, src *os.File) (model.OverlayEntry, error) {
+	e, err := o.OverlayStore.EnsureCopyOnWriteFrom(ctx, repo, path, base, src)
+	o.once.Do(o.replace)
+	return e, err
+}
+
+// TestRenameOpensEveryBlobBeforeCopying replaces the destination's cache file
+// after Rename copies the source, and cancels the request. A Rename that opened
+// the destination's blob only when it copied it would find the blob replaced,
+// stop with the source already copied, and fail to hydrate again.
+func TestRenameOpensEveryBlobBeforeCopying(t *testing.T) {
+	f := newTrackedFixture(t)
+	dir := f.lookup(t, fuseops.RootInodeID, "dir")
+	f.open(t, f.lookup(t, dir, "inner.txt"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.engine.Overlay = &replacingOverlay{OverlayStore: f.store, replace: func() {
+		blob := filepath.Join(f.hydrator.dir, "inner-1")
+		if err := os.WriteFile(blob+".tmp", []byte("inner"), 0o644); err != nil {
+			t.Error(err)
+		}
+		if err := os.Rename(blob+".tmp", blob); err != nil {
+			t.Error(err)
+		}
+		f.hydrator.arm()
+		cancel()
+	}}
+
+	if err := f.fs.Rename(ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "file.txt", NewParent: dir, NewName: "inner.txt"}); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if _, err := f.resolver.ResolvePath("file.txt"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("file.txt after rename = %v, want not exist", err)
+	}
+	if got, err := engineRead(context.Background(), f.engine, "dir/inner.txt", 0, make([]byte, 16)); err != nil || string(got) != "file one" {
+		t.Fatalf("dir/inner.txt after rename = (%q, %v), want file one", got, err)
+	}
+}
+
+func TestSyntheticGitFileRejectsWrites(t *testing.T) {
+	ctx := context.Background()
+	f := newTrackedFixture(t)
+	inode := f.lookup(t, fuseops.RootInodeID, ".git")
+	for _, op := range []*fuseops.OpenFileOp{
+		{Inode: inode, OpenFlags: syscall.O_WRONLY},
+		{Inode: inode, OpenFlags: syscall.O_RDWR},
+	} {
+		if got := kernelErrno(f.fs.OpenFile(ctx, op)); got != syscall.EPERM {
+			t.Errorf("open .git with flags %v: kernel errno = %v, want EPERM", op.OpenFlags, got)
+		}
+	}
+	handle := f.open(t, inode)
+	if got := kernelErrno(f.fs.WriteFile(ctx, &fuseops.WriteFileOp{Inode: inode, Handle: handle, Data: []byte("gitdir: /elsewhere\n")})); got != syscall.EPERM {
+		t.Errorf("write .git: kernel errno = %v, want EPERM", got)
+	}
+	mode := os.FileMode(0o600)
+	size := uint64(0)
+	for name, op := range map[string]*fuseops.SetInodeAttributesOp{
+		"chmod":    {Inode: inode, Mode: &mode},
+		"truncate": {Inode: inode, Size: &size},
+	} {
+		if got := kernelErrno(f.fs.SetInodeAttributes(ctx, op)); got != syscall.EPERM {
+			t.Errorf("%s .git: kernel errno = %v, want EPERM", name, got)
+		}
+	}
+
+	if entry, ok, err := f.store.Lookup(ctx, ".git"); err != nil || ok {
+		t.Fatalf("overlay .git = (%+v, %t, %v), want no entry", entry, ok, err)
+	}
+	if got := f.read(t, inode, handle); got != string(f.fs.gitfileContent) {
+		t.Fatalf(".git reads %q, want the synthesized gitfile %q", got, f.fs.gitfileContent)
 	}
 }

@@ -24,11 +24,13 @@ const maxPrefetchTasksPerDir = 256
 // adapter serves is one Engine method.
 //
 // No Engine method hydrates a blob. A method that reads base content takes a
-// *Blobs, and when the blob it needs is missing it returns a *notHydratedError
-// before it changes anything. Engine.Do then hydrates that blob with no lock
-// held and runs the method again. The method resolves its paths afresh under
-// the transition read lock, so a HEAD switch during hydration makes it ask for
-// the new blob.
+// *Blobs, and when the blob it needs is missing it returns a *notHydratedError.
+// It returns that error before it changes anything, except that a directory
+// rename may already have copied some files into the overlay, each with its
+// base content. Engine.Do then hydrates the blob with no lock held and runs the
+// method again, which completes the op. The method resolves its paths afresh
+// under the transition read lock, so a HEAD switch during hydration makes it ask
+// for the new blob.
 type Engine struct {
 	Resolver *Resolver
 	Repo     model.RepoConfig
@@ -258,16 +260,25 @@ func (e *Engine) ensureOverlay(ctx context.Context, b *Blobs, path string) error
 	if err != nil {
 		return err
 	}
-	if n.Base.ObjectOID != "" {
-		src, err := b.open(n.Base)
-		if err != nil {
-			return err
-		}
-		defer src.Close()
-		_, err = e.Overlay.EnsureCopyOnWriteFrom(ctx, e.Repo, path, n.Base, src)
+	if n.Base.ObjectOID == "" {
+		return e.copyOnWrite(ctx, path, n.Base, nil)
+	}
+	src, err := b.open(n.Base)
+	if err != nil {
 		return err
 	}
-	_, err = e.Overlay.EnsureCopyOnWrite(ctx, e.Repo, path, n.Base)
+	defer src.Close()
+	return e.copyOnWrite(ctx, path, n.Base, src)
+}
+
+// copyOnWrite copies base, whose blob src holds, into the overlay at path. A
+// base with no blob takes a nil src.
+func (e *Engine) copyOnWrite(ctx context.Context, path string, base model.BaseNode, src *os.File) error {
+	if src == nil {
+		_, err := e.Overlay.EnsureCopyOnWrite(ctx, e.Repo, path, base)
+		return err
+	}
+	_, err := e.Overlay.EnsureCopyOnWriteFrom(ctx, e.Repo, path, base, src)
 	return err
 }
 
@@ -529,14 +540,30 @@ func (e *Engine) Rename(ctx context.Context, b *Blobs, oldPath, newPath string, 
 			blobs = append(blobs, n.Base)
 		}
 	}
-	// Require both blobs before copying either, so a missing blob leaves no
-	// copy-on-write source behind.
+	// Open both blobs before copying either, so a missing or replaced blob
+	// leaves no copy-on-write source behind.
 	if err := b.requireFiles(blobs); err != nil {
 		return err
 	}
+	srcs := map[string]*os.File{}
+	defer func() {
+		for _, f := range srcs {
+			_ = f.Close()
+		}
+	}()
+	for path, n := range copies {
+		if n.Base.ObjectOID == "" {
+			continue
+		}
+		f, err := b.open(n.Base)
+		if err != nil {
+			return err
+		}
+		srcs[path] = f
+	}
 	for _, path := range []string{oldPath, newPath} {
-		if _, ok := copies[path]; ok {
-			if err := e.ensureOverlay(ctx, b, path); err != nil {
+		if n, ok := copies[path]; ok {
+			if err := e.copyOnWrite(ctx, path, n.Base, srcs[path]); err != nil {
 				return err
 			}
 		}
@@ -612,6 +639,10 @@ func (e *Engine) renameDirectory(ctx context.Context, b *Blobs, oldPath, newPath
 	if err := b.requireFiles(blobs); err != nil {
 		return err
 	}
+	// Each blob opens only while it is copied, so a large tree holds one
+	// descriptor at a time. A blob replaced since hydration stops the rename
+	// after the copies before it. Those copies hold base content, and the
+	// rerun completes the rename.
 	for _, n := range visible {
 		if n.node.FromOverlay {
 			continue

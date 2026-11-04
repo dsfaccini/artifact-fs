@@ -594,6 +594,9 @@ func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetI
 		if err != nil {
 			return err
 		}
+		if ref.Path == ".git" {
+			return syscall.EPERM
+		}
 		var size *int64
 		if op.Size != nil {
 			s := int64(*op.Size)
@@ -795,6 +798,9 @@ func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) er
 		if err != nil {
 			return err
 		}
+		if ref.Path == ".git" && !op.OpenFlags.IsReadOnly() {
+			return syscall.EPERM
+		}
 		fh := &FileHandle{inode: ref, path: ref.Path}
 		if ref.Path != ".git" {
 			f, gen, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen)
@@ -860,6 +866,10 @@ func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) 
 			return err
 		}
 		fh.mu.Lock()
+		if fh.path == ".git" {
+			fh.mu.Unlock()
+			return syscall.EPERM
+		}
 		if fh.detached {
 			f := fh.cacheFile
 			fh.mu.Unlock()
@@ -1015,7 +1025,7 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 }
 
 // isGitfile reports whether name in parent is the synthesized .git gitfile,
-// which the overlay cannot remove or replace.
+// which no op may remove, replace, or write.
 func isGitfile(parent *InodeRef, name string) bool {
 	return parent.IsRoot && name == ".git"
 }
