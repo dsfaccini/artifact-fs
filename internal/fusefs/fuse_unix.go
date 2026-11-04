@@ -798,9 +798,6 @@ func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) er
 		if err != nil {
 			return err
 		}
-		if ref.Path == ".git" && !op.OpenFlags.IsReadOnly() {
-			return syscall.EPERM
-		}
 		fh := &FileHandle{inode: ref, path: ref.Path}
 		if ref.Path != ".git" {
 			f, gen, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen)

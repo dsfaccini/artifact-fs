@@ -851,15 +851,13 @@ func TestSyntheticGitFileRejectsWrites(t *testing.T) {
 	ctx := context.Background()
 	f := newTrackedFixture(t)
 	inode := f.lookup(t, fuseops.RootInodeID, ".git")
-	for _, op := range []*fuseops.OpenFileOp{
-		{Inode: inode, OpenFlags: syscall.O_WRONLY},
-		{Inode: inode, OpenFlags: syscall.O_RDWR},
-	} {
-		if got := kernelErrno(f.fs.OpenFile(ctx, op)); got != syscall.EPERM {
-			t.Errorf("open .git with flags %v: kernel errno = %v, want EPERM", op.OpenFlags, got)
-		}
+	// Opening .git for writing succeeds; the write itself is rejected.
+	open := &fuseops.OpenFileOp{Inode: inode, OpenFlags: syscall.O_RDWR}
+	if err := f.fs.OpenFile(ctx, open); err != nil {
+		t.Fatalf("open .git for writing: %v", err)
 	}
-	handle := f.open(t, inode)
+	handle := open.Handle
+	t.Cleanup(func() { _ = f.fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: handle}) })
 	if got := kernelErrno(f.fs.WriteFile(ctx, &fuseops.WriteFileOp{Inode: inode, Handle: handle, Data: []byte("gitdir: /elsewhere\n")})); got != syscall.EPERM {
 		t.Errorf("write .git: kernel errno = %v, want EPERM", got)
 	}

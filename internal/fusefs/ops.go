@@ -26,8 +26,8 @@ const maxPrefetchTasksPerDir = 256
 // No Engine method hydrates a blob. A method that reads base content takes a
 // *Blobs, and when the blob it needs is missing it returns a *notHydratedError.
 // It returns that error before it changes anything, except that a directory
-// rename may already have copied some files into the overlay, each with its
-// base content. Engine.Do then hydrates the blob with no lock held and runs the
+// rename may already have promoted some directories and copied some files into
+// the overlay, all with base content. Engine.Do then hydrates the blob with no lock held and runs the
 // method again, which completes the op. The method resolves its paths afresh
 // under the transition read lock, so a HEAD switch during hydration makes it ask
 // for the new blob.
@@ -641,8 +641,8 @@ func (e *Engine) renameDirectory(ctx context.Context, b *Blobs, oldPath, newPath
 	}
 	// Each blob opens only while it is copied, so a large tree holds one
 	// descriptor at a time. A blob replaced since hydration stops the rename
-	// after the copies before it. Those copies hold base content, and the
-	// rerun completes the rename.
+	// after the directories it promoted and the files it copied before that
+	// blob. Those entries hold base content, and the rerun completes the rename.
 	for _, n := range visible {
 		if n.node.FromOverlay {
 			continue
