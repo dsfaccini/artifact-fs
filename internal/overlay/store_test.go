@@ -1815,7 +1815,7 @@ func baseFile(path, content string) model.BaseNode {
 }
 
 // Another Store's reconcile changes a row without logging it, so only the
-// full-row guard keeps this reconcile from deleting the row it rebased.
+// DELETE guard keeps this reconcile from deleting the row it rebased.
 func TestReconcileGuardKeepsAnotherStoresUnloggedRebase(t *testing.T) {
 	s, cfg := testStore(t)
 	ctx := context.Background()
@@ -1865,5 +1865,53 @@ func TestReconcileClassifiesAnEntryWhoseBackingFileVanishedDuringItsLookups(t *t
 	}
 	if got := changesSince(t, cfg, before).Paths; !slices.Equal(got, []string{"x.txt"}) {
 		t.Fatalf("changed paths = %q, want only the write's [x.txt]", got)
+	}
+}
+
+// Another Store's reconcile rebases a row without logging it while this
+// reconcile plans to rebase the same row onto another base. Only the UPDATE
+// guard keeps the other store's rebase.
+func TestReconcileUpdateGuardKeepsAnotherStoresUnloggedRebase(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "x.txt", "mine")
+	other, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { other.Close() })
+	theirs := baseFile("x.txt", "theirs")
+	var once sync.Once
+	if err := s.Reconcile(ctx, func(string) (model.BaseNode, bool) {
+		once.Do(func() {
+			if err := other.Reconcile(ctx, func(string) (model.BaseNode, bool) { return theirs, true }); err != nil {
+				t.Error(err)
+			}
+		})
+		return baseFile("x.txt", "ours"), true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := s.Get("x.txt"); !ok || e.SourceOID != theirs.ObjectOID {
+		t.Fatalf("x.txt = %+v, %t; want the other reconcile's rebase kept", e, ok)
+	}
+}
+
+// A backing file that vanished with no logged write fails the reconcile, as
+// it did when the whole reconcile ran under the lock, and leaves the entry.
+func TestReconcileFailsOnABackingFileMissingWithNoWrite(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "x.txt", "mine")
+	before, _ := s.Get("x.txt")
+	if err := os.Remove(before.BackingPath); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Reconcile(ctx, func(string) (model.BaseNode, bool) { return baseFile("x.txt", "theirs"), true })
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Reconcile = %v, want the missing backing file's ErrNotExist", err)
+	}
+	if after, ok := s.Get("x.txt"); !ok || after != before {
+		t.Fatalf("x.txt after the failed reconcile = %+v, %t; want it unchanged: %+v", after, ok, before)
 	}
 }
