@@ -41,6 +41,9 @@ jobs:
       - name: Check Sandbox bootstrap lock lifetime
         run: bash examples/cloudflare-sandbox-sdk/tests/mount-lock.test.sh
 
+      - name: Check Sandbox remote validation
+        run: bash examples/cloudflare-sandbox-sdk/tests/validate-remote.test.sh
+
       - name: Build generic container
         run: docker build --file examples/Dockerfile .
 

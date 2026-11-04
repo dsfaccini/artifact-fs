@@ -204,3 +204,75 @@ func TestAdoptGitDirRejectsAcquisitionOptions(t *testing.T) {
 		}
 	}
 }
+
+func TestAdoptGitDirWarnsAboutCredentialedOriginOncePerPrepare(t *testing.T) {
+	ctx := t.Context()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
+	runCmd(t, "git", "init", "--initial-branch=main", source)
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", source, "add", "README.md")
+	runCmd(t, "git", "-C", source, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
+	// Remote detection starts at the "git//" inside the password, so a redacted
+	// origin field would keep "alice:pwq". The password is not hex, so a logged
+	// object ID cannot hold it.
+	const origin = "gcrypt::rsync://alice:pwqgit//xyz@example.invalid/repository.git"
+	runCmd(t, "git", "-C", source, "remote", "add", "origin", origin)
+	// The README's adoption steps leave the mountpoint empty.
+	runCmd(t, "git", "-C", source, "worktree", "add", "--no-checkout", "-b", "topic", worktree)
+	gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
+	runCmd(t, "git", "--git-dir", gitDir, "read-tree", "HEAD")
+	if err := os.Rename(filepath.Join(worktree, ".git"), filepath.Join(dir, "topic.gitfile")); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &lockedBuffer{}
+	svc, err := New(ctx, filepath.Join(dir, "state"), slog.New(slog.NewJSONHandler(logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	warnings := func() int { return strings.Count(logs.String(), "adopted worktree origin embeds credentials") }
+	cfg := model.RepoConfig{Name: "adopted", GitDir: gitDir, MountPath: worktree, AdoptGitDir: true, Enabled: true}
+	if err := svc.AddRepo(ctx, cfg); err != nil {
+		t.Fatalf("adoption with a credentialed origin failed: %v", err)
+	}
+	stored, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.PrepareState != "" || stored.PrepareError != "" {
+		t.Fatalf("adopted repo prepare state=%q error=%q, want ready", stored.PrepareState, stored.PrepareError)
+	}
+	if got := warnings(); got != 1 {
+		t.Fatalf("add-repo logged %d credentialed-origin warnings, want 1: %s", got, logs.String())
+	}
+
+	svc.mount = fakeMount
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.Lock()
+	rt := svc.running[stored.ID]
+	svc.mu.Unlock()
+	if rt == nil || rt.mfs == nil {
+		t.Fatal("adopted repo is not mounted after syncRepos")
+	}
+	if got := warnings(); got != 2 {
+		t.Fatalf("add-repo and one mount logged %d credentialed-origin warnings, want 2: %s", got, logs.String())
+	}
+	if strings.Contains(logs.String(), "pwq") || strings.Contains(logs.String(), `"origin":`) {
+		t.Fatalf("warning logged the origin: %s", logs.String())
+	}
+	if strings.Contains(logs.String(), "example.invalid/repository.git") {
+		t.Fatalf("warning kept the remote's location: %s", logs.String())
+	}
+	if got := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "remote", "get-url", "origin")); got != origin {
+		t.Fatalf("adoption changed origin to %q", got)
+	}
+}

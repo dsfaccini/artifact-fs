@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,7 +17,80 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
+	"golang.org/x/sys/unix"
 )
+
+// sshSessionReportEnv makes this test binary act as an SSH command that
+// writes its session ID and SSH_ASKPASS_REQUIRE to the named file and fails.
+const sshSessionReportEnv = "AFS_TEST_SSH_SESSION_REPORT"
+
+func init() {
+	if report := os.Getenv(sshSessionReportEnv); report != "" {
+		sid, err := unix.Getsid(0)
+		if err == nil {
+			err = os.WriteFile(report, []byte(strconv.Itoa(sid)+" "+os.Getenv("SSH_ASKPASS_REQUIRE")), 0o600)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+		}
+		os.Exit(1)
+	}
+}
+
+func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		filter string
+		read   func(ctx context.Context, store *Store, cfg model.RepoConfig, commit, blob string) error
+	}{
+		{"blob", "blob:none", func(ctx context.Context, store *Store, cfg model.RepoConfig, _, blob string) error {
+			_, err := store.BlobToCache(ctx, cfg, blob, filepath.Join(filepath.Dir(cfg.GitDir), "cache", blob))
+			return err
+		}},
+		{"tree", "tree:0", func(ctx context.Context, store *Store, cfg model.RepoConfig, commit, _ string) error {
+			_, err := store.BuildTreeIndex(ctx, cfg, commit)
+			return err
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			isolateLazyFetchEnv(t)
+			tmp := t.TempDir()
+			gitDir, commit, blob := partialClone(t, tmp, tt.filter)
+			exe, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", "ssh://git@example.invalid/repo.git")
+			run(t, "git", "--git-dir", gitDir, "config", "core.sshCommand", shellQuote(exe))
+			report := filepath.Join(tmp, "ssh-session")
+			t.Setenv(sshSessionReportEnv, report)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+			err = tt.read(ctx, store, model.RepoConfig{ID: "x", GitDir: gitDir}, commit, blob)
+			store.Close()
+			if err == nil {
+				t.Fatal("read a missing object through an SSH command that fails")
+			}
+			data, err := os.ReadFile(report)
+			if err != nil {
+				t.Fatalf("the lazy fetch did not run core.sshCommand: %v", err)
+			}
+			testSID, err := unix.Getsid(0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sid, askpass, _ := strings.Cut(string(data), " ")
+			if sid == strconv.Itoa(testSID) {
+				t.Fatalf("core.sshCommand ran in the caller's session %d, which can have a controlling terminal", testSID)
+			}
+			if askpass != "never" {
+				t.Fatalf("core.sshCommand ran with SSH_ASKPASS_REQUIRE=%q, want never", askpass)
+			}
+		})
+	}
+}
 
 func TestRunGitCancellationKillsDescendants(t *testing.T) {
 	tmp := t.TempDir()
@@ -84,6 +158,17 @@ func TestRunGitCancellationKillsDescendants(t *testing.T) {
 func TestRunGitCancellationClosesEscapedDescriptorPipes(t *testing.T) {
 	assertEscapedGitCancellationIsBounded(t, func(ctx context.Context) error {
 		_, err := runGit(ctx, "", "version")
+		return err
+	})
+}
+
+func TestBlobToCacheCancellationClosesEscapedDescriptorPipes(t *testing.T) {
+	assertEscapedGitCancellationIsBounded(t, func(ctx context.Context) error {
+		store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+		defer store.Close()
+		oid := strings.Repeat("a", 40)
+		dir := t.TempDir()
+		_, err := store.BlobToCache(ctx, model.RepoConfig{ID: "x", GitDir: dir}, oid, filepath.Join(dir, "cache", oid))
 		return err
 	})
 }

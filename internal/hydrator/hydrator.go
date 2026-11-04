@@ -719,7 +719,7 @@ func (s *Service) hydrate(repo model.RepoConfig, task model.HydrationTask) {
 		s.notifyHydrated(task.RepoID, task.ObjectOID, size)
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
 		s.finishHydration(key, result{err: err})
 		return
 	}

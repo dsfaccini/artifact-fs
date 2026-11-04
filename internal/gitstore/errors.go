@@ -150,7 +150,15 @@ func (b *boundedGitError) String() string {
 	if !b.truncated {
 		return b.buf.String()
 	}
-	return strings.TrimRight(b.buf.String(), "\r\n") + "\n" + gitErrorTruncatedLabel
+	return strings.TrimRight(withoutPartialLastToken(b.buf.String()), "\r\n") + "\n" + gitErrorTruncatedLabel
+}
+
+// withoutPartialLastToken drops the text after the last space of text that a
+// bound cut. The cut can fall inside a credential, which redaction does not
+// recognize in part. Redaction splits tokens on spaces, so every earlier token
+// is whole. Text with no space keeps nothing.
+func withoutPartialLastToken(text string) string {
+	return text[:max(strings.LastIndexByte(text, ' '), 0)]
 }
 
 func (b *boundedGitError) Retryable() bool {

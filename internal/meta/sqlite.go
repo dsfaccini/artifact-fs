@@ -12,7 +12,7 @@ import (
 )
 
 func OpenDB(path string) (*sql.DB, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir db dir: %w", err)
 	}
 	params := url.Values{}

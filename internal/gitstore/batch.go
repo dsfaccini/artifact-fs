@@ -2,6 +2,7 @@ package gitstore
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -47,7 +49,7 @@ func (s *Store) BlobToCache(ctx context.Context, repo model.RepoConfig, objectOI
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o700); err != nil {
 		return 0, err
 	}
 	pool, err := s.getPool(repo.GitDir)
@@ -440,15 +442,19 @@ type batchCatFile struct {
 	stdin      io.WriteCloser
 	stdoutPipe io.ReadCloser
 	stdout     *bufio.Reader
+	stderr     *gitStderrLogger
 	logger     *slog.Logger
 	closeOnce  sync.Once
 }
 
 func newBatchCatFile(gitDir string, logger *slog.Logger) (*batchCatFile, error) {
 	cmd := exec.Command("git", "cat-file", "--batch")
-	cmd.Env = append(os.Environ(), "GIT_DIR="+gitDir)
-	cmd.Stderr = os.Stderr
-	configureCommandProcessGroup(cmd)
+	cmd.Env = append(append(os.Environ(), "GIT_DIR="+gitDir), lazyFetchEnv()...)
+	stderr := &gitStderrLogger{logger: logger, gitDir: gitDir}
+	cmd.Stderr = stderr
+	configureCommandSession(cmd)
+	// A lazy fetch's descendant can keep the stderr pipe open after a kill.
+	cmd.WaitDelay = gitCommandWaitDelay
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -466,8 +472,57 @@ func newBatchCatFile(gitDir string, logger *slog.Logger) (*batchCatFile, error) 
 		stdin:      stdin,
 		stdoutPipe: stdout,
 		stdout:     bufio.NewReaderSize(stdout, 256*1024),
+		stderr:     stderr,
 		logger:     logger,
 	}, nil
+}
+
+// gitStderrLogger logs each stderr line of a long-lived git process through
+// auth.RedactLogString, like the retry logs of every other Git command. A lazy
+// fetch can print the promisor remote, which may embed credentials or name a
+// private repository; the log keeps Git's error and drops the remote. It
+// buffers no more of a line than it logs: the server shapes this stderr, and
+// redaction's cost grows faster than the line's length.
+type gitStderrLogger struct {
+	logger    *slog.Logger
+	gitDir    string
+	line      []byte
+	truncated bool
+}
+
+func (w *gitStderrLogger) Write(p []byte) (int, error) {
+	n := len(p)
+	for len(p) > 0 {
+		chunk, rest, found := bytes.Cut(p, []byte{'\n'})
+		if room := maxGitErrorBytes - len(w.line); len(chunk) > room {
+			chunk = chunk[:room]
+			w.truncated = true
+		}
+		w.line = append(w.line, chunk...)
+		if !found {
+			break
+		}
+		w.flush()
+		p = rest
+	}
+	return n, nil
+}
+
+func (w *gitStderrLogger) flush() {
+	text := string(w.line)
+	if w.truncated {
+		// A line with no space keeps nothing, and is still logged as truncated.
+		text = withoutPartialLastToken(text)
+	}
+	line := auth.RedactLogString(strings.TrimSpace(text))
+	truncated := w.truncated
+	if len(line) > maxGitErrorBytes {
+		line, truncated = line[:maxGitErrorBytes], true
+	}
+	if line != "" || truncated {
+		w.logger.Warn("git cat-file stderr", "git_dir", w.gitDir, "line", line, "truncated", truncated)
+	}
+	w.line, w.truncated = w.line[:0], false
 }
 
 func (b *batchCatFile) alive() bool {
@@ -496,6 +551,7 @@ func (b *batchCatFile) shutdown(kill bool) {
 		}
 		if b.cmd != nil && b.cmd.Process != nil {
 			_ = b.cmd.Wait()
+			b.stderr.flush()
 		}
 	})
 }

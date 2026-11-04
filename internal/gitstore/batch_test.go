@@ -3,8 +3,12 @@ package gitstore
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -447,4 +451,208 @@ func TestBatchPoolBoundsConcurrentProcesses(t *testing.T) {
 	}
 	p.release(second)
 	p.closeAll()
+}
+
+func TestBlobToCacheLogsLazyFetchStderrWithoutPrompting(t *testing.T) {
+	askpassRuns := isolateLazyFetchEnv(t)
+	tmp := t.TempDir()
+	gitDir, _, blobOID := partialClone(t, tmp, "blob:none")
+	run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", unauthorizedRemote(t))
+
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cfg := model.RepoConfig{ID: "x", GitDir: gitDir}
+	if _, err := store.BlobToCache(ctx, cfg, blobOID, filepath.Join(tmp, "cache", blobOID)); err == nil {
+		t.Fatal("BlobToCache fetched a blob the promisor remote refused")
+	}
+	store.Close()
+	if !strings.Contains(logs.String(), `"msg":"git cat-file stderr"`) || !strings.Contains(logs.String(), "terminal prompts disabled") {
+		t.Fatalf("logs = %s, want the lazy fetch's non-interactive failure", logs.String())
+	}
+	assertAskpassDidNotRun(t, askpassRuns)
+}
+
+func TestBuildTreeIndexLazyTreeFetchDoesNotPrompt(t *testing.T) {
+	askpassRuns := isolateLazyFetchEnv(t)
+	tmp := t.TempDir()
+	gitDir, commit, _ := partialClone(t, tmp, "tree:0")
+	run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", unauthorizedRemote(t))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := New(nil).BuildTreeIndex(ctx, model.RepoConfig{ID: "x", GitDir: gitDir}, commit)
+	if err == nil || !strings.Contains(err.Error(), "terminal prompts disabled") {
+		t.Fatalf("BuildTreeIndex error = %v, want the lazy tree fetch's non-interactive failure", err)
+	}
+	assertAskpassDidNotRun(t, askpassRuns)
+}
+
+func TestCloneBloblessNonInteractiveSkipsSSHAskpass(t *testing.T) {
+	askpassRuns := isolateLazyFetchEnv(t)
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{Name: "repo", GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: unauthorizedRemote(t), Branch: "main"}
+	err := New(slog.New(slog.NewTextHandler(io.Discard, nil))).CloneBloblessNonInteractive(context.Background(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "terminal prompts disabled") {
+		t.Fatalf("CloneBloblessNonInteractive error = %v, want a non-interactive failure", err)
+	}
+	assertAskpassDidNotRun(t, askpassRuns)
+}
+
+// isolateLazyFetchEnv keeps the machine's prompt programs and SSH settings out
+// of a test's Git commands; TestMain already isolates Git config. It sets
+// SSH_ASKPASS to a program that records each run in the returned file.
+func isolateLazyFetchEnv(t *testing.T) string {
+	t.Helper()
+	for _, key := range []string{"GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "SSH_ASKPASS_REQUIRE"} {
+		t.Setenv(key, "")
+		os.Unsetenv(key)
+	}
+	dir := t.TempDir()
+	runs := filepath.Join(dir, "askpass-runs")
+	askpass := filepath.Join(dir, "askpass")
+	if err := os.WriteFile(askpass, []byte("#!/bin/sh\necho \"$*\" >> '"+runs+"'\necho guessed\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SSH_ASKPASS", askpass)
+	return runs
+}
+
+func assertAskpassDidNotRun(t *testing.T, runs string) {
+	t.Helper()
+	if data, err := os.ReadFile(runs); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Git ran SSH_ASKPASS: %q, %v", data, err)
+	}
+}
+
+// unauthorizedRemote returns an HTTP remote that answers every request with 401.
+func unauthorizedRemote(t *testing.T) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="test"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL + "/repo.git"
+}
+
+// partialClone clones a one-file repository with filter into dir and returns
+// the clone's Git dir, its HEAD commit and the file's blob.
+func partialClone(t *testing.T, dir string, filter string) (gitDir, commit, blob string) {
+	t.Helper()
+	src := filepath.Join(dir, "src")
+	run(t, "git", "init", "--initial-branch", "main", src)
+	if err := os.WriteFile(filepath.Join(src, "file.txt"), []byte("data\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", src, "add", "file.txt")
+	run(t, "git", "-C", src, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+	run(t, "git", "-C", src, "config", "uploadpack.allowFilter", "true")
+	clone := filepath.Join(dir, "clone")
+	run(t, "git", "clone", "--filter="+filter, "--no-checkout", "file://"+src, clone)
+	commit = strings.TrimSpace(runOutput(t, "git", "-C", src, "rev-parse", "HEAD"))
+	blob = strings.TrimSpace(runOutput(t, "git", "-C", src, "rev-parse", "HEAD:file.txt"))
+	return filepath.Join(clone, ".git"), commit, blob
+}
+
+func TestBlobToCacheRedactsBatchStderr(t *testing.T) {
+	// Git anonymizes HTTP URLs itself, so only a fake git can print a
+	// credentialed URL the way a remote helper or SSH may.
+	logs := batchStderrLogs(t, `echo "fatal: unable to access 'https://alice:s3cret@example.com/repo.git/': HTTP 401" >&2`)
+	if !strings.Contains(logs, "unable to access") {
+		t.Fatalf("logs = %s, want the batch process's stderr", logs)
+	}
+	if strings.Contains(logs, "s3cret") {
+		t.Fatalf("logs leaked the password: %s", logs)
+	}
+	if strings.Contains(logs, "example.com/repo.git") {
+		t.Fatalf("logs kept the remote's location: %s", logs)
+	}
+}
+
+func TestBlobToCacheRedactsNoMoreOfBatchStderrLineThanItLogs(t *testing.T) {
+	// The server shapes this stderr, and redaction's cost grows faster than a
+	// line's length. Redacting the token shrinks the line far below the logged
+	// bound, so text after it reaches the log only when redaction saw it.
+	logs := batchStderrLogs(t, `printf 'fatal: token=%030000d unbuffered-tail\n' 0 >&2`)
+	if !strings.Contains(logs, `"truncated":true`) {
+		t.Fatalf("logs = %.300s, want a truncated line", logs)
+	}
+	if strings.Contains(logs, "unbuffered-tail") {
+		t.Fatalf("redaction saw text past the logged bound: %.300s", logs)
+	}
+}
+
+func TestBlobToCacheDropsPartialTokenAtBatchStderrBufferBound(t *testing.T) {
+	// The buffer bound falls inside the password, and redacting the token
+	// before it shrinks the line below the logged bound.
+	head := "token=" + strings.Repeat("a", maxGitErrorBytes-len("token=")-len(" alice:s3cr")) + " alice:s3cr"
+	logs := batchStderrLogs(t, "printf '%s' '"+head+"' >&2; echo 'etpassword@example.com/repo.git' >&2")
+	if !strings.Contains(logs, `"truncated":true`) {
+		t.Fatalf("logs = %.300s, want a truncated line", logs)
+	}
+	if strings.Contains(logs, "s3cr") {
+		t.Fatalf("logs leaked part of the password: %.300s", logs)
+	}
+}
+
+func TestBlobToCacheLogsOverflowingBatchStderrTokenAsTruncated(t *testing.T) {
+	logs := batchStderrLogs(t, `printf 'fatal:%070000d\n' 0 >&2`)
+	if !strings.Contains(logs, `"line":"","truncated":true`) {
+		t.Fatalf("logs = %.300s, want an empty truncated line", logs)
+	}
+}
+
+func TestBlobToCacheLogsBatchStderrWithoutTrailingNewline(t *testing.T) {
+	logs := batchStderrLogs(t, "printf 'fatal: last line has no newline' >&2")
+	if !strings.Contains(logs, "fatal: last line has no newline") {
+		t.Fatalf("logs = %s, want the unterminated last line", logs)
+	}
+}
+
+func TestBlobToCacheBoundsBatchStderrLine(t *testing.T) {
+	logs := batchStderrLogs(t, `awk 'BEGIN { for (i = 0; i < 10000; i++) printf "word "; print "" }' >&2`)
+	decoder := json.NewDecoder(strings.NewReader(logs))
+	for decoder.More() {
+		var entry struct {
+			Line      string
+			Truncated bool
+		}
+		if err := decoder.Decode(&entry); err != nil {
+			t.Fatal(err)
+		}
+		if entry.Line == "" || len(entry.Line) > maxGitErrorBytes || !entry.Truncated {
+			t.Fatalf("logged %d bytes, truncated=%v; want at most %d bytes, truncated", len(entry.Line), entry.Truncated, maxGitErrorBytes)
+		}
+	}
+	if logs == "" {
+		t.Fatal("no stderr was logged")
+	}
+}
+
+// batchStderrLogs runs BlobToCache against a fake git whose cat-file --batch
+// runs stderrScript, then reports every blob missing, and returns the logs.
+func batchStderrLogs(t *testing.T, stderrScript string) string {
+	t.Helper()
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeGit := "#!/bin/sh\n" + stderrScript + "\nwhile read -r oid; do echo \"$oid missing\"; done\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(fakeGit), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
+	oid := strings.Repeat("a", 40)
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(tmp, "repo.git")}
+	if _, err := store.BlobToCache(context.Background(), cfg, oid, filepath.Join(tmp, "cache", oid)); err == nil {
+		t.Fatal("BlobToCache succeeded for a missing blob")
+	}
+	store.Close()
+	return logs.String()
 }

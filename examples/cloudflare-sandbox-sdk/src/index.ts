@@ -510,6 +510,10 @@ function normalizeRemote(value: string): string {
     throw new UserError('remote contains invalid characters or is too long', 400);
   }
 
+  if (remote.startsWith('-')) {
+    throw new UserError("remote must not start with '-'", 400);
+  }
+
   if (remote.startsWith('https://') || remote.startsWith('ssh://')) {
     let parsed: URL;
     try {
