@@ -357,7 +357,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 
 5. **Write** -- The Engine promotes base files to the overlay via copy-on-write (hydrate, then copy to the `upper/` directory). Subsequent reads come from the overlay. Deletes are recorded as whiteouts; deleting a file copies it first only while a handle on it is open. No FUSE operation holds a lock while a blob hydrates, so a slow fetch stalls neither a HEAD switch nor other operations. A failed operation returns the errno of its cause, such as `ENOSPC`, and an interrupted one returns `EINTR`.
 
-6. **Background** -- For ordinary workspaces, a watcher polls HEAD/refs every 500ms and republishes HEAD changes. Repositories with `--require-commit` do not run this watcher, so their verified base commit remains fixed. Remote polling is controlled separately by `--refresh`.
+6. **Background** -- For ordinary workspaces, a watcher polls HEAD/refs every 500ms and republishes HEAD changes. A HEAD change compares the overlay with the new generation while reads and writes continue; they wait only while the result is applied. Repositories with `--require-commit` do not run this watcher, so their verified base commit remains fixed. Remote polling is controlled separately by `--refresh`.
 
 ### Subsystems
 
