@@ -74,8 +74,8 @@ file system extension is missing or not enabled. `auto` does not fall back after
 any other FSKit failure, because a retry could mount twice. The daemon logs the
 transport that mounted each repo.
 
-FSKit reuses directory handles across enumerations, so this backend refreshes
-entries when enumeration restarts. It rejects extended attributes to prevent
+FSKit reuses directory handles across enumerations. Every backend lists a
+directory again when an enumeration restarts. FSKit rejects extended attributes to prevent
 AppleDouble metadata files; use `cp -X` when copying files with Finder metadata.
 The native mount API has no supported cancellation for a permanently stalled
 system mount service. `umount` from a terminal cannot unmount an FSKit mount;
