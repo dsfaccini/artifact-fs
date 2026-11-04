@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"golang.org/x/sys/unix"
 )
@@ -50,7 +51,10 @@ func TestStateRootDirectoriesArePrivate(t *testing.T) {
 	if rt == nil {
 		t.Fatal("repo is not running after syncRepos")
 	}
-	if _, err := rt.engine.Read(ctx, "README.md", 0, make([]byte, 16)); err != nil {
+	if err := rt.engine.Do(ctx, nil, func(ctx context.Context, b *fusefs.Blobs) error {
+		_, err := rt.engine.Read(ctx, b, "README.md", 0, make([]byte, 16))
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
 
