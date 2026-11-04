@@ -537,6 +537,13 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 		}
 
 		attrs, err := fs.engine.Attrs(b, childPath)
+		if negativeLookupEntries && errors.Is(err, iofs.ErrNotExist) {
+			// Child 0 is a negative entry: the kernel caches the miss as long
+			// as it caches a positive entry.
+			op.Entry = fuseops.ChildInodeEntry{}
+			setChildEntryExpiry(&op.Entry, time.Second)
+			return nil
+		}
 		if err != nil {
 			return err
 		}

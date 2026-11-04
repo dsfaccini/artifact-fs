@@ -5,6 +5,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// negativeLookupEntries is off: whether FSKit honors negative entries is
+// unverified, so every darwin backend answers a missing name with ENOENT.
+const negativeLookupEntries = false
+
 func platformMountConfig(cfg *fuse.MountConfig) {
 	cfg.FuseImpl = fuse.FUSEImplMacFUSE
 }
