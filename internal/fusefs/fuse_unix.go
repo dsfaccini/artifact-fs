@@ -803,7 +803,8 @@ func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) er
 		}
 		fh := &FileHandle{inode: ref, path: ref.Path}
 		if ref.Path != ".git" {
-			f, gen, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen)
+			// An open for writing only reads nothing, so it prefetches nothing.
+			f, gen, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen, !op.OpenFlags.IsWriteOnly())
 			if err != nil {
 				return err
 			}

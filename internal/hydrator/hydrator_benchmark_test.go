@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -257,6 +258,116 @@ func BenchmarkAsyncHydrationGitStore(b *testing.B) {
 		hydrateBenchmarkNodes(b, h, cfg, targets, callerWorkers)
 		h.Stop()
 	}
+}
+
+// BenchmarkPrefetchBloblessDir hydrates one directory's prefetch from a
+// blobless clone of a local remote, so it measures git's per-fetch cost with no
+// network latency.
+func BenchmarkPrefetchBloblessDir(b *testing.B) {
+	const blobs = 256
+	remote := createBenchmarkPartialCloneRemote(b, blobs)
+	b.ResetTimer()
+	for range b.N {
+		b.StopTimer()
+		git, cfg, nodes := cloneBenchmarkBlobless(b, remote)
+		packs := benchmarkPackCount(b, cfg.GitDir)
+		h := New(git)
+		hydrated := make(chan struct{}, len(nodes))
+		h.SetOnHydrated(func(model.RepoID, string, int64) { hydrated <- struct{}{} })
+		tasks := make([]model.HydrationTask, len(nodes))
+		for i, n := range nodes {
+			tasks[i] = model.HydrationTask{RepoID: cfg.ID, Path: n.Path, ObjectOID: n.ObjectOID, SizeState: n.SizeState, Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()}
+		}
+		h.Start(4, cfg)
+		b.StartTimer()
+		h.EnqueueBatch(tasks)
+		for range nodes {
+			<-hydrated
+		}
+		b.StopTimer()
+		h.Stop()
+		b.ReportMetric(float64(benchmarkPackCount(b, cfg.GitDir)-packs), "packs/op")
+		git.Close()
+		b.StartTimer()
+	}
+}
+
+// BenchmarkReadBloblessFiles reads every file of a blobless clone of a local
+// remote from concurrent callers, as FUSE reads do.
+func BenchmarkReadBloblessFiles(b *testing.B) {
+	const (
+		blobs         = 256
+		callerWorkers = 32
+	)
+	remote := createBenchmarkPartialCloneRemote(b, blobs)
+	b.ResetTimer()
+	for range b.N {
+		b.StopTimer()
+		git, cfg, nodes := cloneBenchmarkBlobless(b, remote)
+		packs := benchmarkPackCount(b, cfg.GitDir)
+		h := New(git)
+		h.Start(4, cfg)
+		b.StartTimer()
+		hydrateBenchmarkNodes(b, h, cfg, nodes, callerWorkers)
+		b.StopTimer()
+		h.Stop()
+		b.ReportMetric(float64(benchmarkPackCount(b, cfg.GitDir)-packs), "packs/op")
+		git.Close()
+		b.StartTimer()
+	}
+}
+
+// createBenchmarkPartialCloneRemote returns a source repo with blobs files,
+// cloned into a bare repository that serves partial clones.
+func createBenchmarkPartialCloneRemote(b *testing.B, blobs int) model.RepoConfig {
+	b.Helper()
+	workDir, _ := createBenchmarkGitRepo(b, blobs)
+	b.Cleanup(func() { _ = os.RemoveAll(workDir) })
+	branch, err := exec.Command("git", "-C", workDir, "symbolic-ref", "--short", "HEAD").Output()
+	if err != nil {
+		b.Fatalf("symbolic-ref: %v", err)
+	}
+	bare := filepath.Join(b.TempDir(), "remote.git")
+	runBenchmarkGit(b, workDir, "clone", "-q", "--bare", workDir, bare)
+	runBenchmarkGit(b, bare, "config", "uploadpack.allowFilter", "true")
+	return model.RepoConfig{ID: "repo", Name: "repo", RemoteURL: "file://" + bare, Branch: strings.TrimSpace(string(branch))}
+}
+
+func cloneBenchmarkBlobless(b *testing.B, remote model.RepoConfig) (*gitstore.Store, model.RepoConfig, []model.BaseNode) {
+	b.Helper()
+	tmp := b.TempDir()
+	cfg := remote
+	cfg.GitDir = filepath.Join(tmp, "repo.git")
+	cfg.BlobCacheDir = filepath.Join(tmp, "cache")
+	git := gitstore.New(nil)
+	ctx := context.Background()
+	if err := git.CloneBlobless(ctx, cfg); err != nil {
+		b.Fatalf("CloneBlobless: %v", err)
+	}
+	head, _, err := git.ResolveHEAD(ctx, cfg)
+	if err != nil {
+		b.Fatalf("ResolveHEAD: %v", err)
+	}
+	all, err := git.BuildTreeIndex(ctx, cfg, head)
+	if err != nil {
+		b.Fatalf("BuildTreeIndex: %v", err)
+	}
+	var nodes []model.BaseNode
+	for _, n := range all {
+		if n.Type == "file" {
+			nodes = append(nodes, n)
+		}
+	}
+	return git, cfg, nodes
+}
+
+func benchmarkPackCount(b *testing.B, gitDir string) int {
+	b.Helper()
+	packs, err := filepath.Glob(filepath.Join(gitDir, "objects", "pack", "*.pack"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	return len(packs)
 }
 
 func hydrateBenchmarkNodes(b *testing.B, h *Service, cfg model.RepoConfig, nodes []model.BaseNode, callerWorkers int) {
