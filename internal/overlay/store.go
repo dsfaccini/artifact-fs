@@ -878,20 +878,20 @@ func (s *Store) Reconcile(ctx context.Context, baseLookup func(path string) (mod
 	return s.ReconcileChecked(ctx, func(path string) (model.BaseNode, bool, error) {
 		n, ok := baseLookup(path)
 		return n, ok, nil
-	}, nil)
+	}, nil, nil)
 }
 
 // ReconcileChecked reconciles as Reconcile does, in two phases, so that
 // readers keep working while it compares the overlay with the new base.
 //
 // The plan phase reads every entry, looks up its base and hashes its content
-// with no lock that a reader or an overlay write takes. swap runs the apply
-// phase: it calls apply while it holds the lock its readers take, and switches
-// them to the base baseLookup reads before it releases that lock. apply takes
-// the database write lock, classifies again every entry the change log shows a
-// write changed since the plan read it, and applies the result. A nil swap
-// applies at once.
-func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path string) (model.BaseNode, bool, error), swap func(apply func() error) error) error {
+// with no lock that a reader or an overlay write takes. The apply phase holds
+// lock, which excludes the readers of the overlay and the base. It takes the
+// database write lock, classifies again every entry the change log shows a
+// write changed since the plan read it, and applies the result. Then it calls
+// switchBase to switch the readers to the base baseLookup reads, and releases
+// lock. Either may be nil.
+func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path string) (model.BaseNode, bool, error), lock sync.Locker, switchBase func()) error {
 	// A reconcile's own changes reach the change log only in part, so one
 	// reconcile must not plan while another applies.
 	s.reconcileMu.Lock()
@@ -911,19 +911,36 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 	if err != nil {
 		return err
 	}
-	apply := func() error { return s.applyReconcile(ctx, r, seq, entries, plan) }
-	if swap == nil {
-		return apply()
+	if lock != nil {
+		lock.Lock()
 	}
-	return swap(apply)
+	removed, err := s.applyReconcile(ctx, r, seq, entries, plan)
+	if err == nil && switchBase != nil {
+		switchBase()
+	}
+	if lock != nil {
+		lock.Unlock()
+	}
+	// Delete backing files only after the transaction commits. If we deleted
+	// before commit and the transaction rolled back, DB rows would reference
+	// non-existent files. No committed row names them, so readers need not
+	// wait for the deletes. Reverse order so children are removed before
+	// parents (os.Remove fails on non-empty directories).
+	for _, v := range slices.Backward(removed) {
+		if v.BackingPath != "" {
+			_ = os.Remove(v.BackingPath)
+		}
+	}
+	return err
 }
 
-func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, entries []model.OverlayEntry, plan reconcilePlan) error {
+// applyReconcile applies plan and returns the entries it removed.
+func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, entries []model.OverlayEntry, plan reconcilePlan) ([]model.OverlayEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
 	// Removing an entry the new base matches, rebasing an entry, and removing
@@ -932,40 +949,40 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 	// Suspending the log takes the write lock first, so no write lands between
 	// reading the log and applying the result.
 	if err := suspendChangeLog(ctx, tx); err != nil {
-		return err
+		return nil, err
 	}
 	rows, err := tx.QueryContext(ctx, changesSinceQuery, seq)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	changed, err := scanPaths(rows)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(changed) > 0 || plan.incomplete {
 		if entries, err = s.rereadChanged(ctx, tx, entries, changed); err != nil {
-			return err
+			return nil, err
 		}
 		if plan, err = r.classify(entries, true); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if len(plan.remove) == 0 && len(plan.update) == 0 {
-		return nil
+		return nil, nil
 	}
 	var revealed []string
 	// Guard the mutations so that a change the log does not show, such as
 	// another Store's reconcile, is not lost.
 	stmt, err := tx.PrepareContext(ctx, `DELETE FROM overlay_entries WHERE path=? AND kind=? AND source_oid=? AND source_mode=? AND mode=? AND mtime_unix_ns=? AND ctime_unix_ns=?`)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer stmt.Close()
 	deleted := make([]model.OverlayEntry, 0, len(plan.remove))
 	for _, e := range plan.remove {
 		res, err := stmt.ExecContext(ctx, e.Path, e.Kind, e.SourceOID, e.SourceMode, e.Mode, e.MtimeUnixNs, e.CtimeUnixNs)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if n, err := res.RowsAffected(); err == nil && n > 0 {
 			deleted = append(deleted, e)
@@ -976,30 +993,21 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 	}
 	updateStmt, err := tx.PrepareContext(ctx, `UPDATE overlay_entries SET kind=?, source_oid=?, source_mode=?, target_path=? WHERE path=? AND kind=? AND source_oid=? AND source_mode=? AND mode=? AND mtime_unix_ns=? AND ctime_unix_ns=?`)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer updateStmt.Close()
 	for _, update := range plan.update {
 		if _, err := updateStmt.ExecContext(ctx, update.after.Kind, update.after.SourceOID, update.after.SourceMode, update.after.TargetPath, update.before.Path, update.before.Kind, update.before.SourceOID, update.before.SourceMode, update.before.Mode, update.before.MtimeUnixNs, update.before.CtimeUnixNs); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if err := resumeChangeLog(ctx, tx, revealed...); err != nil {
-		return err
+		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
-		return err
+		return nil, err
 	}
-	// Delete backing files only after the transaction commits. If we deleted
-	// before commit and the transaction rolled back, DB rows would reference
-	// non-existent files. Reverse order so children are removed before parents
-	// (os.Remove fails on non-empty directories).
-	for _, v := range slices.Backward(deleted) {
-		if v.BackingPath != "" {
-			_ = os.Remove(v.BackingPath)
-		}
-	}
-	return nil
+	return deleted, nil
 }
 
 // rereadChanged replaces the entries at each changed path and at every path

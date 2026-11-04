@@ -5,6 +5,8 @@ package fusefs
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -899,28 +901,46 @@ func (s *pausingSnapshot) LookupNode(ctx context.Context, gen int64, path string
 	return s.SnapshotStore.LookupNode(ctx, gen, path)
 }
 
-// applyObserver calls applied right after a reconcile applies, while its swap
-// still holds the lock.
-type applyObserver struct {
-	model.OverlayStore
-	applied func()
+// observedLock calls locked right after it takes the lock, and unlocking
+// right before it releases the lock.
+type observedLock struct {
+	sync.Locker
+	locked    func()
+	unlocking func()
 }
 
-func (o *applyObserver) ReconcileChecked(ctx context.Context, baseLookup func(string) (model.BaseNode, bool, error), swap func(apply func() error) error) error {
-	return o.OverlayStore.ReconcileChecked(ctx, baseLookup, func(apply func() error) error {
-		return swap(func() error {
-			if err := apply(); err != nil {
-				return err
-			}
-			o.applied()
-			return nil
-		})
-	})
+func (l observedLock) Lock() {
+	l.Locker.Lock()
+	l.locked()
+}
+
+func (l observedLock) Unlock() {
+	l.unlocking()
+	l.Locker.Unlock()
+}
+
+// lockObserver observes the lock each reconcile holds while it applies.
+type lockObserver struct {
+	model.OverlayStore
+	locked    func()
+	unlocking func()
+}
+
+func (o *lockObserver) ReconcileChecked(ctx context.Context, baseLookup func(string) (model.BaseNode, bool, error), lock sync.Locker, switchBase func()) error {
+	return o.OverlayStore.ReconcileChecked(ctx, baseLookup, observedLock{Locker: lock, locked: o.locked, unlocking: o.unlocking}, switchBase)
+}
+
+func blobOID(content string) string {
+	h := sha1.New()
+	_, _ = fmt.Fprintf(h, "blob %d\x00%s", len(content), content)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // A reader during a HEAD switch sees the old overlay with the old generation,
 // or the new overlay with the new one. Generation 2 drops link, which the
 // overlay deletes: the new overlay with the old generation would show link.
+// Generation 2 also commits committed.txt, so the switch removes its overlay
+// entry and backing file.
 func TestSwitchGenerationServesReadsWhileItLooksUpTheBase(t *testing.T) {
 	f := newTrackedFixture(t)
 	ctx := context.Background()
@@ -929,21 +949,48 @@ func TestSwitchGenerationServesReadsWhileItLooksUpTheBase(t *testing.T) {
 	if err := f.store.Remove(ctx, "link"); err != nil {
 		t.Fatal(err)
 	}
+	committed := model.BaseNode{RepoID: "repo", Path: "committed.txt", Type: "file", Mode: 0o100644, ObjectOID: blobOID("committed"), SizeState: "known", SizeBytes: int64(len("committed"))}
+	f.snapshot.nodes[2][committed.Path] = committed
+	f.snapshot.kids[2]["."] = append(f.snapshot.kids[2]["."], committed)
+	if _, err := f.store.CreateFile(ctx, committed.Path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.WriteFile(ctx, committed.Path, 0, []byte("committed")); err != nil {
+		t.Fatal(err)
+	}
+	entry, _, err := f.store.Lookup(ctx, committed.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backing := entry.BackingPath
 	inode := f.lookup(t, fuseops.RootInodeID, "file.txt")
 	snapshot := &pausingSnapshot{SnapshotStore: f.snapshot, gen: 2, paused: make(chan struct{}), resume: make(chan struct{})}
 	f.resolver.Snapshot = snapshot
-	var readersLockedOut, markerGone bool
-	var generationAtApply int64
-	f.resolver.Overlay = &applyObserver{OverlayStore: f.store, applied: func() {
+	type observation struct {
+		readersLockedOut bool
+		markerGone       bool
+		backingKept      bool
+		generation       int64
+	}
+	observe := func() observation {
+		o := observation{generation: f.resolver.Generation()}
 		if f.resolver.transition.TryRLock() {
 			f.resolver.transition.RUnlock()
 		} else {
-			readersLockedOut = true
+			o.readersLockedOut = true
 		}
 		_, marked, _ := f.store.Lookup(ctx, "link")
-		markerGone = !marked
-		generationAtApply = f.resolver.Generation()
-	}}
+		o.markerGone = !marked
+		_, err := os.Stat(backing)
+		o.backingKept = err == nil
+		return o
+	}
+	var atLock, atUnlock observation
+	f.resolver.Overlay = &lockObserver{
+		OverlayStore: f.store,
+		locked:       func() { atLock = observe() },
+		unlocking:    func() { atUnlock = observe() },
+	}
 
 	done := make(chan error, 1)
 	go func() { done <- f.resolver.SwitchGeneration(ctx, 2, 0) }()
@@ -966,8 +1013,16 @@ func TestSwitchGenerationServesReadsWhileItLooksUpTheBase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !readersLockedOut || !markerGone || generationAtApply != 1 {
-		t.Fatalf("right after apply: readers locked out %t, link marker gone %t, generation %d; want true, true, 1", readersLockedOut, markerGone, generationAtApply)
+	// The lock covers applying the overlay and switching the generation,
+	// and no reader waits for the backing file to be deleted.
+	if want := (observation{readersLockedOut: true, backingKept: true, generation: 1}); atLock != want {
+		t.Errorf("when SwitchGeneration took the lock = %+v, want %+v", atLock, want)
+	}
+	if want := (observation{readersLockedOut: true, markerGone: true, backingKept: true, generation: 2}); atUnlock != want {
+		t.Errorf("when SwitchGeneration released the lock = %+v, want %+v", atUnlock, want)
+	}
+	if _, err := os.Stat(backing); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("committed.txt backing file after the switch: %v, want ErrNotExist", err)
 	}
 	if _, gen, _, err := f.resolver.ResolvePathState("link"); !errors.Is(err, fs.ErrNotExist) || gen != 2 {
 		t.Fatalf("link after the switch = generation %d, %v; want generation 2, ErrNotExist", gen, err)

@@ -1798,3 +1798,72 @@ func TestReconcileClassifiesWritesThatLandDuringItsLookups(t *testing.T) {
 		t.Errorf("changed paths after reconcile = %q, want only the writes' %q", got, logged)
 	}
 }
+
+func createWithContent(t *testing.T, s *Store, path, content string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.CreateFile(ctx, path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, path, 0, []byte(content)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func baseFile(path, content string) model.BaseNode {
+	return model.BaseNode{Path: path, Type: "file", Mode: 0o100644, ObjectOID: testBlobOID([]byte(content))}
+}
+
+// Another Store's reconcile changes a row without logging it, so only the
+// full-row guard keeps this reconcile from deleting the row it rebased.
+func TestReconcileGuardKeepsAnotherStoresUnloggedRebase(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "x.txt", "mine")
+	other, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { other.Close() })
+	theirs := baseFile("x.txt", "theirs")
+	var once sync.Once
+	if err := s.Reconcile(ctx, func(string) (model.BaseNode, bool) {
+		once.Do(func() {
+			if err := other.Reconcile(ctx, func(string) (model.BaseNode, bool) { return theirs, true }); err != nil {
+				t.Error(err)
+			}
+		})
+		return baseFile("x.txt", "mine"), true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := s.Get("x.txt"); !ok || e.SourceOID != theirs.ObjectOID {
+		t.Fatalf("x.txt = %+v, %t; want the other reconcile's rebase kept", e, ok)
+	}
+}
+
+// A write that removes an entry's backing file while the plan hashes it must
+// not fail the reconcile: the apply phase classifies the entry the write left.
+func TestReconcileClassifiesAnEntryWhoseBackingFileVanishedDuringItsLookups(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "x.txt", "mine")
+	before := changesSince(t, cfg, 0).Seq
+	var once sync.Once
+	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+		once.Do(func() {
+			if err := s.Remove(ctx, "x.txt"); err != nil {
+				t.Error(err)
+			}
+		})
+		return baseFile("x.txt", "theirs"), true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := s.Get("x.txt"); !ok || e.Kind != model.OverlayKindDelete {
+		t.Fatalf("x.txt = %+v, %t; want the delete marker", e, ok)
+	}
+	if got := changesSince(t, cfg, before).Paths; !slices.Equal(got, []string{"x.txt"}) {
+		t.Fatalf("changed paths = %q, want only the write's [x.txt]", got)
+	}
+}

@@ -59,15 +59,9 @@ func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime i
 	baseLookup := func(path string) (model.BaseNode, bool, error) {
 		return r.Snapshot.LookupNode(ctx, gen, path)
 	}
-	return r.Overlay.ReconcileChecked(ctx, baseLookup, func(apply func() error) error {
-		r.transition.Lock()
-		defer r.transition.Unlock()
-		if err := apply(); err != nil {
-			return err
-		}
+	return r.Overlay.ReconcileChecked(ctx, baseLookup, &r.transition, func() {
 		r.SetCommitTime(commitTime)
 		r.SetGeneration(gen)
-		return nil
 	})
 }
 
