@@ -29,17 +29,21 @@ type MountedFS interface {
 }
 
 // ArtifactFuse is the FUSE adapter following the tigrisfs GoofysFuse pattern:
-// embed NotImplementedFileSystem + core state, thin operation wrappers.
+// embed NotImplementedFileSystem + core state, thin operation wrappers. Engine
+// is its only API to the merged view.
 type ArtifactFuse struct {
 	fuseutil.NotImplementedFileSystem
 	repo           model.RepoConfig
-	resolver       *Resolver
 	engine         *Engine
 	fskit          bool
 	gitfileContent []byte    // synthesized .git gitfile, computed once
 	syntheticTime  time.Time // timestamps of synthesized entries; changing them can deadlock concurrent FSKit Git reads
 
-	mu           sync.RWMutex
+	mu sync.RWMutex
+	// handleOps keeps inode and handle bookkeeping consistent with the overlay:
+	// Unlink and Rename hold it exclusively, and every op that creates or uses
+	// inodes and handles holds it shared. Engine.Do releases it before it
+	// hydrates a blob.
 	handleOps    sync.RWMutex
 	inodes       map[fuseops.InodeID]*InodeRef
 	pathToInode  map[string]fuseops.InodeID
@@ -107,10 +111,9 @@ func (e ReaddirEntry) direntType() fuseutil.DirentType {
 	}
 }
 
-func NewArtifactFuse(repo model.RepoConfig, resolver *Resolver, engine *Engine) *ArtifactFuse {
+func NewArtifactFuse(repo model.RepoConfig, engine *Engine) *ArtifactFuse {
 	fs := &ArtifactFuse{
 		repo:           repo,
-		resolver:       resolver,
 		engine:         engine,
 		gitfileContent: fmt.Appendf(nil, "gitdir: %s\n", repo.GitDir),
 		syntheticTime:  time.Now(),
@@ -282,11 +285,21 @@ func (fs *ArtifactFuse) closeCachedFilesForPath(path string) {
 	}
 }
 
-func (fs *ArtifactFuse) pinOpenHandles(path string) error {
-	ov, ok, err := fs.engine.Overlay.Lookup(context.Background(), path)
-	if err != nil || !ok || ov.IsDeleted() || ov.BackingPath == "" {
-		return err
+func (fs *ArtifactFuse) hasOpenFile(path string) bool {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	for _, fh := range fs.fileHandles {
+		fh.mu.Lock()
+		matches := fh.path == path && !fh.detached
+		fh.mu.Unlock()
+		if matches {
+			return true
+		}
 	}
+	return false
+}
+
+func (fs *ArtifactFuse) pinOpenFiles(path, backingPath string) error {
 	fs.mu.RLock()
 	var handles []*FileHandle
 	for _, fh := range fs.fileHandles {
@@ -301,9 +314,9 @@ func (fs *ArtifactFuse) pinOpenHandles(path string) error {
 	for _, fh := range handles {
 		fh.mu.Lock()
 		if fh.cacheFile == nil || fh.cacheGeneration != -1 {
-			f, openErr := os.OpenFile(ov.BackingPath, os.O_RDWR, 0)
+			f, openErr := os.OpenFile(backingPath, os.O_RDWR, 0)
 			if openErr != nil {
-				f, openErr = os.Open(ov.BackingPath)
+				f, openErr = os.Open(backingPath)
 				if openErr != nil {
 					fh.mu.Unlock()
 					return openErr
@@ -361,7 +374,7 @@ func (fs *ArtifactFuse) moveOpenHandles(oldPath, newPath string) {
 
 // read serves the overlay when it holds the path, and otherwise the base content
 // of generation gen, or of the current generation when gen is 0.
-func (fh *FileHandle) read(ctx context.Context, engine *Engine, gen int64, off int64, dst []byte) ([]byte, error) {
+func (fh *FileHandle) read(ctx context.Context, engine *Engine, b *Blobs, gen int64, off int64, dst []byte) ([]byte, error) {
 	fh.mu.Lock()
 	path := fh.path
 	if fh.detached && fh.cacheFile != nil {
@@ -370,7 +383,7 @@ func (fh *FileHandle) read(ctx context.Context, engine *Engine, gen int64, off i
 	}
 	fh.mu.Unlock()
 	if gen == 0 {
-		gen = engine.Resolver.Generation()
+		gen = engine.Generation()
 	}
 	fh.mu.Lock()
 	if fh.cacheFile != nil && (fh.cacheGeneration == -1 || fh.cacheGeneration == gen) {
@@ -389,18 +402,18 @@ func (fh *FileHandle) read(ctx context.Context, engine *Engine, gen int64, off i
 	seq := fh.invalidateSeq
 	fh.mu.Unlock()
 
-	f, gen, ok, err := engine.BaseCacheFile(ctx, path, gen)
+	f, gen, ok, err := engine.BaseCacheFile(ctx, b, path, gen)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
-		return engine.Read(ctx, path, off, dst)
+		return engine.Read(ctx, b, path, off, dst)
 	}
 	fh.mu.Lock()
 	if fh.invalidateSeq != seq {
 		fh.mu.Unlock()
 		_ = f.Close()
-		return engine.Read(ctx, path, off, dst)
+		return engine.Read(ctx, b, path, off, dst)
 	}
 	if fh.cacheFile != nil && fh.cacheGeneration == gen {
 		_ = f.Close()
@@ -458,169 +471,158 @@ func (fs *ArtifactFuse) StatFS(_ context.Context, op *fuseops.StatFSOp) error {
 	return nil
 }
 
-func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInodeOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
-	parent, err := fs.requireInode(op.Parent, syscall.ENOENT)
-	if err != nil {
-		return err
-	}
+// shared runs op through Engine.Do holding handleOps shared, and exclusive
+// holding it exclusively. Both return the error the kernel receives.
+func (fs *ArtifactFuse) shared(ctx context.Context, op func(context.Context, *Blobs) error) error {
+	return toErrno(ctx, fs.engine.Do(ctx, fs.handleOps.RLocker(), op))
+}
 
-	childPath := cleanChildPath(parent.Path, op.Name)
+func (fs *ArtifactFuse) exclusive(ctx context.Context, op func(context.Context, *Blobs) error) error {
+	return toErrno(ctx, fs.engine.Do(ctx, &fs.handleOps, op))
+}
 
-	// Synthesize .git gitfile in root
-	if parent.IsRoot && op.Name == ".git" {
-		fs.mu.Lock()
-		ref := fs.allocInode(".git", "file", 0o644, fs.resolver.Generation())
-		fs.mu.Unlock()
-		op.Entry.Child = ref.ID
-		op.Entry.Attributes = fs.gitFileAttrs()
-		setChildEntryExpiry(&op.Entry, time.Minute)
+// toErrno returns the error the kernel receives for an op error. The fuse
+// library replies with the first syscall.Errno in the error's chain, and with
+// EIO when it holds none. toErrno passes an error that wraps an errno through,
+// maps a canceled request to EINTR and the io/fs sentinels to their errno, and
+// wraps the original error so its message survives.
+func toErrno(ctx context.Context, err error) error {
+	if err == nil {
 		return nil
 	}
-
-	mode, size, typ, mtime, ctime, gen, err := fs.resolveAttrs(ctx, childPath)
-	if err != nil {
-		if errors.Is(err, iofs.ErrNotExist) {
-			return syscall.ENOENT
-		}
-		return syscall.EIO
+	if isRequestCancellation(ctx, err) {
+		return fmt.Errorf("%w: %w", syscall.EINTR, err)
 	}
+	if _, ok := errors.AsType[syscall.Errno](err); ok {
+		return err
+	}
+	for _, m := range []struct {
+		target error
+		errno  syscall.Errno
+	}{
+		{iofs.ErrNotExist, syscall.ENOENT},
+		{iofs.ErrExist, syscall.EEXIST},
+		{iofs.ErrInvalid, syscall.EINVAL},
+	} {
+		if errors.Is(err, m.target) {
+			return fmt.Errorf("%w: %w", m.errno, err)
+		}
+	}
+	return err
+}
 
-	fs.mu.Lock()
-	ref := fs.allocInode(childPath, typ, mode, gen)
-	fs.mu.Unlock()
+func isRequestCancellation(ctx context.Context, err error) bool {
+	return ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
+}
 
-	op.Entry.Child = ref.ID
-	op.Entry.Attributes = inodeAttrs(mode, uint64(size), typ, mtime, ctime)
-	setChildEntryExpiry(&op.Entry, time.Second)
-	return nil
+func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInodeOp) error {
+	return fs.shared(ctx, func(_ context.Context, b *Blobs) error {
+		parent, err := fs.requireInode(op.Parent, syscall.ENOENT)
+		if err != nil {
+			return err
+		}
+
+		childPath := cleanChildPath(parent.Path, op.Name)
+
+		// Synthesize .git gitfile in root
+		if isGitfile(parent, op.Name) {
+			fs.mu.Lock()
+			ref := fs.allocInode(".git", "file", 0o644, fs.engine.Generation())
+			fs.mu.Unlock()
+			op.Entry.Child = ref.ID
+			op.Entry.Attributes = fs.gitFileAttrs()
+			setChildEntryExpiry(&op.Entry, time.Minute)
+			return nil
+		}
+
+		attrs, err := fs.engine.Attrs(b, childPath)
+		if err != nil {
+			return err
+		}
+
+		fs.mu.Lock()
+		ref := fs.allocInode(childPath, attrs.Type, attrs.Mode, attrs.Gen)
+		fs.mu.Unlock()
+
+		op.Entry.Child = ref.ID
+		op.Entry.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
+		setChildEntryExpiry(&op.Entry, time.Second)
+		return nil
+	})
 }
 
 func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetInodeAttributesOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
-	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
-	if err != nil {
-		return err
-	}
-
-	if ref.IsRoot {
-		if fs.resolver != nil {
-			if mode, size, typ, mtime, ctime, err := fs.resolver.Getattr(ref.Path); err == nil {
-				op.Attributes = inodeAttrs(mode, uint64(size), typ, mtime, ctime)
-				op.AttributesExpiration = attrExpiry(time.Second)
-				return nil
-			}
+	return fs.shared(ctx, func(_ context.Context, b *Blobs) error {
+		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
+		if err != nil {
+			return err
 		}
-		op.Attributes = inodeAttrs(ref.Mode, 4096, "dir", fs.syntheticTime, fs.syntheticTime)
+
+		if ref.IsRoot {
+			if fs.engine != nil {
+				if attrs, err := fs.engine.Attrs(b, ref.Path); err == nil {
+					op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
+					op.AttributesExpiration = attrExpiry(time.Second)
+					return nil
+				}
+			}
+			op.Attributes = inodeAttrs(ref.Mode, 4096, "dir", fs.syntheticTime, fs.syntheticTime)
+			op.AttributesExpiration = attrExpiry(time.Second)
+			return nil
+		}
+
+		if ref.Path == ".git" {
+			op.Attributes = fs.gitFileAttrs()
+			op.AttributesExpiration = attrExpiry(time.Minute)
+			return nil
+		}
+
+		attrs, err := fs.engine.Attrs(b, ref.Path)
+		if err != nil {
+			return err
+		}
+		fs.setInodeGeneration(op.Inode, attrs.Gen)
+		op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
 		op.AttributesExpiration = attrExpiry(time.Second)
 		return nil
-	}
-
-	if ref.Path == ".git" {
-		op.Attributes = fs.gitFileAttrs()
-		op.AttributesExpiration = attrExpiry(time.Minute)
-		return nil
-	}
-
-	mode, size, typ, mtime, ctime, gen, err := fs.resolveAttrs(ctx, ref.Path)
-	if err != nil {
-		if errors.Is(err, iofs.ErrNotExist) {
-			return syscall.ENOENT
-		}
-		return syscall.EIO
-	}
-	fs.setInodeGeneration(op.Inode, gen)
-	op.Attributes = inodeAttrs(mode, uint64(size), typ, mtime, ctime)
-	op.AttributesExpiration = attrExpiry(time.Second)
-	return nil
-}
-
-// resolveAttrs returns the attributes of path and the snapshot generation they
-// came from, or generation 0 when they came from the overlay.
-func (fs *ArtifactFuse) resolveAttrs(ctx context.Context, path string) (mode uint32, size int64, nodeType string, mtime time.Time, ctime time.Time, gen int64, err error) {
-	n, generation, commitTime, err := fs.resolver.ResolvePathState(path)
-	if err != nil {
-		return 0, 0, "", time.Time{}, time.Time{}, 0, err
-	}
-	if n.FromOverlay {
-		typ := n.Overlay.NodeType()
-		mt := time.Unix(0, n.Overlay.MtimeUnixNs)
-		ct := time.Unix(0, n.Overlay.CtimeUnixNs)
-		return n.Overlay.Mode, n.Overlay.SizeBytes, typ, mt, ct, 0, nil
-	}
-
-	mode = normalizeMode(n.Base.Mode, n.Base.Type)
-	size = n.Base.SizeBytes
-	if n.Base.Type == "file" && n.Base.SizeState != "known" && n.Base.ObjectOID != "" {
-		_, hydratedSize, hErr := fs.engine.Hydrator.EnsureHydrated(ctx, fs.repo, n.Base)
-		if hErr != nil {
-			return 0, 0, "", time.Time{}, time.Time{}, 0, hErr
-		}
-		size = hydratedSize
-	} else if n.Base.Type == "symlink" && n.Base.SizeState != "known" && n.Base.ObjectOID != "" {
-		target, readErr := fs.engine.Hydrator.ReadBlob(ctx, fs.repo, n.Base, model.MaxSymlinkTargetBytes)
-		if readErr != nil {
-			return 0, 0, "", time.Time{}, time.Time{}, 0, readErr
-		}
-		size = int64(len(target))
-	}
-
-	// Base files use the HEAD commit timestamp for mtime so tools like
-	// make see a stable, meaningful value.
-	ct := commitTime
-	if ct == 0 {
-		ct = generation // fallback: commit time unavailable
-	}
-	mt := time.Unix(ct, 0)
-	return mode, size, n.Base.Type, mt, mt, generation, nil
+	})
 }
 
 func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
-	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
-	if err != nil {
-		return err
-	}
-	if op.Size != nil {
-		fs.closeCachedFilesForPath(ref.Path)
-		if err := fs.engine.Truncate(ctx, ref.Path, int64(*op.Size)); err != nil {
-			return syscall.EIO
+	return fs.shared(ctx, func(ctx context.Context, b *Blobs) error {
+		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
+		if err != nil {
+			return err
 		}
-		fs.closeCachedFilesForPath(ref.Path)
-	}
-	if op.Mode != nil {
-		if err := fs.engine.SetMode(ctx, ref.Path, uint32(op.Mode.Perm())); err != nil {
-			if errors.Is(err, iofs.ErrInvalid) {
-				return syscall.ENOTSUP
-			}
-			if errors.Is(err, iofs.ErrNotExist) {
-				return syscall.ENOENT
-			}
-			return syscall.EIO
+		if ref.Path == ".git" {
+			return syscall.EPERM
 		}
-	}
-	// Handle mtime updates (e.g., from touch)
-	if op.Mtime != nil {
-		fs.closeCachedFilesForPath(ref.Path)
-		if err := fs.engine.SetMtime(ctx, ref.Path, *op.Mtime); err != nil {
-			if errors.Is(err, iofs.ErrInvalid) {
-				return syscall.ENOTSUP
-			}
-			return syscall.EIO
+		var size *int64
+		if op.Size != nil {
+			s := int64(*op.Size)
+			size = &s
 		}
-		fs.closeCachedFilesForPath(ref.Path)
-	}
-	mode, size, typ, mtime, ctime, err := fs.resolver.Getattr(ref.Path)
-	if err != nil {
-		return syscall.EIO
-	}
-	fs.setInodeGeneration(op.Inode, 0)
-	op.Attributes = inodeAttrs(mode, uint64(size), typ, mtime, ctime)
-	op.AttributesExpiration = attrExpiry(time.Second)
-	return nil
+		var mode *uint32
+		if op.Mode != nil {
+			m := uint32(op.Mode.Perm())
+			mode = &m
+		}
+		changesContent := op.Size != nil || op.Mtime != nil
+		if changesContent {
+			fs.closeCachedFilesForPath(ref.Path)
+		}
+		attrs, err := fs.engine.SetAttributes(ctx, b, ref.Path, size, mode, op.Mtime)
+		if changesContent {
+			fs.closeCachedFilesForPath(ref.Path)
+		}
+		if err != nil {
+			return err
+		}
+		fs.setInodeGeneration(op.Inode, attrs.Gen)
+		op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
+		op.AttributesExpiration = attrExpiry(time.Second)
+		return nil
+	})
 }
 
 func (fs *ArtifactFuse) ForgetInode(_ context.Context, op *fuseops.ForgetInodeOp) error {
@@ -640,30 +642,30 @@ func (fs *ArtifactFuse) ForgetInode(_ context.Context, op *fuseops.ForgetInodeOp
 }
 
 func (fs *ArtifactFuse) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
-	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
-	if err != nil {
-		return err
-	}
-	// Eagerly load children at open time to avoid races on concurrent ReadDir.
-	entries, gen, commitTime, err := fs.readDirSnapshot(ctx, ref)
-	if err != nil {
-		return syscall.EIO
-	}
+	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
+		if err != nil {
+			return err
+		}
+		// Eagerly load children at open time to avoid races on concurrent ReadDir.
+		entries, gen, commitTime, err := fs.readDirSnapshot(ctx, ref)
+		if err != nil {
+			return err
+		}
 
-	dh := &DirHandle{inode: ref, gen: gen, commitTime: commitTime, entries: entries}
-	fs.mu.Lock()
-	handle := fs.nextHandleID
-	fs.nextHandleID++
-	fs.dirHandles[handle] = dh
-	fs.mu.Unlock()
-	op.Handle = handle
-	return nil
+		dh := &DirHandle{inode: ref, gen: gen, commitTime: commitTime, entries: entries}
+		fs.mu.Lock()
+		handle := fs.nextHandleID
+		fs.nextHandleID++
+		fs.dirHandles[handle] = dh
+		fs.mu.Unlock()
+		op.Handle = handle
+		return nil
+	})
 }
 
 func (fs *ArtifactFuse) readDirSnapshot(ctx context.Context, ref *InodeRef) ([]ReaddirEntry, int64, int64, error) {
-	entries, gen, commitTime, err := fs.resolver.ReaddirSnapshot(context.WithoutCancel(ctx), ref.Path)
+	entries, gen, commitTime, err := fs.engine.ReadDir(ctx, ref.Path)
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -674,89 +676,83 @@ func (fs *ArtifactFuse) readDirSnapshot(ctx context.Context, ref *InodeRef) ([]R
 }
 
 func (fs *ArtifactFuse) ReadDir(ctx context.Context, op *fuseops.ReadDirOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
-	dh, err := fs.dirHandle(op.Handle)
-	if err != nil {
-		return err
-	}
-	dh.mu.Lock()
-	defer dh.mu.Unlock()
-	// FSKit keeps a directory handle across separate enumerations.
-	if fs.fskit && op.Offset == 0 {
-		entries, gen, commitTime, err := fs.readDirSnapshot(ctx, dh.inode)
+	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+		dh, err := fs.dirHandle(op.Handle)
 		if err != nil {
-			return syscall.EIO
+			return err
 		}
-		dh.entries, dh.gen, dh.commitTime = entries, gen, commitTime
-	}
-
-	offset := int(op.Offset)
-	for i := offset; i < len(dh.entries); i++ {
-		e := dh.entries[i]
-		dirent := fuseutil.Dirent{
-			Offset: fuseops.DirOffset(i + 1),
-			Inode:  fuseops.RootInodeID + 1, // placeholder; kernel re-looks-up via LookUpInode
-			Name:   e.Name,
-			Type:   e.direntType(),
-		}
-		n := fuseutil.WriteDirent(op.Dst[op.BytesRead:], dirent)
-		if n == 0 {
-			break
-		}
-		op.BytesRead += n
-	}
-	return nil
-}
-
-func (fs *ArtifactFuse) ReadDirPlus(_ context.Context, op *fuseops.ReadDirPlusOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
-	dh, err := fs.dirHandle(op.Handle)
-	if err != nil {
-		return err
-	}
-	dh.mu.Lock()
-	defer dh.mu.Unlock()
-
-	offset := int(op.Offset)
-	for i := offset; i < len(dh.entries); i++ {
-		e := dh.entries[i]
-		childPath := cleanChildPath(dh.inode.Path, e.Name)
-		entry, err := fs.childEntryFromReaddir(childPath, dh.gen, dh.commitTime, e)
-		if err != nil {
-			if errors.Is(err, iofs.ErrNotExist) {
-				return syscall.ENOENT
+		dh.mu.Lock()
+		defer dh.mu.Unlock()
+		// FSKit keeps a directory handle across separate enumerations.
+		if fs.fskit && op.Offset == 0 {
+			entries, gen, commitTime, err := fs.readDirSnapshot(ctx, dh.inode)
+			if err != nil {
+				return err
 			}
-			return syscall.EIO
+			dh.entries, dh.gen, dh.commitTime = entries, gen, commitTime
 		}
-		dirent := fuseutil.DirentPlus{
-			Dirent: fuseutil.Dirent{
+
+		offset := int(op.Offset)
+		for i := offset; i < len(dh.entries); i++ {
+			e := dh.entries[i]
+			dirent := fuseutil.Dirent{
 				Offset: fuseops.DirOffset(i + 1),
-				Inode:  entry.Child,
+				Inode:  fuseops.RootInodeID + 1, // placeholder; kernel re-looks-up via LookUpInode
 				Name:   e.Name,
 				Type:   e.direntType(),
-			},
-			Entry: entry,
+			}
+			n := fuseutil.WriteDirent(op.Dst[op.BytesRead:], dirent)
+			if n == 0 {
+				break
+			}
+			op.BytesRead += n
 		}
-		n := fuseutil.WriteDirentPlus(op.Dst[op.BytesRead:], dirent)
-		if n == 0 {
-			fs.dropInodeLookup(entry.Child)
-			break
-		}
-		op.BytesRead += n
-	}
-	return nil
+		return nil
+	})
 }
 
-func (fs *ArtifactFuse) childEntryFromReaddir(path string, gen, commitTime int64, e ReaddirEntry) (fuseops.ChildInodeEntry, error) {
+func (fs *ArtifactFuse) ReadDirPlus(ctx context.Context, op *fuseops.ReadDirPlusOp) error {
+	return fs.shared(ctx, func(context.Context, *Blobs) error {
+		dh, err := fs.dirHandle(op.Handle)
+		if err != nil {
+			return err
+		}
+		dh.mu.Lock()
+		defer dh.mu.Unlock()
+
+		offset := int(op.Offset)
+		for i := offset; i < len(dh.entries); i++ {
+			e := dh.entries[i]
+			childPath := cleanChildPath(dh.inode.Path, e.Name)
+			entry := fs.childEntryFromReaddir(childPath, dh.gen, dh.commitTime, e)
+			dirent := fuseutil.DirentPlus{
+				Dirent: fuseutil.Dirent{
+					Offset: fuseops.DirOffset(i + 1),
+					Inode:  entry.Child,
+					Name:   e.Name,
+					Type:   e.direntType(),
+				},
+				Entry: entry,
+			}
+			n := fuseutil.WriteDirentPlus(op.Dst[op.BytesRead:], dirent)
+			if n == 0 {
+				fs.dropInodeLookup(entry.Child)
+				break
+			}
+			op.BytesRead += n
+		}
+		return nil
+	})
+}
+
+func (fs *ArtifactFuse) childEntryFromReaddir(path string, gen, commitTime int64, e ReaddirEntry) fuseops.ChildInodeEntry {
 	if path == ".git" {
 		fs.mu.Lock()
 		ref := fs.allocInode(path, "file", 0o644, gen)
 		fs.mu.Unlock()
 		entry := fuseops.ChildInodeEntry{Child: ref.ID, Attributes: fs.gitFileAttrs()}
 		setChildEntryExpiry(&entry, time.Minute)
-		return entry, nil
+		return entry
 	}
 	mode, size, typ, mtime, ctime := readdirAttrs(e, gen, commitTime)
 	refGen := gen
@@ -771,7 +767,7 @@ func (fs *ArtifactFuse) childEntryFromReaddir(path string, gen, commitTime int64
 		Attributes: inodeAttrs(mode, uint64(size), typ, mtime, ctime),
 	}
 	setChildEntryExpiry(&entry, time.Second)
-	return entry, nil
+	return entry
 }
 
 func readdirAttrs(e ReaddirEntry, gen, commitTime int64) (mode uint32, size int64, typ string, mtime time.Time, ctime time.Time) {
@@ -797,378 +793,252 @@ func (fs *ArtifactFuse) ReleaseDirHandle(_ context.Context, op *fuseops.ReleaseD
 }
 
 func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
-	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
-	if err != nil {
-		return err
-	}
-	fh := &FileHandle{inode: ref, path: ref.Path}
-	if ref.Path != ".git" {
-		metadataCtx := context.WithoutCancel(ctx)
-		if ov, ok, err := fs.engine.Overlay.Lookup(metadataCtx, ref.Path); err != nil {
-			return syscall.EIO
-		} else if ok && !ov.IsDeleted() {
-			f, err := os.OpenFile(ov.BackingPath, os.O_RDWR, 0)
-			if err != nil {
-				f, err = os.Open(ov.BackingPath)
-			}
-			if err != nil {
-				return syscall.EIO
-			}
-			fh.cacheFile = f
-			fh.cacheGeneration = -1
-		} else {
-			f, gen, base, err := fs.engine.baseCacheFile(ctx, metadataCtx, ref.Path, ref.Gen)
-			if err != nil {
-				if isRequestCancellation(ctx, err) {
-					return syscall.EINTR
-				}
-				return syscall.EIO
-			}
-			if base {
-				fh.cacheFile = f
-				fh.cacheGeneration = gen
-			}
+	return fs.shared(ctx, func(ctx context.Context, b *Blobs) error {
+		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
+		if err != nil {
+			return err
 		}
-	}
-	fs.mu.Lock()
-	handle := fs.nextHandleID
-	fs.nextHandleID++
-	fs.fileHandles[handle] = fh
-	fs.mu.Unlock()
-	op.Handle = handle
-	op.KeepPageCache = false
-	return nil
+		fh := &FileHandle{inode: ref, path: ref.Path}
+		if ref.Path != ".git" {
+			f, gen, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen)
+			if err != nil {
+				return err
+			}
+			fh.cacheFile, fh.cacheGeneration = f, gen
+		}
+		fs.mu.Lock()
+		handle := fs.nextHandleID
+		fs.nextHandleID++
+		fs.fileHandles[handle] = fh
+		fs.mu.Unlock()
+		op.Handle = handle
+		op.KeepPageCache = false
+		return nil
+	})
 }
 
 func (fs *ArtifactFuse) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
-	fh, err := fs.fileHandle(op.Handle)
-	if err != nil {
-		return err
-	}
+	return fs.shared(ctx, func(ctx context.Context, b *Blobs) error {
+		fh, err := fs.fileHandle(op.Handle)
+		if err != nil {
+			return err
+		}
 
-	fh.mu.Lock()
-	path := fh.path
-	fh.mu.Unlock()
-	if path == ".git" {
-		start := int(op.Offset)
-		if start >= len(fs.gitfileContent) {
-			op.BytesRead = 0
+		fh.mu.Lock()
+		path := fh.path
+		fh.mu.Unlock()
+		if path == ".git" {
+			start := int(op.Offset)
+			if start >= len(fs.gitfileContent) {
+				op.BytesRead = 0
+				return nil
+			}
+			end := min(start+int(op.Size), len(fs.gitfileContent))
+			op.Data = [][]byte{fs.gitfileContent[start:end]}
+			op.BytesRead = end - start
 			return nil
 		}
-		end := min(start+int(op.Size), len(fs.gitfileContent))
-		op.Data = [][]byte{fs.gitfileContent[start:end]}
-		op.BytesRead = end - start
-		return nil
-	}
 
-	// The library leaves Dst nil for reads larger than its request buffer.
-	dst := op.Dst
-	if dst == nil {
-		dst = make([]byte, op.Size)
-	}
-	data, err := fh.read(ctx, fs.engine, fs.inodeGeneration(op.Inode), op.Offset, dst)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return syscall.ENOENT
+		// The library leaves Dst nil for reads larger than its request buffer.
+		dst := op.Dst
+		if dst == nil {
+			dst = make([]byte, op.Size)
 		}
-		return syscall.EIO
-	}
-	if op.Dst == nil {
-		op.Data = [][]byte{data}
-	}
-	op.BytesRead = len(data)
-	return nil
+		data, err := fh.read(ctx, fs.engine, b, fs.inodeGeneration(op.Inode), op.Offset, dst)
+		if err != nil {
+			return err
+		}
+		if op.Dst == nil {
+			op.Data = [][]byte{data}
+		}
+		op.BytesRead = len(data)
+		return nil
+	})
 }
 
 func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
-	fh, err := fs.fileHandle(op.Handle)
-	if err != nil {
-		return err
-	}
-	fh.mu.Lock()
-	if fh.detached {
-		f := fh.cacheFile
+	return fs.shared(ctx, func(ctx context.Context, b *Blobs) error {
+		fh, err := fs.fileHandle(op.Handle)
+		if err != nil {
+			return err
+		}
+		fh.mu.Lock()
+		if fh.path == ".git" {
+			fh.mu.Unlock()
+			return syscall.EPERM
+		}
+		if fh.detached {
+			f := fh.cacheFile
+			fh.mu.Unlock()
+			if f == nil {
+				return syscall.EIO
+			}
+			_, err := f.WriteAt(op.Data, op.Offset)
+			return err
+		}
+		path := fh.path
 		fh.mu.Unlock()
-		if f == nil {
+		fs.closeCachedFilesForPath(path)
+		n, err := fs.engine.Write(ctx, b, path, op.Offset, op.Data)
+		if err != nil {
+			return err
+		}
+		if n != len(op.Data) {
 			return syscall.EIO
 		}
-		if _, err := f.WriteAt(op.Data, op.Offset); err != nil {
-			return syscall.EIO
-		}
+		fs.setInodeGeneration(op.Inode, 0)
+		fs.closeCachedFilesForPath(path)
 		return nil
-	}
-	path := fh.path
-	fh.mu.Unlock()
-	fs.closeCachedFilesForPath(path)
-	n, err := fs.engine.Write(ctx, path, op.Offset, op.Data)
-	if err != nil {
-		return syscall.EIO
-	}
-	if n != len(op.Data) {
-		return syscall.EIO
-	}
-	fs.setInodeGeneration(op.Inode, 0)
-	fs.closeCachedFilesForPath(path)
-	return nil
+	})
 }
 
 func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
-	_, childPath, err := fs.childPath(op.Parent, op.Name)
-	if err != nil {
-		return err
-	}
-	if err := fs.engine.Create(ctx, childPath, uint32(op.Mode)); err != nil {
-		return syscall.EIO
-	}
-	fs.mu.Lock()
-	ref := fs.allocInode(childPath, "file", uint32(op.Mode), 0)
-	fh := &FileHandle{inode: ref, path: childPath}
-	handle := fs.nextHandleID
-	fs.nextHandleID++
-	fs.fileHandles[handle] = fh
-	fs.mu.Unlock()
+	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+		_, childPath, err := fs.childPath(op.Parent, op.Name)
+		if err != nil {
+			return err
+		}
+		if err := fs.engine.Create(ctx, childPath, uint32(op.Mode)); err != nil {
+			return err
+		}
+		fs.mu.Lock()
+		ref := fs.allocInode(childPath, "file", uint32(op.Mode), 0)
+		fh := &FileHandle{inode: ref, path: childPath}
+		handle := fs.nextHandleID
+		fs.nextHandleID++
+		fs.fileHandles[handle] = fh
+		fs.mu.Unlock()
 
-	op.Entry.Child = ref.ID
-	now := time.Now()
-	op.Entry.Attributes = inodeAttrs(uint32(op.Mode), 0, "file", now, now)
-	setChildEntryExpiry(&op.Entry, time.Second)
-	op.Handle = handle
-	return nil
+		op.Entry.Child = ref.ID
+		now := time.Now()
+		op.Entry.Attributes = inodeAttrs(uint32(op.Mode), 0, "file", now, now)
+		setChildEntryExpiry(&op.Entry, time.Second)
+		op.Handle = handle
+		return nil
+	})
 }
 
 func (fs *ArtifactFuse) CreateSymlink(ctx context.Context, op *fuseops.CreateSymlinkOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
-	_, childPath, err := fs.childPath(op.Parent, op.Name)
-	if err != nil {
-		return err
-	}
-	if len(op.Target) > model.MaxSymlinkTargetBytes {
-		return syscall.ENAMETOOLONG
-	}
-	if err := fs.engine.Symlink(ctx, childPath, op.Target); err != nil {
-		return syscall.EIO
-	}
-	fs.mu.Lock()
-	ref := fs.allocInode(childPath, "symlink", 0o120000, 0)
-	fs.mu.Unlock()
+	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+		_, childPath, err := fs.childPath(op.Parent, op.Name)
+		if err != nil {
+			return err
+		}
+		if len(op.Target) > model.MaxSymlinkTargetBytes {
+			return syscall.ENAMETOOLONG
+		}
+		if err := fs.engine.Symlink(ctx, childPath, op.Target); err != nil {
+			return err
+		}
+		fs.mu.Lock()
+		ref := fs.allocInode(childPath, "symlink", 0o120000, 0)
+		fs.mu.Unlock()
 
-	op.Entry.Child = ref.ID
-	now := time.Now()
-	op.Entry.Attributes = inodeAttrs(0o120000, uint64(len(op.Target)), "symlink", now, now)
-	setChildEntryExpiry(&op.Entry, time.Second)
-	return nil
+		op.Entry.Child = ref.ID
+		now := time.Now()
+		op.Entry.Attributes = inodeAttrs(0o120000, uint64(len(op.Target)), "symlink", now, now)
+		setChildEntryExpiry(&op.Entry, time.Second)
+		return nil
+	})
 }
 
 func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
-	_, childPath, err := fs.childPath(op.Parent, op.Name)
-	if err != nil {
-		return err
-	}
-	if err := fs.engine.Mkdir(ctx, childPath, uint32(op.Mode)); err != nil {
-		return syscall.EIO
-	}
-	fs.mu.Lock()
-	ref := fs.allocInode(childPath, "dir", uint32(op.Mode), 0)
-	fs.mu.Unlock()
+	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+		_, childPath, err := fs.childPath(op.Parent, op.Name)
+		if err != nil {
+			return err
+		}
+		if err := fs.engine.Mkdir(ctx, childPath, uint32(op.Mode)); err != nil {
+			return err
+		}
+		fs.mu.Lock()
+		ref := fs.allocInode(childPath, "dir", uint32(op.Mode), 0)
+		fs.mu.Unlock()
 
-	op.Entry.Child = ref.ID
-	now := time.Now()
-	op.Entry.Attributes = inodeAttrs(uint32(op.Mode)|uint32(os.ModeDir), 4096, "dir", now, now)
-	setChildEntryExpiry(&op.Entry, time.Second)
-	return nil
+		op.Entry.Child = ref.ID
+		now := time.Now()
+		op.Entry.Attributes = inodeAttrs(uint32(op.Mode)|uint32(os.ModeDir), 4096, "dir", now, now)
+		setChildEntryExpiry(&op.Entry, time.Second)
+		return nil
+	})
 }
 
 func (fs *ArtifactFuse) RmDir(ctx context.Context, op *fuseops.RmDirOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
-	_, childPath, err := fs.childPath(op.Parent, op.Name)
-	if err != nil {
-		return err
-	}
-	if err := fs.engine.Rmdir(ctx, childPath); err != nil {
-		if os.IsExist(err) {
-			return syscall.ENOTEMPTY
+	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+		parent, childPath, err := fs.childPath(op.Parent, op.Name)
+		if err != nil {
+			return err
 		}
-		return syscall.EIO
-	}
-	return nil
+		if isGitfile(parent, op.Name) {
+			return syscall.EPERM
+		}
+		return fs.engine.Rmdir(ctx, childPath)
+	})
 }
 
 func (fs *ArtifactFuse) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error {
-	fs.handleOps.Lock()
-	defer fs.handleOps.Unlock()
-	_, childPath, err := fs.childPath(op.Parent, op.Name)
-	if err != nil {
-		return err
-	}
-	if err := fs.engine.ensureOverlay(ctx, childPath); err != nil {
-		return syscall.EIO
-	}
-	if err := fs.pinOpenHandles(childPath); err != nil {
-		return syscall.EIO
-	}
-	if err := fs.engine.Unlink(ctx, childPath); err != nil {
-		return syscall.EIO
-	}
-	fs.detachOpenHandles(childPath)
-	return nil
+	return fs.exclusive(ctx, func(ctx context.Context, b *Blobs) error {
+		parent, childPath, err := fs.childPath(op.Parent, op.Name)
+		if err != nil {
+			return err
+		}
+		if isGitfile(parent, op.Name) {
+			return syscall.EPERM
+		}
+		if err := fs.engine.Unlink(ctx, b, childPath, fs); err != nil {
+			return err
+		}
+		fs.detachOpenHandles(childPath)
+		return nil
+	})
 }
 
 func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error {
-	fs.handleOps.Lock()
-	defer fs.handleOps.Unlock()
-	metadataCtx := context.WithoutCancel(ctx)
-	oldParent, err := fs.requireInode(op.OldParent, syscall.ENOENT)
-	if err != nil {
-		return err
-	}
-	newParent, err := fs.requireInode(op.NewParent, syscall.ENOENT)
-	if err != nil {
-		return err
-	}
-	oldPath := cleanChildPath(oldParent.Path, op.OldName)
-	newPath := cleanChildPath(newParent.Path, op.NewName)
-	source, err := fs.resolver.ResolvePath(oldPath)
-	if err != nil {
-		return syscall.ENOENT
-	}
-	sourceType := resolvedNodeType(source)
-	if oldPath == newPath {
+	return fs.exclusive(ctx, func(ctx context.Context, b *Blobs) error {
+		oldParent, err := fs.requireInode(op.OldParent, syscall.ENOENT)
+		if err != nil {
+			return err
+		}
+		newParent, err := fs.requireInode(op.NewParent, syscall.ENOENT)
+		if err != nil {
+			return err
+		}
+		if isGitfile(oldParent, op.OldName) || isGitfile(newParent, op.NewName) {
+			return syscall.EPERM
+		}
+		oldPath := cleanChildPath(oldParent.Path, op.OldName)
+		newPath := cleanChildPath(newParent.Path, op.NewName)
+		if err := fs.engine.Rename(ctx, b, oldPath, newPath, fs); err != nil {
+			return err
+		}
+		if oldPath == newPath {
+			return nil
+		}
+		fs.moveInodePath(oldPath, newPath)
+		fs.detachOpenHandles(newPath)
+		fs.moveOpenHandles(oldPath, newPath)
 		return nil
-	}
-	if sourceType == "dir" && strings.HasPrefix(newPath, oldPath+"/") {
-		return syscall.EINVAL
-	}
-	destination, destinationErr := fs.resolver.ResolvePath(newPath)
-	if destinationErr == nil {
-		destinationType := resolvedNodeType(destination)
-		if sourceType == "dir" && destinationType != "dir" {
-			return syscall.ENOTDIR
-		}
-		if sourceType != "dir" && destinationType == "dir" {
-			return syscall.EISDIR
-		}
-	}
-	if sourceType != "dir" {
-		// Hydrate both paths before copying either, so an interrupted request
-		// cannot leave a copy-on-write source behind.
-		nodes := []ResolvedNode{source}
-		if destinationErr == nil {
-			nodes = append(nodes, destination)
-		}
-		for _, n := range nodes {
-			if n.FromOverlay || n.Base.ObjectOID == "" {
-				continue
-			}
-			if _, _, err := fs.engine.Hydrator.EnsureHydrated(ctx, fs.repo, n.Base); err != nil {
-				if isRequestCancellation(ctx, err) {
-					return syscall.EINTR
-				}
-				return syscall.EIO
-			}
-		}
-		if err := fs.engine.ensureOverlayWithContexts(ctx, metadataCtx, oldPath); err != nil {
-			if isRequestCancellation(ctx, err) {
-				return syscall.EINTR
-			}
-			return syscall.EIO
-		}
-		if err := fs.pinOpenHandles(oldPath); err != nil {
-			return syscall.EIO
-		}
-		if _, err := fs.resolver.ResolvePath(newPath); err == nil {
-			if err := fs.engine.ensureOverlayWithContexts(ctx, metadataCtx, newPath); err != nil {
-				if isRequestCancellation(ctx, err) {
-					return syscall.EINTR
-				}
-				return syscall.EIO
-			}
-			if err := fs.pinOpenHandles(newPath); err != nil {
-				return syscall.EIO
-			}
-		}
-	}
-	if err := fs.engine.rename(ctx, metadataCtx, oldPath, newPath); err != nil {
-		if isRequestCancellation(ctx, err) {
-			return syscall.EINTR
-		}
-		if errors.Is(err, iofs.ErrInvalid) {
-			return syscall.EINVAL
-		}
-		if os.IsExist(err) {
-			return syscall.ENOTEMPTY
-		}
-		if errors.Is(err, iofs.ErrNotExist) {
-			return syscall.ENOENT
-		}
-		return syscall.EIO
-	}
-	fs.moveInodePath(oldPath, newPath)
-	fs.detachOpenHandles(newPath)
-	fs.moveOpenHandles(oldPath, newPath)
-	return nil
+	})
 }
 
-func isRequestCancellation(ctx context.Context, err error) bool {
-	return ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
+// isGitfile reports whether name in parent is the synthesized .git gitfile,
+// which no op may remove, replace, or write.
+func isGitfile(parent *InodeRef, name string) bool {
+	return parent.IsRoot && name == ".git"
 }
 
+// ReadSymlink holds no lock: it changes no bookkeeping, and a base target can
+// take a fetch.
 func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlinkOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
 	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 	if err != nil {
 		return err
 	}
-	n, err := fs.resolver.ResolvePath(ref.Path)
+	target, err := fs.engine.ReadSymlink(ctx, ref.Path)
 	if err != nil {
-		return syscall.ENOENT
+		return toErrno(ctx, err)
 	}
-	if n.FromOverlay && n.Overlay.Kind == model.OverlayKindSymlink {
-		if len(n.Overlay.TargetPath) > model.MaxSymlinkTargetBytes {
-			return syscall.ENAMETOOLONG
-		}
-		op.Target = n.Overlay.TargetPath
-		return nil
-	}
-	if n.Base.ObjectOID != "" {
-		if err := validateKnownSymlinkTargetSize(n.Base); err != nil {
-			return err
-		}
-		data, err := fs.engine.Hydrator.ReadBlob(ctx, fs.repo, n.Base, model.MaxSymlinkTargetBytes)
-		if err != nil {
-			if errors.Is(err, model.ErrBlobTooLarge) {
-				return syscall.ENAMETOOLONG
-			}
-			return syscall.EIO
-		}
-		op.Target = string(data)
-		return nil
-	}
-	return syscall.ENOENT
-}
-
-func validateKnownSymlinkTargetSize(node model.BaseNode) error {
-	if node.SizeState != "known" {
-		return nil
-	}
-	if node.SizeBytes < 0 {
-		return syscall.EIO
-	}
-	if node.SizeBytes > model.MaxSymlinkTargetBytes {
-		return syscall.ENAMETOOLONG
-	}
+	op.Target = target
 	return nil
 }
 
@@ -1177,44 +1047,41 @@ func (fs *ArtifactFuse) FlushFile(_ context.Context, _ *fuseops.FlushFileOp) err
 }
 
 func (fs *ArtifactFuse) SyncFile(ctx context.Context, op *fuseops.SyncFileOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
-	fh, err := fs.fileHandle(op.Handle)
-	if err != nil {
-		return err
-	}
-	fh.mu.Lock()
-	if fh.detached {
-		f := fh.cacheFile
-		fh.mu.Unlock()
-		if f == nil || f.Sync() != nil {
-			return syscall.EIO
+	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+		fh, err := fs.fileHandle(op.Handle)
+		if err != nil {
+			return err
 		}
-		return nil
-	}
-	path := fh.path
-	if fh.cacheFile != nil && fh.cacheGeneration >= 0 {
+		fh.mu.Lock()
+		if fh.detached {
+			f := fh.cacheFile
+			fh.mu.Unlock()
+			if f == nil {
+				return syscall.EIO
+			}
+			return f.Sync()
+		}
+		path := fh.path
+		if fh.cacheFile != nil && fh.cacheGeneration >= 0 {
+			fh.mu.Unlock()
+			return nil
+		}
 		fh.mu.Unlock()
-		return nil
-	}
-	fh.mu.Unlock()
-	if err := fs.engine.Sync(ctx, path); err != nil {
-		return syscall.EIO
-	}
-	return nil
+		return fs.engine.Sync(ctx, path)
+	})
 }
 
-func (fs *ArtifactFuse) ReleaseFileHandle(_ context.Context, op *fuseops.ReleaseFileHandleOp) error {
-	fs.handleOps.RLock()
-	defer fs.handleOps.RUnlock()
-	fs.mu.Lock()
-	fh := fs.fileHandles[op.Handle]
-	delete(fs.fileHandles, op.Handle)
-	fs.mu.Unlock()
-	if fh != nil {
-		fh.release()
-	}
-	return nil
+func (fs *ArtifactFuse) ReleaseFileHandle(ctx context.Context, op *fuseops.ReleaseFileHandleOp) error {
+	return fs.shared(ctx, func(context.Context, *Blobs) error {
+		fs.mu.Lock()
+		fh := fs.fileHandles[op.Handle]
+		delete(fs.fileHandles, op.Handle)
+		fs.mu.Unlock()
+		if fh != nil {
+			fh.release()
+		}
+		return nil
+	})
 }
 
 func (fs *ArtifactFuse) GetXattr(_ context.Context, _ *fuseops.GetXattrOp) error {
@@ -1248,8 +1115,8 @@ func (m *mountedFSWrapper) Unmount() error {
 
 func (m *mountedFSWrapper) Backend() string { return m.backend }
 
-func MountRepo(repo model.RepoConfig, resolver *Resolver, engine *Engine) (MountedFS, error) {
-	return MountRepoWithGate(repo, resolver, engine, nil)
+func MountRepo(repo model.RepoConfig, engine *Engine) (MountedFS, error) {
+	return MountRepoWithGate(repo, engine, nil)
 }
 
 const backendEnv = "ARTIFACT_FS_FUSE_BACKEND"
@@ -1302,12 +1169,12 @@ func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileS
 	return mfs, BackendKernel, nil
 }
 
-func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine, gate *ReadyGate) (MountedFS, error) {
+func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate) (MountedFS, error) {
 	backend, err := MountBackend()
 	if err != nil {
 		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
 	}
-	fsint := NewArtifactFuse(repo, resolver, engine)
+	fsint := NewArtifactFuse(repo, engine)
 	server := fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate))
 
 	mountCfg := fuse.MountConfig{

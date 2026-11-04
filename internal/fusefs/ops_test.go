@@ -200,11 +200,11 @@ func TestFileHandleCachesHydratedBaseFile(t *testing.T) {
 	fh := &FileHandle{path: "file.txt"}
 	defer fh.closeCachedFile()
 
-	first, err := fh.read(context.Background(), engine, 0, 0, make([]byte, 4))
+	first, err := handleRead(context.Background(), engine, fh, 0, 0, make([]byte, 4))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := fh.read(context.Background(), engine, 0, 4, make([]byte, 3))
+	second, err := handleRead(context.Background(), engine, fh, 0, 4, make([]byte, 3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,12 +240,12 @@ func TestFileHandleRehydratesAfterGenerationChange(t *testing.T) {
 	fh := &FileHandle{path: "file.txt"}
 	defer fh.closeCachedFile()
 
-	first, err := fh.read(context.Background(), engine, 0, 0, make([]byte, 3))
+	first, err := handleRead(context.Background(), engine, fh, 0, 0, make([]byte, 3))
 	if err != nil {
 		t.Fatal(err)
 	}
 	resolver.SetGeneration(2)
-	second, err := fh.read(context.Background(), engine, 0, 0, make([]byte, 3))
+	second, err := handleRead(context.Background(), engine, fh, 0, 0, make([]byte, 3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,12 +273,12 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 	}
 	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": {Path: "file.txt", Type: "file", ObjectOID: "blob", Mode: 0o644}}}, overlay.fakeOverlay)
 	engine := &Engine{Repo: model.RepoConfig{ID: "repo"}, Resolver: resolver, Overlay: overlay, Hydrator: h}
-	fs := NewArtifactFuse(model.RepoConfig{ID: "repo"}, resolver, engine)
+	fs := NewArtifactFuse(model.RepoConfig{ID: "repo"}, engine)
 	fh := &FileHandle{path: "file.txt"}
 	fs.fileHandles[1] = fh
 	defer fh.closeCachedFile()
 
-	first, err := fh.read(context.Background(), engine, 0, 0, make([]byte, 3))
+	first, err := handleRead(context.Background(), engine, fh, 0, 0, make([]byte, 3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +289,7 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 	writeDone := make(chan error, 1)
 	go func() {
 		fs.closeCachedFilesForPath("file.txt")
-		_, err := engine.Write(context.Background(), "file.txt", 0, []byte("new"))
+		_, err := engineWrite(context.Background(), engine, "file.txt", 0, []byte("new"))
 		if err == nil {
 			fs.closeCachedFilesForPath("file.txt")
 		}
@@ -297,7 +297,7 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 	}()
 
 	<-overlay.beforeCopy
-	overlapped, err := fh.read(context.Background(), engine, 0, 0, make([]byte, 3))
+	overlapped, err := handleRead(context.Background(), engine, fh, 0, 0, make([]byte, 3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +309,7 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	after, err := fh.read(context.Background(), engine, 0, 0, make([]byte, 3))
+	after, err := handleRead(context.Background(), engine, fh, 0, 0, make([]byte, 3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,10 +353,10 @@ func TestRenameBaseDirectoryHydratesAndMovesContents(t *testing.T) {
 		Hydrator: &fakeBatchHydrator{path: cachePath},
 	}
 
-	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+	if err := engineRename(context.Background(), engine, "src", "dst"); err != nil {
 		t.Fatal(err)
 	}
-	got, err := engine.Read(context.Background(), "dst/a.txt", 0, make([]byte, 64))
+	got, err := engineRead(context.Background(), engine, "dst/a.txt", 0, make([]byte, 64))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,21 +415,21 @@ func TestRenameRecreatedTrackedEntryHidesSource(t *testing.T) {
 			engine := &Engine{Repo: cfg, Resolver: resolver, Overlay: ov, Hydrator: &fakeBatchHydrator{path: cachePath}}
 
 			if tc.sourceType == "symlink" {
-				if err := engine.Unlink(ctx, "README.md"); err != nil {
+				if err := engineUnlink(ctx, engine, "README.md"); err != nil {
 					t.Fatal(err)
 				}
 			} else {
-				if err := engine.Rename(ctx, "README.md", "first.md"); err != nil {
+				if err := engineRename(ctx, engine, "README.md", "first.md"); err != nil {
 					t.Fatal(err)
 				}
-				if err := engine.Unlink(ctx, "first.md"); err != nil {
+				if err := engineUnlink(ctx, engine, "first.md"); err != nil {
 					t.Fatal(err)
 				}
 			}
 			if err := engine.Create(ctx, "README.md", 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := engine.Write(ctx, "README.md", 0, []byte(content)); err != nil {
+			if _, err := engineWrite(ctx, engine, "README.md", 0, []byte(content)); err != nil {
 				t.Fatal(err)
 			}
 
@@ -448,7 +448,7 @@ func TestRenameRecreatedTrackedEntryHidesSource(t *testing.T) {
 			if tc.trackedDestination {
 				destination = "destination.txt"
 			}
-			if err := engine.Rename(ctx, "README.md", destination); err != nil {
+			if err := engineRename(ctx, engine, "README.md", destination); err != nil {
 				t.Fatal(err)
 			}
 
@@ -473,7 +473,7 @@ func TestRenameRecreatedTrackedEntryHidesSource(t *testing.T) {
 					t.Fatal("recreated source remains in root directory listing")
 				}
 			}
-			got, err := engine.Read(ctx, destination, 0, make([]byte, len(content)))
+			got, err := engineRead(ctx, engine, destination, 0, make([]byte, len(content)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -578,13 +578,13 @@ func TestRenameReplacedTrackedEntryHidesSource(t *testing.T) {
 			engine := &Engine{Repo: cfg, Resolver: resolver, Overlay: ov, Hydrator: &fakeBatchHydrator{path: cachePath}}
 
 			if tc.sourceType == "dir" {
-				if err := engine.Unlink(ctx, "entry/child.txt"); err != nil {
+				if err := engineUnlink(ctx, engine, "entry/child.txt"); err != nil {
 					t.Fatal(err)
 				}
 				if err := engine.Rmdir(ctx, "entry"); err != nil {
 					t.Fatal(err)
 				}
-			} else if err := engine.Unlink(ctx, "entry"); err != nil {
+			} else if err := engineUnlink(ctx, engine, "entry"); err != nil {
 				t.Fatal(err)
 			}
 			if tc.replacementType == "symlink" {
@@ -594,7 +594,7 @@ func TestRenameReplacedTrackedEntryHidesSource(t *testing.T) {
 			} else if err := engine.Create(ctx, "entry", 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if err := engine.Rename(ctx, "entry", destination); err != nil {
+			if err := engineRename(ctx, engine, "entry", destination); err != nil {
 				t.Fatal(err)
 			}
 
@@ -668,14 +668,14 @@ func TestRenameChainHidesReplacedTrackedIntermediate(t *testing.T) {
 			engine := &Engine{Repo: cfg, Resolver: resolver, Overlay: ov, Hydrator: &fakeBatchHydrator{path: cachePath}}
 
 			if tc.unlinkIntermediate {
-				if err := engine.Unlink(ctx, intermediate.Path); err != nil {
+				if err := engineUnlink(ctx, engine, intermediate.Path); err != nil {
 					t.Fatal(err)
 				}
 			}
-			if err := engine.Rename(ctx, first.Path, intermediate.Path); err != nil {
+			if err := engineRename(ctx, engine, first.Path, intermediate.Path); err != nil {
 				t.Fatal(err)
 			}
-			if err := engine.Rename(ctx, intermediate.Path, "final.txt"); err != nil {
+			if err := engineRename(ctx, engine, intermediate.Path, "final.txt"); err != nil {
 				t.Fatal(err)
 			}
 			if err := ov.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
@@ -697,7 +697,7 @@ func TestRenameChainHidesReplacedTrackedIntermediate(t *testing.T) {
 			if len(entries) != 1 || entries[0].Name != "final.txt" {
 				t.Fatalf("root entries = %+v, want only final.txt", entries)
 			}
-			got, err := engine.Read(ctx, "final.txt", 0, make([]byte, len(content)))
+			got, err := engineRead(ctx, engine, "final.txt", 0, make([]byte, len(content)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -751,7 +751,7 @@ func TestRenameBaseDirectoryHydratesBeforeMutatingOverlay(t *testing.T) {
 	}
 	engine := &Engine{Repo: cfg, Resolver: resolver, Overlay: ov, Hydrator: hydrator}
 
-	if err := engine.Rename(context.Background(), "src", "dst"); !errors.Is(err, hydrationFailure) {
+	if err := engineRename(context.Background(), engine, "src", "dst"); !errors.Is(err, hydrationFailure) {
 		t.Fatalf("Rename error = %v, want hydration failure", err)
 	}
 	entries, err := ov.ListAll(context.Background())
@@ -771,11 +771,11 @@ func TestRenameBaseDirectoryHydratesBeforeMutatingOverlay(t *testing.T) {
 	}
 
 	delete(hydrator.errorsByOID, "second")
-	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+	if err := engineRename(context.Background(), engine, "src", "dst"); err != nil {
 		t.Fatalf("retry Rename: %v", err)
 	}
 	for path, want := range map[string]string{"dst/a.txt": "first", "dst/b.txt": "second"} {
-		got, err := engine.Read(context.Background(), path, 0, make([]byte, 64))
+		got, err := engineRead(context.Background(), engine, path, 0, make([]byte, 64))
 		if err != nil {
 			t.Fatalf("read %q after retry: %v", path, err)
 		}
@@ -832,7 +832,7 @@ func TestRenameBaseDirectoryDoesNotResurrectReplacedDestinationDescendants(t *te
 		t.Fatal(err)
 	}
 
-	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+	if err := engineRename(context.Background(), engine, "src", "dst"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := resolver.ResolvePath("dst/overlap"); err != nil {
@@ -890,7 +890,7 @@ func TestRenameDirectoryRejectsDestinationChildCreatedDuringHydration(t *testing
 
 	renameDone := make(chan error, 1)
 	go func() {
-		renameDone <- engine.Rename(context.Background(), "src", "dst")
+		renameDone <- engineRename(context.Background(), engine, "src", "dst")
 	}()
 	select {
 	case <-hydrator.started:
@@ -914,4 +914,50 @@ func TestRenameDirectoryRejectsDestinationChildCreatedDuringHydration(t *testing
 	if _, err := resolver.ResolvePath("dst/a.txt"); !os.IsNotExist(err) {
 		t.Fatalf("destination source child resolve error = %v, want not exist", err)
 	}
+}
+
+// The helpers below run an Engine method through Engine.Do, as the adapter
+// does, without the adapter's namespace lock or open handles.
+
+func engineRename(ctx context.Context, e *Engine, oldPath, newPath string) error {
+	return e.Do(ctx, nil, func(ctx context.Context, b *Blobs) error {
+		return e.Rename(ctx, b, oldPath, newPath, nil)
+	})
+}
+
+func engineUnlink(ctx context.Context, e *Engine, path string) error {
+	return e.Do(ctx, nil, func(ctx context.Context, b *Blobs) error {
+		return e.Unlink(ctx, b, path, nil)
+	})
+}
+
+func engineWrite(ctx context.Context, e *Engine, path string, off int64, data []byte) (n int, err error) {
+	err = e.Do(ctx, nil, func(ctx context.Context, b *Blobs) error {
+		n, err = e.Write(ctx, b, path, off, data)
+		return err
+	})
+	return n, err
+}
+
+func engineRead(ctx context.Context, e *Engine, path string, off int64, dst []byte) (data []byte, err error) {
+	err = e.Do(ctx, nil, func(ctx context.Context, b *Blobs) error {
+		data, err = e.Read(ctx, b, path, off, dst)
+		return err
+	})
+	return data, err
+}
+
+func engineSetMtime(ctx context.Context, e *Engine, path string, t time.Time) error {
+	return e.Do(ctx, nil, func(ctx context.Context, b *Blobs) error {
+		_, err := e.SetAttributes(ctx, b, path, nil, nil, &t)
+		return err
+	})
+}
+
+func handleRead(ctx context.Context, e *Engine, fh *FileHandle, gen, off int64, dst []byte) (data []byte, err error) {
+	err = e.Do(ctx, nil, func(ctx context.Context, b *Blobs) error {
+		data, err = fh.read(ctx, e, b, gen, off, dst)
+		return err
+	})
+	return data, err
 }

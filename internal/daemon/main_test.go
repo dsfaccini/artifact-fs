@@ -21,7 +21,7 @@ func TestMain(m *testing.M) {
 		fmt.Print("artifact-fs:package-test\x00/\x00")
 		os.Exit(0)
 	}
-	defaultMount = func(cfg model.RepoConfig, _ *fusefs.Resolver, _ *fusefs.Engine, _ *fusefs.ReadyGate) (fusefs.MountedFS, error) {
+	defaultMount = func(cfg model.RepoConfig, _ *fusefs.Engine, _ *fusefs.ReadyGate) (fusefs.MountedFS, error) {
 		panic(fmt.Sprintf("daemon unit test tried to mount %q; set Service.mount to fakeMount", cfg.MountPath))
 	}
 	gittest.IsolateConfig()
@@ -31,7 +31,7 @@ func TestMain(m *testing.M) {
 func TestGitIgnoresMachineConfig(t *testing.T) { gittest.RequireConfigIsolated(t) }
 
 // fakeMount stands in for a successful mount.
-func fakeMount(model.RepoConfig, *fusefs.Resolver, *fusefs.Engine, *fusefs.ReadyGate) (fusefs.MountedFS, error) {
+func fakeMount(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate) (fusefs.MountedFS, error) {
 	return &fakeMountedFS{unmounted: make(chan struct{})}, nil
 }
 

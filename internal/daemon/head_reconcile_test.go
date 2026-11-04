@@ -454,7 +454,7 @@ func TestHeadReconcileServesReadsMatchingReportedSize(t *testing.T) {
 	h := hydrator.New(f.svc.git)
 	h.Start(1, repo)
 	t.Cleanup(h.Stop)
-	fs := fusefs.NewArtifactFuse(repo, f.rt.resolver, &fusefs.Engine{Resolver: f.rt.resolver, Repo: repo, Overlay: f.rt.overlay, Hydrator: h})
+	fs := fusefs.NewArtifactFuse(repo, &fusefs.Engine{Resolver: f.rt.resolver, Repo: repo, Overlay: f.rt.overlay, Hydrator: h})
 	open := func(inode fuseops.InodeID) fuseops.HandleID {
 		t.Helper()
 		op := &fuseops.OpenFileOp{Inode: inode}

@@ -334,7 +334,7 @@ func TestStatusReportsMountErrorUntilRetryMounts(t *testing.T) {
 	defer svc.Close()
 	svc.SetMountRoot(filepath.Join(tmp, "mnt"))
 	mountErr := errors.New("fskit: file system extension requires approval")
-	svc.mount = func(model.RepoConfig, *fusefs.Resolver, *fusefs.Engine, *fusefs.ReadyGate) (fusefs.MountedFS, error) {
+	svc.mount = func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate) (fusefs.MountedFS, error) {
 		return nil, mountErr
 	}
 	if err := svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", Enabled: true}); err != nil {

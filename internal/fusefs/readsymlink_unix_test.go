@@ -60,10 +60,10 @@ func TestReadSymlinkRejectsKnownOversizedBlobBeforeHydration(t *testing.T) {
 		}},
 		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
 	)
-	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, resolver, &Engine{Hydrator: hydrator})
+	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, &Engine{Resolver: resolver, Repo: model.RepoConfig{ID: repoID}, Hydrator: hydrator})
 
 	fs.mu.Lock()
-	ref := fs.allocInode("link", "symlink", 0o120000, fs.resolver.Generation())
+	ref := fs.allocInode("link", "symlink", 0o120000, fs.engine.Generation())
 	fs.mu.Unlock()
 
 	op := &fuseops.ReadSymlinkOp{Inode: ref.ID}
@@ -99,10 +99,10 @@ func TestReadSymlinkRejectsNegativeKnownBlobBeforeHydration(t *testing.T) {
 		}},
 		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
 	)
-	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, resolver, &Engine{Hydrator: hydrator})
+	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, &Engine{Resolver: resolver, Repo: model.RepoConfig{ID: repoID}, Hydrator: hydrator})
 
 	fs.mu.Lock()
-	ref := fs.allocInode("link", "symlink", 0o120000, fs.resolver.Generation())
+	ref := fs.allocInode("link", "symlink", 0o120000, fs.engine.Generation())
 	fs.mu.Unlock()
 
 	op := &fuseops.ReadSymlinkOp{Inode: ref.ID}
@@ -137,10 +137,10 @@ func TestReadSymlinkRejectsUnknownOversizedBlobWithoutHydration(t *testing.T) {
 		}},
 		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
 	)
-	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, resolver, &Engine{Hydrator: hydrator})
+	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, &Engine{Resolver: resolver, Repo: model.RepoConfig{ID: repoID}, Hydrator: hydrator})
 
 	fs.mu.Lock()
-	ref := fs.allocInode("link", "symlink", 0o120000, fs.resolver.Generation())
+	ref := fs.allocInode("link", "symlink", 0o120000, fs.engine.Generation())
 	fs.mu.Unlock()
 
 	op := &fuseops.ReadSymlinkOp{Inode: ref.ID}
@@ -175,10 +175,10 @@ func TestReadSymlinkReadsUnknownBlobThroughBoundedRead(t *testing.T) {
 		}},
 		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
 	)
-	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, resolver, &Engine{Hydrator: hydrator})
+	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, &Engine{Resolver: resolver, Repo: model.RepoConfig{ID: repoID}, Hydrator: hydrator})
 
 	fs.mu.Lock()
-	ref := fs.allocInode("link", "symlink", 0o120000, fs.resolver.Generation())
+	ref := fs.allocInode("link", "symlink", 0o120000, fs.engine.Generation())
 	fs.mu.Unlock()
 
 	op := &fuseops.ReadSymlinkOp{Inode: ref.ID}
