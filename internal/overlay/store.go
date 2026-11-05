@@ -52,6 +52,9 @@ var migrations = []meta.Migration{
 		}
 		return meta.SQL(slices.Concat(changeLogV1, changeLogTriggers)...)(ctx, conn)
 	},
+	// Migration 2 records the paths whose writes are not yet committed, so
+	// the fsmonitor hook reports them on every query until they are.
+	meta.SQL(`CREATE TABLE IF NOT EXISTS overlay_pending (path TEXT PRIMARY KEY)`),
 }
 
 var overlayEntriesV1 = []string{
@@ -396,7 +399,7 @@ func (s *Store) WriteFile(ctx context.Context, path string, off int64, data []by
 	if e.Kind != model.OverlayKindCreate {
 		e.Kind = model.OverlayKindModify
 	}
-	if upErr := s.upsertEntry(ctx, e); upErr != nil {
+	if upErr := s.commitFirstWrite(ctx, e); upErr != nil {
 		p.f.Close()
 		return n, upErr
 	}
@@ -404,6 +407,21 @@ func (s *Store) WriteFile(ctx context.Context, path string, off int64, data []by
 	s.pending[path] = p
 	s.pendingMu.Unlock()
 	return n, err
+}
+
+func (s *Store) commitFirstWrite(ctx context.Context, e model.OverlayEntry) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := upsertEntryOn(ctx, tx, e); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO overlay_pending(path) VALUES (?)`, e.Path); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // FlushFile commits the size and times of path's writes since its last flush.
@@ -423,7 +441,18 @@ func (s *Store) flushLocked(ctx context.Context, path string) error {
 	s.pendingMu.Lock()
 	size, t := p.size, p.timeUnixNs
 	s.pendingMu.Unlock()
-	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET size_bytes=?, mtime_unix_ns=?, ctime_unix_ns=? WHERE path=? AND backing_path=?`, size, t, t, path, p.backingPath); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE overlay_entries SET size_bytes=?, mtime_unix_ns=?, ctime_unix_ns=? WHERE path=? AND backing_path=?`, size, t, t, path, p.backingPath); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_pending WHERE path=?`, path); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
 		return err
 	}
 	s.pendingMu.Lock()
@@ -1426,6 +1455,10 @@ func resumeChangeLog(ctx context.Context, tx *sql.Tx, paths ...string) error {
 // sorts only the delta, instead of walking the whole path index in order.
 const changesSinceQuery = `SELECT path FROM overlay_changes WHERE seq > ? ORDER BY +path`
 
+// hookChangesQuery also returns every path with uncommitted writes, whose
+// later writes log no change until a flush.
+const hookChangesQuery = `SELECT path FROM overlay_changes WHERE seq > ? UNION SELECT path FROM overlay_pending ORDER BY 1`
+
 // Changes is one consistent read of an overlay database's change log.
 type Changes struct {
 	// Instance identifies the database.
@@ -1457,10 +1490,10 @@ func ReadChangesSince(ctx context.Context, cfg model.RepoConfig, since int64) (c
 	defer tx.Rollback()
 	// Without every trigger, the log misses writes.
 	var objects int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE (type = 'table' AND name IN ('overlay_changes', 'overlay_instance')) OR (type = 'trigger' AND name IN (?, ?, ?))`, changeLogTriggerNames[0], changeLogTriggerNames[1], changeLogTriggerNames[2]).Scan(&objects); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE (type = 'table' AND name IN ('overlay_changes', 'overlay_instance', 'overlay_pending')) OR (type = 'trigger' AND name IN (?, ?, ?))`, changeLogTriggerNames[0], changeLogTriggerNames[1], changeLogTriggerNames[2]).Scan(&objects); err != nil {
 		return Changes{}, false, err
 	}
-	if objects != 2+len(changeLogTriggerNames) {
+	if objects != 3+len(changeLogTriggerNames) {
 		return Changes{}, false, nil
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT id FROM overlay_instance`).Scan(&changes.Instance); err != nil {
@@ -1469,7 +1502,7 @@ func ReadChangesSince(ctx context.Context, cfg model.RepoConfig, since int64) (c
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM overlay_changes`).Scan(&changes.Seq); err != nil {
 		return Changes{}, false, err
 	}
-	rows, err := tx.QueryContext(ctx, changesSinceQuery, since)
+	rows, err := tx.QueryContext(ctx, hookChangesQuery, since)
 	if err != nil {
 		return Changes{}, false, err
 	}
@@ -1539,8 +1572,8 @@ func (s *Store) upsertEntry(ctx context.Context, e model.OverlayEntry) error {
 	return upsertEntryOn(ctx, s.db, e)
 }
 
-// upsertEntryDurable commits e with synchronous=FULL, which syncs the WAL and
-// so every commit before it. OpenDB's synchronous=NORMAL syncs only at
+// upsertEntryDurable commits e and clears its pending marker with
+// synchronous=FULL, which syncs the WAL and so every commit before it. OpenDB's synchronous=NORMAL syncs only at
 // checkpoints.
 func (s *Store) upsertEntryDurable(ctx context.Context, e model.OverlayEntry) error {
 	conn, err := s.db.Conn(ctx)
@@ -1551,7 +1584,7 @@ func (s *Store) upsertEntryDurable(ctx context.Context, e model.OverlayEntry) er
 	if _, err := conn.ExecContext(ctx, `PRAGMA synchronous=FULL`); err != nil {
 		return err
 	}
-	err = upsertEntryOn(ctx, conn, e)
+	err = commitDurable(ctx, conn, e)
 	if _, resetErr := conn.ExecContext(context.Background(), `PRAGMA synchronous=NORMAL`); resetErr != nil {
 		// A pooled connection left at FULL would sync every later commit.
 		conn.Raw(func(any) error { return driver.ErrBadConn })
@@ -1560,6 +1593,21 @@ func (s *Store) upsertEntryDurable(ctx context.Context, e model.OverlayEntry) er
 		}
 	}
 	return err
+}
+
+func commitDurable(ctx context.Context, conn *sql.Conn, e model.OverlayEntry) error {
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := upsertEntryOn(ctx, tx, e); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_pending WHERE path=?`, e.Path); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func upsertEntryOn(ctx context.Context, db interface {

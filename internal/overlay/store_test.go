@@ -1881,3 +1881,36 @@ func TestSyncFileCommitsUnflushedWrites(t *testing.T) {
 		t.Fatalf("backing file = %q, %v; want onetwo", data, err)
 	}
 }
+
+func TestHookReportsEveryWriteAfterAQueryUntilFlush(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	write := func(off int64, data string) {
+		t.Helper()
+		if _, err := s.WriteFile(ctx, "f.txt", off, []byte(data)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	createWithContent(t, s, "f.txt", "one")
+	if err := s.FlushFile(ctx, "f.txt"); err != nil {
+		t.Fatal(err)
+	}
+	for i, data := range []string{"two", "six"} {
+		seq := changesSince(t, cfg, 0).Seq
+		write(int64(3*(i+1)), data)
+		if got := changesSince(t, cfg, seq).Paths; !slices.Equal(got, []string{"f.txt"}) {
+			t.Fatalf("changes after write %d following a query = %q, want f.txt", i+1, got)
+		}
+	}
+	seq := changesSince(t, cfg, 0).Seq
+	if err := s.FlushFile(ctx, "f.txt"); err != nil {
+		t.Fatal(err)
+	}
+	flushed := changesSince(t, cfg, seq)
+	if !slices.Equal(flushed.Paths, []string{"f.txt"}) {
+		t.Fatalf("changes after the flush = %q, want f.txt", flushed.Paths)
+	}
+	if got := changesSince(t, cfg, flushed.Seq).Paths; len(got) != 0 {
+		t.Fatalf("changes after a query following the flush = %q, want none", got)
+	}
+}
