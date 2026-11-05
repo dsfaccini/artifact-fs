@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"time"
 
@@ -31,7 +32,7 @@ func (s *Service) Start(ctx context.Context) error {
 
 	// Poll the registry for repos added or removed after startup, and sync at
 	// once when a CLI command nudges the control socket.
-	ticker := time.NewTicker(registrySyncInterval)
+	ticker := time.NewTicker(cmp.Or(s.syncInterval, registrySyncInterval))
 	defer ticker.Stop()
 	for {
 		select {

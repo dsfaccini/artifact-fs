@@ -360,7 +360,7 @@ func (s *Service) requestMount(ctx context.Context, name string, mount bool) err
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("%s %s: the daemon did not carry out the request within %s; run status --name %s", op, name, mountRequestTimeout, name)
+			return fmt.Errorf("%s %s: the daemon did not carry out the request in time; run status --name %s", op, name, name)
 		case <-ticker.C:
 		}
 	}

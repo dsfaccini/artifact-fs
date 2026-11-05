@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -116,5 +117,25 @@ func TestUnmountAndRemountApplyThroughTheRunningDaemon(t *testing.T) {
 	}
 	if d.mounts.resolver() == served {
 		t.Fatal("remount kept the earlier mount")
+	}
+}
+
+// A daemon that never polls carries out an unmount only through the nudge.
+func TestUnmountNudge(t *testing.T) {
+	svc, ctl := newSyncedDaemon(t)
+	if !controlSocketFits(controlSocketPath(svc.root)) {
+		t.Skipf("control socket path %s does not fit sun_path", controlSocketPath(svc.root))
+	}
+	svc.syncInterval = time.Hour
+	done := startService(t, svc)
+	ctx := context.Background()
+	waitFor(t, done, func() bool {
+		st, err := ctl.Status(ctx, "repo")
+		return err == nil && st.State == repoStateMounted
+	})
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := ctl.Unmount(ctx, "repo"); err != nil {
+		t.Fatal(err)
 	}
 }

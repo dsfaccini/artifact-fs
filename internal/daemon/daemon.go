@@ -98,6 +98,9 @@ type Service struct {
 	lock *os.File
 	// wake carries control socket nudges to the sync loop.
 	wake chan struct{}
+	// syncInterval is how often Start polls the registry; zero means
+	// registrySyncInterval.
+	syncInterval time.Duration
 	// records holds what recordRuntime last wrote for each repo. recordMu
 	// serializes the writes, and is taken before mu.
 	recordMu sync.Mutex
