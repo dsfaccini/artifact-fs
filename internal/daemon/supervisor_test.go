@@ -179,9 +179,9 @@ func TestStartRetriesHEADReconcileAfterSnapshotLock(t *testing.T) {
 
 	want := d.commit(t, "README.md", "reconciled after the lock\n")
 	d.moveMain(t, want)
-	waitFor(t, d.startErr, func() bool { return strings.Contains(d.logs.String(), "snapshot publish failed") })
-	if st := d.status(t); st.CurrentHEADOID != initial.CurrentHEADOID || st.SnapshotGeneration != initial.SnapshotGeneration {
-		t.Fatalf("HEAD advanced while the snapshot was locked: %+v", st)
+	waitFor(t, d.startErr, func() bool { return d.status(t).LastErrorPhase == phaseHEADReconcile })
+	if st := d.status(t); st.CurrentHEADOID != initial.CurrentHEADOID || st.SnapshotGeneration != initial.SnapshotGeneration || st.NextRetryAt.IsZero() || !strings.Contains(st.LastError, "locked") {
+		t.Fatalf("status while the snapshot was locked = %+v, want the old HEAD and the retried failure", st)
 	}
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
