@@ -1122,8 +1122,10 @@ func MountRepo(repo model.RepoConfig, engine *Engine, logger *slog.Logger) (Moun
 // fuseMount is fuse.Mount. Package tests replace it so they cannot mount.
 var fuseMount = fuse.Mount
 
-// fuseErrorLog writes each line the fuse library logs, an op error or a failed
-// reply, to logger as a warning with the repo's remote redacted.
+// fuseErrorLog writes each line the fuse library logs to logger, with the
+// repo's remote redacted. An op error, which the library logs for expected
+// errnos such as ENOTEMPTY too, goes out at Debug; anything else, such as a
+// failed reply, as a warning.
 type fuseErrorLog struct {
 	logger *slog.Logger
 	repo   model.RepoConfig
@@ -1131,7 +1133,11 @@ type fuseErrorLog struct {
 
 func (l fuseErrorLog) Write(p []byte) (int, error) {
 	msg := strings.TrimSuffix(string(p), "\n")
-	l.logger.Warn("fuse error", "repo", l.repo.Name, "error", auth.RedactLogString(msg, l.repo.RemoteURL))
+	level := slog.LevelWarn
+	if strings.HasPrefix(msg, "Op ") {
+		level = slog.LevelDebug
+	}
+	l.logger.Log(context.Background(), level, "fuse error", "repo", l.repo.Name, "error", auth.RedactLogString(msg, l.repo.RemoteURL))
 	return len(p), nil
 }
 
