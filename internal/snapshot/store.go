@@ -11,7 +11,9 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
-var migrations = []string{
+// migrations build the snapshot schema. Migration 1 creates it, or brings an
+// older build's database to it.
+var migrations = []meta.Migration{meta.SQL(
 	`CREATE TABLE IF NOT EXISTS repo_state (
 	  key TEXT PRIMARY KEY,
 	  value TEXT NOT NULL
@@ -31,7 +33,7 @@ var migrations = []string{
 	`CREATE INDEX IF NOT EXISTS idx_base_nodes_gen_oid ON base_nodes(generation, object_oid);`,
 	`DROP TABLE IF EXISTS learned_path_stats;`,
 	`DROP TABLE IF EXISTS blob_cache_index;`,
-}
+)}
 
 type Store struct {
 	db *sql.DB
@@ -46,7 +48,7 @@ func New(ctx context.Context, path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := meta.ExecMigrations(ctx, db, migrations); err != nil {
+	if err := meta.Migrate(ctx, db, migrations); err != nil {
 		db.Close()
 		return nil, err
 	}
