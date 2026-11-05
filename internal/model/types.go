@@ -173,13 +173,17 @@ func CleanPath(path string) string {
 	return path
 }
 
-// ValidateRepoName checks that a repo name is safe for use in filesystem paths.
+// ValidateRepoName checks that a repo name is safe for use in filesystem paths
+// and in the FUSE mount's fsname option.
 func ValidateRepoName(name string) error {
 	if name == "" {
 		return fmt.Errorf("repo name must not be empty")
 	}
 	if strings.ContainsAny(name, "/\\") || name == ".." || strings.Contains(name, "..") {
 		return fmt.Errorf("invalid repo name %q: must not contain path separators or '..'", name)
+	}
+	if strings.ContainsAny(name, ",=") {
+		return fmt.Errorf("invalid repo name %q: must not contain ',' or '=', which separate FUSE mount options", name)
 	}
 	return nil
 }

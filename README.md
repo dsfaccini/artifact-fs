@@ -75,11 +75,22 @@ any other FSKit failure, because a retry could mount twice. The daemon logs the
 transport that mounted each repo.
 
 FSKit reuses directory handles across enumerations, so this backend refreshes
-entries when enumeration restarts. It rejects extended attributes to prevent
-AppleDouble metadata files; use `cp -X` when copying files with Finder metadata.
+entries when enumeration restarts. Both macOS backends reject extended
+attributes, so macOS writes no AppleDouble `._` files to store them. macOS
+attaches extended attributes such as `com.apple.provenance` to nearly every local
+file, so copying files onto the mount with `cp` or `ditto` may fail; `cp -X`
+skips extended attributes and should avoid it. On an NFS mount that rejects
+extended attributes the same way, `cp` exits 1 after copying the data and
+`ditto` fails without leaving the file. None of this is measured on a FUSE
+mount yet, and `cp -X` is not measured at all. Both
+backends serve tracked `._*` and `.DS_Store` files. A `.DS_Store` that Finder
+writes lands in the overlay as an untracked file.
 The native mount API has no supported cancellation for a permanently stalled
-system mount service. `umount` from a terminal cannot unmount an FSKit mount;
-use `diskutil unmount <path>`.
+system mount service. macOS treats an FSKit mount as a network volume, so
+`umount <path>` returns `Operation not permitted` unless the terminal app has
+the Network Volumes permission (Privacy & Security → Files & Folders). The daemon
+unmounts through the same `unmount(2)` call. `diskutil unmount <path>` removes an
+FSKit mount that `umount` cannot.
 
 Quick start against a public repo:
 
@@ -157,6 +168,8 @@ Use `--hydration-concurrency` to control the number of parallel blob-fetch worke
 ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the mode, source, attempt, phase, state, duration, and deadline. Clone and fetch operations retry known transient transport failures up to three total attempts. Preparation has a 30-minute timeout. Caller cancellation stops the active Git command and retry backoff; synchronous preparation records a redacted `prepare canceled` status, while daemon shutdown leaves async preparation queued for restart.
 
 Async existing-clone preparation reports remote configuration, fetch, and branch update as separate `configure_remote`, `fetch`, and `update_branch` phases.
+
+Each error the FUSE library reports becomes a `fuse error` record. A reply the kernel refuses, other than with `ENOENT`, logs at `WARN`. A failed FUSE op logs at `DEBUG`, because expected errnos such as `ENOTEMPTY` fail ops too. The daemon logs at `INFO`, so it never emits these lines. The library reports no failed lookup of a missing name, no `GetXattr` or `ListXattr` that fails with `ENOSYS`, `ENODATA` or `ERANGE`, and no request whose opcode the library does not recognize.
 
 Successful `add-repo`:
 
