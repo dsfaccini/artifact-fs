@@ -136,7 +136,59 @@ func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := commitPendingFromBackingFiles(ctx, db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open %s: %w", cfg.OverlayDBPath, err)
+	}
 	return &Store{db: db, repo: cfg, upperDir: upperDir, pending: map[string]*pendingWrite{}}, nil
+}
+
+// commitPendingFromBackingFiles commits the size and mtime of each path a
+// process left with uncommitted writes, from its backing file.
+func commitPendingFromBackingFiles(ctx context.Context, db *sql.DB) error {
+	// Read outside the write transaction: SQLite fails a read transaction's
+	// upgrade to a write at once, without the busy handler.
+	rows, err := db.QueryContext(ctx, `SELECT e.path, e.backing_path FROM overlay_pending p JOIN overlay_entries e USING(path)`)
+	if err != nil {
+		return err
+	}
+	type pendingRow struct{ path, backingPath string }
+	var pending []pendingRow
+	for rows.Next() {
+		var r pendingRow
+		var backing sql.NullString
+		if err := rows.Scan(&r.path, &backing); err != nil {
+			rows.Close()
+			return err
+		}
+		r.backingPath = backing.String
+		pending = append(pending, r)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, r := range pending {
+		st, err := os.Stat(r.backingPath)
+		if err != nil {
+			continue
+		}
+		t := st.ModTime().UnixNano()
+		if _, err := tx.ExecContext(ctx, `UPDATE overlay_entries SET size_bytes=?, mtime_unix_ns=?, ctime_unix_ns=? WHERE path=? AND backing_path=?`, st.Size(), t, t, r.path, r.backingPath); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_pending`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Close() error {

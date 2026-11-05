@@ -1914,3 +1914,24 @@ func TestHookReportsEveryWriteAfterAQueryUntilFlush(t *testing.T) {
 		t.Fatalf("changes after a query following the flush = %q, want none", got)
 	}
 }
+
+func TestNewCommitsWritesAProcessLeftUncommitted(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "f.txt", "one")
+	if _, err := s.WriteFile(ctx, "f.txt", 3, []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	// A crashed process never flushes; a second store stands in for its restart.
+	restarted, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { restarted.Close() })
+	if e, ok := restarted.Get("f.txt"); !ok || e.SizeBytes != 6 {
+		t.Fatalf("f.txt after restart = %+v, %t; want size 6", e, ok)
+	}
+	if got := changesSince(t, cfg, changesSince(t, cfg, 0).Seq).Paths; len(got) != 0 {
+		t.Fatalf("pending paths after restart = %q, want none", got)
+	}
+}
