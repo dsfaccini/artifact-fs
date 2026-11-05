@@ -3,6 +3,7 @@ package overlay
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
@@ -351,7 +352,16 @@ func (s *Store) SyncFile(ctx context.Context, path string) error {
 		f.Close()
 		return err
 	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return err
+	}
 	if err := f.Close(); err != nil {
+		return err
+	}
+	e.SizeBytes = st.Size()
+	if err := s.upsertEntryDurable(ctx, e); err != nil {
 		return err
 	}
 	dir, err := os.Open(s.upperDir)
@@ -1373,10 +1383,39 @@ func (s *Store) scanEntries(rows *sql.Rows) ([]model.OverlayEntry, error) {
 }
 
 func (s *Store) upsertEntry(ctx context.Context, e model.OverlayEntry) error {
+	return upsertEntryOn(ctx, s.db, e)
+}
+
+// upsertEntryDurable commits e with synchronous=FULL, which syncs the WAL and
+// so every commit before it. OpenDB's synchronous=NORMAL syncs only at
+// checkpoints.
+func (s *Store) upsertEntryDurable(ctx context.Context, e model.OverlayEntry) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA synchronous=FULL`); err != nil {
+		return err
+	}
+	err = upsertEntryOn(ctx, conn, e)
+	if _, resetErr := conn.ExecContext(context.Background(), `PRAGMA synchronous=NORMAL`); resetErr != nil {
+		// A pooled connection left at FULL would sync every later commit.
+		conn.Raw(func(any) error { return driver.ErrBadConn })
+		if err == nil {
+			err = resetErr
+		}
+	}
+	return err
+}
+
+func upsertEntryOn(ctx context.Context, db interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, e model.OverlayEntry) error {
 	if e.Path == "" {
 		return errors.New("empty path")
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := db.ExecContext(ctx, `
 	INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path)
 	VALUES(?,?,?,?,?,?,?,?,?,?)
 	ON CONFLICT(path) DO UPDATE SET
