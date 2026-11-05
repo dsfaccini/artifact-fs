@@ -15,7 +15,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/logging"
 	"github.com/cloudflare/artifact-fs/internal/model"
-	ucli "github.com/urfave/cli"
+	ucli "github.com/urfave/cli/v3"
 )
 
 func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) int {
@@ -24,22 +24,22 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		root = v
 	}
 
-	app := ucli.NewApp()
-	app.Name = "artifact-fs"
-	app.Usage = "Git-backed FUSE filesystem with persistent writable overlay"
-	app.Writer = stdout
-	app.ErrWriter = stderr
-	app.Metadata = map[string]any{"ctx": ctx, "root": root}
+	app := &ucli.Command{
+		Name:      "artifact-fs",
+		Usage:     "Git-backed FUSE filesystem with persistent writable overlay",
+		Writer:    stdout,
+		ErrWriter: stderr,
+	}
 
-	app.Commands = []ucli.Command{
+	app.Commands = []*ucli.Command{
 		{
 			Name:  "daemon",
 			Usage: "start the artifact-fs daemon",
 			Flags: []ucli.Flag{
-				ucli.StringFlag{Name: "root", Value: filepath.Join(root, "mnt"), Usage: "mount root directory"},
-				ucli.IntFlag{Name: "hydration-concurrency", Value: daemon.DefaultHydrationConcurrency, Usage: "number of concurrent blob hydration workers"},
+				&ucli.StringFlag{Name: "root", Value: filepath.Join(root, "mnt"), Usage: "mount root directory"},
+				&ucli.IntFlag{Name: "hydration-concurrency", Value: daemon.DefaultHydrationConcurrency, Usage: "number of concurrent blob hydration workers"},
 			},
-			Action: func(c *ucli.Context) error {
+			Action: func(_ context.Context, c *ucli.Command) error {
 				logger := logging.NewJSONLogger(stderr, slog.LevelInfo)
 				svc, err := daemon.New(ctx, root, logger)
 				if err != nil {
@@ -59,22 +59,22 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			Name:  "add-repo",
 			Usage: "add and mount a repository",
 			Flags: []ucli.Flag{
-				ucli.StringFlag{Name: "name", Usage: "repo name (required)"},
-				ucli.StringFlag{Name: "remote", Usage: "remote URL (required)"},
-				ucli.StringFlag{Name: "branch", Usage: "deprecated alias for --ref refs/heads/<branch>"},
-				ucli.StringFlag{Name: "ref", Value: "refs/heads/main", Usage: "canonical source ref"},
-				ucli.StringFlag{Name: "require-commit", Usage: "require the source ref to resolve to this exact commit"},
-				ucli.IntFlag{Name: "depth", Usage: "history depth to transfer; 0 transfers complete history"},
-				ucli.StringFlag{Name: "refresh", Value: "30s", Usage: "remote refresh interval or never"},
-				ucli.StringFlag{Name: "mount-root", Usage: "override mount root"},
-				ucli.BoolFlag{Name: "async", Usage: "return after registration and prepare the repo in the daemon"},
-				ucli.BoolFlag{Name: "adopt-gitdir", Usage: "adopt an initialized linked worktree without fetching or resetting its index"},
-				ucli.BoolFlag{Name: "prepared-gitdir", Usage: "use an existing git dir for async preparation"},
-				ucli.StringFlag{Name: "git-dir", Usage: "explicit git dir path"},
-				ucli.StringFlag{Name: "blob-cache-dir", Usage: "directory for hydrated blobs; may be shared between repositories"},
-				ucli.StringFlag{Name: "fetch-ref", Usage: "ref to fetch during async preparation"},
+				&ucli.StringFlag{Name: "name", Usage: "repo name (required)"},
+				&ucli.StringFlag{Name: "remote", Usage: "remote URL (required)"},
+				&ucli.StringFlag{Name: "branch", Usage: "deprecated alias for --ref refs/heads/<branch>"},
+				&ucli.StringFlag{Name: "ref", Value: "refs/heads/main", Usage: "canonical source ref"},
+				&ucli.StringFlag{Name: "require-commit", Usage: "require the source ref to resolve to this exact commit"},
+				&ucli.IntFlag{Name: "depth", Usage: "history depth to transfer; 0 transfers complete history"},
+				&ucli.StringFlag{Name: "refresh", Value: "30s", Usage: "remote refresh interval or never"},
+				&ucli.StringFlag{Name: "mount-root", Usage: "override mount root"},
+				&ucli.BoolFlag{Name: "async", Usage: "return after registration and prepare the repo in the daemon"},
+				&ucli.BoolFlag{Name: "adopt-gitdir", Usage: "adopt an initialized linked worktree without fetching or resetting its index"},
+				&ucli.BoolFlag{Name: "prepared-gitdir", Usage: "use an existing git dir for async preparation"},
+				&ucli.StringFlag{Name: "git-dir", Usage: "explicit git dir path"},
+				&ucli.StringFlag{Name: "blob-cache-dir", Usage: "directory for hydrated blobs; may be shared between repositories"},
+				&ucli.StringFlag{Name: "fetch-ref", Usage: "ref to fetch during async preparation"},
 			},
-			Action: withService(ctx, root, stderr, func(c *ucli.Context, svc *daemon.Service) error {
+			Action: withService(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Service) error {
 				name := strings.TrimSpace(c.String("name"))
 				remote := strings.TrimSpace(c.String("remote"))
 				branch := strings.TrimSpace(c.String("branch"))
@@ -183,7 +183,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		{
 			Name:  "list-repos",
 			Usage: "list configured repos",
-			Action: withService(ctx, root, stderr, func(c *ucli.Context, svc *daemon.Service) error {
+			Action: withService(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Service) error {
 				repos, err := svc.ListRepos(ctx)
 				if err != nil {
 					return err
@@ -216,8 +216,8 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			Name:   "fsmonitor-hook",
 			Usage:  "internal fsmonitor hook",
 			Hidden: true,
-			Flags:  []ucli.Flag{ucli.StringFlag{Name: "name", Usage: "repo name (required)"}},
-			Action: withService(ctx, root, stderr, func(c *ucli.Context, svc *daemon.Service) error {
+			Flags:  []ucli.Flag{&ucli.StringFlag{Name: "name", Usage: "repo name (required)"}},
+			Action: withService(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Service) error {
 				name := strings.TrimSpace(c.String("name"))
 				if name == "" {
 					return fmt.Errorf("--name required")
@@ -230,10 +230,10 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			Name:  "set-refresh",
 			Usage: "update refresh interval",
 			Flags: []ucli.Flag{
-				ucli.StringFlag{Name: "name", Usage: "repo name (required)"},
-				ucli.StringFlag{Name: "interval", Usage: "refresh interval (required)"},
+				&ucli.StringFlag{Name: "name", Usage: "repo name (required)"},
+				&ucli.StringFlag{Name: "interval", Usage: "refresh interval (required)"},
 			},
-			Action: withService(ctx, root, stderr, func(c *ucli.Context, svc *daemon.Service) error {
+			Action: withService(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Service) error {
 				name := strings.TrimSpace(c.String("name"))
 				interval := strings.TrimSpace(c.String("interval"))
 				if name == "" || interval == "" {
@@ -261,7 +261,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		stubCommand("prefetch", "prefetch blobs", stdout),
 	}
 
-	if err := app.Run(append([]string{"artifact-fs"}, args...)); err != nil {
+	if err := app.Run(ctx, append([]string{"artifact-fs"}, args...)); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
@@ -278,8 +278,8 @@ func defaultRoot() string {
 }
 
 // withService creates a daemon.Service for the duration of the action.
-func withService(ctx context.Context, root string, stderr io.Writer, fn func(*ucli.Context, *daemon.Service) error) ucli.ActionFunc {
-	return func(c *ucli.Context) error {
+func withService(ctx context.Context, root string, stderr io.Writer, fn func(*ucli.Command, *daemon.Service) error) ucli.ActionFunc {
+	return func(_ context.Context, c *ucli.Command) error {
 		logger := logging.NewJSONLogger(stderr, slog.LevelInfo)
 		svc, err := daemon.NewController(ctx, root, logger)
 		if err != nil {
@@ -291,12 +291,12 @@ func withService(ctx context.Context, root string, stderr io.Writer, fn func(*uc
 }
 
 // nameCommand builds a subcommand that takes a --name flag and runs fn.
-func nameCommand(name, usage string, ctx context.Context, root string, stderr io.Writer, stdout io.Writer, fn func(context.Context, *daemon.Service, string, io.Writer) error) ucli.Command {
-	return ucli.Command{
+func nameCommand(name, usage string, ctx context.Context, root string, stderr io.Writer, stdout io.Writer, fn func(context.Context, *daemon.Service, string, io.Writer) error) *ucli.Command {
+	return &ucli.Command{
 		Name:  name,
 		Usage: usage,
-		Flags: []ucli.Flag{ucli.StringFlag{Name: "name", Usage: "repo name (required)"}},
-		Action: withService(ctx, root, stderr, func(c *ucli.Context, svc *daemon.Service) error {
+		Flags: []ucli.Flag{&ucli.StringFlag{Name: "name", Usage: "repo name (required)"}},
+		Action: withService(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Service) error {
 			n := strings.TrimSpace(c.String("name"))
 			if n == "" {
 				return fmt.Errorf("--name required")
@@ -364,12 +364,12 @@ func formatStatusError(err string) string {
 	return strings.Join(strings.Fields(auth.RedactString(err)), "_")
 }
 
-func stubCommand(name, usage string, stdout io.Writer) ucli.Command {
-	return ucli.Command{
+func stubCommand(name, usage string, stdout io.Writer) *ucli.Command {
+	return &ucli.Command{
 		Name:  name,
 		Usage: usage,
-		Flags: []ucli.Flag{ucli.StringFlag{Name: "name", Usage: "repo name"}},
-		Action: func(c *ucli.Context) error {
+		Flags: []ucli.Flag{&ucli.StringFlag{Name: "name", Usage: "repo name"}},
+		Action: func(_ context.Context, c *ucli.Command) error {
 			fmt.Fprintf(stdout, "%s not implemented yet\n", name)
 			return nil
 		},
