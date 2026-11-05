@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -93,13 +94,49 @@ type Service struct {
 	mountFailures        map[model.RepoID]*mountFailure
 	prepareWorkers       sync.WaitGroup
 	closing              bool
+	// lock is the daemon lock on root, held until Close.
+	lock *os.File
+	// wake carries control socket nudges to the sync loop.
+	wake chan struct{}
+	// records holds what recordRuntime last wrote for each repo. recordMu
+	// serializes the writes, and is taken before mu.
+	recordMu sync.Mutex
+	records  map[model.RepoID]*model.RepoRuntimeRecord
 }
 
+// New returns the daemon for root. It takes the daemon lock, so a second
+// daemon on root fails here.
 func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error) {
 	root, err := ensureStateRoot(root)
 	if err != nil {
 		return nil, err
 	}
+	lock, err := acquireDaemonLock(root)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := newService(ctx, root, logger)
+	if err != nil {
+		lock.Close()
+		return nil, err
+	}
+	svc.lock = lock
+	return svc, nil
+}
+
+// NewController returns the controller one CLI command runs on. It takes no
+// daemon lock and reaches the daemon only through the registry and the
+// control socket.
+// TODO(daemon-status): split into its own type.
+func NewController(ctx context.Context, root string, logger *slog.Logger) (*Service, error) {
+	root, err := ensureStateRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	return newService(ctx, root, logger)
+}
+
+func newService(ctx context.Context, root string, logger *slog.Logger) (*Service, error) {
 	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
 	if err != nil {
 		return nil, err
@@ -114,6 +151,8 @@ func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error
 		preparing:       map[model.RepoID]int64{},
 		prepareAttempts: map[model.RepoID]int64{},
 		mountFailures:   map[model.RepoID]*mountFailure{},
+		wake:            make(chan struct{}, 1),
+		records:         map[model.RepoID]*model.RepoRuntimeRecord{},
 	}
 	svc.git.SetBatchPoolSize(DefaultHydrationConcurrency)
 	return svc, nil
@@ -158,7 +197,11 @@ func (s *Service) Close() error {
 	}
 	s.prepareWorkers.Wait()
 	s.git.Close()
-	return s.registry.Close()
+	err := s.registry.Close()
+	if s.lock != nil {
+		s.lock.Close()
+	}
+	return err
 }
 
 func (s *Service) fillPaths(cfg *model.RepoConfig) {

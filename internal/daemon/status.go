@@ -13,46 +13,59 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 )
 
+// Status reports name from what the daemon recorded in repo_runtime and from
+// the stores. A record counts only while a daemon holds the daemon lock.
 func (s *Service) Status(ctx context.Context, name string) (model.RepoRuntimeState, error) {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
 		return model.RepoRuntimeState{}, err
 	}
-
-	// If we're the running daemon, use in-memory state.
-	s.mu.Lock()
-	rt, ok := s.running[cfg.ID]
-	if ok {
-		dirty, _ := rt.overlay.DirtyCount(ctx)
-		rt.state.DirtyOverlay = dirty > 0
-		st := rt.state // copy under lock
-		blobCacheDir := rt.cfg.BlobCacheDir
-		s.mu.Unlock()
-		applyHydrationStats(&st, blobCacheDir)
-		applySourceStatus(&st, cfg)
-		st.MountError = cfg.MountError
-		return st, nil
+	rec, recorded, err := s.registry.GetRuntime(ctx, cfg.ID)
+	if err != nil {
+		return model.RepoRuntimeState{}, err
 	}
-	s.mu.Unlock()
-	return s.readPersistedStatus(ctx, cfg), nil
+	live, err := daemonRunning(s.root)
+	if err != nil {
+		return model.RepoRuntimeState{}, err
+	}
+	return persistedStatus(ctx, cfg, rec, recorded && live), nil
 }
 
-func (s *Service) readPersistedStatus(ctx context.Context, cfg model.RepoConfig) model.RepoRuntimeState {
-	// One-shot CLI process: reconstruct state from persisted stores and
-	// OS-level mount check since we don't share memory with the daemon.
-	st := model.RepoRuntimeState{RepoID: cfg.ID, State: repoStateUnmounted, LastFetchResult: "never", PrepareError: cfg.PrepareError, MountError: cfg.MountError}
-	if cfg.PrepareState == model.PrepareStateSyncPreparing {
+// persistedStatus builds cfg's status. live says whether rec comes from the
+// running daemon.
+func persistedStatus(ctx context.Context, cfg model.RepoConfig, rec model.RepoRuntimeRecord, live bool) model.RepoRuntimeState {
+	st := model.RepoRuntimeState{RepoID: cfg.ID, State: repoStateUnmounted, LastFetchResult: "never", PrepareError: cfg.PrepareError}
+	switch {
+	case cfg.PrepareState == model.PrepareStateSyncPreparing:
 		st.State = model.PrepareStatePreparing
-	} else if isPendingOrFailedPrepareState(cfg.PrepareState) {
+	case live && rec.State != "":
+		st.State = rec.State
+	case isPendingOrFailedPrepareState(cfg.PrepareState):
 		st.State = cfg.PrepareState
-	} else if isMounted(cfg.MountPath) {
-		st.State = repoStateMounted
+	}
+	// The last failure stays visible after the daemon stops, but nothing
+	// retries it.
+	st.Phase, st.LastError, st.LastErrorPhase, st.LastErrorAt, st.Attempts = rec.Phase, rec.LastError, rec.LastErrorPhase, rec.LastErrorAt, rec.Attempts
+	if live {
+		st.NextRetryAt = rec.NextRetryAt
+		st.ServedHEADOID, st.ServedHEADRef, st.ServedGeneration = rec.ServedCommit, rec.ServedRef, rec.ServedGeneration
+		st.AheadCount, st.BehindCount, st.Diverged = rec.AheadCount, rec.BehindCount, rec.Diverged
+	}
+	if rec.LastErrorPhase == phaseMount {
+		st.MountError = rec.LastError
+	}
+	if !rec.LastFetchAt.IsZero() || rec.LastFetchResult != "" {
+		st.LastFetchAt, st.LastFetchResult = rec.LastFetchAt, rec.LastFetchResult
 	}
 	if cfg.MetaDBPath != "" {
 		if snap, err := snapshot.New(ctx, cfg.MetaDBPath); err == nil {
-			st.CurrentHEADOID, st.CurrentHEADRef, st.SnapshotGeneration, _ = snap.ReadState(ctx)
+			st.PublishedHEADOID, st.PublishedHEADRef, st.PublishedGeneration, _ = snap.ReadState(ctx)
 			snap.Close()
 		}
+	}
+	st.CurrentHEADOID, st.CurrentHEADRef, st.SnapshotGeneration = st.PublishedHEADOID, st.PublishedHEADRef, st.PublishedGeneration
+	if st.ServedGeneration > 0 {
+		st.CurrentHEADOID, st.CurrentHEADRef, st.SnapshotGeneration = st.ServedHEADOID, st.ServedHEADRef, st.ServedGeneration
 	}
 	if cfg.OverlayDBPath != "" {
 		if _, statErr := os.Stat(cfg.OverlayDBPath); statErr == nil {
@@ -65,8 +78,13 @@ func (s *Service) readPersistedStatus(ctx context.Context, cfg model.RepoConfig)
 			}
 		}
 	}
-	// Best-effort last fetch time from FETCH_HEAD mtime.
-	if fi, err := os.Stat(filepath.Join(cfg.GitDir, "FETCH_HEAD")); err == nil {
+	// A CLI fetch writes FETCH_HEAD and no record, so a FETCH_HEAD newer than
+	// the daemon's last fetch is a later successful fetch.
+	lastFetch := st.LastFetchAt
+	if rec.LastErrorPhase == phaseFetch && rec.LastErrorAt.After(lastFetch) {
+		lastFetch = rec.LastErrorAt
+	}
+	if fi, err := os.Stat(filepath.Join(cfg.GitDir, "FETCH_HEAD")); err == nil && fi.ModTime().After(lastFetch) {
 		// Verified acquisition itself writes FETCH_HEAD before its receipt.
 		// Only a newer mtime is evidence of a later remote refresh.
 		if cfg.RequiredCommit == "" || (!cfg.AcquiredAt.IsZero() && fi.ModTime().After(cfg.AcquiredAt)) {

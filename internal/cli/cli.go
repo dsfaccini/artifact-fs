@@ -198,11 +198,19 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				return nil
 			}),
 		},
-		unsupportedMountCommand("remount", func(string) string {
-			return "stop the daemon and start it again to remount every repo"
+		nameCommand("remount", "ask the running daemon to mount a repository again", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Service, name string, w io.Writer) error {
+			if err := svc.Remount(c, name); err != nil {
+				return err
+			}
+			fmt.Fprintf(w, "remounted %s\n", name)
+			return nil
 		}),
-		unsupportedMountCommand("unmount", func(repo string) string {
-			return "run remove-repo --name " + repo + " and the daemon unmounts the repo at its next registry poll, or stop the daemon to unmount every repo"
+		nameCommand("unmount", "ask the running daemon to unmount a repository until remount", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Service, name string, w io.Writer) error {
+			if err := svc.Unmount(c, name); err != nil {
+				return err
+			}
+			fmt.Fprintf(w, "unmounted %s\n", name)
+			return nil
 		}),
 		{
 			Name:   "fsmonitor-hook",
@@ -273,7 +281,7 @@ func defaultRoot() string {
 func withService(ctx context.Context, root string, stderr io.Writer, fn func(*ucli.Context, *daemon.Service) error) ucli.ActionFunc {
 	return func(c *ucli.Context) error {
 		logger := logging.NewJSONLogger(stderr, slog.LevelInfo)
-		svc, err := daemon.New(ctx, root, logger)
+		svc, err := daemon.NewController(ctx, root, logger)
 		if err != nil {
 			return err
 		}
@@ -298,24 +306,6 @@ func nameCommand(name, usage string, ctx context.Context, root string, stderr io
 	}
 }
 
-// unsupportedMountCommand rejects a mount command: the daemon owns every mount
-// and reads only the registry, so a CLI process cannot reach its mounts.
-// instead names the alternative for a repo.
-func unsupportedMountCommand(name string, instead func(repo string) string) ucli.Command {
-	return ucli.Command{
-		Name:  name,
-		Usage: "unsupported: a running daemon owns the mounts",
-		Flags: []ucli.Flag{ucli.StringFlag{Name: "name", Usage: "repo name"}},
-		Action: func(c *ucli.Context) error {
-			repo := strings.TrimSpace(c.String("name"))
-			if repo == "" {
-				repo = "<name>"
-			}
-			return fmt.Errorf("%s cannot reach the running daemon's mounts; %s", name, instead(repo))
-		},
-	}
-}
-
 func formatStatusLine(st model.RepoRuntimeState) string {
 	requiredCommit := st.RequiredCommit
 	if requiredCommit == "" {
@@ -329,12 +319,28 @@ func formatStatusLine(st model.RepoRuntimeState) string {
 	if st.RemoteRefreshDisabled {
 		remoteRefresh = "disabled"
 	}
-	return fmt.Sprintf("repo=%s state=%s head=%s ref=%s source_ref=%s required_commit=%s acquisition=%s base_commit=%s remote_refresh=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s prepare_error=%s mount_error=%s hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
-		st.RepoID, st.State, st.CurrentHEADOID, st.CurrentHEADRef, st.SourceRef, requiredCommit, acquisition, st.CurrentHEADOID, remoteRefresh,
+	return fmt.Sprintf("repo=%s state=%s head=%s ref=%s source_ref=%s required_commit=%s acquisition=%s base_commit=%s served_commit=%s served_generation=%d published_commit=%s published_generation=%d remote_refresh=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s prepare_error=%s mount_error=%s last_error=%s last_error_phase=%s last_error_at=%s next_retry=%s attempts=%d hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
+		st.RepoID, st.State, st.CurrentHEADOID, st.CurrentHEADRef, st.SourceRef, requiredCommit, acquisition, st.CurrentHEADOID,
+		formatNone(st.ServedHEADOID), st.ServedGeneration, formatNone(st.PublishedHEADOID), st.PublishedGeneration, remoteRefresh,
 		st.AheadCount, st.BehindCount, st.Diverged,
 		formatLastFetchAt(st.LastFetchAt), formatLastFetchResult(st.LastFetchResult),
 		formatStatusError(st.PrepareError), formatStatusError(st.MountError),
+		formatStatusError(st.LastError), formatNone(st.LastErrorPhase), formatStatusTime(st.LastErrorAt), formatStatusTime(st.NextRetryAt), st.Attempts,
 		st.HydratedBlobCount, st.HydratedBlobBytes, st.DirtyOverlay)
+}
+
+func formatNone(v string) string {
+	if v == "" {
+		return "none"
+	}
+	return v
+}
+
+func formatStatusTime(at time.Time) string {
+	if at.IsZero() {
+		return "none"
+	}
+	return at.UTC().Format(time.RFC3339)
 }
 
 func formatLastFetchAt(at time.Time) string {

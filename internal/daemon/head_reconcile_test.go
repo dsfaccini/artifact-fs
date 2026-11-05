@@ -18,6 +18,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
+	"github.com/cloudflare/artifact-fs/internal/registry"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 	"github.com/dsfaccini/fuse/fuseops"
 )
@@ -140,10 +141,17 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 		headChanges: make(chan struct{}, 1),
 		state:       newRuntimeState(cfg.ID, oldOID, "main", oldGen),
 	}
+	reg, err := registry.New(ctx, filepath.Join(t.TempDir(), "repos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
 	svc := &Service{
 		logger:               logger,
 		git:                  git,
+		registry:             reg,
 		running:              map[model.RepoID]*repoRuntime{cfg.ID: rt},
+		records:              map[model.RepoID]*model.RepoRuntimeRecord{},
 		headReconcileBackoff: backoff,
 	}
 	f := &headReconcileFixture{
@@ -325,7 +333,7 @@ func TestHeadReconcileRestoresPersistedStateWhenHEADReturnsAfterOverlayFailure(t
 
 	cfg := f.rt.cfg
 	cfg.MetaDBPath = filepath.Join(filepath.Dir(cfg.OverlayDir), "snapshot.sqlite")
-	status := f.svc.readPersistedStatus(f.ctx, cfg)
+	status := persistedStatus(f.ctx, cfg, model.RepoRuntimeRecord{}, false)
 	if status.CurrentHEADOID != f.oldOID || status.CurrentHEADRef != "main" || status.SnapshotGeneration != f.oldGen+2 {
 		t.Fatalf("persisted status after rollback = %+v", status)
 	}

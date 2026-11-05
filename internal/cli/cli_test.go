@@ -281,17 +281,11 @@ func TestPrepareCLIReportsQueuedPrepare(t *testing.T) {
 	}
 }
 
-func TestMountCommandsRefuseAndPointToAlternative(t *testing.T) {
-	for _, tt := range []struct {
-		command, name string
-		wants         []string
-	}{
-		{"unmount", "repo", []string{"remove-repo --name repo", "stop the daemon"}},
-		// remount of a registered repo mounted FUSE from the CLI process, and
-		// package tests never mount, so it names an unregistered repo.
-		{"remount", "missing", []string{"stop the daemon and start it again"}},
-	} {
-		t.Run(tt.command, func(t *testing.T) {
+// unmount and remount are requests to the running daemon, so without one
+// they must fail rather than report a change nothing made.
+func TestMountCommandsFailWithoutDaemon(t *testing.T) {
+	for _, command := range []string{"unmount", "remount"} {
+		t.Run(command, func(t *testing.T) {
 			t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
 			ctx := context.Background()
 			var stdout, stderr bytes.Buffer
@@ -300,16 +294,14 @@ func TestMountCommandsRefuseAndPointToAlternative(t *testing.T) {
 			}
 			stdout.Reset()
 			stderr.Reset()
-			if code := Run(ctx, []string{tt.command, "--name", tt.name}, &stdout, &stderr); code == 0 {
-				t.Fatalf("%s exit = 0, stdout=%q", tt.command, stdout.String())
+			if code := Run(ctx, []string{command, "--name", "repo"}, &stdout, &stderr); code == 0 {
+				t.Fatalf("%s exit = 0, stdout=%q", command, stdout.String())
 			}
 			if stdout.Len() != 0 {
 				t.Fatalf("stdout = %q, want nothing", stdout.String())
 			}
-			for _, want := range tt.wants {
-				if !strings.Contains(stderr.String(), want) {
-					t.Fatalf("stderr = %q, want substring %q", stderr.String(), want)
-				}
+			if !strings.Contains(stderr.String(), daemon.ErrNoDaemon.Error()) {
+				t.Fatalf("stderr = %q, want %q", stderr.String(), daemon.ErrNoDaemon)
 			}
 		})
 	}
@@ -323,12 +315,12 @@ func TestStatusCLIPrintsDaemonMountError(t *testing.T) {
 	if code := Run(ctx, []string{"add-repo", "--name", "repo", "--remote", "https://github.com/example/repo.git", "--async"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("add-repo exit = %d, stderr=%q", code, stderr.String())
 	}
-	// The daemon persists mount errors in the registry that status reads.
+	// The daemon records mount errors in the registry that status reads.
 	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = reg.UpdateMountError(ctx, "repo", "fskit: extension requires approval")
+	err = reg.PutRuntime(ctx, model.RepoRuntimeRecord{RepoID: "repo", LastError: "fskit: extension requires approval", LastErrorPhase: "mount"})
 	if closeErr := reg.Close(); err != nil || closeErr != nil {
 		t.Fatalf("record mount error: %v, close: %v", err, closeErr)
 	}

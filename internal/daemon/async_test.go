@@ -243,12 +243,12 @@ func TestSupersededPrepareDoesNotMutateExistingClone(t *testing.T) {
 func TestRepoPrepareLockSerializesServices(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	first, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	first, err := NewController(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.Close()
-	second, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	second, err := NewController(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1533,7 +1533,7 @@ func TestPrepareRequeuesReadyVerifiedSourceForRecovery(t *testing.T) {
 	if !recovered.AcquiredAt.After(initialAcquiredAt) {
 		t.Fatalf("recovery acquisition time = %v, want after %v", recovered.AcquiredAt, initialAcquiredAt)
 	}
-	st := svc.readPersistedStatus(ctx, recovered)
+	st := persistedStatus(ctx, recovered, model.RepoRuntimeRecord{}, false)
 	if !st.LastFetchAt.IsZero() || st.LastFetchResult != "never" {
 		t.Fatalf("recovery acquisition reported as remote refresh: %+v", st)
 	}

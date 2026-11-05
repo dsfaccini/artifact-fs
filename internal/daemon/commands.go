@@ -289,30 +289,79 @@ func (s *Service) Prepare(ctx context.Context, name string) error {
 	return nil
 }
 
-func (s *Service) Remount(ctx context.Context, name string) error {
-	cfg, err := s.registry.GetRepo(ctx, name)
-	if err != nil {
-		return err
-	}
-	if err := s.unmount(cfg.ID); err != nil {
-		return err
-	}
-	if shouldMountAsync(cfg) {
-		if err := s.mountAsyncRepo(ctx, cfg); err != nil {
-			return err
-		}
-		if cfg.PrepareState == model.PrepareStatePreparing {
-			s.startPrepareWorker(ctx, cfg)
-		}
-		return nil
-	}
-	return s.mountRepo(ctx, cfg)
+// mountRequestTimeout bounds how long Unmount and Remount wait for the
+// daemon. Unmounting can take a minute: macFUSE retries a busy unmount for
+// 20 s, and the daemon then drains the FUSE server for up to 30 s.
+const mountRequestTimeout = 2 * time.Minute
+
+// ErrNoDaemon is the error of a request that needs the running daemon.
+var ErrNoDaemon = errors.New("no artifact-fs daemon is running on this state root")
+
+// Unmount asks the running daemon to unmount name and keep it unmounted until
+// Remount, and waits for the outcome.
+func (s *Service) Unmount(ctx context.Context, name string) error {
+	return s.requestMount(ctx, name, false)
 }
 
-func (s *Service) Unmount(ctx context.Context, name string) error {
+// Remount asks the running daemon to unmount name if it serves it and mount
+// it again, and waits for the outcome.
+func (s *Service) Remount(ctx context.Context, name string) error {
+	return s.requestMount(ctx, name, true)
+}
+
+// requestMount records the intent in the registry, nudges the daemon over its
+// control socket, and waits until repo_runtime shows the daemon carried out
+// the request.
+func (s *Service) requestMount(ctx context.Context, name string, mount bool) error {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
 		return err
 	}
-	return s.unmount(cfg.ID)
+	if live, err := daemonRunning(s.root); err != nil {
+		return err
+	} else if !live {
+		return fmt.Errorf("%w: start one with artifact-fs daemon", ErrNoDaemon)
+	}
+	if mount && cfg.PrepareState == model.PrepareStateSyncPreparing {
+		return fmt.Errorf("repo %s is still preparing", name)
+	}
+	request := rand.Text()
+	requested := time.Now()
+	if err := s.registry.RequestMount(ctx, cfg.ID, mount, request); err != nil {
+		return err
+	}
+	nudgeDaemon(s.root)
+	op := "unmount"
+	if mount {
+		op = "remount"
+	}
+	ctx, cancel := context.WithTimeout(ctx, mountRequestTimeout)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		rec, ok, err := s.registry.GetRuntime(ctx, cfg.ID)
+		if err != nil {
+			return err
+		}
+		if ok && rec.MountRequest == request {
+			failed := !rec.LastErrorAt.Before(requested) && (rec.LastErrorPhase == phaseUnmount || mount && rec.LastErrorPhase == phaseMount)
+			if failed {
+				return fmt.Errorf("%s %s failed in phase %s: %s; the daemon retries it", op, name, rec.LastErrorPhase, rec.LastError)
+			}
+			if !mount && rec.State == repoStateUnmounted || mount && rec.State != repoStateUnmounted {
+				return nil
+			}
+		}
+		if live, err := daemonRunning(s.root); err != nil {
+			return err
+		} else if !live {
+			return fmt.Errorf("%s %s: the daemon stopped before it carried out the request", op, name)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%s %s: the daemon did not carry out the request within %s; run status --name %s", op, name, mountRequestTimeout, name)
+		case <-ticker.C:
+		}
+	}
 }

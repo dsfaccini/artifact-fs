@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -28,6 +29,8 @@ var defaultMount mountFunc = fusefs.MountRepoWithGate
 type mountFailure struct {
 	lastAttempt time.Time
 	backoff     time.Duration
+	// request is the mount request the failed attempt carried out.
+	request string
 }
 
 // mountRepo opens all stores, starts the FUSE server, watcher, and refresh
@@ -128,11 +131,8 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 		Hydrator: h,
 	}
 
-	mfs, err := s.mountFS(ctx, cfg, engine, nil)
-	if err != nil {
-		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
-		mfs = nil
-	} else {
+	mfs, mountErr := s.mountFS(ctx, cfg, engine, nil)
+	if mountErr == nil {
 		s.configureStatusOptimization(ctx, cfg)
 	}
 	rt := &repoRuntime{
@@ -153,23 +153,29 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 		rt.state.State = repoStateDegraded
 	}
 	s.startRuntime(rt)
+	s.recordStartedRuntime(rt, mountErr)
 	s.startRepoBackground(rt)
 
 	return nil
 }
 
-// mountFS mounts cfg through s.mount and logs which backend serves the mount.
-// It persists the mount error that status reports, and clears it on success.
+// recordStartedRuntime records a runtime that started, with the error of its
+// first mount, which the next registry sync retries.
+func (s *Service) recordStartedRuntime(rt *repoRuntime, mountErr error) {
+	cleared := phaseMount
+	if mountErr != nil {
+		s.recordFailure(rt.cfg, phaseMount, mountErr, time.Now().Add(registrySyncInterval))
+		cleared = ""
+	}
+	s.recordRuntimeState(rt, cleared)
+}
+
+// mountFS mounts cfg through s.mount and logs the outcome. Its caller
+// records a failure with the time of the retry.
 func (s *Service) mountFS(ctx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate) (fusefs.MountedFS, error) {
 	mfs, err := s.mount(cfg, engine, gate, s.logger)
-	mountErr := ""
 	if err != nil {
-		mountErr = auth.RedactLogString(err.Error(), cfg.RemoteURL)
-	}
-	if writeErr := s.registry.UpdateMountError(ctx, cfg.ID, mountErr); writeErr != nil {
-		s.logger.Error("repo mount error write failed", "repo", cfg.Name, "error", writeErr)
-	}
-	if err != nil {
+		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", auth.RedactLogString(err.Error(), cfg.RemoteURL))
 		return nil, err
 	}
 	s.logger.Info("fuse mounted", "repo", cfg.Name, "backend", mfs.Backend())
@@ -216,11 +222,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		Hydrator: h,
 	}
 
-	mfs, err := s.mountFS(ctx, cfg, engine, gate)
-	if err != nil {
-		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
-		mfs = nil
-	}
+	mfs, mountErr := s.mountFS(ctx, cfg, engine, gate)
 	state := cfg.PrepareState
 	if strings.TrimSpace(state) == "" {
 		state = model.PrepareStatePreparing
@@ -249,6 +251,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		},
 	}
 	s.startRuntime(rt)
+	s.recordStartedRuntime(rt, mountErr)
 	return nil
 }
 
@@ -263,15 +266,21 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 	rt.joinDone = done
 	s.mu.Unlock()
 	go func() {
-		_ = mfs.Join(context.Background())
+		joinErr := mfs.Join(context.Background())
 		close(done)
 		s.mu.Lock()
-		if !rt.stopping && !rt.detached && rt.mfs == mfs {
+		exited := !rt.stopping && !rt.detached && rt.mfs == mfs
+		if exited {
 			rt.mfs = nil
 			rt.joinDone = nil
 			rt.state.State = repoStateDegraded
 		}
 		s.mu.Unlock()
+		if exited {
+			// The next registry sync mounts the runtime again.
+			s.recordFailure(rt.cfg, phaseServe, cmp.Or(joinErr, errFUSEServerExited), time.Now().Add(registrySyncInterval))
+			s.recordRuntimeState(rt, "")
+		}
 	}()
 }
 
@@ -300,12 +309,15 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 			s.mountFailures[cfg.ID] = mf
 		}
 		mf.lastAttempt = time.Now()
+		mf.request = cfg.MountRequest
 		if mf.backoff == 0 {
 			mf.backoff = 30 * time.Second
 		} else {
 			mf.backoff = min(mf.backoff*2, 5*time.Minute)
 		}
+		nextRetry := mf.lastAttempt.Add(mf.backoff)
 		s.mu.Unlock()
+		s.recordFailure(cfg, phaseMount, err, nextRetry)
 		return
 	}
 	if s.running[cfg.ID] != rt || rt.mfs != nil {
@@ -323,6 +335,8 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 	s.mu.Unlock()
 	if !stopping {
 		s.configureStatusOptimization(rt.ctx, cfg)
+		s.recordRuntimeState(rt, phaseMount)
+		s.recordRuntime(cfg.ID, func(rec *model.RepoRuntimeRecord) { clearFailure(rec, phaseServe) })
 	}
 	s.joinRuntimeMount(rt)
 }
