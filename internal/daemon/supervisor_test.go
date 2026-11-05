@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -296,6 +297,32 @@ func TestStartUnmountsFailedConnectionBeforeRemount(t *testing.T) {
 	if want := "readMessage: transport to REDACTED_REMOTE failed"; st.State != repoStateDegraded || st.MountError != want {
 		t.Fatalf("state = %q, mount_error = %q; want %q, %q", st.State, st.MountError, repoStateDegraded, want)
 	}
+	for line := range strings.SplitSeq(d.logs.String(), "\n") {
+		if strings.Contains(line, "fuse connection failed") && (strings.Contains(line, d.workDir) || !strings.Contains(line, "REDACTED_REMOTE")) {
+			t.Fatalf("connection failure log is not redacted: %s", line)
+		}
+	}
+}
+
+func TestStartRemountsAfterFailedUnmountWhenNothingIsMounted(t *testing.T) {
+	// Nothing is mounted under the test's mount root, so the failed unmount leaves no mount behind.
+	d, m := startConnFailureDaemon(t, 1, "")
+
+	calls := failConnectionUntilRemount(t, d, m)
+	if want := []string{"mount", "unmount failed", "mount"}; !slices.Equal(calls, want) {
+		t.Fatalf("calls = %q, want %q", calls, want)
+	}
+}
+
+func TestStartRemountsWithoutUnmountWhenConnectionEndsUnmounted(t *testing.T) {
+	// Nothing is mounted under the test's mount root, as after an external unmount.
+	d, m := startConnFailureDaemon(t, 0, "")
+	m.abort = true
+
+	calls := failConnectionUntilRemount(t, d, m)
+	if want := []string{"mount", "mount"}; !slices.Equal(calls, want) {
+		t.Fatalf("calls = %q, want %q", calls, want)
+	}
 }
 
 func TestStartRetriesFailedConnectionUnmountBeforeRemount(t *testing.T) {
@@ -329,10 +356,34 @@ func TestRemoveRepoUnmountsFailedConnectionLeftMounted(t *testing.T) {
 	// supervisor's retry, which then backs off.
 	waitFor(t, d.startErr, func() bool { return len(m.recorded()) == 3 })
 
-	if err := d.svc.RemoveRepo(context.Background(), "repo"); err != nil {
+	// remove-repo runs in its own process, so the daemon's registry poll stops the runtime.
+	ctx := context.Background()
+	cliSvc, err := New(ctx, d.root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
 		t.Fatal(err)
 	}
+	err = cliSvc.RemoveRepo(ctx, "repo")
+	if closeErr := cliSvc.Close(); err != nil || closeErr != nil {
+		t.Fatalf("CLI remove-repo: %v, close: %v", err, closeErr)
+	}
+	waitFor(t, d.startErr, func() bool {
+		d.svc.mu.Lock()
+		defer d.svc.mu.Unlock()
+		return len(d.svc.running) == 0
+	})
 	if want := []string{"mount", "unmount failed", "unmount failed", "unmount"}; !slices.Equal(m.recorded(), want) {
 		t.Fatalf("calls = %q, want %q", m.recorded(), want)
+	}
+}
+
+func TestMountPointHeldResolvesParentSymlinks(t *testing.T) {
+	// /dev is a mount point on macOS and Linux. The mount table lists it only by its resolved path.
+	link := filepath.Join(t.TempDir(), "root")
+	if err := os.Symlink("/", link); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(link, "dev")
+	if isMounted(path) || !mountPointHeld(path) {
+		t.Fatalf("isMounted(%q) = %t, mountPointHeld = %t; want false, true", path, isMounted(path), mountPointHeld(path))
 	}
 }

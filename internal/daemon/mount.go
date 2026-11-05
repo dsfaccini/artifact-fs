@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -276,7 +277,7 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 		// still hold the mount point. Join also returns nil after an abort,
 		// which leaves the dead mount in place.
 		connErr := mfs.Join(context.Background())
-		if connErr == nil && isMounted(rt.cfg.MountPath) {
+		if connErr == nil && mountPointHeld(rt.cfg.MountPath) {
 			connErr = errConnectionEndedMounted
 		}
 		s.mu.Lock()
@@ -315,13 +316,31 @@ func (s *Service) unmountFailedMount(rt *repoRuntime) error {
 	if mfs == nil {
 		return nil
 	}
-	if err := mfs.Unmount(); err != nil && isMounted(rt.cfg.MountPath) {
+	if err := mfs.Unmount(); err != nil && mountPointHeld(rt.cfg.MountPath) {
 		return fmt.Errorf("unmount %s after its connection failed: %w", rt.cfg.Name, err)
 	}
 	s.mu.Lock()
 	rt.failedMount = nil
 	s.mu.Unlock()
 	return nil
+}
+
+// isMounted reports whether path is an active mount point, and false when it cannot tell.
+func isMounted(path string) bool {
+	mounted, _ := mountTableHas(path)
+	return mounted
+}
+
+// mountPointHeld reports whether path still holds a mount, and true when it
+// cannot tell. The mount table lists resolved paths, so it resolves the
+// parent's symlinks; a dead mount point itself can fail with ENOTCONN.
+func mountPointHeld(path string) bool {
+	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return true
+	}
+	mounted, err := mountTableHas(filepath.Join(parent, filepath.Base(path)))
+	return mounted || err != nil
 }
 
 func (s *Service) retryRuntimeMount(rt *repoRuntime) {
