@@ -408,6 +408,13 @@ func (e *Engine) Write(ctx context.Context, b *Blobs, path string, off int64, da
 	return e.Overlay.WriteFile(ctx, path, off, data)
 }
 
+// Flush commits the size and times of path's writes since its last flush.
+func (e *Engine) Flush(ctx context.Context, path string) error {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
+	return e.Overlay.FlushFile(ctx, path)
+}
+
 func (e *Engine) Sync(ctx context.Context, path string) error {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()

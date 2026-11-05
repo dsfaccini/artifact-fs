@@ -1046,8 +1046,26 @@ func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlink
 	return nil
 }
 
-func (fs *ArtifactFuse) FlushFile(_ context.Context, _ *fuseops.FlushFileOp) error {
-	return nil
+func (fs *ArtifactFuse) FlushFile(ctx context.Context, op *fuseops.FlushFileOp) error {
+	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+		fh, err := fs.fileHandle(op.Handle)
+		if err != nil {
+			return err
+		}
+		return fs.flushHandle(ctx, fh)
+	})
+}
+
+// flushHandle commits the writes made through fh's path. A detached handle
+// writes to a file no entry names, so it has nothing to commit.
+func (fs *ArtifactFuse) flushHandle(ctx context.Context, fh *FileHandle) error {
+	fh.mu.Lock()
+	path, detached := fh.path, fh.detached
+	fh.mu.Unlock()
+	if detached || path == ".git" {
+		return nil
+	}
+	return fs.engine.Flush(ctx, path)
 }
 
 func (fs *ArtifactFuse) SyncFile(ctx context.Context, op *fuseops.SyncFileOp) error {
@@ -1076,15 +1094,17 @@ func (fs *ArtifactFuse) SyncFile(ctx context.Context, op *fuseops.SyncFileOp) er
 }
 
 func (fs *ArtifactFuse) ReleaseFileHandle(ctx context.Context, op *fuseops.ReleaseFileHandleOp) error {
-	return fs.shared(ctx, func(context.Context, *Blobs) error {
+	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
 		fs.mu.Lock()
 		fh := fs.fileHandles[op.Handle]
 		delete(fs.fileHandles, op.Handle)
 		fs.mu.Unlock()
-		if fh != nil {
-			fh.release()
+		if fh == nil {
+			return nil
 		}
-		return nil
+		err := fs.flushHandle(ctx, fh)
+		fh.release()
+		return err
 	})
 }
 

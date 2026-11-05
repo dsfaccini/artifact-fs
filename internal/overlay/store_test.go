@@ -1843,3 +1843,41 @@ func TestReconcileFailsOnABackingFileMissingWithNoWrite(t *testing.T) {
 		t.Fatalf("x.txt after the failed reconcile = %+v, %t; want it unchanged: %+v", after, ok, before)
 	}
 }
+
+func TestLookupShowsUnflushedWriteSize(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "f.txt", "one")
+	before, _ := s.Get("f.txt")
+	if _, err := s.WriteFile(ctx, "f.txt", 3, []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	e, ok := s.Get("f.txt")
+	if !ok || e.SizeBytes != 6 || e.MtimeUnixNs <= before.MtimeUnixNs {
+		t.Fatalf("f.txt = %+v, %t; want size 6 and an mtime after %d", e, ok, before.MtimeUnixNs)
+	}
+}
+
+func TestSyncFileCommitsUnflushedWrites(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "f.txt", "one")
+	if _, err := s.WriteFile(ctx, "f.txt", 3, []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SyncFile(ctx, "f.txt"); err != nil {
+		t.Fatal(err)
+	}
+	other, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { other.Close() })
+	e, ok := other.Get("f.txt")
+	if !ok || e.SizeBytes != 6 {
+		t.Fatalf("committed f.txt = %+v, %t; want size 6", e, ok)
+	}
+	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "onetwo" {
+		t.Fatalf("backing file = %q, %v; want onetwo", data, err)
+	}
+}

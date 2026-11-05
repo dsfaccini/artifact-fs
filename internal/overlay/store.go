@@ -111,6 +111,10 @@ type Store struct {
 	repo     model.RepoConfig
 	upperDir string
 	mu       sync.Mutex
+	// pending holds the files written since their last commit. Under mu;
+	// pendingMu also guards it for readers that do not take mu.
+	pending   map[string]*pendingWrite
+	pendingMu sync.Mutex
 	// reconcileMu serializes reconciles without blocking writes.
 	reconcileMu sync.Mutex
 }
@@ -129,10 +133,15 @@ func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, repo: cfg, upperDir: upperDir}, nil
+	return &Store{db: db, repo: cfg, upperDir: upperDir, pending: map[string]*pendingWrite{}}, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	s.mu.Lock()
+	flushErr := s.flushAllLocked(context.Background())
+	s.mu.Unlock()
+	return errors.Join(flushErr, s.db.Close())
+}
 
 // overlayCols is the column list for overlay_entries queries. Keep in sync with
 // the Scan call in queryEntries and the single-row scan in Get.
@@ -144,7 +153,18 @@ func (s *Store) Get(path string) (model.OverlayEntry, bool) {
 }
 
 func (s *Store) Lookup(ctx context.Context, path string) (model.OverlayEntry, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+overlayCols+` FROM overlay_entries WHERE path=?`, model.CleanPath(path))
+	path = model.CleanPath(path)
+	e, ok, err := s.lookupCommitted(ctx, path)
+	if ok {
+		s.pendingMu.Lock()
+		s.pending[path].apply(&e)
+		s.pendingMu.Unlock()
+	}
+	return e, ok, err
+}
+
+func (s *Store) lookupCommitted(ctx context.Context, path string) (model.OverlayEntry, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+overlayCols+` FROM overlay_entries WHERE path=?`, path)
 	var e model.OverlayEntry
 	if err := row.Scan(&e.Path, &e.Kind, &e.BackingPath, &e.Mode, &e.SizeBytes, &e.MtimeUnixNs, &e.CtimeUnixNs, &e.SourceOID, &e.SourceMode, &e.TargetPath); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -172,6 +192,9 @@ func (s *Store) EnsureCopyOnWrite(ctx context.Context, repo model.RepoConfig, pa
 func (s *Store) EnsureCopyOnWriteFrom(ctx context.Context, _ model.RepoConfig, path string, base model.BaseNode, src *os.File) (model.OverlayEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.flushAllLocked(ctx); err != nil {
+		return model.OverlayEntry{}, err
+	}
 	if e, ok, err := s.Lookup(ctx, path); err != nil {
 		return model.OverlayEntry{}, err
 	} else if ok && !e.IsDeleted() {
@@ -255,6 +278,9 @@ func (s *Store) EnsureCopyOnWriteFrom(ctx context.Context, _ model.RepoConfig, p
 func (s *Store) CreateFile(ctx context.Context, path string, mode uint32) (model.OverlayEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.flushAllLocked(ctx); err != nil {
+		return model.OverlayEntry{}, err
+	}
 	f, err := os.CreateTemp(s.upperDir, ".artifact-fs-entry-*")
 	if err != nil {
 		return model.OverlayEntry{}, err
@@ -281,6 +307,9 @@ func (s *Store) CreateFile(ctx context.Context, path string, mode uint32) (model
 func (s *Store) CreateSymlink(ctx context.Context, path string, target string) (model.OverlayEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.flushAllLocked(ctx); err != nil {
+		return model.OverlayEntry{}, err
+	}
 	if len(target) > model.MaxSymlinkTargetBytes {
 		return model.OverlayEntry{}, fmt.Errorf("symlink target exceeds %d bytes", model.MaxSymlinkTargetBytes)
 	}
@@ -301,39 +330,124 @@ func (s *Store) CreateSymlink(ctx context.Context, path string, target string) (
 	return e, nil
 }
 
+// pendingWrite is a file whose content reached its backing file while its
+// size and times are newer than its committed entry.
+type pendingWrite struct {
+	f           *os.File
+	backingPath string
+	size        int64
+	timeUnixNs  int64
+}
+
+// apply sets e's size and times to p's when e still names p's backing file.
+// Other fields stay as committed, so a concurrent mode change or rebase holds.
+func (p *pendingWrite) apply(e *model.OverlayEntry) {
+	if p != nil && e.BackingPath == p.backingPath {
+		e.SizeBytes = p.size
+		e.MtimeUnixNs = p.timeUnixNs
+		e.CtimeUnixNs = p.timeUnixNs
+	}
+}
+
+// WriteFile writes through the open backing file and commits the entry only
+// on the first write since the path's last flush. Lookup reports the newer
+// size and times at once; FlushFile, SyncFile and every other mutation commit
+// them.
 func (s *Store) WriteFile(ctx context.Context, path string, off int64, data []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, ok, err := s.Lookup(ctx, path)
-	if err != nil {
-		return 0, err
+	path = model.CleanPath(path)
+	s.pendingMu.Lock()
+	p := s.pending[path]
+	s.pendingMu.Unlock()
+	first := p == nil
+	var e model.OverlayEntry
+	if first {
+		var ok bool
+		var err error
+		e, ok, err = s.lookupCommitted(ctx, path)
+		if err != nil {
+			return 0, err
+		}
+		if !ok || e.IsDeleted() {
+			return 0, os.ErrNotExist
+		}
+		f, err := os.OpenFile(e.BackingPath, os.O_WRONLY|os.O_CREATE, os.FileMode(e.Mode))
+		if err != nil {
+			return 0, err
+		}
+		p = &pendingWrite{f: f, backingPath: e.BackingPath, size: e.SizeBytes}
 	}
-	if !ok || e.IsDeleted() {
-		return 0, os.ErrNotExist
+	n, err := p.f.WriteAt(data, off)
+	if n > 0 {
+		s.pendingMu.Lock()
+		p.size = max(p.size, off+int64(n))
+		p.timeUnixNs = time.Now().UnixNano()
+		s.pendingMu.Unlock()
 	}
-	f, err := os.OpenFile(e.BackingPath, os.O_WRONLY|os.O_CREATE, os.FileMode(e.Mode))
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	n, err := f.WriteAt(data, off)
-	if err != nil {
+	if !first {
 		return n, err
 	}
-	st, _ := f.Stat()
-	now := time.Now().UnixNano()
-	e.SizeBytes = st.Size()
-	e.MtimeUnixNs = now
-	e.CtimeUnixNs = now
+	if n == 0 {
+		p.f.Close()
+		return n, err
+	}
+	p.apply(&e)
 	if e.Kind != model.OverlayKindCreate {
 		e.Kind = model.OverlayKindModify
 	}
-	return n, s.upsertEntry(ctx, e)
+	if upErr := s.upsertEntry(ctx, e); upErr != nil {
+		p.f.Close()
+		return n, upErr
+	}
+	s.pendingMu.Lock()
+	s.pending[path] = p
+	s.pendingMu.Unlock()
+	return n, err
+}
+
+// FlushFile commits the size and times of path's writes since its last flush.
+func (s *Store) FlushFile(ctx context.Context, path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.flushLocked(ctx, model.CleanPath(path))
+}
+
+func (s *Store) flushLocked(ctx context.Context, path string) error {
+	s.pendingMu.Lock()
+	p := s.pending[path]
+	s.pendingMu.Unlock()
+	if p == nil {
+		return nil
+	}
+	s.pendingMu.Lock()
+	size, t := p.size, p.timeUnixNs
+	s.pendingMu.Unlock()
+	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET size_bytes=?, mtime_unix_ns=?, ctime_unix_ns=? WHERE path=? AND backing_path=?`, size, t, t, path, p.backingPath); err != nil {
+		return err
+	}
+	s.pendingMu.Lock()
+	delete(s.pending, path)
+	s.pendingMu.Unlock()
+	return p.f.Close()
+}
+
+func (s *Store) flushAllLocked(ctx context.Context) error {
+	s.pendingMu.Lock()
+	paths := slices.Collect(maps.Keys(s.pending))
+	s.pendingMu.Unlock()
+	for _, path := range paths {
+		if err := s.flushLocked(ctx, path); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) SyncFile(ctx context.Context, path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	path = model.CleanPath(path)
 	e, ok, err := s.Lookup(ctx, path)
 	if err != nil {
 		return err
@@ -352,17 +466,18 @@ func (s *Store) SyncFile(ctx context.Context, path string) error {
 		f.Close()
 		return err
 	}
-	st, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return err
-	}
 	if err := f.Close(); err != nil {
 		return err
 	}
-	e.SizeBytes = st.Size()
 	if err := s.upsertEntryDurable(ctx, e); err != nil {
 		return err
+	}
+	s.pendingMu.Lock()
+	p := s.pending[path]
+	delete(s.pending, path)
+	s.pendingMu.Unlock()
+	if p != nil {
+		p.f.Close()
 	}
 	dir, err := os.Open(s.upperDir)
 	if err != nil {
@@ -378,6 +493,9 @@ func (s *Store) SyncFile(ctx context.Context, path string) error {
 func (s *Store) Truncate(ctx context.Context, path string, size int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.flushAllLocked(ctx); err != nil {
+		return err
+	}
 	e, ok, err := s.Lookup(ctx, path)
 	if err != nil {
 		return err
@@ -401,6 +519,9 @@ func (s *Store) Truncate(ctx context.Context, path string, size int64) error {
 func (s *Store) Remove(ctx context.Context, path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.flushAllLocked(ctx); err != nil {
+		return err
+	}
 	path = model.CleanPath(path)
 	existing, _, err := s.Lookup(ctx, path)
 	if err != nil {
@@ -423,6 +544,9 @@ func (s *Store) Remove(ctx context.Context, path string) error {
 func (s *Store) Rename(ctx context.Context, oldPath, newPath string, sourceTracked bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.flushAllLocked(ctx); err != nil {
+		return err
+	}
 	oldPath = model.CleanPath(oldPath)
 	newPath = model.CleanPath(newPath)
 	e, ok, err := s.Lookup(ctx, oldPath)
@@ -506,6 +630,9 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string, sourceTrack
 func (s *Store) RenameTree(ctx context.Context, oldPath, newPath string, sourceBasePaths, destinationBasePaths []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.flushAllLocked(ctx); err != nil {
+		return err
+	}
 	return s.renameTreeLocked(ctx, model.CleanPath(oldPath), model.CleanPath(newPath), sourceBasePaths, destinationBasePaths)
 }
 
@@ -710,6 +837,9 @@ func (s *Store) listTreeEntries(ctx context.Context, path string) ([]model.Overl
 func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newPath string, sourceOID string, sourceMode uint32, sourceTracked bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.flushAllLocked(ctx); err != nil {
+		return err
+	}
 	oldPath = model.CleanPath(oldPath)
 	newPath = model.CleanPath(newPath)
 	e, ok, err := s.Lookup(ctx, oldPath)
@@ -770,6 +900,9 @@ func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newP
 func (s *Store) Mkdir(ctx context.Context, path string, mode uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.flushAllLocked(ctx); err != nil {
+		return err
+	}
 	path = model.CleanPath(path)
 	mode, _ = normalizeGitDirMode(mode)
 	backing, err := os.MkdirTemp(s.upperDir, ".artifact-fs-dir-*")
@@ -799,6 +932,9 @@ func normalizeGitDirMode(mode uint32) (uint32, bool) {
 func (s *Store) SetMtime(ctx context.Context, path string, t time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.flushAllLocked(ctx); err != nil {
+		return err
+	}
 	path = model.CleanPath(path)
 	if e, ok, err := s.Lookup(ctx, path); err != nil {
 		return err
@@ -822,6 +958,9 @@ func (s *Store) SetMtime(ctx context.Context, path string, t time.Time) error {
 func (s *Store) SetMode(ctx context.Context, path string, mode uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.flushAllLocked(ctx); err != nil {
+		return err
+	}
 	path = model.CleanPath(path)
 	e, ok, err := s.Lookup(ctx, path)
 	if err != nil {
@@ -874,6 +1013,14 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 	s.reconcileMu.Lock()
 	defer s.reconcileMu.Unlock()
 	r := &reconciler{lookup: baseLookup, bases: map[string]reconcileBase{}, matches: map[model.OverlayEntry]bool{}}
+	// A flush after the sequence read would log the flushed paths as written
+	// during the reconcile.
+	s.mu.Lock()
+	err := s.flushAllLocked(ctx)
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	// Read the sequence before the entries: a write between the two reads
 	// is then classified again in the apply phase.
 	var seq int64
@@ -915,6 +1062,9 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, entries []model.OverlayEntry, plan reconcilePlan) ([]model.OverlayEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.flushAllLocked(ctx); err != nil {
+		return nil, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -1377,6 +1527,9 @@ func (s *Store) scanEntries(rows *sql.Rows) ([]model.OverlayEntry, error) {
 			return nil, err
 		}
 		e.RepoID = s.repo.ID
+		s.pendingMu.Lock()
+		s.pending[e.Path].apply(&e)
+		s.pendingMu.Unlock()
 		out = append(out, e)
 	}
 	return out, rows.Err()

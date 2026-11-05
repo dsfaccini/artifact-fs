@@ -99,6 +99,7 @@ func (f *fakeOverlay) WriteFile(_ context.Context, _ string, _ int64, data []byt
 	f.data = append([]byte(nil), data...)
 	return len(data), nil
 }
+func (f *fakeOverlay) FlushFile(_ context.Context, _ string) error         { return nil }
 func (f *fakeOverlay) SyncFile(_ context.Context, _ string) error          { return nil }
 func (f *fakeOverlay) Truncate(_ context.Context, _ string, _ int64) error { return nil }
 func (f *fakeOverlay) Remove(_ context.Context, _ string) error            { return nil }
