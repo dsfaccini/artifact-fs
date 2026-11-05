@@ -85,7 +85,7 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		baseLookup := func(path string) (model.BaseNode, bool, error) {
 			return snap.LookupNode(prepareCtx, gen, path)
 		}
-		if err := ov.ReconcileChecked(prepareCtx, baseLookup); err != nil {
+		if err := ov.ReconcileChecked(prepareCtx, baseLookup, nil, nil); err != nil {
 			ov.Close()
 			ov = nil
 			snap.Close()
