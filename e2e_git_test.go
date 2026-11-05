@@ -542,7 +542,11 @@ func testE2EGitMergeAndRebase(t *testing.T, repo *mountedE2ERepo) {
 	if preRebaseHEAD == featureHEAD {
 		t.Fatal("feature branch did not advance before rebase")
 	}
-	gitCmd(t, repo.mountPath, "rebase", "main")
+	gitCmd(t, repo.mountPath,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"rebase", "main",
+	)
 	waitForHeadAndStatus(t, repo.mountPath, preRebaseHEAD, map[string]string{})
 	if rebasedHEAD := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD")); rebasedHEAD == preRebaseHEAD {
 		t.Fatal("rebase did not rewrite the feature commit")

@@ -19,7 +19,41 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
-var migrations = slices.Concat([]string{
+// migrations build the overlay schema.
+var migrations = []meta.Migration{
+	// Migration 1 creates the schema, or brings an older build's database to
+	// it.
+	func(ctx context.Context, conn *sql.Conn) error {
+		if err := meta.SQL(overlayEntriesV1...)(ctx, conn); err != nil {
+			return err
+		}
+		cols, err := meta.Columns(ctx, conn, "overlay_entries")
+		if err != nil {
+			return err
+		}
+		if !cols["ctime_unix_ns"] {
+			if _, err := conn.ExecContext(ctx, `ALTER TABLE overlay_entries ADD COLUMN ctime_unix_ns INTEGER NOT NULL DEFAULT 0`); err != nil {
+				return err
+			}
+		}
+		if !cols["source_mode"] {
+			if _, err := conn.ExecContext(ctx, `ALTER TABLE overlay_entries ADD COLUMN source_mode INTEGER NOT NULL DEFAULT 0`); err != nil {
+				return err
+			}
+			if _, err := conn.ExecContext(ctx, `UPDATE overlay_entries SET source_mode=mode WHERE source_oid<>''`); err != nil {
+				return err
+			}
+		}
+		// Every write sets ctime_unix_ns, so a zero comes only from the
+		// column's default.
+		if _, err := conn.ExecContext(ctx, `UPDATE overlay_entries SET ctime_unix_ns=? WHERE ctime_unix_ns=0`, time.Now().UnixNano()); err != nil {
+			return err
+		}
+		return meta.SQL(slices.Concat(changeLogV1, changeLogTriggers)...)(ctx, conn)
+	},
+}
+
+var overlayEntriesV1 = []string{
 	`CREATE TABLE IF NOT EXISTS overlay_entries (
 	  path TEXT PRIMARY KEY,
 	  kind TEXT NOT NULL,
@@ -33,6 +67,9 @@ var migrations = slices.Concat([]string{
 	  target_path TEXT
 	);`,
 	`CREATE INDEX IF NOT EXISTS idx_overlay_kind ON overlay_entries(kind);`,
+}
+
+var changeLogV1 = []string{
 	// overlay_changes keeps one row per path ever changed, renumbered on each
 	// change. AUTOINCREMENT never reuses a sequence number, so the FSMonitor
 	// hook can answer "changed since sequence N" without scanning the overlay.
@@ -44,11 +81,13 @@ var migrations = slices.Concat([]string{
 	// database's sequence never matches.
 	`CREATE TABLE IF NOT EXISTS overlay_instance (id TEXT NOT NULL);`,
 	`INSERT INTO overlay_instance(id) SELECT lower(hex(randomblob(16))) WHERE NOT EXISTS (SELECT 1 FROM overlay_instance);`,
-}, changeLogTriggers)
+}
 
 // changeLogTriggers feed overlay_changes from every write to overlay_entries.
-// CREATE TRIGGER IF NOT EXISTS keeps an existing trigger's body, so a change
-// to a trigger must DROP TRIGGER IF EXISTS first.
+// Migration 1 and resumeChangeLog create them from this list. To change a
+// trigger, change it here and append a migration that runs DROP TRIGGER IF
+// EXISTS before it creates the trigger again: CREATE TRIGGER IF NOT EXISTS
+// keeps an existing trigger's body.
 var changeLogTriggers = []string{
 	`CREATE TRIGGER IF NOT EXISTS overlay_entries_insert_change AFTER INSERT ON overlay_entries BEGIN
 	  DELETE FROM overlay_changes WHERE path = NEW.path;
@@ -80,13 +119,9 @@ func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := migrate(ctx, db); err != nil {
+	if err := meta.Migrate(ctx, db, migrations); err != nil {
 		db.Close()
-		return nil, err
-	}
-	if err := ensureOverlaySchema(ctx, db); err != nil {
-		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("open %s: %w", cfg.OverlayDBPath, err)
 	}
 	upperDir := filepath.Join(cfg.OverlayDir, "upper")
 	if err := os.MkdirAll(upperDir, 0o700); err != nil {
@@ -94,74 +129,6 @@ func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
 		return nil, err
 	}
 	return &Store{db: db, repo: cfg, upperDir: upperDir}, nil
-}
-
-// migrate runs the migrations in a transaction that takes the write lock
-// before it reads. A deferred transaction that reads first and then writes,
-// as INSERT INTO overlay_instance does, fails at once with SQLITE_BUSY while
-// another connection writes, instead of waiting out busy_timeout. New closes
-// the pool on an error, so a connection left inside the transaction is never
-// reused.
-func migrate(ctx context.Context, db *sql.DB) error {
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-		return err
-	}
-	rollback := func(err error) error {
-		_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
-		return err
-	}
-	for _, stmt := range migrations {
-		if _, err := conn.ExecContext(ctx, stmt); err != nil {
-			return rollback(err)
-		}
-	}
-	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
-		return rollback(err)
-	}
-	return nil
-}
-
-func ensureOverlaySchema(ctx context.Context, db *sql.DB) error {
-	rows, err := db.QueryContext(ctx, `PRAGMA table_info(overlay_entries)`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	cols := map[string]bool{}
-	for rows.Next() {
-		var cid int
-		var name, typ string
-		var notNull int
-		var defaultValue any
-		var pk int
-		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
-			return err
-		}
-		cols[name] = true
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if !cols["ctime_unix_ns"] {
-		if _, err := db.ExecContext(ctx, `ALTER TABLE overlay_entries ADD COLUMN ctime_unix_ns INTEGER NOT NULL DEFAULT 0`); err != nil {
-			return err
-		}
-	}
-	if !cols["source_mode"] {
-		if _, err := db.ExecContext(ctx, `ALTER TABLE overlay_entries ADD COLUMN source_mode INTEGER NOT NULL DEFAULT 0`); err != nil {
-			return err
-		}
-		if _, err := db.ExecContext(ctx, `UPDATE overlay_entries SET source_mode=mode WHERE source_oid<>''`); err != nil {
-			return err
-		}
-	}
-	_, err = db.ExecContext(ctx, `UPDATE overlay_entries SET ctime_unix_ns=? WHERE ctime_unix_ns=0`, time.Now().UnixNano())
-	return err
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -1310,8 +1277,7 @@ type Changes struct {
 }
 
 // ReadChangesSince reads the change log of an existing overlay database
-// without the schema setup and backfill that New runs, so it never takes the
-// write lock. ok is false when the database, its change log or a trigger that
+// without the migrations that New runs, so it never takes the write lock. ok is false when the database, its change log or a trigger that
 // feeds the log is missing.
 func ReadChangesSince(ctx context.Context, cfg model.RepoConfig, since int64) (changes Changes, ok bool, err error) {
 	if _, err := os.Stat(cfg.OverlayDBPath); errors.Is(err, os.ErrNotExist) {
