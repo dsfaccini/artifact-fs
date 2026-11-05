@@ -29,10 +29,12 @@ func Exec(t testing.TB, path string, stmts ...string) {
 	}
 }
 
-// Schema describes the database at path: each table's columns, and each
-// index's and trigger's SQL, sorted. Column order and whitespace do not count,
-// because ALTER TABLE ADD COLUMN appends a column and older builds indented
-// their SQL differently.
+// Schema describes the database at path, sorted: each table's columns and
+// AUTOINCREMENT, each index with its origin, uniqueness and columns, and each
+// trigger's SQL. Indexes include the ones SQLite creates for PRIMARY KEY and
+// UNIQUE constraints. Column order and whitespace do not count, because ALTER
+// TABLE ADD COLUMN appends a column and older builds indented their SQL
+// differently.
 func Schema(t testing.TB, path string) []string {
 	t.Helper()
 	db, err := meta.OpenDB(path)
@@ -41,11 +43,20 @@ func Schema(t testing.TB, path string) []string {
 	}
 	defer db.Close()
 	rows, err := db.Query(`
+		SELECT 'table ' || name || ' autoincrement=' || (instr(upper(sql), 'AUTOINCREMENT') > 0)
+		FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+		UNION ALL
 		SELECT 'table ' || m.name || ' column ' || c.name || ' ' || c.type || ' notnull=' || c."notnull" || ' default=' || COALESCE(c.dflt_value, 'NULL') || ' pk=' || c.pk
 		FROM sqlite_master AS m, pragma_table_info(m.name) AS c
 		WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'
 		UNION ALL
-		SELECT type || ' ' || name || ' ' || sql FROM sqlite_master WHERE type IN ('index', 'trigger') AND sql IS NOT NULL`)
+		SELECT 'table ' || m.name || ' index ' || i.name || ' origin=' || i.origin || ' unique=' || i."unique" || ' partial=' || i.partial
+		  || ' columns=' || (SELECT group_concat(name, ',' ORDER BY seqno) FROM pragma_index_info(i.name))
+		  || ' sql=' || COALESCE((SELECT sql FROM sqlite_master WHERE type = 'index' AND name = i.name), 'NULL')
+		FROM sqlite_master AS m, pragma_index_list(m.name) AS i
+		WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'
+		UNION ALL
+		SELECT 'trigger ' || name || ' ' || sql FROM sqlite_master WHERE type = 'trigger'`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,6 +74,16 @@ func Schema(t testing.TB, path string) []string {
 	}
 	slices.Sort(schema)
 	return schema
+}
+
+// RequireNewerSchemaError fails the test unless err, from opening the
+// database at path after a newer build migrated it, names path and the
+// upgrade that opens it.
+func RequireNewerSchemaError(t testing.TB, err error, path string) {
+	t.Helper()
+	if msg := err.Error(); !strings.Contains(msg, path) || !strings.Contains(msg, "upgrade artifact-fs") {
+		t.Fatalf("error = %q, want it to name %s and the upgrade", msg, path)
+	}
 }
 
 // UserVersion reads PRAGMA user_version of the database at path.

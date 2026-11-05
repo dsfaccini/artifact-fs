@@ -28,12 +28,16 @@ const (
 	  PRIMARY KEY (generation, path)
 	);`
 	parentIndex  = `CREATE INDEX IF NOT EXISTS idx_base_nodes_gen_parent ON base_nodes(generation, parent_path);`
+	oidIndex     = `CREATE INDEX IF NOT EXISTS idx_base_nodes_gen_oid ON base_nodes(generation, object_oid);`
 	snapshotRows = `INSERT INTO repo_state(key, value) VALUES ('current_generation', '1'), ('head_oid', 'head1'), ('head_ref', 'main');
 	INSERT INTO base_nodes(generation, path, parent_path, type, mode, object_oid, size_state, size_bytes) VALUES (1, 'README.md', '.', 'file', 420, 'abc', 'known', 42);`
 )
 
-// legacySnapshots are databases that builds before migrations created, named
-// for the commit that created them.
+// legacySnapshots are databases that earlier builds created, named for the
+// commit that created them or for the user_version a migrated one records.
+// Keep each fixture as it is, and add one at the new user_version with each
+// migration. The fixture at the current user_version fails when an edit to a
+// shipped migration changes the schema a new database gets.
 var legacySnapshots = map[string][]string{
 	// The first schema: learned_path_stats and blob_cache_index, and no
 	// idx_base_nodes_gen_oid.
@@ -56,10 +60,9 @@ var legacySnapshots = map[string][]string{
 	// No idx_base_nodes_gen_oid.
 	"43ec712": {repoStateTable, baseNodesTable, parentIndex, snapshotRows},
 	// main before migrations.
-	"25971f7": {repoStateTable, baseNodesTable, parentIndex,
-		`CREATE INDEX IF NOT EXISTS idx_base_nodes_gen_oid ON base_nodes(generation, object_oid);`,
-		snapshotRows,
-	},
+	"25971f7": {repoStateTable, baseNodesTable, parentIndex, oidIndex, snapshotRows},
+	// This schema, after migration 1.
+	"user_version 1": {repoStateTable, baseNodesTable, parentIndex, oidIndex, snapshotRows, `PRAGMA user_version = 1`},
 }
 
 func openSnapshot(path string) func() (io.Closer, error) {
@@ -134,4 +137,15 @@ func createSnapshot(t *testing.T) string {
 	}
 	s.Close()
 	return path
+}
+
+func TestNewRefusesANewerSchema(t *testing.T) {
+	path := createSnapshot(t)
+	metatest.Exec(t, path, `PRAGMA user_version = 99`)
+	s, err := New(context.Background(), path)
+	if err == nil {
+		s.Close()
+		t.Fatal("New on a newer schema succeeded")
+	}
+	metatest.RequireNewerSchemaError(t, err, path)
 }

@@ -121,7 +121,7 @@ func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
 	}
 	if err := meta.Migrate(ctx, db, migrations); err != nil {
 		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("open %s: %w", cfg.OverlayDBPath, err)
 	}
 	upperDir := filepath.Join(cfg.OverlayDir, "upper")
 	if err := os.MkdirAll(upperDir, 0o700); err != nil {

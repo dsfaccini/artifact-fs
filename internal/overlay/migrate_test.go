@@ -30,8 +30,34 @@ const (
 
 var legacyRow = model.OverlayEntry{RepoID: "test", Path: "a.txt", Kind: model.OverlayKindModify, BackingPath: "/upper/a.txt", Mode: 33188, SizeBytes: 5, MtimeUnixNs: 7, CtimeUnixNs: 9, SourceOID: "oid", SourceMode: 33188}
 
-// legacyOverlays are databases that builds before migrations created, named
-// for the commit that created them.
+// overlayWithChangeLog is main's schema at 25971f7, with overlayRow logged.
+var overlayWithChangeLog = []string{overlayEntriesTable, overlayKindIndex,
+	`CREATE TABLE IF NOT EXISTS overlay_changes (
+		  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+		  path TEXT NOT NULL UNIQUE
+		);`,
+	`CREATE TABLE IF NOT EXISTS overlay_instance (id TEXT NOT NULL);`,
+	`INSERT INTO overlay_instance(id) VALUES ('instance')`,
+	`CREATE TRIGGER IF NOT EXISTS overlay_entries_insert_change AFTER INSERT ON overlay_entries BEGIN
+		  DELETE FROM overlay_changes WHERE path = NEW.path;
+		  INSERT INTO overlay_changes(path) VALUES (NEW.path);
+		END;`,
+	`CREATE TRIGGER IF NOT EXISTS overlay_entries_update_change AFTER UPDATE ON overlay_entries BEGIN
+		  DELETE FROM overlay_changes WHERE path IN (OLD.path, NEW.path);
+		  INSERT INTO overlay_changes(path) SELECT OLD.path UNION SELECT NEW.path;
+		END;`,
+	`CREATE TRIGGER IF NOT EXISTS overlay_entries_delete_change AFTER DELETE ON overlay_entries BEGIN
+		  DELETE FROM overlay_changes WHERE path = OLD.path;
+		  INSERT INTO overlay_changes(path) VALUES (OLD.path);
+		END;`,
+	overlayRow,
+}
+
+// legacyOverlays are databases that earlier builds created, named for the
+// commit that created them or for the user_version a migrated one records.
+// Keep each fixture as it is, and add one at the new user_version with each
+// migration. The fixture at the current user_version fails when an edit to a
+// shipped migration changes the schema a new database gets.
 var legacyOverlays = map[string][]string{
 	// The first schema: no ctime_unix_ns, source_mode or change log.
 	"01dd4de": {
@@ -51,27 +77,9 @@ var legacyOverlays = map[string][]string{
 	// No change log.
 	"26ccac8": {overlayEntriesTable, overlayKindIndex, overlayRow},
 	// main before migrations.
-	"25971f7": {overlayEntriesTable, overlayKindIndex,
-		`CREATE TABLE IF NOT EXISTS overlay_changes (
-		  seq INTEGER PRIMARY KEY AUTOINCREMENT,
-		  path TEXT NOT NULL UNIQUE
-		);`,
-		`CREATE TABLE IF NOT EXISTS overlay_instance (id TEXT NOT NULL);`,
-		`INSERT INTO overlay_instance(id) VALUES ('instance')`,
-		`CREATE TRIGGER IF NOT EXISTS overlay_entries_insert_change AFTER INSERT ON overlay_entries BEGIN
-		  DELETE FROM overlay_changes WHERE path = NEW.path;
-		  INSERT INTO overlay_changes(path) VALUES (NEW.path);
-		END;`,
-		`CREATE TRIGGER IF NOT EXISTS overlay_entries_update_change AFTER UPDATE ON overlay_entries BEGIN
-		  DELETE FROM overlay_changes WHERE path IN (OLD.path, NEW.path);
-		  INSERT INTO overlay_changes(path) SELECT OLD.path UNION SELECT NEW.path;
-		END;`,
-		`CREATE TRIGGER IF NOT EXISTS overlay_entries_delete_change AFTER DELETE ON overlay_entries BEGIN
-		  DELETE FROM overlay_changes WHERE path = OLD.path;
-		  INSERT INTO overlay_changes(path) VALUES (OLD.path);
-		END;`,
-		overlayRow,
-	},
+	"25971f7": overlayWithChangeLog,
+	// This schema, after migration 1.
+	"user_version 1": append(slices.Clone(overlayWithChangeLog), `PRAGMA user_version = 1`),
 }
 
 func testConfig(t *testing.T) model.RepoConfig {
@@ -127,7 +135,7 @@ func TestNewMigratesEarlierSchemas(t *testing.T) {
 				t.Fatalf("a.txt = %+v, want %+v", got, wantRow)
 			}
 			changes := changesSince(t, cfg, 0)
-			if name == "25971f7" && (changes.Instance != "instance" || !slices.Equal(changes.Paths, []string{"a.txt"})) {
+			if (name == "25971f7" || name == "user_version 1") && (changes.Instance != "instance" || !slices.Equal(changes.Paths, []string{"a.txt"})) {
 				t.Fatalf("change log = %+v, want instance's log of a.txt", changes)
 			}
 		})
@@ -184,4 +192,15 @@ func TestConcurrentFirstOpensApplyEachMigrationOnce(t *testing.T) {
 			t.Fatalf("user_version = %d, want %d", got, len(migrations))
 		}
 	}
+}
+
+func TestNewRefusesANewerSchema(t *testing.T) {
+	_, cfg := testStore(t)
+	metatest.Exec(t, cfg.OverlayDBPath, `PRAGMA user_version = 99`)
+	s, err := New(context.Background(), cfg)
+	if err == nil {
+		s.Close()
+		t.Fatal("New on a newer schema succeeded")
+	}
+	metatest.RequireNewerSchemaError(t, err, cfg.OverlayDBPath)
 }

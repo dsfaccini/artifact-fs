@@ -105,7 +105,7 @@ func New(ctx context.Context, dbPath string) (*Store, error) {
 	}
 	if err := meta.Migrate(ctx, db, migrations); err != nil {
 		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("open %s: %w", dbPath, err)
 	}
 	return &Store{db: db}, nil
 }

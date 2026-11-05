@@ -72,7 +72,8 @@ func SQL(stmts ...string) Migration {
 // costs one read and takes no lock.
 //
 // On an error the caller must close db: a connection whose ROLLBACK failed
-// stays inside the transaction.
+// stays inside the transaction. The error names no database, so the caller
+// wraps it with the path.
 func Migrate(ctx context.Context, db *sql.DB, migrations []Migration) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -123,7 +124,7 @@ func userVersion(ctx context.Context, conn *sql.Conn, latest int) (int, error) {
 		return 0, err
 	}
 	if version > latest {
-		return 0, fmt.Errorf("database schema version %d is newer than this build's %d", version, latest)
+		return 0, fmt.Errorf("schema version %d is newer than this build's %d: a newer artifact-fs wrote the database; upgrade artifact-fs to open it", version, latest)
 	}
 	return version, nil
 }
