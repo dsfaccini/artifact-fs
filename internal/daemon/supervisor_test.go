@@ -211,6 +211,9 @@ type connFailureMounts struct {
 	calls   []string
 	// unmountFails is how many unmounts of the failed mount fail first.
 	unmountFails int
+	// abort makes the failed connection's Join return nil, as after an
+	// abort. Set it before closing fail.
+	abort bool
 }
 
 // startConnFailureDaemon starts a daemon whose repo, mounted at mountPath,
@@ -252,6 +255,9 @@ func (f *failedConnectionMount) Backend() string { return "fake" }
 func (f *failedConnectionMount) Join(ctx context.Context) error {
 	select {
 	case <-f.m.fail:
+		if f.m.abort {
+			return nil
+		}
 		return f.err
 	case <-ctx.Done():
 		return ctx.Err()
@@ -299,6 +305,20 @@ func TestStartRetriesFailedConnectionUnmountBeforeRemount(t *testing.T) {
 	calls := failConnectionUntilRemount(t, d, m)
 	if want := []string{"mount", "unmount failed", "unmount", "mount"}; !slices.Equal(calls, want) {
 		t.Fatalf("calls = %q, want %q", calls, want)
+	}
+}
+
+func TestStartUnmountsAbortedConnectionBeforeRemount(t *testing.T) {
+	// "/" is always in the mount table, so the aborted connection's mount stays in place.
+	d, m := startConnFailureDaemon(t, 0, "/")
+	m.abort = true
+
+	calls := failConnectionUntilRemount(t, d, m)
+	if want := []string{"mount", "unmount", "mount"}; !slices.Equal(calls, want) {
+		t.Fatalf("calls = %q, want %q", calls, want)
+	}
+	if st := d.status(t); st.State != repoStateDegraded || st.MountError != errConnectionEndedMounted.Error() {
+		t.Fatalf("state = %q, mount_error = %q; want %q, %q", st.State, st.MountError, repoStateDegraded, errConnectionEndedMounted)
 	}
 }
 

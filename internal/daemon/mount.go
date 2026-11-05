@@ -25,6 +25,10 @@ type mountFunc func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.L
 // defaultMount is what New installs as Service.mount. Package tests replace it so they cannot mount.
 var defaultMount mountFunc = fusefs.MountRepoWithGate
 
+// errConnectionEndedMounted is the mount error of a connection that ended
+// with no error while the mount point still holds its mount.
+var errConnectionEndedMounted = errors.New("fuse connection ended while the mount point still holds the mount")
+
 type mountFailure struct {
 	lastAttempt time.Time
 	backoff     time.Duration
@@ -268,11 +272,15 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 	rt.joinDone = done
 	s.mu.Unlock()
 	go func() {
-		// Join returns nil once the mount is gone. Its error can be fatal to
-		// the connection while the dead mount still holds the mount point.
-		joinErr := mfs.Join(context.Background())
+		// Join's error is fatal to the connection, and the dead mount can
+		// still hold the mount point. Join also returns nil after an abort,
+		// which leaves the dead mount in place.
+		connErr := mfs.Join(context.Background())
+		if connErr == nil && isMounted(rt.cfg.MountPath) {
+			connErr = errConnectionEndedMounted
+		}
 		s.mu.Lock()
-		failed := joinErr != nil && !rt.stopping && !rt.detached && rt.mfs == mfs
+		failed := connErr != nil && !rt.stopping && !rt.detached && rt.mfs == mfs
 		if failed {
 			rt.failedMount = mfs
 			rt.mounts.Add(1)
@@ -280,8 +288,8 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 		s.mu.Unlock()
 		if failed {
 			defer rt.mounts.Done()
-			s.logger.Error("fuse connection failed, unmounting", "repo", rt.cfg.Name, "error", auth.RedactLogString(joinErr.Error(), rt.cfg.RemoteURL))
-			s.recordMountError(rt.ctx, rt.cfg, joinErr)
+			s.logger.Error("fuse connection failed, unmounting", "repo", rt.cfg.Name, "error", auth.RedactLogString(connErr.Error(), rt.cfg.RemoteURL))
+			s.recordMountError(rt.ctx, rt.cfg, connErr)
 			if err := s.unmountFailedMount(rt); err != nil {
 				s.logger.Error("fuse unmount failed, runtime will retry", "repo", rt.cfg.Name, "error", err)
 			}

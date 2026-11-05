@@ -171,7 +171,7 @@ Async existing-clone preparation reports remote configuration, fetch, and branch
 
 Each error the FUSE library reports becomes a `fuse error` record. A reply the kernel refuses, other than with `ENOENT`, logs at `WARN`. A failed FUSE op logs at `DEBUG`, because expected errnos such as `ENOTEMPTY` fail ops too. The daemon logs at `INFO`, so it never emits these lines. The library reports no failed lookup of a missing name, no `GetXattr` or `ListXattr` that fails with `ENOSYS`, `ENODATA` or `ERANGE`, and no request whose opcode the library does not recognize.
 
-An error fatal to a repo's FUSE connection, such as a failed read from the kernel, ends serving while the mount can stay in place. The daemon logs it as `fuse connection failed, unmounting`, records it as the repo's `mount_error`, unmounts the repo, and mounts it again. While that unmount fails, each mount retry tries it again first, so a mount never lands on top of a dead one.
+A repo's FUSE connection can end while its mount stays in place: after an error fatal to the connection, such as a failed read from the kernel, or after the connection is aborted. The daemon then logs `fuse connection failed, unmounting`, records the connection's error as the repo's `mount_error` (for an abort, which carries no error, `fuse connection ended while the mount point still holds the mount`), unmounts the repo, and mounts it again. While that unmount fails, each mount retry tries it again first, so a mount never lands on top of a dead one.
 
 Successful `add-repo`:
 
