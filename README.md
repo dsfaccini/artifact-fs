@@ -79,9 +79,10 @@ entries when enumeration restarts. Both macOS backends reject extended
 attributes, so macOS writes no AppleDouble `._` files to store them. macOS
 attaches extended attributes such as `com.apple.provenance` to nearly every local
 file, so copying files onto the mount with `cp` or `ditto` may fail; `cp -X`
-skips extended attributes and avoids it. On an NFS mount that rejects extended
-attributes the same way, `cp` exits 1 after copying the data and `ditto` fails
-without leaving the file; this is not yet measured on a FUSE mount. Both
+skips extended attributes and should avoid it. On an NFS mount that rejects
+extended attributes the same way, `cp` exits 1 after copying the data and
+`ditto` fails without leaving the file. None of this is measured on a FUSE
+mount yet, and `cp -X` is not measured at all. Both
 backends serve tracked `._*` and `.DS_Store` files. A `.DS_Store` that Finder
 writes lands in the overlay as an untracked file.
 The native mount API has no supported cancellation for a permanently stalled
@@ -168,7 +169,7 @@ ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the 
 
 Async existing-clone preparation reports remote configuration, fetch, and branch update as separate `configure_remote`, `fetch`, and `update_branch` phases.
 
-The daemon logs each error the FUSE library reports as `fuse error`. A reply the kernel refuses, other than with `ENOENT`, logs at `WARN`. A failed FUSE op logs at `DEBUG`, because expected errnos such as `ENOTEMPTY` fail ops too; the default `INFO` level hides it. The library reports no failed lookup of a missing name, no `GetXattr` or `ListXattr` that fails with `ENOSYS`, `ENODATA` or `ERANGE`, and no request whose opcode the library does not recognize.
+Each error the FUSE library reports becomes a `fuse error` record. A reply the kernel refuses, other than with `ENOENT`, logs at `WARN`. A failed FUSE op logs at `DEBUG`, because expected errnos such as `ENOTEMPTY` fail ops too. The daemon logs at `INFO`, so it never emits these lines. The library reports no failed lookup of a missing name, no `GetXattr` or `ListXattr` that fails with `ENOSYS`, `ENODATA` or `ERANGE`, and no request whose opcode the library does not recognize.
 
 Successful `add-repo`:
 
