@@ -162,6 +162,16 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 // It persists the mount error that status reports, and clears it on success.
 func (s *Service) mountFS(ctx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate) (fusefs.MountedFS, error) {
 	mfs, err := s.mount(cfg, engine, gate, s.logger)
+	s.recordMountError(ctx, cfg, err)
+	if err != nil {
+		return nil, err
+	}
+	s.logger.Info("fuse mounted", "repo", cfg.Name, "backend", mfs.Backend())
+	return mfs, nil
+}
+
+// recordMountError persists err, redacted, as the repo's mount error. A nil err clears it.
+func (s *Service) recordMountError(ctx context.Context, cfg model.RepoConfig, err error) {
 	mountErr := ""
 	if err != nil {
 		mountErr = auth.RedactLogString(err.Error(), cfg.RemoteURL)
@@ -169,11 +179,6 @@ func (s *Service) mountFS(ctx context.Context, cfg model.RepoConfig, engine *fus
 	if writeErr := s.registry.UpdateMountError(ctx, cfg.ID, mountErr); writeErr != nil {
 		s.logger.Error("repo mount error write failed", "repo", cfg.Name, "error", writeErr)
 	}
-	if err != nil {
-		return nil, err
-	}
-	s.logger.Info("fuse mounted", "repo", cfg.Name, "backend", mfs.Backend())
-	return mfs, nil
 }
 
 func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) error {
@@ -263,16 +268,52 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 	rt.joinDone = done
 	s.mu.Unlock()
 	go func() {
-		_ = mfs.Join(context.Background())
+		// Join returns nil once the mount is gone. Its error can be fatal to
+		// the connection while the dead mount still holds the mount point.
+		joinErr := mfs.Join(context.Background())
+		s.mu.Lock()
+		failed := joinErr != nil && !rt.stopping && !rt.detached && rt.mfs == mfs
+		if failed {
+			rt.failedMount = mfs
+			rt.mounts.Add(1)
+		}
+		s.mu.Unlock()
+		if failed {
+			defer rt.mounts.Done()
+			s.logger.Error("fuse connection failed, unmounting", "repo", rt.cfg.Name, "error", auth.RedactLogString(joinErr.Error(), rt.cfg.RemoteURL))
+			s.recordMountError(rt.ctx, rt.cfg, joinErr)
+			if err := s.unmountFailedMount(rt); err != nil {
+				s.logger.Error("fuse unmount failed, runtime will retry", "repo", rt.cfg.Name, "error", err)
+			}
+		}
 		close(done)
 		s.mu.Lock()
-		if !rt.stopping && !rt.detached && rt.mfs == mfs {
+		if failed || !rt.stopping && !rt.detached && rt.mfs == mfs {
 			rt.mfs = nil
 			rt.joinDone = nil
 			rt.state.State = repoStateDegraded
 		}
 		s.mu.Unlock()
 	}()
+}
+
+// unmountFailedMount unmounts the mount whose connection failed, so that no
+// mount lands on top of it. A failed unmount leaves it for the next call
+// unless the mount point no longer holds a mount. The caller holds rt.mounts.
+func (s *Service) unmountFailedMount(rt *repoRuntime) error {
+	s.mu.Lock()
+	mfs := rt.failedMount
+	s.mu.Unlock()
+	if mfs == nil {
+		return nil
+	}
+	if err := mfs.Unmount(); err != nil && isMounted(rt.cfg.MountPath) {
+		return fmt.Errorf("unmount %s after its connection failed: %w", rt.cfg.Name, err)
+	}
+	s.mu.Lock()
+	rt.failedMount = nil
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *Service) retryRuntimeMount(rt *repoRuntime) {
@@ -291,7 +332,13 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 	s.mu.Unlock()
 	defer rt.mounts.Done()
 
-	mfs, err := s.mountFS(rt.ctx, cfg, engine, gate)
+	err := s.unmountFailedMount(rt)
+	var mfs fusefs.MountedFS
+	if err != nil {
+		s.logger.Error("fuse unmount failed, runtime will retry", "repo", cfg.Name, "error", err)
+	} else {
+		mfs, err = s.mountFS(rt.ctx, cfg, engine, gate)
+	}
 	s.mu.Lock()
 	if err != nil {
 		mf = s.mountFailures[cfg.ID]
