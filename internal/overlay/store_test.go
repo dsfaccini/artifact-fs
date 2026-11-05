@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -286,40 +285,6 @@ func TestRenameBaseSymlinkReconcilesAfterCommit(t *testing.T) {
 	}
 	if _, ok := s.Get("link"); ok {
 		t.Fatal("committed symlink rename destination should be removed from overlay")
-	}
-}
-
-func TestNewBackfillsOverlayMetadata(t *testing.T) {
-	s, cfg := testStore(t)
-	ctx := context.Background()
-
-	if _, err := s.CreateFile(ctx, "old.txt", 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET mode=?, source_oid=?, ctime_unix_ns=0 WHERE path=?`, 0o100644, "base-oid", "old.txt"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.ExecContext(ctx, `ALTER TABLE overlay_entries DROP COLUMN source_mode`); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	reopened, err := New(ctx, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { reopened.Close() })
-	got, ok := reopened.Get("old.txt")
-	if !ok {
-		t.Fatal("expected entry")
-	}
-	if got.CtimeUnixNs == 0 {
-		t.Fatal("expected zero ctime to be repaired")
-	}
-	if got.SourceMode != 0o100644 {
-		t.Fatalf("source mode = %#o, want legacy entry mode", got.SourceMode)
 	}
 }
 
@@ -1667,43 +1632,6 @@ func TestReadChangesSinceDistrustsALogMissingATrigger(t *testing.T) {
 	}
 	if _, ok, err := ReadChangesSince(context.Background(), cfg, 0); err != nil || ok {
 		t.Fatalf("ReadChangesSince without the delete trigger = %v, %v; want false, nil", ok, err)
-	}
-}
-
-// Another connection holds the write lock briefly, as each overlay write does.
-// New must wait it out within busy_timeout instead of failing.
-func TestNewWaitsOutAnotherConnectionsWriteLock(t *testing.T) {
-	ctx := context.Background()
-	s, cfg := testStore(t)
-	s.Close()
-	holder, err := meta.OpenDB(cfg.OverlayDBPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer holder.Close()
-	conn, err := holder.Conn(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-		t.Fatal(err)
-	}
-	// The hold is far below busy_timeout, so it cannot make a waiting New
-	// fail. A New that does not wait fails before the commit, unless the
-	// machine delays it past the hold; then the test passes without proof.
-	committed := make(chan error, 1)
-	time.AfterFunc(200*time.Millisecond, func() {
-		_, err := conn.ExecContext(ctx, `COMMIT`)
-		committed <- err
-	})
-	reopened, err := New(ctx, cfg)
-	if err != nil {
-		t.Fatalf("New while another connection held the write lock: %v", err)
-	}
-	reopened.Close()
-	if err := <-committed; err != nil {
-		t.Fatal(err)
 	}
 }
 

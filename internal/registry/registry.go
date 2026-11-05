@@ -13,8 +13,34 @@ import (
 
 var ErrRepoChanged = errors.New("repo config changed")
 
-var migrations = []string{
-	`CREATE TABLE IF NOT EXISTS repos (
+// migrations build the repos table. Add a column with a new migration, then
+// list it in AddRepo, its upsert, the SELECTs and scanRepo.
+var migrations = []meta.Migration{
+	// Migration 1 creates reposTableV1, or brings an older build's table to
+	// it.
+	func(ctx context.Context, conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, reposTableV1); err != nil {
+			return err
+		}
+		cols, err := meta.Columns(ctx, conn, "repos")
+		if err != nil {
+			return err
+		}
+		for _, col := range reposColumnsAddedBeforeV1 {
+			if cols[col.name] {
+				continue
+			}
+			if _, err := conn.ExecContext(ctx, `ALTER TABLE repos ADD COLUMN `+col.name+` `+col.ddl); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+	// Nothing reads or writes remote_url_secret_ref.
+	meta.SQL(`ALTER TABLE repos DROP COLUMN remote_url_secret_ref`),
+}
+
+const reposTableV1 = `CREATE TABLE IF NOT EXISTS repos (
 	  repo_id TEXT PRIMARY KEY,
 	  name TEXT NOT NULL UNIQUE,
 	  mount_root TEXT NOT NULL,
@@ -46,7 +72,26 @@ var migrations = []string{
 	  config_version TEXT NOT NULL DEFAULT '',
 	  created_at_ns INTEGER NOT NULL,
 	  updated_at_ns INTEGER NOT NULL
-	);`,
+	);`
+
+// reposColumnsAddedBeforeV1 lists the columns older builds added to repos
+// after creating it, in the order they appeared.
+var reposColumnsAddedBeforeV1 = []struct{ name, ddl string }{
+	{"remote_url", `TEXT NOT NULL DEFAULT ''`},
+	{"prepared_gitdir", `INTEGER NOT NULL DEFAULT 0`},
+	{"fetch_ref", `TEXT NOT NULL DEFAULT ''`},
+	{"prepare_state", `TEXT NOT NULL DEFAULT ''`},
+	{"prepare_error", `TEXT NOT NULL DEFAULT ''`},
+	{"refresh_interval_ns", `INTEGER NOT NULL DEFAULT 0`},
+	{"required_commit", `TEXT NOT NULL DEFAULT ''`},
+	{"history_depth", `INTEGER NOT NULL DEFAULT 0`},
+	{"refresh_disabled", `INTEGER NOT NULL DEFAULT 0`},
+	{"acquired_ref", `TEXT NOT NULL DEFAULT ''`},
+	{"acquired_commit", `TEXT NOT NULL DEFAULT ''`},
+	{"acquired_at_ns", `INTEGER NOT NULL DEFAULT 0`},
+	{"config_version", `TEXT NOT NULL DEFAULT ''`},
+	{"adopt_gitdir", `INTEGER NOT NULL DEFAULT 0`},
+	{"mount_error", `TEXT NOT NULL DEFAULT ''`},
 }
 
 type Store struct {
@@ -58,13 +103,9 @@ func New(ctx context.Context, dbPath string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := meta.ExecMigrations(ctx, db, migrations); err != nil {
+	if err := meta.Migrate(ctx, db, migrations); err != nil {
 		db.Close()
-		return nil, err
-	}
-	if err := ensureRepoColumns(ctx, db); err != nil {
-		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("open %s: %w", dbPath, err)
 	}
 	return &Store{db: db}, nil
 }
@@ -300,54 +341,4 @@ func boolToInt(v bool) int {
 		return 1
 	}
 	return 0
-}
-
-func ensureRepoColumns(ctx context.Context, db *sql.DB) error {
-	rows, err := db.QueryContext(ctx, `PRAGMA table_info(repos)`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	cols := map[string]bool{}
-	for rows.Next() {
-		var cid int
-		var name string
-		var typ string
-		var notNull int
-		var defaultValue any
-		var pk int
-		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
-			return err
-		}
-		cols[name] = true
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	add := map[string]string{
-		"remote_url":          `TEXT NOT NULL DEFAULT ''`,
-		"prepared_gitdir":     `INTEGER NOT NULL DEFAULT 0`,
-		"adopt_gitdir":        `INTEGER NOT NULL DEFAULT 0`,
-		"fetch_ref":           `TEXT NOT NULL DEFAULT ''`,
-		"prepare_state":       `TEXT NOT NULL DEFAULT ''`,
-		"prepare_error":       `TEXT NOT NULL DEFAULT ''`,
-		"mount_error":         `TEXT NOT NULL DEFAULT ''`,
-		"config_version":      `TEXT NOT NULL DEFAULT ''`,
-		"refresh_interval_ns": `INTEGER NOT NULL DEFAULT 0`,
-		"required_commit":     `TEXT NOT NULL DEFAULT ''`,
-		"history_depth":       `INTEGER NOT NULL DEFAULT 0`,
-		"refresh_disabled":    `INTEGER NOT NULL DEFAULT 0`,
-		"acquired_ref":        `TEXT NOT NULL DEFAULT ''`,
-		"acquired_commit":     `TEXT NOT NULL DEFAULT ''`,
-		"acquired_at_ns":      `INTEGER NOT NULL DEFAULT 0`,
-	}
-	for name, ddl := range add {
-		if cols[name] {
-			continue
-		}
-		if _, err := db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE repos ADD COLUMN %s %s`, name, ddl)); err != nil {
-			return err
-		}
-	}
-	return nil
 }
