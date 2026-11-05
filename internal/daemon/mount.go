@@ -164,7 +164,10 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 func (s *Service) recordStartedRuntime(rt *repoRuntime, mountErr error) {
 	cleared := phaseMount
 	if mountErr != nil {
-		s.recordFailure(rt.cfg, phaseMount, mountErr, time.Now().Add(registrySyncInterval))
+		s.mu.Lock()
+		cfg := rt.cfg
+		s.mu.Unlock()
+		s.recordFailure(cfg, phaseMount, mountErr, time.Now().Add(registrySyncInterval))
 		cleared = ""
 	}
 	s.recordRuntimeState(rt, cleared)
@@ -275,10 +278,11 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 			rt.joinDone = nil
 			rt.state.State = repoStateDegraded
 		}
+		cfg := rt.cfg
 		s.mu.Unlock()
 		if exited {
 			// The next registry sync mounts the runtime again.
-			s.recordFailure(rt.cfg, phaseServe, cmp.Or(joinErr, errFUSEServerExited), time.Now().Add(registrySyncInterval))
+			s.recordFailure(cfg, phaseServe, cmp.Or(joinErr, errFUSEServerExited), time.Now().Add(registrySyncInterval))
 			s.recordRuntimeState(rt, "")
 		}
 	}()

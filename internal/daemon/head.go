@@ -131,7 +131,10 @@ func (s *Service) headReconcileLoop(rt *repoRuntime) {
 				return
 			}
 			// A HEAD change can also start the retry early.
-			s.recordFailure(rt.cfg, phaseHEADReconcile, err, time.Now().Add(backoff))
+			s.mu.Lock()
+			cfg := rt.cfg
+			s.mu.Unlock()
+			s.recordFailure(cfg, phaseHEADReconcile, err, time.Now().Add(backoff))
 
 			timer := time.NewTimer(backoff)
 			select {
