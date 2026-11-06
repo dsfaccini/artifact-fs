@@ -4,6 +4,7 @@ package fusefs
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -1514,3 +1515,58 @@ func (f *fakeLookupHydrator) ReadBlob(_ context.Context, _ model.RepoConfig, _ m
 }
 
 func (f *fakeLookupHydrator) QueueDepth(model.RepoID) int { return 0 }
+
+func TestReleasingAReaderLeavesAnotherHandlesWritesCoalescing(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	ov, err := overlaystore.New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ov.Close() })
+	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{}}, Overlay: ov}
+	resolver.SetGeneration(1)
+	fs := NewArtifactFuse(cfg, &Engine{Repo: cfg, Resolver: resolver, Overlay: ov})
+	create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "f.txt", Mode: 0o644}
+	if err := fs.CreateFile(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.WriteFile(ctx, &fuseops.WriteFileOp{Inode: create.Entry.Child, Handle: create.Handle, Data: []byte("one")}); err != nil {
+		t.Fatal(err)
+	}
+	reader := &fuseops.OpenFileOp{Inode: create.Entry.Child}
+	if err := fs.OpenFile(ctx, reader); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.FlushFile(ctx, &fuseops.FlushFileOp{Inode: create.Entry.Child, Handle: reader.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: reader.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	if size, pending := committedOverlay(t, cfg.OverlayDBPath, "f.txt"); size != 0 || pending != 1 {
+		t.Fatalf("after the reader's release: committed size %d, pending rows %d; want 0 and 1", size, pending)
+	}
+	if err := fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	if size, pending := committedOverlay(t, cfg.OverlayDBPath, "f.txt"); size != 3 || pending != 0 {
+		t.Fatalf("after the writer's release: committed size %d, pending rows %d; want 3 and 0", size, pending)
+	}
+}
+
+// committedOverlay reads path's committed size and the pending row count
+// straight from the database, past the store's in-memory values.
+func committedOverlay(t *testing.T, dbPath, path string) (size int64, pending int) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.QueryRow(`SELECT size_bytes, (SELECT COUNT(*) FROM overlay_pending) FROM overlay_entries WHERE path=?`, path).Scan(&size, &pending); err != nil {
+		t.Fatal(err)
+	}
+	return size, pending
+}

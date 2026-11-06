@@ -88,6 +88,9 @@ type FileHandle struct {
 	cacheGeneration int64
 	invalidateSeq   uint64
 	detached        bool
+	// wrote says the handle created or wrote its file, so its flush commits
+	// the path's pending writes. A reader's close leaves them coalescing.
+	wrote bool
 }
 
 // ReaddirEntry holds child metadata, avoiding per-child Getattr or snapshot lookups.
@@ -881,6 +884,7 @@ func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) 
 			return err
 		}
 		path := fh.path
+		fh.wrote = true
 		fh.mu.Unlock()
 		n, err := fs.engine.Write(ctx, b, path, op.Offset, op.Data)
 		// A handle that cached the base content before the write promoted the
@@ -909,7 +913,7 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 		}
 		fs.mu.Lock()
 		ref := fs.allocInode(childPath, "file", uint32(op.Mode), 0)
-		fh := &FileHandle{inode: ref, path: childPath}
+		fh := &FileHandle{inode: ref, path: childPath, wrote: true}
 		handle := fs.nextHandleID
 		fs.nextHandleID++
 		fs.fileHandles[handle] = fh
@@ -1058,13 +1062,14 @@ func (fs *ArtifactFuse) FlushFile(ctx context.Context, op *fuseops.FlushFileOp) 
 	})
 }
 
-// flushHandle commits the writes made through fh's path. A detached handle
-// writes to a file no entry names, so it has nothing to commit.
+// flushHandle commits the writes made through fh's path when fh wrote. A
+// detached handle writes to a file no entry names, so it has nothing to
+// commit.
 func (fs *ArtifactFuse) flushHandle(ctx context.Context, fh *FileHandle) error {
 	fh.mu.Lock()
-	path, detached := fh.path, fh.detached
+	path, detached, wrote := fh.path, fh.detached, fh.wrote
 	fh.mu.Unlock()
-	if detached || path == ".git" {
+	if !wrote || detached || path == ".git" {
 		return nil
 	}
 	return fs.engine.Flush(ctx, path)
