@@ -33,7 +33,7 @@ func TestOpenHydratedRehydratesBlobEvictedAfterValidation(t *testing.T) {
 			return
 		}
 		evicted = true
-		if res, err := blobcache.Evict(cfg.BlobCacheDir, 0); err != nil || res.Evicted != 1 {
+		if res, err := blobcache.Evict(context.Background(), cfg.BlobCacheDir, 0); err != nil || res.Evicted != 1 {
 			t.Errorf("evict = %+v, %v; want one blob evicted", res, err)
 		}
 	}

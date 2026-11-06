@@ -327,5 +327,5 @@ func (s *Service) EvictCache(ctx context.Context, name string, maxBytes int64) (
 		return blobcache.EvictResult{}, err
 	}
 	s.fillPaths(&cfg)
-	return blobcache.Evict(cfg.BlobCacheDir, maxBytes)
+	return blobcache.Evict(ctx, cfg.BlobCacheDir, maxBytes)
 }

@@ -7,6 +7,7 @@
 package blobcache
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -87,7 +88,7 @@ func Install(dir, oid, staged string) error {
 		return err
 	}
 	if !valid {
-		_, err := recountLocked(dir, lock)
+		_, _, err := recountLocked(dir, lock)
 		return err
 	}
 	if oldErr == nil && old.Mode().IsRegular() {
@@ -117,7 +118,8 @@ func Recount(dir string) (Stats, error) {
 		return Stats{}, err
 	}
 	defer lock.Close()
-	return recountLocked(dir, lock)
+	st, _, err := recountLocked(dir, lock)
+	return st, err
 }
 
 // ReadStats returns dir's counters. A directory that has no counters yet is
@@ -138,7 +140,8 @@ func ReadStats(dir string) (Stats, error) {
 	if err != nil || valid {
 		return st, err
 	}
-	return recountLocked(dir, lock)
+	st, _, err = recountLocked(dir, lock)
+	return st, err
 }
 
 type candidate struct {
@@ -147,38 +150,56 @@ type candidate struct {
 	atime time.Time
 }
 
+// testHookBeforeEvictBatch, when set, runs after Evict lists the cache and
+// before each batch takes the lock.
+var testHookBeforeEvictBatch func()
+
 // Evict removes blobs in order of least recent access time until the cache
-// holds at most maxBytes. It unlinks each blob, so a handle open on it keeps
-// reading the blob, and the next open of its path hydrates it again. A blob
-// read or replaced after Evict listed it stays.
-func Evict(dir string, maxBytes int64) (EvictResult, error) {
+// holds at most maxBytes, or until ctx ends. It first recounts the cache, so
+// it also corrects counters that drifted. It unlinks each blob, so a handle
+// open on it keeps reading the blob, and the next open of its path hydrates
+// it again. A blob read or replaced after Evict listed it stays.
+func Evict(ctx context.Context, dir string, maxBytes int64) (EvictResult, error) {
 	if maxBytes < 0 {
 		return EvictResult{}, errors.New("max bytes must not be negative")
 	}
-	st, err := ReadStats(dir)
-	if err != nil || st.Bytes <= maxBytes {
-		return EvictResult{Remaining: st}, err
+	if strings.TrimSpace(dir) == "" {
+		return EvictResult{}, nil
 	}
-	candidates, err := listBlobs(dir)
+	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
+		return EvictResult{}, nil
+	}
+	lock, err := lockStats(dir)
 	if err != nil {
 		return EvictResult{}, err
 	}
+	st, candidates, err := recountLocked(dir, lock)
+	_ = lock.Close()
+	res := EvictResult{Remaining: st}
+	if err != nil || st.Bytes <= maxBytes {
+		return res, err
+	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].atime.Before(candidates[j].atime) })
-	var res EvictResult
 	for len(candidates) > 0 {
+		if err := ctx.Err(); err != nil {
+			return res, err
+		}
+		if testHookBeforeEvictBatch != nil {
+			testHookBeforeEvictBatch()
+		}
 		var done bool
-		candidates, done, err = evictBatchLocked(dir, maxBytes, candidates, &res)
+		candidates, done, err = evictBatchLocked(ctx, dir, maxBytes, candidates, &res)
 		if err != nil || done {
 			return res, err
 		}
 	}
-	res.Remaining, err = ReadStats(dir)
-	return res, err
+	return res, nil
 }
 
 // evictBatchLocked removes up to evictBatch candidates under one lock hold and
-// returns the candidates left. done says the cache fits.
-func evictBatchLocked(dir string, maxBytes int64, candidates []candidate, res *EvictResult) ([]candidate, bool, error) {
+// returns the candidates left. done says the cache fits. It writes the
+// counters for every blob it removed, even when it fails.
+func evictBatchLocked(ctx context.Context, dir string, maxBytes int64, candidates []candidate, res *EvictResult) (left []candidate, done bool, err error) {
 	lock, err := lockStats(dir)
 	if err != nil {
 		return nil, false, err
@@ -186,16 +207,25 @@ func evictBatchLocked(dir string, maxBytes int64, candidates []candidate, res *E
 	defer lock.Close()
 	st, valid, err := readStats(lock)
 	if err == nil && !valid {
-		st, err = recountLocked(dir, lock)
+		st, _, err = recountLocked(dir, lock)
 	}
 	if err != nil {
 		return nil, false, err
 	}
+	defer func() {
+		if writeErr := writeStats(lock, st); err == nil {
+			err = writeErr
+		}
+		res.Remaining = st
+	}()
 	n := 0
 	for ; n < len(candidates) && n < evictBatch && st.Bytes > maxBytes; n++ {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
 		c := candidates[n]
-		cur, err := os.Lstat(c.path)
-		if err != nil || !os.SameFile(c.info, cur) || !accessTime(cur).Equal(c.atime) {
+		cur, statErr := os.Lstat(c.path)
+		if statErr != nil || !os.SameFile(c.info, cur) || !accessTime(cur).Equal(c.atime) {
 			continue
 		}
 		if err := os.Remove(c.path); err != nil {
@@ -209,10 +239,6 @@ func evictBatchLocked(dir string, maxBytes int64, candidates []candidate, res *E
 		res.Evicted++
 		res.EvictedBytes += cur.Size()
 	}
-	if err := writeStats(lock, st); err != nil {
-		return nil, false, err
-	}
-	res.Remaining = st
 	return candidates[n:], st.Bytes <= maxBytes, nil
 }
 
@@ -262,20 +288,22 @@ func writeStats(f *os.File, st Stats) error {
 	return err
 }
 
-func recountLocked(dir string, lock *os.File) (Stats, error) {
+// recountLocked moves flat-layout blobs into shards, recounts the counters
+// from the blobs it lists, and returns them with the list.
+func recountLocked(dir string, lock *os.File) (Stats, []candidate, error) {
 	if err := migrateFlat(dir); err != nil {
-		return Stats{}, err
+		return Stats{}, nil, err
 	}
 	blobs, err := listBlobs(dir)
 	if err != nil {
-		return Stats{}, err
+		return Stats{}, nil, err
 	}
 	var st Stats
 	for _, b := range blobs {
 		st.Blobs++
 		st.Bytes += b.info.Size()
 	}
-	return st, writeStats(lock, st)
+	return st, blobs, writeStats(lock, st)
 }
 
 // migrateFlat moves each blob of the flat layout into its shard.
