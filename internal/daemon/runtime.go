@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -322,6 +323,8 @@ func (s *Service) attachMount(rt *repoRuntime) (bool, error) {
 		return false, nil
 	}
 	rt.mfs, rt.mount = mfs, mountServing
+	// Every later mount at the mount point is this daemon's.
+	delete(s.leftovers, cfg.ID)
 	s.mu.Unlock()
 	// A mount that serves ends the mount and connection failures before it.
 	// The new connection can fail at once, so the join starts after.
@@ -393,10 +396,12 @@ func (s *Service) releaseMount(rt *repoRuntime, mfs fusefs.MountedFS, err error,
 	}
 }
 
-// releaseLeftoverMount unmounts the FUSE mount at cfg's mount point when the
-// daemon process before this one ran cfg's repo, because that mount is the
+// releaseLeftoverMount unmounts the mount at cfg's mount point when the
+// daemon process before this one ran cfg's repo and the mount is one an
+// artifact-fs daemon made for it (ownsLeftover), because that mount is the
 // one it left. It leaves any other mount alone, such as one of a daemon on
-// another state root.
+// another state root. A mount table it cannot read leaves the claim for the
+// next attempt.
 func (s *Service) releaseLeftoverMount(cfg model.RepoConfig) error {
 	s.mu.Lock()
 	leftover := s.leftovers[cfg.ID]
@@ -404,7 +409,11 @@ func (s *Service) releaseLeftoverMount(cfg model.RepoConfig) error {
 	if !leftover {
 		return nil
 	}
-	if entry, held := s.mountPointEntry(cfg.MountPath); held && isFUSEType(entry.fstype) {
+	entry, held := s.mountPointEntry(cfg.MountPath)
+	if held && entry == (mountEntry{}) {
+		return nil
+	}
+	if held && ownsLeftover(runtime.GOOS, entry, cfg.Name) {
 		s.logger.Warn("unmounting a mount an earlier daemon left", "repo", cfg.Name, "mount_path", cfg.MountPath)
 		if err := s.unmountMountPoint(cfg); err != nil {
 			return fmt.Errorf("unmount the mount an earlier daemon left: %w", err)

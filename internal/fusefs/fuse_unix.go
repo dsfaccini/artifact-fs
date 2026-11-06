@@ -1392,9 +1392,13 @@ func MountRepo(ctx, opCtx context.Context, repo model.RepoConfig, engine *Engine
 // fuseMount is fuse.MountContext. Package tests replace it so they cannot mount.
 var fuseMount = fuse.MountContext
 
-// FSName is the file system name of repo's mount, which the mount table
-// lists as the mount's source.
+// FSName is the file system name of repo's mount, which the Linux mount
+// table lists as the mount's source.
 func FSName(repo string) string { return "artifact-fs:" + repo }
+
+// FSSubtype is the subtype of every mount, which the Linux mount table lists
+// as the type fuse.artifact-fs.
+const FSSubtype = "artifact-fs"
 
 // UnmountPath unmounts the mount at dir without the MountedFS that mounted
 // it, such as one a daemon process that stopped left behind. It does not
@@ -1506,7 +1510,7 @@ func MountRepoWithGate(ctx, opCtx context.Context, repo model.RepoConfig, engine
 
 	mountCfg := fuse.MountConfig{
 		FSName:                  FSName(repo.Name),
-		Subtype:                 "artifact-fs",
+		Subtype:                 FSSubtype,
 		DisableWritebackCaching: true,
 		ErrorLogger:             log.New(fuseErrorLog{logger: logger, repo: repo}, "", 0),
 		OpContext:               opCtx,

@@ -23,10 +23,6 @@ func mountTableEntry(path string) (mountEntry, bool, error) {
 	return entry, found, nil
 }
 
-// isFUSEType reports whether fstype is a FUSE file system: fuse, or
-// fuse.<subtype> for a mount with a subtype, such as fuse.artifact-fs.
-func isFUSEType(fstype string) bool { return fstype == "fuse" || strings.HasPrefix(fstype, "fuse.") }
-
 // procMountsEscaper undoes the octal escapes /proc/mounts writes for these bytes in a path.
 var procMountsEscaper = strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
 

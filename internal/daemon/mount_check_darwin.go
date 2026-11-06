@@ -34,8 +34,3 @@ func mountTableEntry(path string) (mountEntry, bool, error) {
 	}
 	return entry, found, nil
 }
-
-// isFUSEType reports whether fstype is a macFUSE file system. macFUSE's FSKit
-// modules list the type macfuse, and its mounts list the source
-// macfuse://<UUID>, not the mount's fsname.
-func isFUSEType(fstype string) bool { return strings.HasPrefix(fstype, "macfuse") }

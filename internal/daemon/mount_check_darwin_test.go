@@ -1,17 +1,15 @@
 package daemon
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
 
-// The mount table lists macFUSE's FSKit mounts with the type macfuse, which
-// identifies a mount the daemon process before this one left.
-func TestMountTableReadsTheFUSEType(t *testing.T) {
+// The mount table names each volume's type, which tells a macFUSE mount from
+// any other.
+func TestMountTableReadsTheMountSourceAndType(t *testing.T) {
 	entry, found, err := mountTableEntry("/")
-	if err != nil || !found || entry.fstype == "" || isFUSEType(entry.fstype) {
-		t.Fatalf("mount table entry for / = %+v, %t, %v; want a listed volume that is not FUSE", entry, found, err)
-	}
-	for fstype, want := range map[string]bool{"macfuse": true, "apfs": false, "fskit": false} {
-		if got := isFUSEType(fstype); got != want {
-			t.Errorf("isFUSEType(%q) = %t, want %t", fstype, got, want)
-		}
+	if err != nil || !found || entry.fstype == "" || entry.source == "" || ownsLeftover(runtime.GOOS, entry, "repo") {
+		t.Fatalf("mount table entry for / = %+v, %t, %v; want a listed volume that is not macFUSE", entry, found, err)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
@@ -162,6 +163,18 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 type mountEntry struct {
 	source string
 	fstype string
+}
+
+// ownsLeftover reports whether entry, the mount at repo's mount point, is one
+// an artifact-fs daemon made for repo on goos. The Linux mount table lists
+// such a mount with the type fuse.artifact-fs and the source
+// artifact-fs:<repo>. macFUSE's FSKit lists the type macfuse and the source
+// macfuse://<UUID>, so on darwin any macFUSE mount counts.
+func ownsLeftover(goos string, entry mountEntry, repo string) bool {
+	if goos == "linux" {
+		return entry.fstype == "fuse."+fusefs.FSSubtype && entry.source == fusefs.FSName(repo)
+	}
+	return strings.HasPrefix(entry.fstype, "macfuse")
 }
 
 // isMounted reports whether path is an active mount point, and false when it cannot tell.

@@ -92,13 +92,16 @@ func TestHangingUnmountStallsOnlyItsRepo(t *testing.T) {
 	})
 }
 
-// recordingMountTable stands in for the kernel's mount table: it lists a
-// mount of type fstype at path until something unmounts path.
+// recordingMountTable stands in for the kernel's mount table: it lists entry
+// at path until something unmounts path.
 type recordingMountTable struct {
-	mu     sync.Mutex
-	path   string
-	fstype string
-	held   bool
+	mu    sync.Mutex
+	path  string
+	entry mountEntry
+	held  bool
+	// unreadable fails this many lookups first, as a mount table that
+	// cannot be read does.
+	unreadable int
 	// unmountErr fails every unmount, which leaves the mount listed.
 	unmountErr error
 	calls      []string
@@ -107,8 +110,12 @@ type recordingMountTable struct {
 func (m *recordingMountTable) mountPointEntry(path string) (mountEntry, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.unreadable > 0 {
+		m.unreadable--
+		return mountEntry{}, true
+	}
 	if path == m.path && m.held {
-		return mountEntry{source: "macfuse://2E221B83-5BAF-4BA5-83B4-4CBE7746AB82", fstype: m.fstype}, true
+		return m.entry, true
 	}
 	return mountEntry{}, false
 }
@@ -139,13 +146,36 @@ func (m *recordingMountTable) recorded() []string {
 	return slices.Clone(m.calls)
 }
 
-// ownFUSEType is the file system type the mount table lists for one of the
-// daemon's mounts on this OS.
-func ownFUSEType() string {
-	if runtime.GOOS == "darwin" {
-		return "macfuse"
+// ownMountEntry is what this OS's mount table lists for a daemon's mount of
+// repo: on FSKit the type macfuse and a source that names no repo.
+func ownMountEntry(repo string) mountEntry {
+	if runtime.GOOS == "linux" {
+		return mountEntry{source: fusefs.FSName(repo), fstype: "fuse." + fusefs.FSSubtype}
 	}
-	return "fuse.artifact-fs"
+	return mountEntry{source: "macfuse://2E221B83-5BAF-4BA5-83B4-4CBE7746AB82", fstype: "macfuse"}
+}
+
+// The Linux mount table names the type and the source of a daemon's mount,
+// so only a mount of that repo counts as a leftover. FSKit names neither, so
+// any macFUSE mount counts there.
+func TestOwnsLeftoverMatchesTheDaemonsMounts(t *testing.T) {
+	for _, tt := range []struct {
+		goos  string
+		entry mountEntry
+		want  bool
+	}{
+		{"linux", mountEntry{source: "artifact-fs:repo", fstype: "fuse.artifact-fs"}, true},
+		{"linux", mountEntry{source: "artifact-fs:other", fstype: "fuse.artifact-fs"}, false},
+		{"linux", mountEntry{source: "u@host:/dir", fstype: "fuse.sshfs"}, false},
+		{"linux", mountEntry{source: "artifact-fs:repo", fstype: "fuse"}, false},
+		{"linux", mountEntry{source: "/dev/sda1", fstype: "ext4"}, false},
+		{"darwin", mountEntry{source: "macfuse://2E221B83-5BAF-4BA5-83B4-4CBE7746AB82", fstype: "macfuse"}, true},
+		{"darwin", mountEntry{source: "/dev/disk3s1", fstype: "apfs"}, false},
+	} {
+		if got := ownsLeftover(tt.goos, tt.entry, "repo"); got != tt.want {
+			t.Errorf("ownsLeftover(%s, %+v) = %t, want %t", tt.goos, tt.entry, got, tt.want)
+		}
+	}
 }
 
 // A FUSE mount at the mount point of a repo that the daemon process before
@@ -155,50 +185,32 @@ func ownFUSEType() string {
 // that is not FUSE, and a FUSE mount of a repo the earlier daemon did not
 // run, such as a daemon's on another state root.
 func TestStartUnmountsAMountTheEarlierDaemonLeft(t *testing.T) {
-	for _, tt := range []struct {
+	type leftoverCase struct {
 		name       string
 		recorded   string
-		fstype     string
+		entry      mountEntry
+		unreadable int
 		unmountErr error
 		wantCalls  func(path string) []string
-	}{
-		{
-			name:      "left by the earlier daemon",
-			recorded:  repoStateMounted,
-			fstype:    ownFUSEType(),
-			wantCalls: func(path string) []string { return []string{"unmount " + path, "mount"} },
-		},
-		{
-			name:      "left by the earlier daemon while degraded",
-			recorded:  repoStateDegraded,
-			fstype:    ownFUSEType(),
-			wantCalls: func(path string) []string { return []string{"unmount " + path, "mount"} },
-		},
-		{
-			name:       "unmount fails",
-			recorded:   repoStateMounted,
-			fstype:     ownFUSEType(),
-			unmountErr: errors.New("busy"),
-			wantCalls:  func(path string) []string { return []string{"unmount " + path} },
-		},
-		{
-			name:      "repo the earlier daemon had unmounted",
-			recorded:  repoStateUnmounted,
-			fstype:    ownFUSEType(),
-			wantCalls: func(string) []string { return []string{"mount"} },
-		},
-		{
-			name:      "repo the earlier daemon did not run",
-			fstype:    ownFUSEType(),
-			wantCalls: func(string) []string { return []string{"mount"} },
-		},
-		{
-			name:      "another file system",
-			recorded:  repoStateMounted,
-			fstype:    "apfs",
-			wantCalls: func(string) []string { return []string{"mount"} },
-		},
-	} {
+	}
+	unmountThenMount := func(path string) []string { return []string{"unmount " + path, "mount"} }
+	mountOnly := func(string) []string { return []string{"mount"} }
+	cases := []leftoverCase{
+		{name: "left by the earlier daemon", recorded: repoStateMounted, entry: ownMountEntry("repo"), wantCalls: unmountThenMount},
+		{name: "left by the earlier daemon while degraded", recorded: repoStateDegraded, entry: ownMountEntry("repo"), wantCalls: unmountThenMount},
+		{name: "mount table unreadable at first", recorded: repoStateMounted, entry: ownMountEntry("repo"), unreadable: 1, wantCalls: unmountThenMount},
+		{name: "unmount fails", recorded: repoStateMounted, entry: ownMountEntry("repo"), unmountErr: errors.New("busy"), wantCalls: func(path string) []string { return []string{"unmount " + path} }},
+		{name: "repo the earlier daemon had unmounted", recorded: repoStateUnmounted, entry: ownMountEntry("repo"), wantCalls: mountOnly},
+		{name: "repo the earlier daemon did not run", entry: ownMountEntry("repo"), wantCalls: mountOnly},
+		{name: "another file system", recorded: repoStateMounted, entry: mountEntry{source: "/dev/disk3s1", fstype: "apfs"}, wantCalls: mountOnly},
+	}
+	if runtime.GOOS == "linux" {
+		cases = append(cases,
+			leftoverCase{name: "foreign FUSE mount", recorded: repoStateMounted, entry: mountEntry{source: "u@host:/dir", fstype: "fuse.sshfs"}, wantCalls: mountOnly},
+			leftoverCase{name: "mount of another repo", recorded: repoStateMounted, entry: ownMountEntry("other"), wantCalls: mountOnly},
+		)
+	}
+	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			svc, ctl := newSyncedDaemon(t)
 			ctx := context.Background()
@@ -211,7 +223,7 @@ func TestStartUnmountsAMountTheEarlierDaemonLeft(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			table := &recordingMountTable{path: cfg.MountPath, fstype: tt.fstype, held: true, unmountErr: tt.unmountErr}
+			table := &recordingMountTable{path: cfg.MountPath, entry: tt.entry, held: true, unreadable: tt.unreadable, unmountErr: tt.unmountErr}
 			svc.mountPointEntry = table.mountPointEntry
 			svc.unmountPath = table.unmountPath
 			svc.mount = table.mount
@@ -234,6 +246,48 @@ func TestStartUnmountsAMountTheEarlierDaemonLeft(t *testing.T) {
 				t.Fatalf("calls = %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+// A daemon that stopped cleanly unmounted its repos and recorded them
+// stopped, so the next daemon unmounts nothing at their mount points, not
+// even a mount it would count as its own.
+func TestCleanStopLeavesNoLeftoverClaim(t *testing.T) {
+	first, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	cfg, err := first.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- first.Start(startCtx) }()
+	waitFor(t, done, func() bool {
+		st, err := ctl.Status(ctx, "repo")
+		return err == nil && st.State == repoStateMounted
+	})
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start = %v, want context canceled", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("clean Close = %v", err)
+	}
+
+	next, err := New(ctx, first.root, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = next.Close() })
+	// A mount appears at the mount point before the next daemon starts.
+	table := &recordingMountTable{path: cfg.MountPath, entry: ownMountEntry("repo"), held: true}
+	next.mountPointEntry = table.mountPointEntry
+	next.unmountPath = table.unmountPath
+	next.mount = table.mount
+	nextDone := startService(t, next)
+	waitFor(t, nextDone, func() bool { return slices.Contains(table.recorded(), "mount") })
+	if got := table.recorded(); !slices.Equal(got, []string{"mount"}) {
+		t.Fatalf("calls = %q; the daemon unmounted a mount the cleanly stopped daemon did not leave", got)
 	}
 }
 
@@ -619,7 +673,7 @@ func TestAbandonedMountLeftInPlaceIsUnmountedBeforeTheNextMount(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			table := &recordingMountTable{path: cfg.MountPath, fstype: ownFUSEType(), unmountErr: tt.unmountErr}
+			table := &recordingMountTable{path: cfg.MountPath, entry: ownMountEntry("repo"), unmountErr: tt.unmountErr}
 			svc.mountPointEntry = table.mountPointEntry
 			svc.unmountPath = table.unmountPath
 			svc.mountTimeout = time.Millisecond
@@ -693,8 +747,12 @@ func TestShutdownUnmountsBeforeCancellingOps(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := mount.Load()
-	if cancelled := m.cancelled.Load(); cancelled == nil || *cancelled {
-		t.Fatalf("op context cancelled at the shutdown's unmount = %v, want live (nil means no unmount)", cancelled)
+	cancelled := m.cancelled.Load()
+	if cancelled == nil {
+		t.Fatal("the shutdown never unmounted the mount")
+	}
+	if *cancelled {
+		t.Fatal("the shutdown cancelled the op context before its unmount")
 	}
 	if m.opCtx.Err() == nil {
 		t.Fatal("op context still live after the shutdown")

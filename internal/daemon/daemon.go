@@ -241,16 +241,19 @@ func (s *Service) hydrationWorkers() int {
 func (s *Service) Close() error {
 	s.mu.Lock()
 	s.closing = true
-	ids := make([]model.RepoID, 0, len(s.running))
-	for id := range s.running {
-		ids = append(ids, id)
+	cfgs := make([]model.RepoConfig, 0, len(s.running))
+	for _, rt := range s.running {
+		cfgs = append(cfgs, rt.cfg)
 	}
 	s.mu.Unlock()
 	var errs []error
-	for _, id := range ids {
-		if err := s.unmount(id); err != nil {
+	for _, cfg := range cfgs {
+		if err := s.unmount(cfg.ID); err != nil {
 			errs = append(errs, err)
+			continue
 		}
+		// The next daemon on the root finds no mount of this one's to unmount.
+		s.recordStopped(cfg)
 	}
 	if len(errs) == 0 {
 		s.prepareWorkers.Wait()
