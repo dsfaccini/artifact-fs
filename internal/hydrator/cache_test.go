@@ -2,6 +2,7 @@ package hydrator
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -108,5 +109,23 @@ func TestVerifiedCacheFilesStayBounded(t *testing.T) {
 	h.mu.Unlock()
 	if n > 2 {
 		t.Fatalf("verified entries = %d, want at most 2", n)
+	}
+}
+
+func TestFailedBlobWriteNeverReachesTheCachePath(t *testing.T) {
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	node := model.BaseNode{RepoID: cfg.ID, Path: "a.txt", ObjectOID: strings.Repeat("ef", 20), SizeState: "known", SizeBytes: 7}
+	h := New(&fakeBlobFetcher{payload: []byte("partial"), failAfterWrite: errors.New("short read")})
+	h.Start(1, cfg)
+	defer h.Stop()
+
+	if _, _, err := h.EnsureHydrated(context.Background(), cfg, node); err == nil {
+		t.Fatal("EnsureHydrated succeeded after a failed write")
+	}
+	if _, err := os.Stat(blobcache.Path(cfg.BlobCacheDir, node.ObjectOID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cache path stat err = %v, want not exist", err)
+	}
+	if st, err := blobcache.ReadStats(cfg.BlobCacheDir); err != nil || st != (blobcache.Stats{}) {
+		t.Fatalf("cache stats = %+v, %v; want none", st, err)
 	}
 }

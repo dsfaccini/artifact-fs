@@ -88,7 +88,7 @@ func Install(dir, oid, staged string) error {
 		return err
 	}
 	if !valid {
-		_, _, err := recountLocked(dir, lock)
+		_, _, err := recountLocked(context.Background(), dir, lock)
 		return err
 	}
 	if oldErr == nil && old.Mode().IsRegular() {
@@ -118,7 +118,7 @@ func Recount(dir string) (Stats, error) {
 		return Stats{}, err
 	}
 	defer lock.Close()
-	st, _, err := recountLocked(dir, lock)
+	st, _, err := recountLocked(context.Background(), dir, lock)
 	return st, err
 }
 
@@ -140,7 +140,7 @@ func ReadStats(dir string) (Stats, error) {
 	if err != nil || valid {
 		return st, err
 	}
-	st, _, err = recountLocked(dir, lock)
+	st, _, err = recountLocked(context.Background(), dir, lock)
 	return st, err
 }
 
@@ -173,7 +173,7 @@ func Evict(ctx context.Context, dir string, maxBytes int64) (EvictResult, error)
 	if err != nil {
 		return EvictResult{}, err
 	}
-	st, candidates, err := recountLocked(dir, lock)
+	st, candidates, err := recountLocked(ctx, dir, lock)
 	_ = lock.Close()
 	res := EvictResult{Remaining: st}
 	if err != nil || st.Bytes <= maxBytes {
@@ -207,7 +207,7 @@ func evictBatchLocked(ctx context.Context, dir string, maxBytes int64, candidate
 	defer lock.Close()
 	st, valid, err := readStats(lock)
 	if err == nil && !valid {
-		st, _, err = recountLocked(dir, lock)
+		st, _, err = recountLocked(ctx, dir, lock)
 	}
 	if err != nil {
 		return nil, false, err
@@ -289,12 +289,13 @@ func writeStats(f *os.File, st Stats) error {
 }
 
 // recountLocked moves flat-layout blobs into shards, recounts the counters
-// from the blobs it lists, and returns them with the list.
-func recountLocked(dir string, lock *os.File) (Stats, []candidate, error) {
+// from the blobs it lists, and returns them with the list. When ctx ends it
+// returns without writing the counters, which leaves them as they were.
+func recountLocked(ctx context.Context, dir string, lock *os.File) (Stats, []candidate, error) {
 	if err := migrateFlat(dir); err != nil {
 		return Stats{}, nil, err
 	}
-	blobs, err := listBlobs(dir)
+	blobs, err := listBlobs(ctx, dir)
 	if err != nil {
 		return Stats{}, nil, err
 	}
@@ -327,8 +328,9 @@ func migrateFlat(dir string) error {
 	return nil
 }
 
-// listBlobs lists the blobs in dir's shards with their access times.
-func listBlobs(dir string) ([]candidate, error) {
+// listBlobs lists the blobs in dir's shards with their access times. It
+// stops between shards when ctx ends.
+func listBlobs(ctx context.Context, dir string) ([]candidate, error) {
 	shards, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -338,6 +340,9 @@ func listBlobs(dir string) ([]candidate, error) {
 	}
 	var out []candidate
 	for _, shard := range shards {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if !shard.IsDir() || len(shard.Name()) != 2 {
 			continue
 		}

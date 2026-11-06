@@ -1563,6 +1563,9 @@ type fakeBlobFetcher struct {
 	fetchMissing func(ctx context.Context, objectOIDs []string) error
 	// blobToCache, when set, runs first inside BlobToCache.
 	blobToCache func(ctx context.Context, objectOID string) error
+	// failAfterWrite, when set, makes BlobToCache write the payload and then
+	// fail with it, like a write cut short.
+	failAfterWrite error
 }
 
 func (f *fakeBlobFetcher) BlobToCache(ctx context.Context, _ model.RepoConfig, objectOID string, dstPath string) (int64, error) {
@@ -1589,6 +1592,9 @@ func (f *fakeBlobFetcher) BlobToCache(ctx context.Context, _ model.RepoConfig, o
 	}
 	if err := os.WriteFile(dstPath, f.payload, 0o644); err != nil {
 		return 0, err
+	}
+	if f.failAfterWrite != nil {
+		return 0, f.failAfterWrite
 	}
 	return int64(len(f.payload)), nil
 }

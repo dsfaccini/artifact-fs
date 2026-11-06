@@ -133,3 +133,24 @@ func TestEvictKeepsBlobChangedAfterListing(t *testing.T) {
 		})
 	}
 }
+
+func TestEvictLeavesCountersWhenContextEndsDuringRecount(t *testing.T) {
+	dir := t.TempDir()
+	install(t, dir, strings.Repeat("a", 40), 10, time.Now())
+	// An uncounted blob makes a finished recount visible in the counters.
+	uncounted := Path(dir, strings.Repeat("b", 40))
+	if err := os.MkdirAll(filepath.Dir(uncounted), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(uncounted, []byte(strings.Repeat("x", 1000)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	res, err := Evict(ctx, dir, 0)
+	if !errors.Is(err, context.Canceled) || res.Evicted != 0 {
+		t.Fatalf("Evict = %+v, %v; want nothing evicted and context.Canceled", res, err)
+	}
+	requireStats(t, dir, Stats{Blobs: 1, Bytes: 10})
+}
