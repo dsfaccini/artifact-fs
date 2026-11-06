@@ -204,14 +204,15 @@ func runE2EBenchmarkOnce(t *testing.T, repo e2eBenchRepoSpec, iteration int, hyd
 	defer svc.Close()
 	svc.SetMountRoot(mountDir)
 	svc.SetHydrationConcurrency(hydratorWorkers)
+	ctl := newE2EController(t, root)
 
-	if err := svc.AddRepo(ctx, cfg); err != nil {
+	if err := ctl.AddRepo(ctx, cfg); err != nil {
 		t.Fatalf("add-repo: %v", err)
 	}
 
 	errCh := startE2EDaemon(ctx, svc)
 
-	if err := waitForMount(svc, mountPath, 60*time.Second); err != nil {
+	if err := waitForMount(ctl, mountPath, 60*time.Second); err != nil {
 		cancel()
 		t.Fatal(err)
 	}

@@ -80,7 +80,7 @@ func (s *Service) configureStatusOptimization(ctx context.Context, cfg model.Rep
 // registration and this database while the worktree is mounted. Otherwise
 // native edits may have bypassed the overlay, and "/" makes Git rescan the
 // worktree.
-func (s *Service) FSMonitorHook(ctx context.Context, name string, since string, w io.Writer) error {
+func (s *Controller) FSMonitorHook(ctx context.Context, name string, since string, w io.Writer) error {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
 		return err

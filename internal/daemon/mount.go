@@ -34,6 +34,8 @@ var errConnectionEndedMounted = errors.New("fuse connection ended while the moun
 type mountFailure struct {
 	lastAttempt time.Time
 	backoff     time.Duration
+	// request is the mount request the failed attempt carried out.
+	request string
 }
 
 // mountRepo opens all stores, starts the FUSE server, watcher, and refresh
@@ -134,11 +136,8 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 		Hydrator: h,
 	}
 
-	mfs, err := s.mountFS(ctx, cfg, engine, nil)
-	if err != nil {
-		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
-		mfs = nil
-	} else {
+	mfs, mountErr := s.mountFS(ctx, cfg, engine, nil)
+	if mountErr == nil {
 		s.configureStatusOptimization(ctx, cfg)
 	}
 	rt := &repoRuntime{
@@ -158,33 +157,58 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 	if mfs == nil {
 		rt.state.State = repoStateDegraded
 	}
+	s.clearMountFailures(cfg, mountErr)
 	s.startRuntime(rt)
+	runHook(s.runtimeStarted)
+	s.recordStartedRuntime(rt, mountErr)
 	s.startRepoBackground(rt)
 
 	return nil
 }
 
-// mountFS mounts cfg through s.mount and logs which backend serves the mount.
-// It persists the mount error that status reports, and clears it on success.
+// recordStartedRuntime records a runtime that started, with the error of its
+// first mount, which the next registry sync retries.
+func (s *Service) recordStartedRuntime(rt *repoRuntime, mountErr error) {
+	if mountErr != nil {
+		s.mu.Lock()
+		cfg := rt.cfg
+		s.mu.Unlock()
+		s.recordFailure(cfg, phaseMount, mountErr, time.Now().Add(registrySyncInterval))
+	}
+	s.recordRuntimeState(rt)
+}
+
+// clearMountFailures clears cfg's mount and connection failures once its
+// mount succeeded: a mount that serves ends them. It runs before the runtime
+// starts, because the new connection can fail at once and that failure must
+// stay.
+func (s *Service) clearMountFailures(cfg model.RepoConfig, mountErr error) {
+	if mountErr != nil {
+		return
+	}
+	s.recordRuntime(cfg.ID, func(rec *model.RepoRuntimeRecord) {
+		clearFailure(rec, phaseMount)
+		clearFailure(rec, phaseServe)
+	})
+}
+
+// runHook runs a test hook of Service when a test set it.
+func runHook(hook func()) {
+	if hook != nil {
+		hook()
+	}
+}
+
+// mountFS mounts cfg through s.mount and logs the outcome. Its caller
+// records a failure with the time of the retry.
 func (s *Service) mountFS(ctx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate) (fusefs.MountedFS, error) {
 	mfs, err := s.mount(cfg, engine, gate, s.logger)
-	s.recordMountError(ctx, cfg, err)
 	if err != nil {
+		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", auth.RedactLogString(err.Error(), cfg.RemoteURL))
 		return nil, err
 	}
 	s.logger.Info("fuse mounted", "repo", cfg.Name, "backend", mfs.Backend())
 	return mfs, nil
-}
-
-// recordMountError persists err, redacted, as the repo's mount error. A nil err clears it.
-func (s *Service) recordMountError(ctx context.Context, cfg model.RepoConfig, err error) {
-	mountErr := ""
-	if err != nil {
-		mountErr = auth.RedactLogString(err.Error(), cfg.RemoteURL)
-	}
-	if writeErr := s.registry.UpdateMountError(ctx, cfg.ID, mountErr); writeErr != nil {
-		s.logger.Error("repo mount error write failed", "repo", cfg.Name, "error", writeErr)
-	}
 }
 
 func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) error {
@@ -227,11 +251,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		Hydrator: h,
 	}
 
-	mfs, err := s.mountFS(ctx, cfg, engine, gate)
-	if err != nil {
-		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
-		mfs = nil
-	}
+	mfs, mountErr := s.mountFS(ctx, cfg, engine, gate)
 	state := cfg.PrepareState
 	if strings.TrimSpace(state) == "" {
 		state = model.PrepareStatePreparing
@@ -259,7 +279,10 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 			PrepareError:       cfg.PrepareError,
 		},
 	}
+	s.clearMountFailures(cfg, mountErr)
 	s.startRuntime(rt)
+	runHook(s.runtimeStarted)
+	s.recordStartedRuntime(rt, mountErr)
 	return nil
 }
 
@@ -272,13 +295,15 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 	}
 	done := make(chan struct{})
 	rt.joinDone = done
+	// Preparation replaces rt.cfg under s.mu.
+	mountPath := rt.cfg.MountPath
 	s.mu.Unlock()
 	go func() {
 		// Join's error is fatal to the connection, and the dead mount can
 		// still hold the mount point. Join also returns nil after an abort,
 		// which leaves the dead mount in place.
 		connErr := mfs.Join(context.Background())
-		if connErr == nil && mountPointHeld(rt.cfg.MountPath) {
+		if connErr == nil && mountPointHeld(mountPath) {
 			connErr = errConnectionEndedMounted
 		}
 		s.mu.Lock()
@@ -287,23 +312,40 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 			rt.failedMount = mfs
 			rt.mounts.Add(1)
 		}
+		cfg := rt.cfg
 		s.mu.Unlock()
+		// The next registry sync mounts the runtime again.
+		nextRetry := time.Now().Add(registrySyncInterval)
 		if failed {
 			defer rt.mounts.Done()
-			s.logger.Error("fuse connection failed, unmounting", "repo", rt.cfg.Name, "error", auth.RedactLogString(connErr.Error(), rt.cfg.RemoteURL))
-			s.recordMountError(rt.ctx, rt.cfg, connErr)
+			s.logger.Error("fuse connection failed, unmounting", "repo", cfg.Name, "error", auth.RedactLogString(connErr.Error(), cfg.RemoteURL))
+			s.recordFailure(cfg, phaseServe, connErr, nextRetry)
 			if err := s.unmountFailedMount(rt); err != nil {
-				s.logger.Error("fuse unmount failed, runtime will retry", "repo", rt.cfg.Name, "error", err)
+				s.logger.Error("fuse unmount failed, runtime will retry", "repo", cfg.Name, "error", auth.RedactLogString(err.Error(), cfg.RemoteURL))
 			}
 		}
 		close(done)
+		// A retry may mount once rt.mfs is nil, and it clears the serve
+		// failure. Holding recordMu until the clean exit is recorded keeps
+		// that clear after it.
+		s.recordMu.Lock()
 		s.mu.Lock()
-		if failed || !rt.stopping && !rt.detached && rt.mfs == mfs {
+		exited := failed || !rt.stopping && !rt.detached && rt.mfs == mfs
+		if exited {
 			rt.mfs = nil
 			rt.joinDone = nil
 			rt.state.State = repoStateDegraded
 		}
 		s.mu.Unlock()
+		if exited && !failed {
+			runHook(s.mountReleased)
+			s.recordFailureLocked(cfg, phaseServe, errFUSEServerExited, nextRetry)
+		}
+		s.recordMu.Unlock()
+		if exited {
+			s.recordRuntimeState(rt)
+		}
+		runHook(s.joinFinished)
 	}()
 }
 
@@ -313,12 +355,13 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 func (s *Service) unmountFailedMount(rt *repoRuntime) error {
 	s.mu.Lock()
 	mfs := rt.failedMount
+	name, mountPath := rt.cfg.Name, rt.cfg.MountPath
 	s.mu.Unlock()
 	if mfs == nil {
 		return nil
 	}
-	if err := mfs.Unmount(); err != nil && mountPointHeld(rt.cfg.MountPath) {
-		return fmt.Errorf("unmount %s after its connection failed: %w", rt.cfg.Name, err)
+	if err := mfs.Unmount(); err != nil && mountPointHeld(mountPath) {
+		return fmt.Errorf("unmount %s after its connection failed: %w", name, err)
 	}
 	s.mu.Lock()
 	rt.failedMount = nil
@@ -387,7 +430,7 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 	err := s.unmountFailedMount(rt)
 	var mfs fusefs.MountedFS
 	if err != nil {
-		s.logger.Error("fuse unmount failed, runtime will retry", "repo", cfg.Name, "error", err)
+		s.logger.Error("fuse unmount failed, runtime will retry", "repo", cfg.Name, "error", auth.RedactLogString(err.Error(), cfg.RemoteURL))
 	} else {
 		mfs, err = s.mountFS(rt.ctx, cfg, engine, gate)
 	}
@@ -399,12 +442,15 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 			s.mountFailures[cfg.ID] = mf
 		}
 		mf.lastAttempt = time.Now()
+		mf.request = cfg.MountRequest
 		if mf.backoff == 0 {
 			mf.backoff = 30 * time.Second
 		} else {
 			mf.backoff = min(mf.backoff*2, 5*time.Minute)
 		}
+		nextRetry := mf.lastAttempt.Add(mf.backoff)
 		s.mu.Unlock()
+		s.recordFailure(cfg, phaseMount, err, nextRetry)
 		return
 	}
 	if s.running[cfg.ID] != rt || rt.mfs != nil {
@@ -422,6 +468,7 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 	s.mu.Unlock()
 	if !stopping {
 		s.configureStatusOptimization(rt.ctx, cfg)
+		s.recordRuntimeState(rt, phaseMount, phaseServe)
 	}
 	s.joinRuntimeMount(rt)
 }

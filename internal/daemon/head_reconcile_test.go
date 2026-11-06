@@ -18,6 +18,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
+	"github.com/cloudflare/artifact-fs/internal/registry"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 	"github.com/dsfaccini/fuse/fuseops"
 )
@@ -101,6 +102,7 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 		GitDir:        filepath.Join(workDir, ".git"),
 		OverlayDir:    filepath.Join(root, "overlay"),
 		OverlayDBPath: filepath.Join(root, "overlay", "meta.sqlite"),
+		MetaDBPath:    filepath.Join(root, "snapshot.sqlite"),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	logs := &lockedBuffer{}
@@ -111,7 +113,7 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 		cancel()
 		t.Fatal(err)
 	}
-	snap, err := snapshot.New(ctx, filepath.Join(root, "snapshot.sqlite"))
+	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
 	if err != nil {
 		cancel()
 		t.Fatal(err)
@@ -140,10 +142,15 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 		headChanges: make(chan struct{}, 1),
 		state:       newRuntimeState(cfg.ID, oldOID, "main", oldGen),
 	}
+	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
 	svc := &Service{
-		logger:               logger,
-		git:                  git,
+		core:                 &core{root: root, logger: logger, git: git, registry: reg},
 		running:              map[model.RepoID]*repoRuntime{cfg.ID: rt},
+		records:              map[model.RepoID]*model.RepoRuntimeRecord{},
 		headReconcileBackoff: backoff,
 	}
 	f := &headReconcileFixture{
@@ -294,6 +301,37 @@ func TestHeadReconcileRetriesTransientOverlayFailureWithoutRepublishing(t *testi
 	}
 }
 
+// After a failed overlay transition the snapshot store holds the new
+// generation while the mount still serves the old one.
+func TestStatusReportsPublishedAndServedGenerationsAfterOverlayFailure(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	if err := f.svc.registry.AddRepo(f.ctx, f.rt.cfg); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := acquireDaemonLock(f.svc.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	// The daemon records a runtime once it mounts.
+	f.svc.recordRuntimeState(f.rt, "")
+	f.updateMain(f.nextOID)
+	if err := f.rt.overlay.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.signal()
+	var st model.RepoRuntimeState
+	waitFor(t, nil, func() bool {
+		st, err = f.svc.ctl().Status(f.ctx, f.rt.cfg.Name)
+		return err == nil && st.LastErrorPhase == phaseHEADReconcile
+	})
+	if st.PublishedHEADOID != f.nextOID || st.PublishedGeneration != f.oldGen+1 ||
+		st.ServedHEADOID != f.oldOID || st.ServedGeneration != f.oldGen ||
+		st.CurrentHEADOID != f.oldOID || st.NextRetryAt.IsZero() || st.Attempts == 0 {
+		t.Fatalf("status after a failed overlay transition = %+v, want %s/%d published and %s/%d served with a retry", st, f.nextOID, f.oldGen+1, f.oldOID, f.oldGen)
+	}
+}
+
 func TestHeadReconcileRestoresPersistedStateWhenHEADReturnsAfterOverlayFailure(t *testing.T) {
 	f := newHeadReconcileFixture(t)
 	f.updateMain(f.nextOID)
@@ -325,7 +363,7 @@ func TestHeadReconcileRestoresPersistedStateWhenHEADReturnsAfterOverlayFailure(t
 
 	cfg := f.rt.cfg
 	cfg.MetaDBPath = filepath.Join(filepath.Dir(cfg.OverlayDir), "snapshot.sqlite")
-	status := f.svc.readPersistedStatus(f.ctx, cfg)
+	status := persistedStatus(f.ctx, cfg, model.RepoRuntimeRecord{}, false)
 	if status.CurrentHEADOID != f.oldOID || status.CurrentHEADRef != "main" || status.SnapshotGeneration != f.oldGen+2 {
 		t.Fatalf("persisted status after rollback = %+v", status)
 	}

@@ -83,7 +83,7 @@ func startDaemonWithMount(t *testing.T, mount mountFunc, mountPath string) *star
 	svc.SetMountRoot(filepath.Join(tmp, "mnt"))
 	svc.mount = d.mounts.mount
 	// A remote refresh never runs during the test, so only the HEAD watcher can start a reconcile.
-	if err := svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: d.workDir, Branch: "main", MountPath: mountPath, RefreshInterval: time.Hour, Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: d.workDir, Branch: "main", MountPath: mountPath, RefreshInterval: time.Hour, Enabled: true}); err != nil {
 		_ = svc.Close()
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func startDaemonWithMount(t *testing.T, mount mountFunc, mountPath string) *star
 		}
 	})
 	waitFor(t, d.startErr, func() bool {
-		st, err := svc.Status(ctx, "repo")
+		st, err := svc.ctl().Status(ctx, "repo")
 		return err == nil && st.State == repoStateMounted && d.mounts.resolver() != nil
 	})
 	return d
@@ -131,7 +131,7 @@ func (d *startedDaemon) moveMain(t *testing.T, oid string) {
 
 func (d *startedDaemon) status(t *testing.T) model.RepoRuntimeState {
 	t.Helper()
-	st, err := d.svc.Status(context.Background(), "repo")
+	st, err := d.svc.ctl().Status(context.Background(), "repo")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,9 +191,9 @@ func TestStartRetriesHEADReconcileAfterSnapshotLock(t *testing.T) {
 
 	want := d.commit(t, "README.md", "reconciled after the lock\n")
 	d.moveMain(t, want)
-	waitFor(t, d.startErr, func() bool { return strings.Contains(d.logs.String(), "snapshot publish failed") })
-	if st := d.status(t); st.CurrentHEADOID != initial.CurrentHEADOID || st.SnapshotGeneration != initial.SnapshotGeneration {
-		t.Fatalf("HEAD advanced while the snapshot was locked: %+v", st)
+	waitFor(t, d.startErr, func() bool { return d.status(t).LastErrorPhase == phaseHEADReconcile })
+	if st := d.status(t); st.CurrentHEADOID != initial.CurrentHEADOID || st.SnapshotGeneration != initial.SnapshotGeneration || st.NextRetryAt.IsZero() || !strings.Contains(st.LastError, "locked") {
+		t.Fatalf("status while the snapshot was locked = %+v, want the old HEAD and the retried failure", st)
 	}
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
@@ -365,7 +365,7 @@ func TestRemoveRepoUnmountsFailedConnectionLeftMounted(t *testing.T) {
 	m.releaseRemount()
 	// remove-repo runs in its own process, so the daemon's registry poll stops the runtime.
 	ctx := context.Background()
-	cliSvc, err := New(ctx, d.root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cliSvc, err := NewController(ctx, d.root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

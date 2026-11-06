@@ -29,6 +29,7 @@ type mountedE2ERepo struct {
 	mountDir  string
 	mountPath string
 	svc       *daemon.Service
+	ctl       *daemon.Controller
 	cancel    context.CancelFunc
 	errCh     chan error
 	logs      *synchronizedBuffer
@@ -95,6 +96,7 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 		t.Fatal(err)
 	}
 	svc.SetMountRoot(mountDir)
+	ctl := newE2EController(t, root)
 
 	cfg := model.RepoConfig{
 		Name:              repoName,
@@ -106,7 +108,7 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 		MountRoot:         mountDir,
 		Enabled:           true,
 	}
-	if err := svc.AddRepo(ctx, cfg); err != nil {
+	if err := ctl.AddRepo(ctx, cfg); err != nil {
 		cancel()
 		_ = svc.Close()
 		t.Fatalf("add-repo: %v", err)
@@ -114,7 +116,7 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 
 	errCh := startE2EDaemon(ctx, svc)
 
-	if err := waitForMount(svc, mountPath, 60*time.Second); err != nil {
+	if err := waitForMount(ctl, mountPath, 60*time.Second); err != nil {
 		cancel()
 		_ = svc.Close()
 		t.Fatal(err)
@@ -125,6 +127,7 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 		mountDir:  mountDir,
 		mountPath: mountPath,
 		svc:       svc,
+		ctl:       ctl,
 		cancel:    cancel,
 		errCh:     errCh,
 		logs:      logs,
@@ -189,7 +192,7 @@ func (r *mountedE2ERepo) restart(t *testing.T) {
 	}
 	svc.SetMountRoot(r.mountDir)
 	errCh := startE2EDaemon(ctx, svc)
-	if err := waitForMount(svc, r.mountPath, 60*time.Second); err != nil {
+	if err := waitForMount(r.ctl, r.mountPath, 60*time.Second); err != nil {
 		cancel()
 		_ = svc.Close()
 		t.Fatalf("mount after restart: %v", err)
@@ -885,7 +888,7 @@ func assertGitStatus(t *testing.T, dir string, want map[string]string) {
 func waitForOverlayClean(t *testing.T, repo *mountedE2ERepo) {
 	t.Helper()
 	waitForCondition(t, 10*time.Second, "overlay reconciliation", func() (bool, string) {
-		status, err := repo.svc.Status(context.Background(), repoName)
+		status, err := repo.ctl.Status(context.Background(), repoName)
 		if err != nil {
 			return false, err.Error()
 		}

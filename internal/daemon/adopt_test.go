@@ -56,7 +56,7 @@ func TestAdoptGitDirPreservesGitStateAndScopesConfig(t *testing.T) {
 	}
 	defer svc.Close()
 	cfg := model.RepoConfig{Name: "adopted", GitDir: gitDir, MountPath: worktree, AdoptGitDir: true, Enabled: true}
-	if err := svc.AddRepo(ctx, cfg); err != nil {
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := svc.registry.GetRepo(ctx, cfg.Name)
@@ -69,7 +69,7 @@ func TestAdoptGitDirPreservesGitStateAndScopesConfig(t *testing.T) {
 	if err := svc.mountRepo(ctx, stored); err == nil || !strings.Contains(err.Error(), "adopted mountpoint must be empty") {
 		t.Fatalf("adoption must not hide native working files: %v", err)
 	}
-	if err := svc.Prepare(ctx, cfg.Name); err != nil {
+	if err := svc.ctl().Prepare(ctx, cfg.Name); err != nil {
 		t.Fatal(err)
 	}
 	afterIndex, err := os.ReadFile(indexPath)
@@ -107,10 +107,10 @@ func TestAdoptGitDirPreservesGitStateAndScopesConfig(t *testing.T) {
 	if got := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "config", "--get", "core.filemode")); got != "true" {
 		t.Fatalf("adopted filemode = %s", got)
 	}
-	if err := svc.SetRefresh(ctx, cfg.Name, time.Second, false); err == nil {
+	if err := svc.ctl().SetRefresh(ctx, cfg.Name, time.Second, false); err == nil {
 		t.Fatal("adoption allowed remote refresh to be enabled")
 	}
-	if err := svc.FetchNow(context.Background(), cfg.Name); err == nil {
+	if err := svc.ctl().FetchNow(context.Background(), cfg.Name); err == nil {
 		t.Fatal("adoption allowed a daemon fetch")
 	}
 }
@@ -137,7 +137,7 @@ func TestRemoveRepoStopsAdoptedFSMonitor(t *testing.T) {
 	}
 	defer svc.Close()
 	cfg := model.RepoConfig{Name: "adopted", GitDir: gitDir, MountPath: worktree, AdoptGitDir: true, Enabled: true}
-	if err := svc.AddRepo(ctx, cfg); err != nil {
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := svc.registry.GetRepo(ctx, cfg.Name)
@@ -159,7 +159,7 @@ func TestRemoveRepoStopsAdoptedFSMonitor(t *testing.T) {
 	if got := runCmdOutput(t, "git", "-C", worktree, "status", "--porcelain"); got != "" {
 		t.Fatalf("adopted worktree status = %q", got)
 	}
-	if err := svc.RemoveRepo(ctx, cfg.Name); err != nil {
+	if err := svc.ctl().RemoveRepo(ctx, cfg.Name); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(worktree, "README.md"), []byte("native edit\n"), 0o644); err != nil {
@@ -173,19 +173,19 @@ func TestRemoveRepoStopsAdoptedFSMonitor(t *testing.T) {
 	}
 	// Removal still succeeds when core.fsmonitor is already unset or the
 	// worktree's Git metadata is gone.
-	if err := svc.AddRepo(ctx, cfg); err != nil {
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.RemoveRepo(ctx, cfg.Name); err != nil {
+	if err := svc.ctl().RemoveRepo(ctx, cfg.Name); err != nil {
 		t.Fatalf("remove-repo with core.fsmonitor unset: %v", err)
 	}
-	if err := svc.AddRepo(ctx, cfg); err != nil {
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.RemoveAll(gitDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.RemoveRepo(ctx, cfg.Name); err != nil {
+	if err := svc.ctl().RemoveRepo(ctx, cfg.Name); err != nil {
 		t.Fatalf("remove-repo without Git metadata: %v", err)
 	}
 }
@@ -240,7 +240,7 @@ func TestAdoptGitDirWarnsAboutCredentialedOriginOncePerPrepare(t *testing.T) {
 	defer svc.Close()
 	warnings := func() int { return strings.Count(logs.String(), "adopted worktree origin embeds credentials") }
 	cfg := model.RepoConfig{Name: "adopted", GitDir: gitDir, MountPath: worktree, AdoptGitDir: true, Enabled: true}
-	if err := svc.AddRepo(ctx, cfg); err != nil {
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
 		t.Fatalf("adoption with a credentialed origin failed: %v", err)
 	}
 	stored, err := svc.registry.GetRepo(ctx, cfg.Name)
@@ -303,7 +303,7 @@ func TestAdoptedMountConfiguresWorktreeOnce(t *testing.T) {
 	}
 	defer svc.Close()
 	cfg := model.RepoConfig{Name: "adopted", GitDir: gitDir, MountPath: worktree, AdoptGitDir: true, Enabled: true}
-	if err := svc.AddRepo(ctx, cfg); err != nil {
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
 

@@ -31,6 +31,10 @@ func TestMain(m *testing.M) {
 
 func TestGitIgnoresMachineConfig(t *testing.T) { gittest.RequireConfigIsolated(t) }
 
+// ctl is the controller a CLI command on s's root would run on. It shares s's
+// registry connection.
+func (s *Service) ctl() *Controller { return &Controller{core: s.core} }
+
 // fakeMount stands in for a successful mount.
 func fakeMount(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
 	return &fakeMountedFS{unmounted: make(chan struct{})}, nil

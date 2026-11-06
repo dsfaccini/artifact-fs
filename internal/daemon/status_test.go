@@ -60,7 +60,7 @@ func TestVerifiedSourceStatusAndRefreshPolicy(t *testing.T) {
 	if err := svc.registry.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.FetchNow(ctx, cfg.Name); err == nil || !strings.Contains(err.Error(), "refresh is disabled") {
+	if err := svc.ctl().FetchNow(ctx, cfg.Name); err == nil || !strings.Contains(err.Error(), "refresh is disabled") {
 		t.Fatalf("FetchNow error = %v, want refresh-disabled rejection", err)
 	}
 }
@@ -260,8 +260,7 @@ func TestPersistedVerifiedStatusDoesNotCountAcquisitionAsRefresh(t *testing.T) {
 		AcquiredCommit: strings.Repeat("a", 40),
 		AcquiredAt:     acquiredAt,
 	}
-	svc := &Service{}
-	st := svc.readPersistedStatus(context.Background(), cfg)
+	st := persistedStatus(context.Background(), cfg, model.RepoRuntimeRecord{}, false)
 	if !st.LastFetchAt.IsZero() || st.LastFetchResult != "never" {
 		t.Fatalf("acquisition reported as remote refresh: %+v", st)
 	}
@@ -270,7 +269,7 @@ func TestPersistedVerifiedStatusDoesNotCountAcquisitionAsRefresh(t *testing.T) {
 	if err := os.Chtimes(fetchHead, refreshAt, refreshAt); err != nil {
 		t.Fatal(err)
 	}
-	st = svc.readPersistedStatus(context.Background(), cfg)
+	st = persistedStatus(context.Background(), cfg, model.RepoRuntimeRecord{}, false)
 	if !st.LastFetchAt.Equal(refreshAt) || st.LastFetchResult != "ok" {
 		t.Fatalf("later remote refresh status = %+v, want %v and ok", st, refreshAt)
 	}
@@ -297,8 +296,7 @@ func TestReadPersistedStatusIncludesHydrationStats(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	svc := &Service{}
-	st := svc.readPersistedStatus(context.Background(), model.RepoConfig{ID: "repo", BlobCacheDir: cacheDir, GitDir: gitDir})
+	st := persistedStatus(context.Background(), model.RepoConfig{ID: "repo", BlobCacheDir: cacheDir, GitDir: gitDir}, model.RepoRuntimeRecord{}, false)
 
 	if st.LastFetchResult != "never" {
 		t.Fatalf("LastFetchResult = %q, want never", st.LastFetchResult)
@@ -337,22 +335,22 @@ func TestStatusReportsMountErrorUntilRetryMounts(t *testing.T) {
 	svc.mount = func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
 		return nil, mountErr
 	}
-	if err := svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
-	st, err := svc.Status(ctx, "repo")
+	st, err := svc.ctl().Status(ctx, "repo")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if st.State != repoStateDegraded || st.MountError != mountErr.Error() {
 		t.Fatalf("daemon status after failed mount: state=%q mount_error=%q", st.State, st.MountError)
 	}
-	// The status CLI runs in its own process and reads only persisted state.
-	cliSvc, err := New(ctx, root, logger)
+	// The status CLI runs in its own process and reads what the daemon recorded.
+	cliSvc, err := NewController(ctx, root, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,15 +358,15 @@ func TestStatusReportsMountErrorUntilRetryMounts(t *testing.T) {
 	if closeErr := cliSvc.Close(); err != nil || closeErr != nil {
 		t.Fatalf("CLI status: %v, close: %v", err, closeErr)
 	}
-	if st.State != repoStateUnmounted || st.MountError != mountErr.Error() {
-		t.Fatalf("CLI status after failed mount: state=%q mount_error=%q", st.State, st.MountError)
+	if st.State != repoStateDegraded || st.MountError != mountErr.Error() || st.LastErrorPhase != phaseMount || st.NextRetryAt.IsZero() {
+		t.Fatalf("CLI status after failed mount: %+v", st)
 	}
 
 	svc.mount = fakeMount
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
-	st, err = svc.Status(ctx, "repo")
+	st, err = svc.ctl().Status(ctx, "repo")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,7 +466,7 @@ func newHookService(t *testing.T, mountPath string) (*Service, model.RepoConfig)
 func hookAnswer(t *testing.T, svc *Service, since string) ([]byte, string, []string) {
 	t.Helper()
 	var out bytes.Buffer
-	if err := svc.FSMonitorHook(t.Context(), "repo", since, &out); err != nil {
+	if err := svc.ctl().FSMonitorHook(t.Context(), "repo", since, &out); err != nil {
 		t.Fatal(err)
 	}
 	fields := strings.Split(strings.TrimSuffix(out.String(), "\x00"), "\x00")

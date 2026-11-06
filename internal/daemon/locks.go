@@ -9,15 +9,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func (s *Service) withRepoConfigLock(ctx context.Context, repoName string, fn func() error) error {
+func (s *core) withRepoConfigLock(ctx context.Context, repoName string, fn func() error) error {
 	return s.withRepoLock(ctx, repoName+".lock", fn)
 }
 
-func (s *Service) withRepoPrepareLock(ctx context.Context, repoName string, fn func() error) error {
+func (s *core) withRepoPrepareLock(ctx context.Context, repoName string, fn func() error) error {
 	return s.withRepoLock(ctx, repoName+".prepare.lock", fn)
 }
 
-func (s *Service) withRepoLock(ctx context.Context, lockName string, fn func() error) error {
+func (s *core) withRepoLock(ctx context.Context, lockName string, fn func() error) error {
 	lockDir := filepath.Join(s.root, "config", "locks")
 	if err := os.MkdirAll(lockDir, 0o700); err != nil {
 		return err

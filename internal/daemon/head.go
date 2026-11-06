@@ -50,6 +50,7 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 			rt.state.CurrentHEADRef = ref
 		}
 		s.mu.Unlock()
+		s.recordRuntimeState(rt, phaseHEADReconcile)
 		return nil
 	}
 	if stateErr != nil || storedOID != oid || storedRef != ref || gen == 0 {
@@ -86,6 +87,7 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 		setHeadState(&rt.state, oid, ref, gen)
 	}
 	s.mu.Unlock()
+	s.recordRuntimeState(rt, phaseHEADReconcile)
 	if err := rt.snapshot.PruneGenerations(ctx, min(prevGen, gen-1)); err != nil {
 		s.logger.Warn("snapshot generation cleanup failed", "repo", cfg.Name, "error", err)
 	}
@@ -120,13 +122,19 @@ func (s *Service) headReconcileLoop(rt *repoRuntime) {
 		}
 
 		for {
-			if err := s.reconcileHEAD(rt.ctx, rt); err == nil {
+			err := s.reconcileHEAD(rt.ctx, rt)
+			if err == nil {
 				backoff = minBackoff
 				break
 			}
 			if rt.ctx.Err() != nil {
 				return
 			}
+			// A HEAD change can also start the retry early.
+			s.mu.Lock()
+			cfg := rt.cfg
+			s.mu.Unlock()
+			s.recordFailure(cfg, phaseHEADReconcile, err, time.Now().Add(backoff))
 
 			timer := time.NewTimer(backoff)
 			select {
