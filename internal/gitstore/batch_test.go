@@ -710,3 +710,32 @@ func batchStderrLogs(t *testing.T, stderrScript string) string {
 	store.Close()
 	return logs.String()
 }
+
+func TestBlobToCacheRemovesDstAfterAFailedWrite(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// cat-file announces 10 bytes and sends 3, a cut-short stream a local
+	// repository cannot produce.
+	fakeGit := "#!/bin/sh\nread -r oid\necho \"$oid blob 10\"\nprintf abc\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(fakeGit), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	store := New(nil)
+	defer store.Close()
+	// The hydrator passes a file blobcache.Stage already created.
+	dst := filepath.Join(tmp, "staged")
+	if err := os.WriteFile(dst, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(tmp, "repo.git")}
+	if _, err := store.BlobToCache(context.Background(), cfg, strings.Repeat("a", 40), dst); err == nil {
+		t.Fatal("BlobToCache succeeded on a cut-short blob")
+	}
+	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dst stat err = %v, want it removed", err)
+	}
+}

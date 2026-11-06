@@ -147,7 +147,7 @@ Check the state of a mounted repo with `status`:
 | `ahead` / `behind` / `diverged` | Currently zero/false in one-shot CLI status output |
 | `prepare_error` | Last redacted preparation error, if any |
 | `mount_error` | Last redacted FUSE mount or connection error, if any; a successful mount clears it |
-| `hydrated_blobs` / `hydrated_bytes` | Blob count and bytes present in the local hydration cache |
+| `hydrated_blobs` / `hydrated_bytes` | Blob count and bytes in the repo's blob cache, read from counters kept with the cache (see [Evicting the blob cache](#evicting-the-blob-cache)) |
 | `overlay_dirty` | `true` if the overlay contains created or modified files; delete-only overlays are not counted |
 | `last_fetch` / `result` | `FETCH_HEAD` modification time and `ok` when present; otherwise `never` |
 
@@ -162,6 +162,26 @@ Use `--hydration-concurrency` to control the number of parallel blob-fetch worke
 ```bash
 ./artifact-fs daemon --root /tmp --hydration-concurrency 8
 ```
+
+### Evicting the blob cache
+
+The blob cache keeps every hydrated blob until you evict it. Nothing evicts automatically. `evict-cache` removes the least recently accessed blobs, by file access time, until the cache holds at most `--max-bytes` bytes. The flag is required and has no default; `--max-bytes 0` empties the cache:
+
+```bash
+./artifact-fs evict-cache --name workers-sdk --max-bytes 1073741824
+# evicted_blobs=812 evicted_bytes=402653184 hydrated_blobs=2210 hydrated_bytes=1073610752
+```
+
+It is safe while the daemon runs. A file already open keeps reading its blob, and the next open of an evicted file hydrates it again. A blob whose access time changes after `evict-cache` lists the cache stays. Repos that share a `--blob-cache-dir` share one budget, and evicting through any of them evicts the shared directory.
+
+Eviction follows the access times the filesystem records, so its order depends on the mount:
+
+- `noatime`: reads never update the access time, so eviction removes the oldest-hydrated blobs first.
+- `relatime`, the Linux default: after the first read, a read updates the access time only when it is more than a day old, so eviction order is accurate to about a day.
+- APFS on macOS: a read updates the access time only while it is not newer than the modification time, so only the first read after hydration counts, and eviction removes the blobs first read longest ago.
+- The kernel can serve repeated reads of a mounted file from its page cache without reading the blob file, and those reads leave its access time unchanged.
+
+The cache shards blobs by the first two hex characters of their object ID, `<blob-cache-dir>/<2 hex>/<oid>`. When a repo mounts, the daemon moves blobs of the earlier flat layout into their shards and recounts the cache. `evict-cache` does the same before it evicts, and `status` does it once for a cache that has no counters yet. While one of them recounts, hydration into the same cache waits, so mounting a repo stalls hydration for every repo that shares its `--blob-cache-dir` for one walk of the directory, about half a second per 100,000 blobs on an APFS laptop. Hydration and eviction update the counters `status` reports as they add and remove blobs, under a lock on the cache's `stats` file, so `status` never walks the cache. The recount corrects counters that a crash between a blob change and its counter update, or a change made by hand, left wrong.
 
 ## Logging
 
@@ -389,6 +409,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 | `gitstore` | Git CLI wrapper: clone, fetch, ls-tree, batch pool for `cat-file --batch` |
 | `snapshot` | SQLite store for `base_nodes` keyed by `(generation, path)` |
 | `overlay` | SQLite metadata + `upper/` directory for local writes, whiteouts, reconciliation |
+| `blobcache` | Blob cache layout (sharded by object ID), its counters, and LRU eviction for `evict-cache` |
 | `hydrator` | Priority queue with deduped waiters; workers fetch queued blobs in batches. With more than one worker, a reserved worker takes only reads and copies of local blobs and blocks on `reservedReady`; the others block on `workReady` |
 | `watcher` | Polls gitdir mtimes (HEAD, index, refs) at 500ms intervals |
 | `registry` | SQLite-backed repo config persistence |

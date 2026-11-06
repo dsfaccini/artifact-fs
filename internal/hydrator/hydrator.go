@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -42,9 +43,20 @@ type Service struct {
 	// copies of blobs that are already local.
 	reservedReady chan struct{}
 	onHydrated    OnHydratedFunc
-	verified      map[string]os.FileInfo
-	active        map[string]struct{}
+	// verified holds the cache files whose content was checked, at most
+	// maxVerified of them. A file it drops is checked again on its next use.
+	verified    map[string]os.FileInfo
+	maxVerified int
+	active      map[string]struct{}
 }
+
+// maxVerified bounds Service.verified, so a long-lived daemon that serves many
+// blobs, including blobs evict-cache has since removed, keeps bounded memory.
+const maxVerified = 1 << 16
+
+// testHookBeforeOpen, when set, runs before OpenHydrated opens a validated
+// cache file.
+var testHookBeforeOpen func(cachePath string)
 
 // maxFetchBatch caps the blobs one fetch requests. It matches the fusefs
 // per-directory prefetch cap, so one listing's prefetch is one fetch.
@@ -74,6 +86,7 @@ func New(fetcher BlobFetcher) *Service {
 
 		reservedReady: make(chan struct{}, 1),
 		verified:      map[string]os.FileInfo{},
+		maxVerified:   maxVerified,
 		active:        map[string]struct{}{},
 	}
 }
@@ -98,6 +111,9 @@ func (s *Service) signalWork() {
 	}
 }
 
+// Start recounts repo's blob cache, moving blobs of the flat layout into
+// shards, then starts workers. A failed recount leaves the counters to the
+// next install or status, which recount them when they are missing.
 func (s *Service) Start(workers int, repo model.RepoConfig) {
 	s.mu.Lock()
 	if s.started || s.stopped {
@@ -107,6 +123,7 @@ func (s *Service) Start(workers int, repo model.RepoConfig) {
 	s.started = true
 	s.background.Add(workers)
 	s.mu.Unlock()
+	_, _ = blobcache.Recount(repo.BlobCacheDir)
 	for i := range workers {
 		// With more than one worker, one is reserved so a read never waits
 		// for a prefetch download. A single worker has to take everything.
@@ -285,6 +302,11 @@ func (s *Service) OpenHydrated(ctx context.Context, repo model.RepoConfig, node 
 		if err != nil {
 			return nil, 0, err
 		}
+		if testHookBeforeOpen != nil {
+			testHookBeforeOpen(cachePath)
+		}
+		// evict-cache can remove the blob after EnsureHydrated validated it.
+		// The next EnsureHydrated hydrates it again.
 		f, err := os.Open(cachePath)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -449,8 +471,20 @@ func sameFileInfo(a, b os.FileInfo) bool {
 
 func (s *Service) rememberVerified(key string, info os.FileInfo) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rememberVerifiedLocked(key, info)
+}
+
+// rememberVerifiedLocked records info as verified. At the cap it first drops
+// an arbitrary entry.
+func (s *Service) rememberVerifiedLocked(key string, info os.FileInfo) {
+	if _, ok := s.verified[key]; !ok && len(s.verified) >= s.maxVerified {
+		for k := range s.verified {
+			delete(s.verified, k)
+			break
+		}
+	}
 	s.verified[key] = info
-	s.mu.Unlock()
 }
 
 func (s *Service) clearVerified(key string) {
@@ -520,7 +554,7 @@ func (s *Service) runVerification(key string, file os.FileInfo, cachePath string
 
 	s.mu.Lock()
 	if err == nil && ok {
-		s.verified[key] = file
+		s.rememberVerifiedLocked(key, file)
 	}
 	waiters := s.verifying.take(key)
 	s.mu.Unlock()
@@ -725,14 +759,19 @@ func (s *Service) hydrate(repo model.RepoConfig, task model.HydrationTask) {
 		s.notifyHydrated(task.RepoID, task.ObjectOID, size)
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
+	staged, err := blobcache.Stage(repo.BlobCacheDir, task.ObjectOID)
+	if err != nil {
 		s.finishHydration(key, result{err: err})
 		return
 	}
 	ctx, cancel := s.fetchContext()
 	defer cancel()
-	size, err := s.fetcher.BlobToCache(ctx, repo, task.ObjectOID, cachePath)
+	size, err := s.fetcher.BlobToCache(ctx, repo, task.ObjectOID, staged)
+	if err == nil {
+		err = blobcache.Install(repo.BlobCacheDir, task.ObjectOID, staged)
+	}
 	if err != nil {
+		_ = os.Remove(staged)
 		s.finishHydration(key, result{err: fmt.Errorf("hydrate %s: %w", task.Path, err)})
 		return
 	}
@@ -743,7 +782,7 @@ func (s *Service) hydrate(repo model.RepoConfig, task model.HydrationTask) {
 		return
 	}
 	if st, statErr := os.Stat(cachePath); statErr == nil {
-		s.verified[key] = st
+		s.rememberVerifiedLocked(key, st)
 	}
 	waits := s.wait.take(key)
 	delete(s.active, key)
@@ -802,7 +841,7 @@ func taskKey(repoID model.RepoID, oid string) string {
 }
 
 func cachePathFor(repo model.RepoConfig, oid string) string {
-	return filepath.Join(repo.BlobCacheDir, oid)
+	return blobcache.Path(repo.BlobCacheDir, oid)
 }
 
 func explicitReadTask(repoID model.RepoID, node model.BaseNode) model.HydrationTask {
