@@ -52,7 +52,7 @@ This fork depends on `github.com/dsfaccini/fuse`, a fork of `jacobsa/fuse` that
 loads macFUSE's FSKit framework at run time, with no cgo. Every macOS build has
 the FSKit backend.
 
-FSKit needs macOS 26 or later and macFUSE 5.3 or later. Enable the `macFUSE`
+FSKit needs macOS 26 or later and macFUSE 5.5 or later. Enable the `macFUSE`
 and `macFUSE (local)` file system extensions under System Settings > General >
 Login Items & Extensions > File System Extensions. FSKit uses this user-space
 file system extension and needs no kernel extension.
@@ -171,7 +171,7 @@ Async existing-clone preparation reports remote configuration, fetch, and branch
 
 Each error the FUSE library reports becomes a `fuse error` record:
 
-- `ERROR`: a bug the library answers with `EIO`. That is a panic it recovers from an op or from a read or write callback, logged with its stack; an op that exits through `runtime.Goexit`; or a reply whose byte count falls outside its buffer.
+- `ERROR`: a bug the library answers with `EIO`. That is a panic it recovers from an op, logged with its stack; an op that exits through `runtime.Goexit`; or a reply whose byte count falls outside its buffer.
 - `WARN`: a reply the kernel refuses, other than with `ENOENT`. On Linux, also a mount whose `FUSE_POLL` setup failed.
 - `DEBUG`: every other failed op, including a request the library cannot decode, because expected errnos such as `EEXIST` fail ops too.
 

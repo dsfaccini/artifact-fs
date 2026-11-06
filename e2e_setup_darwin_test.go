@@ -31,7 +31,7 @@ func skipIfNoFUSE(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const noFSKit = "FSKit is unavailable; it needs macOS 26 or later and macFUSE 5.3 or later"
+	const noFSKit = "FSKit is unavailable; it needs macOS 26 or later and macFUSE 5.5 or later"
 	fskit := fskitAvailable()
 	_, kextErr := unix.SysctlRaw("vfs.generic.macfuse.version.number")
 	switch {
