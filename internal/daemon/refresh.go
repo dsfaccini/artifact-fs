@@ -65,7 +65,7 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 				}
 				ticker.Reset(backoff)
 				s.recordFailure(cfg, phaseFetch, err, time.Now().Add(backoff))
-				s.recordRuntimeState(rt, "")
+				s.recordRuntimeState(rt)
 				continue
 			}
 			state, abErr := s.fetchState(ctx, cfg)

@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -55,15 +56,15 @@ func TestStatusTrustsTheRecordOnlyWhileADaemonRuns(t *testing.T) {
 	if err := ctl.registry.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := ctl.registry.PutRuntime(ctx, model.RepoRuntimeRecord{RepoID: "repo", State: repoStateMounted, ServedGeneration: 3, ServedCommit: strings.Repeat("a", 40)}); err != nil {
+	if err := ctl.registry.PutRuntime(ctx, model.RepoRuntimeRecord{RepoID: "repo", State: repoStateMounted, Phase: phaseServe, ServedGeneration: 3, ServedCommit: strings.Repeat("a", 40)}); err != nil {
 		t.Fatal(err)
 	}
 	st, err := ctl.Status(ctx, "repo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.State != repoStateUnmounted || st.ServedGeneration != 0 {
-		t.Fatalf("status without a daemon = %+v, want unmounted and nothing served", st)
+	if st.State != repoStateUnmounted || st.Phase != "" || st.ServedGeneration != 0 {
+		t.Fatalf("status without a daemon = %+v, want unmounted, no phase and nothing served", st)
 	}
 	lock, err := acquireDaemonLock(ctl.root)
 	if err != nil {
@@ -74,7 +75,7 @@ func TestStatusTrustsTheRecordOnlyWhileADaemonRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.State != repoStateMounted || st.ServedGeneration != 3 || st.CurrentHEADOID != strings.Repeat("a", 40) {
+	if st.State != repoStateMounted || st.Phase != phaseServe || st.ServedGeneration != 3 || st.CurrentHEADOID != strings.Repeat("a", 40) {
 		t.Fatalf("status with a daemon = %+v, want the recorded mount", st)
 	}
 }
@@ -245,4 +246,26 @@ func TestUnmountReportsASupersedingRequest(t *testing.T) {
 	if err := <-errCh; err == nil || !strings.Contains(err.Error(), "superseded") {
 		t.Fatalf("Unmount = %v, want the superseding request", err)
 	}
+}
+
+// The control socket only wakes the daemon early, so a socket path the daemon
+// cannot take over leaves it on the registry poll.
+func TestStartRunsWithoutTheControlSocket(t *testing.T) {
+	// The socket path must fit sun_path, or the daemon skips it before the
+	// step under test.
+	tmp, err := os.MkdirTemp("/tmp", "afs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmp) })
+	svc, ctl := newSyncedDaemonIn(t, tmp)
+	// A directory that is not empty cannot be removed to make room for the socket.
+	if err := os.MkdirAll(filepath.Join(controlSocketPath(svc.root), "keep"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	done := startService(t, svc)
+	waitFor(t, done, func() bool {
+		st, err := ctl.Status(context.Background(), "repo")
+		return err == nil && st.State == repoStateMounted
+	})
 }

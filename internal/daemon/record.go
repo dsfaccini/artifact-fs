@@ -23,8 +23,12 @@ const (
 	phaseFetch         = "fetch"
 )
 
-// runtimePhase is the phase of a runtime in state.
-func runtimePhase(state string) string {
+// runtimePhase is the phase of a runtime in state. A runtime with no FUSE
+// mount serves nothing while the daemon retries the mount.
+func runtimePhase(state string, mounted bool) string {
+	if !mounted {
+		return phaseMount
+	}
 	switch state {
 	case model.PrepareStatePreparing, model.PrepareStateFailed:
 		return phasePrepare
@@ -67,10 +71,10 @@ func (s *Service) recordRuntime(id model.RepoID, update func(*model.RepoRuntimeR
 }
 
 // recordRuntimeState writes rt's state: what it serves, its fetch result and
-// its divergence from the remote. clear names the phase that just succeeded,
-// whose recorded failure it clears. It reads the state under recordMu, so
+// its divergence from the remote. cleared names the phases that just
+// succeeded, whose recorded failure it clears. It reads the state under recordMu, so
 // the last write holds the latest state.
-func (s *Service) recordRuntimeState(rt *repoRuntime, clear string) {
+func (s *Service) recordRuntimeState(rt *repoRuntime, cleared ...string) {
 	s.mu.Lock()
 	id := rt.cfg.ID
 	s.mu.Unlock()
@@ -80,7 +84,7 @@ func (s *Service) recordRuntimeState(rt *repoRuntime, clear string) {
 		}
 		st := rt.state
 		rec.State = st.State
-		rec.Phase = runtimePhase(st.State)
+		rec.Phase = runtimePhase(st.State, rt.mfs != nil)
 		rec.ServedGeneration = st.SnapshotGeneration
 		rec.ServedCommit = st.CurrentHEADOID
 		rec.ServedRef = st.CurrentHEADRef
@@ -90,7 +94,9 @@ func (s *Service) recordRuntimeState(rt *repoRuntime, clear string) {
 		rec.BehindCount = st.BehindCount
 		rec.Diverged = st.Diverged
 		rec.MountRequest = rt.cfg.MountRequest
-		clearFailure(rec, clear)
+		for _, phase := range cleared {
+			clearFailure(rec, phase)
+		}
 	})
 }
 

@@ -38,6 +38,7 @@ func TestFormatStatusLineUsesNeverForUnsetFetch(t *testing.T) {
 		"required_commit=none",
 		"acquisition=not_required",
 		"base_commit=abc123",
+		" phase=none ",
 		"remote_refresh=enabled",
 		"prepare_error=none",
 		"hydrated_blobs=3",

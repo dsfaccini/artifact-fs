@@ -104,7 +104,7 @@ type RepoRuntimeState struct {
 	DirtyOverlay       bool
 	State              string
 	PrepareError       string
-	// MountError is LastError when the mount phase failed last.
+	// MountError is LastError when the mount or serve phase failed last.
 	MountError            string
 	SourceRef             string
 	RequiredCommit        string

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -99,7 +100,10 @@ func TestStatusRedactsAFailedFUSEMount(t *testing.T) {
 	if err := svc.syncRepos(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	requireFailure(t, ctl, phaseMount, "refused")
+	// The daemon retries the mount and serves nothing meanwhile.
+	if st := requireFailure(t, ctl, phaseMount, "refused"); st.Phase != phaseMount {
+		t.Fatalf("phase = %q, want %q", st.Phase, phaseMount)
+	}
 }
 
 // exitingMount is a mount whose FUSE server exits with err when exit closes.
@@ -244,4 +248,85 @@ func TestCloseReleasesTheDaemonLockAfterAFailedUnmount(t *testing.T) {
 		t.Fatalf("daemon after a Close that failed to unmount: %v", err)
 	}
 	next.Close()
+}
+
+// A mount that serves again ends the connection failure before it, so
+// mount_error clears.
+func TestRemountClearsAConnectionFailure(t *testing.T) {
+	// The socket path must fit sun_path, so the remount does not wait for a poll.
+	tmp, err := os.MkdirTemp("/tmp", "afs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmp) })
+	svc, ctl := newSyncedDaemonIn(t, tmp)
+	svc.syncInterval = time.Hour
+	first := &exitingMount{exit: make(chan struct{}), err: errors.New("connection lost")}
+	var mounts atomic.Int32
+	svc.mount = func(cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+		if mounts.Add(1) == 1 {
+			return first, nil
+		}
+		return fakeMount(cfg, engine, gate, logger)
+	}
+	done := startService(t, svc)
+	ctx := context.Background()
+	waitFor(t, done, func() bool {
+		st, err := ctl.Status(ctx, "repo")
+		return err == nil && st.State == repoStateMounted
+	})
+	close(first.exit)
+	waitFor(t, done, func() bool {
+		st, err := ctl.Status(ctx, "repo")
+		return err == nil && st.State == repoStateDegraded && st.LastErrorPhase == phaseServe
+	})
+	if err := ctl.Unmount(ctx, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctl.Remount(ctx, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := ctl.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State != repoStateMounted || st.MountError != "" || st.LastErrorPhase != "" {
+		t.Fatalf("status after a remount that serves = %+v, want mounted with no mount error", st)
+	}
+}
+
+// A preparation that restarts a running repo records the failure to mount
+// its placeholder.
+func TestStatusReportsAFailedPlaceholderMountOnRePrepare(t *testing.T) {
+	ctx := context.Background()
+	svc, err := New(ctx, t.TempDir(), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+	ctl := svc.ctl()
+	if err := ctl.AddRepoWithOptions(ctx, model.RepoConfig{Name: "repo", ID: "repo", RemoteURL: "https://github.com/example/repo.git", Branch: "master", Enabled: true}, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An active runtime whose registry entry asks for another preparation.
+	rt := &repoRuntime{cfg: cfg, gate: fusefs.NewReadyGate(true), active: true, state: model.RepoRuntimeState{RepoID: cfg.ID, State: repoStateMounted}}
+	svc.mu.Lock()
+	svc.running[cfg.ID] = rt
+	svc.mu.Unlock()
+	// A snapshot store a newer build migrated fails the placeholder mount.
+	metatest.Exec(t, cfg.MetaDBPath, `PRAGMA user_version = 99`)
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st, err := ctl.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State != repoStateUnmounted || st.LastErrorPhase != phaseMount || !strings.Contains(st.LastError, "upgrade artifact-fs") || st.NextRetryAt.IsZero() {
+		t.Fatalf("status after a failed placeholder mount = %+v, want unmounted with the mount failure", st)
+	}
 }

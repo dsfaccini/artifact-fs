@@ -364,7 +364,7 @@ func (s *Service) resetRunningPrepareState(cfg model.RepoConfig) bool {
 	rt.state.State = model.PrepareStatePreparing
 	rt.state.PrepareError = ""
 	s.mu.Unlock()
-	s.recordRuntimeState(rt, "")
+	s.recordRuntimeState(rt)
 	return true
 }
 
@@ -693,7 +693,7 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	rt.state.PrepareError = ""
 	s.mu.Unlock()
 	rt.gate.MarkReady()
-	s.recordRuntimeState(rt, "")
+	s.recordRuntimeState(rt)
 	s.startRepoBackground(rt)
 	return nil
 }
@@ -720,7 +720,7 @@ func (s *Service) applyPrepareState(ctx context.Context, cfg model.RepoConfig, s
 			s.mu.Unlock()
 			return nil
 		}
-		defer s.recordRuntimeState(rt, "")
+		defer s.recordRuntimeState(rt)
 		rt.cfg.PrepareState = state
 		rt.cfg.PrepareError = msg
 		rt.state.PrepareError = msg

@@ -45,8 +45,9 @@ func persistedStatus(ctx context.Context, cfg model.RepoConfig, rec model.RepoRu
 	}
 	// The last failure stays visible after the daemon stops, but nothing
 	// retries it.
-	st.Phase, st.LastError, st.LastErrorPhase, st.LastErrorAt, st.Attempts = rec.Phase, rec.LastError, rec.LastErrorPhase, rec.LastErrorAt, rec.Attempts
+	st.LastError, st.LastErrorPhase, st.LastErrorAt, st.Attempts = rec.LastError, rec.LastErrorPhase, rec.LastErrorAt, rec.Attempts
 	if live {
+		st.Phase = rec.Phase
 		st.NextRetryAt = rec.NextRetryAt
 		st.ServedHEADOID, st.ServedHEADRef, st.ServedGeneration = rec.ServedCommit, rec.ServedRef, rec.ServedGeneration
 		st.AheadCount, st.BehindCount, st.Diverged = rec.AheadCount, rec.BehindCount, rec.Diverged

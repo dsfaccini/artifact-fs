@@ -167,15 +167,16 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 // recordStartedRuntime records a runtime that started, with the error of its
 // first mount, which the next registry sync retries.
 func (s *Service) recordStartedRuntime(rt *repoRuntime, mountErr error) {
-	cleared := phaseMount
 	if mountErr != nil {
 		s.mu.Lock()
 		cfg := rt.cfg
 		s.mu.Unlock()
 		s.recordFailure(cfg, phaseMount, mountErr, time.Now().Add(registrySyncInterval))
-		cleared = ""
+		s.recordRuntimeState(rt)
+		return
 	}
-	s.recordRuntimeState(rt, cleared)
+	// A mount that serves again ends an earlier connection failure.
+	s.recordRuntimeState(rt, phaseMount, phaseServe)
 }
 
 // mountFS mounts cfg through s.mount and logs the outcome. Its caller
@@ -272,13 +273,15 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 	}
 	done := make(chan struct{})
 	rt.joinDone = done
+	// Preparation replaces rt.cfg under s.mu.
+	mountPath := rt.cfg.MountPath
 	s.mu.Unlock()
 	go func() {
 		// Join's error is fatal to the connection, and the dead mount can
 		// still hold the mount point. Join also returns nil after an abort,
 		// which leaves the dead mount in place.
 		connErr := mfs.Join(context.Background())
-		if connErr == nil && mountPointHeld(rt.cfg.MountPath) {
+		if connErr == nil && mountPointHeld(mountPath) {
 			connErr = errConnectionEndedMounted
 		}
 		s.mu.Lock()
@@ -312,7 +315,7 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 			if !failed {
 				s.recordFailure(cfg, phaseServe, errFUSEServerExited, nextRetry)
 			}
-			s.recordRuntimeState(rt, "")
+			s.recordRuntimeState(rt)
 		}
 	}()
 }
@@ -323,12 +326,13 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 func (s *Service) unmountFailedMount(rt *repoRuntime) error {
 	s.mu.Lock()
 	mfs := rt.failedMount
+	name, mountPath := rt.cfg.Name, rt.cfg.MountPath
 	s.mu.Unlock()
 	if mfs == nil {
 		return nil
 	}
-	if err := mfs.Unmount(); err != nil && mountPointHeld(rt.cfg.MountPath) {
-		return fmt.Errorf("unmount %s after its connection failed: %w", rt.cfg.Name, err)
+	if err := mfs.Unmount(); err != nil && mountPointHeld(mountPath) {
+		return fmt.Errorf("unmount %s after its connection failed: %w", name, err)
 	}
 	s.mu.Lock()
 	rt.failedMount = nil
@@ -435,8 +439,7 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 	s.mu.Unlock()
 	if !stopping {
 		s.configureStatusOptimization(rt.ctx, cfg)
-		s.recordRuntimeState(rt, phaseMount)
-		s.recordRuntime(cfg.ID, func(rec *model.RepoRuntimeRecord) { clearFailure(rec, phaseServe) })
+		s.recordRuntimeState(rt, phaseMount, phaseServe)
 	}
 	s.joinRuntimeMount(rt)
 }
