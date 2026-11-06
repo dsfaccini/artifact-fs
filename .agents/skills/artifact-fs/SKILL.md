@@ -33,6 +33,7 @@ go build -o artifact-fs ./cmd/artifact-fs
 | Mount all registered repos | `./artifact-fs daemon --root <mount-root>` |
 | Check mount and overlay state | `./artifact-fs status --name <name>` |
 | List registered repos | `./artifact-fs list-repos` |
+| Shrink a repo's blob cache | `./artifact-fs evict-cache --name <name> --max-bytes <bytes>`; evicts least recently accessed blobs, never automatic |
 | Unmount and remove a repo | `./artifact-fs remove-repo --name <name>`; the running daemon unmounts it at its next registry poll |
 | Remount all repos | Stop the daemon and start it again. `unmount` and `remount` cannot reach a running daemon and exit non-zero |
 

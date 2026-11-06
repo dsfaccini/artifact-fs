@@ -13,6 +13,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
@@ -1117,7 +1118,7 @@ func TestFirstFileReadPrefetchesItsDirectoryAndListingPrefetchesNothing(t *testi
 		t.Fatalf("packs = %d after reading the prefetched siblings, want %d", got, packs+2)
 	}
 	for _, path := range []string{"docs/guide.md", "top.txt"} {
-		if _, err := os.Stat(filepath.Join(repo.BlobCacheDir, oids[path])); err == nil {
+		if _, err := os.Stat(blobcache.Path(repo.BlobCacheDir, oids[path])); err == nil {
 			t.Fatalf("%s was hydrated though nothing in its directory was read", path)
 		}
 	}
@@ -1348,7 +1349,7 @@ func readWholeFile(t *testing.T, fs *ArtifactFuse, inode fuseops.InodeID) string
 func waitForCachedBlob(t *testing.T, repo model.RepoConfig, oid string) {
 	t.Helper()
 	for {
-		if _, err := os.Stat(filepath.Join(repo.BlobCacheDir, oid)); err == nil {
+		if _, err := os.Stat(blobcache.Path(repo.BlobCacheDir, oid)); err == nil {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
