@@ -350,7 +350,7 @@ func TestStatusKeepsAConnectionFailureAtStart(t *testing.T) {
 		return mfs, nil
 	}
 	// The daemon records the started runtime only after the connection failed.
-	runtimeStarted = func() {
+	svc.runtimeStarted = func() {
 		waitFor(t, nil, func() bool {
 			svc.mu.Lock()
 			defer svc.mu.Unlock()
@@ -358,7 +358,6 @@ func TestStatusKeepsAConnectionFailureAtStart(t *testing.T) {
 			return rec != nil && rec.State == repoStateDegraded
 		})
 	}
-	t.Cleanup(func() { runtimeStarted = func() {} })
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -434,6 +433,7 @@ func TestRetryClearsAConnectionFailure(t *testing.T) {
 		rec := svc.records["repo"]
 		return rt.mfs == nil && rt.failedMount == nil && rec != nil && rec.State == repoStateDegraded
 	})
+	requireFailure(t, ctl, phaseServe, "connection lost")
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -443,6 +443,29 @@ func TestRetryClearsAConnectionFailure(t *testing.T) {
 	}
 	if st.State != repoStateMounted || st.MountError != "" || st.LastErrorPhase != "" {
 		t.Fatalf("status after a retry that serves = %+v, want mounted with no mount error", st)
+	}
+}
+
+// A FUSE server that exits cleanly while the daemon serves its repo is a
+// serve failure.
+func TestStatusReportsACleanFUSEExit(t *testing.T) {
+	svc, ctl := newSyncedDaemon(t)
+	mfs := &exitingMount{exit: make(chan struct{})}
+	svc.mount = func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+		return mfs, nil
+	}
+	if err := svc.syncRepos(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(mfs.exit)
+	waitFor(t, nil, func() bool {
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		rec := svc.records["repo"]
+		return rec != nil && rec.State == repoStateDegraded
+	})
+	if st := requireFailure(t, ctl, phaseServe, errFUSEServerExited.Error()); st.MountError != errFUSEServerExited.Error() {
+		t.Fatalf("mount_error = %q, want %q", st.MountError, errFUSEServerExited)
 	}
 }
 
@@ -465,15 +488,23 @@ func TestRetryInACleanExitWindowClearsTheExit(t *testing.T) {
 	svc.mu.Lock()
 	rt := svc.running["repo"]
 	svc.mu.Unlock()
+	var released atomic.Bool
+	var retryErr error
 	retried := make(chan struct{})
 	joined := make(chan struct{})
 	var joinOnce sync.Once
-	mountReleased = func() {
+	svc.mountReleased = func() {
+		released.Store(true)
 		go func() {
-			svc.retryRuntimeMount(rt)
+			retryErr = svc.syncRepos(ctx)
 			close(retried)
 		}()
 		waitFor(t, nil, func() bool {
+			select {
+			case <-retried:
+				return true
+			default:
+			}
 			svc.mu.Lock()
 			defer svc.mu.Unlock()
 			return rt.mfs != nil
@@ -485,11 +516,16 @@ func TestRetryInACleanExitWindowClearsTheExit(t *testing.T) {
 			<-retried
 		}
 	}
-	joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
-	t.Cleanup(func() { mountReleased, joinFinished = func() {}, func() {} })
+	svc.joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
 	close(first.exit)
-	<-retried
 	<-joined
+	if !released.Load() {
+		t.Fatal("the join goroutine ended without releasing a cleanly exited mount")
+	}
+	<-retried
+	if retryErr != nil {
+		t.Fatal(retryErr)
+	}
 	st, err := ctl.Status(ctx, "repo")
 	if err != nil {
 		t.Fatal(err)

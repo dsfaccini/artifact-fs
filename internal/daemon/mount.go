@@ -159,7 +159,7 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 	}
 	s.clearMountFailures(cfg, mountErr)
 	s.startRuntime(rt)
-	runtimeStarted()
+	runHook(s.runtimeStarted)
 	s.recordStartedRuntime(rt, mountErr)
 	s.startRepoBackground(rt)
 
@@ -192,9 +192,12 @@ func (s *Service) clearMountFailures(cfg model.RepoConfig, mountErr error) {
 	})
 }
 
-// runtimeStarted runs between starting a runtime and recording it. Tests
-// replace it to fail the connection in that window.
-var runtimeStarted = func() {}
+// runHook runs a test hook of Service when a test set it.
+func runHook(hook func()) {
+	if hook != nil {
+		hook()
+	}
+}
 
 // mountFS mounts cfg through s.mount and logs the outcome. Its caller
 // records a failure with the time of the retry.
@@ -278,7 +281,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 	}
 	s.clearMountFailures(cfg, mountErr)
 	s.startRuntime(rt)
-	runtimeStarted()
+	runHook(s.runtimeStarted)
 	s.recordStartedRuntime(rt, mountErr)
 	return nil
 }
@@ -335,24 +338,16 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 		}
 		s.mu.Unlock()
 		if exited && !failed {
-			mountReleased()
+			runHook(s.mountReleased)
 			s.recordFailureLocked(cfg, phaseServe, errFUSEServerExited, nextRetry)
 		}
 		s.recordMu.Unlock()
 		if exited {
 			s.recordRuntimeState(rt)
 		}
-		joinFinished()
+		runHook(s.joinFinished)
 	}()
 }
-
-// mountReleased runs in the join goroutine after it released a FUSE mount
-// whose server exited cleanly, before it records the exit. joinFinished runs
-// as the goroutine ends. Tests replace them to retry the mount in that window.
-var (
-	mountReleased = func() {}
-	joinFinished  = func() {}
-)
 
 // unmountFailedMount unmounts the mount whose connection failed, so that no
 // mount lands on top of it. A failed unmount leaves it for the next call

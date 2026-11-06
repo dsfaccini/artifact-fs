@@ -99,6 +99,11 @@ type Service struct {
 	*core
 	mount                mountFunc
 	hydrationConcurrency int
+	// Test hooks, nil in production. runtimeStarted runs between starting a
+	// runtime and recording it. mountReleased runs in a join goroutine after
+	// it released a FUSE mount whose server exited cleanly, before it records
+	// the exit. joinFinished runs as a join goroutine ends.
+	runtimeStarted, mountReleased, joinFinished func()
 	// headReconcileBackoff is the first retry delay after a failed HEAD
 	// reconcile; zero means headReconcileMinBackoff.
 	headReconcileBackoff time.Duration
