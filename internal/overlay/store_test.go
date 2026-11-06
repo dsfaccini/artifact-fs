@@ -2058,3 +2058,97 @@ func TestListByPrefixShowsUnflushedWriteSize(t *testing.T) {
 		t.Fatalf("ListByPrefix(d) = %+v, want d/f.txt with size 9", entries)
 	}
 }
+
+// A listing that runs while a flush commits must report the size of writes
+// that completed before the listing began.
+func TestListByPrefixDuringFlushShowsCompletedWrites(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "d/f.txt", "x")
+	if err := s.FlushFile(ctx, "d/f.txt"); err != nil {
+		t.Fatal(err)
+	}
+	size := int64(1)
+	stale, calls := 0, 0
+	for i := range 3000 {
+		for range 2 {
+			if _, err := s.WriteFile(ctx, "d/f.txt", size, []byte("y")); err != nil {
+				t.Fatal(err)
+			}
+			size++
+		}
+		done := make(chan error, 1)
+		go func() { done <- s.FlushFile(ctx, "d/f.txt") }()
+	loop:
+		for {
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+				break loop
+			default:
+			}
+			entries, err := s.ListByPrefix(ctx, "d")
+			if err != nil || len(entries) != 1 {
+				t.Fatal(entries, err)
+			}
+			calls++
+			if entries[0].SizeBytes != size {
+				stale++
+				if stale == 1 {
+					t.Logf("iteration %d: listed size %d after writes reached %d", i, entries[0].SizeBytes, size)
+				}
+			}
+		}
+	}
+	t.Logf("%d listings", calls)
+	if stale > 0 {
+		t.Fatalf("%d listings during a flush returned a size older than completed writes", stale)
+	}
+}
+
+// open(2) with O_CREAT and a read-only mode returns a writable descriptor,
+// and a chmod leaves an open descriptor writable. Their writes must succeed
+// however other mutations interleave, while the entry keeps the mode.
+func TestReadOnlyModeFileAcceptsWrites(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	write := func(step string, off int64, data string) {
+		t.Helper()
+		if _, err := s.WriteFile(ctx, "ro.txt", off, []byte(data)); err != nil {
+			t.Fatalf("write %s: %v", step, err)
+		}
+	}
+	if _, err := s.CreateFile(ctx, "ro.txt", 0o444); err != nil {
+		t.Fatal(err)
+	}
+	write("after the create", 0, "one")
+	if err := s.Mkdir(ctx, "d", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write("after an unrelated mkdir", 3, "two")
+	if err := s.SetMode(ctx, "ro.txt", 0o444); err != nil {
+		t.Fatal(err)
+	}
+	write("after a chmod", 6, "six")
+	e, _ := s.Get("ro.txt")
+	if err := s.FlushFile(ctx, "ro.txt"); err != nil {
+		t.Fatal(err)
+	}
+	// An earlier version left the backing file read-only.
+	if err := os.Chmod(e.BackingPath, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	write("to a read-only backing file", 9, "ten")
+	if err := os.Chmod(e.BackingPath, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Truncate(ctx, "ro.txt", 6); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	e, _ = s.Get("ro.txt")
+	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "onetwo" || e.Mode&0o777 != 0o444 {
+		t.Fatalf("ro.txt = %q, %v, mode %o; want onetwo and mode 444", data, err, e.Mode&0o777)
+	}
+}

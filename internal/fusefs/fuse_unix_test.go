@@ -1573,6 +1573,34 @@ func TestReleasingAReaderLeavesAnotherHandlesWritesCoalescing(t *testing.T) {
 	}
 }
 
+// A create and close with no write, as touch does, leaves no pending row.
+func TestCreateThenCloseClearsPending(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	ov, err := overlaystore.New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ov.Close() })
+	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{}}, Overlay: ov}
+	resolver.SetGeneration(1)
+	fs := NewArtifactFuse(cfg, &Engine{Repo: cfg, Resolver: resolver, Overlay: ov})
+	create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "f.txt", Mode: 0o644}
+	if err := fs.CreateFile(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.FlushFile(ctx, &fuseops.FlushFileOp{Inode: create.Entry.Child, Handle: create.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	if size, pending := committedOverlay(t, cfg.OverlayDBPath, "f.txt"); size != 0 || pending != 0 {
+		t.Fatalf("after create and close: committed size %d, pending rows %d; want 0 and 0", size, pending)
+	}
+}
+
 // committedOverlay reads path's committed size and the pending row count
 // straight from the database, past the store's in-memory values.
 func committedOverlay(t *testing.T, dbPath, path string) (size int64, pending int) {

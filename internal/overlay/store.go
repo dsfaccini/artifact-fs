@@ -314,12 +314,12 @@ func (s *Store) EnsureCopyOnWriteFrom(ctx context.Context, _ model.RepoConfig, p
 		return model.OverlayEntry{}, err
 	}
 	if src != nil {
-		if err := copyFileFrom(src, backing, os.FileMode(base.Mode)); err != nil {
+		if err := copyFileFrom(src, backing, backingFileMode(base.Mode)); err != nil {
 			os.Remove(backing)
 			return model.OverlayEntry{}, fmt.Errorf("copy-on-write %s: %w", path, err)
 		}
 	}
-	if err := os.Chmod(backing, os.FileMode(base.Mode)); err != nil {
+	if err := os.Chmod(backing, backingFileMode(base.Mode)); err != nil {
 		os.Remove(backing)
 		return model.OverlayEntry{}, err
 	}
@@ -358,7 +358,7 @@ func (s *Store) CreateFile(ctx context.Context, path string, mode uint32) (model
 		return model.OverlayEntry{}, err
 	}
 	backing := f.Name()
-	if err := f.Chmod(os.FileMode(mode)); err != nil {
+	if err := f.Chmod(backingFileMode(mode)); err != nil {
 		f.Close()
 		os.Remove(backing)
 		return model.OverlayEntry{}, err
@@ -454,7 +454,12 @@ func (s *Store) WriteFile(ctx context.Context, path string, off int64, data []by
 	if !ok || e.IsDeleted() {
 		return 0, os.ErrNotExist
 	}
-	f, err := os.OpenFile(e.BackingPath, os.O_WRONLY|os.O_CREATE, os.FileMode(e.Mode))
+	var f *os.File
+	err = retryWithOwnerAccess(e.BackingPath, e.Mode, func() error {
+		var openErr error
+		f, openErr = os.OpenFile(e.BackingPath, os.O_WRONLY|os.O_CREATE, backingFileMode(e.Mode))
+		return openErr
+	})
 	if err != nil {
 		return 0, err
 	}
@@ -623,7 +628,7 @@ func (s *Store) Truncate(ctx context.Context, path string, size int64) error {
 	if !ok || e.IsDeleted() {
 		return os.ErrNotExist
 	}
-	if err := os.Truncate(e.BackingPath, size); err != nil {
+	if err := retryWithOwnerAccess(e.BackingPath, e.Mode, func() error { return os.Truncate(e.BackingPath, size) }); err != nil {
 		return err
 	}
 	now := time.Now().UnixNano()
@@ -1091,7 +1096,11 @@ func (s *Store) SetMode(ctx context.Context, path string, mode uint32) error {
 	}
 	e.Mode = e.Mode&^0o777 | mode&0o777
 	if e.BackingPath != "" {
-		if err := os.Chmod(e.BackingPath, os.FileMode(e.Mode)); err != nil {
+		perm := backingFileMode(e.Mode)
+		if e.Kind == model.OverlayKindMkdir {
+			perm = os.FileMode(e.Mode)
+		}
+		if err := os.Chmod(e.BackingPath, perm); err != nil {
 			return err
 		}
 	}
@@ -1753,6 +1762,28 @@ func copyFileContents(src string, dst string, mode os.FileMode) error {
 	}
 	defer f.Close()
 	return copyFileFrom(f, dst, mode)
+}
+
+// backingFileMode is the permission of a file's backing file. The entry holds
+// the mode the mount reports; the backing file stays readable and writable by
+// its owner, so the store can reopen it for a descriptor that may write, such
+// as one open(2) returned with O_CREAT and a read-only mode.
+func backingFileMode(mode uint32) os.FileMode {
+	return os.FileMode(mode).Perm() | 0o600
+}
+
+// retryWithOwnerAccess runs op on the backing file at path. When the file
+// refuses op for permission, as one an earlier version left read-only does,
+// it grants the owner read and write and runs op again.
+func retryWithOwnerAccess(path string, mode uint32, op func() error) error {
+	err := op()
+	if !errors.Is(err, iofs.ErrPermission) {
+		return err
+	}
+	if chmodErr := os.Chmod(path, backingFileMode(mode)); chmodErr != nil {
+		return errors.Join(err, chmodErr)
+	}
+	return op()
 }
 
 func copyFileFrom(src *os.File, dst string, mode os.FileMode) error {
