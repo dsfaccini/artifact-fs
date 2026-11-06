@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -32,6 +33,14 @@ func newSyncedDaemon(t *testing.T) (*Service, *Controller) {
 // under tmp.
 func newSyncedDaemonIn(t *testing.T, tmp string) (*Service, *Controller) {
 	t.Helper()
+	return newDaemonWithRepo(t, tmp, AddRepoOptions{})
+}
+
+// newDaemonWithRepo is a daemon, not started, with one repo added with opts
+// from a local repository, and a controller on its root. Its state root and
+// repositories are under tmp.
+func newDaemonWithRepo(t *testing.T, tmp string, opts AddRepoOptions) (*Service, *Controller) {
+	t.Helper()
 	ctx := context.Background()
 	remote := filepath.Join(tmp, "remote")
 	runCmd(t, "git", "init", "--initial-branch", "main", remote)
@@ -48,7 +57,7 @@ func newSyncedDaemonIn(t *testing.T, tmp string) (*Service, *Controller) {
 	t.Cleanup(func() { _ = svc.Close() })
 	svc.SetMountRoot(filepath.Join(tmp, "mnt"))
 	svc.mount = fakeMount
-	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", RefreshInterval: time.Hour, Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", RefreshInterval: time.Hour, Enabled: true}, opts); err != nil {
 		t.Fatal(err)
 	}
 	ctl, err := NewController(ctx, root, discardLogger())
@@ -359,5 +368,133 @@ func TestStatusKeepsAConnectionFailureAtStart(t *testing.T) {
 	}
 	if st.State != repoStateDegraded || st.LastErrorPhase != phaseServe || st.MountError != "connection lost" {
 		t.Fatalf("status after the connection failed at start = %+v, want degraded with the serve failure", st)
+	}
+}
+
+// An async repo's mount that serves ends the mount failure before it, so
+// mount_error clears.
+func TestAsyncMountClearsAnEarlierMountFailure(t *testing.T) {
+	svc, ctl := newDaemonWithRepo(t, t.TempDir(), AddRepoOptions{Async: true})
+	ctx := context.Background()
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.fillPaths(&cfg)
+	if err := os.MkdirAll(filepath.Dir(cfg.MetaDBPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A snapshot store a newer build migrated fails the placeholder mount.
+	metatest.Exec(t, cfg.MetaDBPath, `PRAGMA user_version = 99`)
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	requireFailure(t, ctl, phaseMount, "upgrade artifact-fs")
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if err := os.Remove(cfg.MetaDBPath + suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st, err := ctl.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.MountError != "" || st.LastErrorPhase != "" {
+		t.Fatalf("status after an async mount that serves = %+v, want no mount error", st)
+	}
+}
+
+// The daemon's retry of a runtime whose connection failed ends that failure
+// once the new mount serves, so mount_error clears.
+func TestRetryClearsAConnectionFailure(t *testing.T) {
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	first := &exitingMount{exit: make(chan struct{}), err: errors.New("connection lost")}
+	var mounts atomic.Int32
+	svc.mount = func(cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+		if mounts.Add(1) == 1 {
+			return first, nil
+		}
+		return fakeMount(cfg, engine, gate, logger)
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.Lock()
+	rt := svc.running["repo"]
+	svc.mu.Unlock()
+	close(first.exit)
+	// The failed mount is unmounted and its failure recorded.
+	waitFor(t, nil, func() bool {
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		rec := svc.records["repo"]
+		return rt.mfs == nil && rt.failedMount == nil && rec != nil && rec.State == repoStateDegraded
+	})
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st, err := ctl.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State != repoStateMounted || st.MountError != "" || st.LastErrorPhase != "" {
+		t.Fatalf("status after a retry that serves = %+v, want mounted with no mount error", st)
+	}
+}
+
+// A retry that mounts between the join goroutine releasing a cleanly exited
+// FUSE mount and recording the exit clears that exit.
+func TestRetryInACleanExitWindowClearsTheExit(t *testing.T) {
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	first := &exitingMount{exit: make(chan struct{})}
+	var mounts atomic.Int32
+	svc.mount = func(cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+		if mounts.Add(1) == 1 {
+			return first, nil
+		}
+		return fakeMount(cfg, engine, gate, logger)
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.Lock()
+	rt := svc.running["repo"]
+	svc.mu.Unlock()
+	retried := make(chan struct{})
+	joined := make(chan struct{})
+	var joinOnce sync.Once
+	mountReleased = func() {
+		go func() {
+			svc.retryRuntimeMount(rt)
+			close(retried)
+		}()
+		waitFor(t, nil, func() bool {
+			svc.mu.Lock()
+			defer svc.mu.Unlock()
+			return rt.mfs != nil
+		})
+		// The retry mounted. When the join goroutine does not hold recordMu,
+		// the retry records first, so the exit is recorded after it.
+		if svc.recordMu.TryLock() {
+			svc.recordMu.Unlock()
+			<-retried
+		}
+	}
+	joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
+	t.Cleanup(func() { mountReleased, joinFinished = func() {}, func() {} })
+	close(first.exit)
+	<-retried
+	<-joined
+	st, err := ctl.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State != repoStateMounted || st.LastError != "" {
+		t.Fatalf("status after a retry that serves = %+v, want mounted with no failure", st)
 	}
 }

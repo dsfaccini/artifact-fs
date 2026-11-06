@@ -335,14 +335,24 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 		}
 		s.mu.Unlock()
 		if exited && !failed {
+			mountReleased()
 			s.recordFailureLocked(cfg, phaseServe, errFUSEServerExited, nextRetry)
 		}
 		s.recordMu.Unlock()
 		if exited {
 			s.recordRuntimeState(rt)
 		}
+		joinFinished()
 	}()
 }
+
+// mountReleased runs in the join goroutine after it released a FUSE mount
+// whose server exited cleanly, before it records the exit. joinFinished runs
+// as the goroutine ends. Tests replace them to retry the mount in that window.
+var (
+	mountReleased = func() {}
+	joinFinished  = func() {}
+)
 
 // unmountFailedMount unmounts the mount whose connection failed, so that no
 // mount lands on top of it. A failed unmount leaves it for the next call

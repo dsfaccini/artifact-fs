@@ -149,7 +149,7 @@ Check the state of a mounted repo with `status`:
 | `remote_refresh` | Whether daemon and manual remote refreshes are enabled |
 | `ahead` / `behind` / `diverged` | Divergence from the remote at the daemon's last successful refresh |
 | `prepare_error` | Last redacted preparation error, if any |
-| `mount_error` | `last_error` when mounting the repo failed last (phase `mount`: opening its stores, reconciling the overlay, preparing the index or the FUSE mount itself) or its FUSE connection failed (phase `serve`); a mount that serves clears it |
+| `mount_error` | `last_error` when any step of mounting the repo failed last (phase `mount`: from cloning or fetching its source and building its snapshot to the FUSE mount itself, including unmounting a dead mount before a retry) or its FUSE connection failed (phase `serve`); a mount that serves clears it |
 | `last_error` / `last_error_phase` / `last_error_at` | Last redacted failure the daemon retries, the phase that failed (`mount`, `serve`, `unmount`, `head_reconcile`, `fetch` or `registry_sync`) and when. `serve` is a FUSE connection that failed or exited. A success of that phase clears it |
 | `next_retry` / `attempts` | When the daemon retries the failed phase, and how many times in a row it failed; `next_retry` is `none` when no daemon runs |
 | `hydrated_blobs` / `hydrated_bytes` | Blob count and bytes in the repo's blob cache, read from counters kept with the cache (see [Evicting the blob cache](#evicting-the-blob-cache)) |
