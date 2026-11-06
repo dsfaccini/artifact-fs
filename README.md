@@ -132,7 +132,7 @@ Check the state of a mounted repo with `status`:
 
 ```bash
 ./artifact-fs status --name workers-sdk
-# repo=workers-sdk state=mounted head=d4c61587... ref=main source_ref=refs/heads/main required_commit=none acquisition=not_required base_commit=d4c61587... served_commit=d4c61587... served_generation=3 published_commit=d4c61587... published_generation=3 remote_refresh=enabled ahead=0 behind=0 diverged=false last_fetch=2026-03-27T12:00:00Z result=ok prepare_error=none mount_error=none last_error=none last_error_phase=none last_error_at=none next_retry=none attempts=0 hydrated_blobs=42 hydrated_bytes=131072 overlay_dirty=false
+# repo=workers-sdk state=mounted head=d4c61587... ref=main source_ref=refs/heads/main required_commit=none acquisition=not_required base_commit=d4c61587... served_commit=d4c61587... served_generation=3 published_commit=d4c61587... published_generation=3 phase=serve remote_refresh=enabled ahead=0 behind=0 diverged=false last_fetch=2026-03-27T12:00:00Z result=ok prepare_error=none mount_error=none last_error=none last_error_phase=none last_error_at=none next_retry=none attempts=0 hydrated_blobs=42 hydrated_bytes=131072 overlay_dirty=false
 ```
 
 | Field | Meaning |
@@ -145,6 +145,7 @@ Check the state of a mounted repo with `status`:
 | `base_commit` | The served commit while the daemon serves the repo, otherwise the published one |
 | `served_commit` / `served_generation` | Commit and snapshot generation the daemon's mount serves; `none`/`0` when no daemon serves the repo |
 | `published_commit` / `published_generation` | Commit and generation the snapshot store last published. After a failed overlay transition they run ahead of the served ones until the daemon's retry succeeds |
+| `phase` | The step the daemon's runtime for the repo is in: `prepare` (async preparation), `mount`, `serve` or `unmount`; `none` before the daemon records one |
 | `remote_refresh` | Whether daemon and manual remote refreshes are enabled |
 | `ahead` / `behind` / `diverged` | Divergence from the remote at the daemon's last successful refresh |
 | `prepare_error` | Last redacted preparation error, if any |

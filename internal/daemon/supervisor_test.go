@@ -365,7 +365,7 @@ func TestRemoveRepoUnmountsFailedConnectionLeftMounted(t *testing.T) {
 	m.releaseRemount()
 	// remove-repo runs in its own process, so the daemon's registry poll stops the runtime.
 	ctx := context.Background()
-	cliSvc, err := New(ctx, d.root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cliSvc, err := NewController(ctx, d.root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
