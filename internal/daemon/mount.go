@@ -157,7 +157,9 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 	if mfs == nil {
 		rt.state.State = repoStateDegraded
 	}
+	s.clearMountFailures(cfg, mountErr)
 	s.startRuntime(rt)
+	runtimeStarted()
 	s.recordStartedRuntime(rt, mountErr)
 	s.startRepoBackground(rt)
 
@@ -172,12 +174,27 @@ func (s *Service) recordStartedRuntime(rt *repoRuntime, mountErr error) {
 		cfg := rt.cfg
 		s.mu.Unlock()
 		s.recordFailure(cfg, phaseMount, mountErr, time.Now().Add(registrySyncInterval))
-		s.recordRuntimeState(rt)
+	}
+	s.recordRuntimeState(rt)
+}
+
+// clearMountFailures clears cfg's mount and connection failures once its
+// mount succeeded: a mount that serves ends them. It runs before the runtime
+// starts, because the new connection can fail at once and that failure must
+// stay.
+func (s *Service) clearMountFailures(cfg model.RepoConfig, mountErr error) {
+	if mountErr != nil {
 		return
 	}
-	// A mount that serves again ends an earlier connection failure.
-	s.recordRuntimeState(rt, phaseMount, phaseServe)
+	s.recordRuntime(cfg.ID, func(rec *model.RepoRuntimeRecord) {
+		clearFailure(rec, phaseMount)
+		clearFailure(rec, phaseServe)
+	})
 }
+
+// runtimeStarted runs between starting a runtime and recording it. Tests
+// replace it to fail the connection in that window.
+var runtimeStarted = func() {}
 
 // mountFS mounts cfg through s.mount and logs the outcome. Its caller
 // records a failure with the time of the retry.
@@ -259,7 +276,9 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 			PrepareError:       cfg.PrepareError,
 		},
 	}
+	s.clearMountFailures(cfg, mountErr)
 	s.startRuntime(rt)
+	runtimeStarted()
 	s.recordStartedRuntime(rt, mountErr)
 	return nil
 }
@@ -303,6 +322,10 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 			}
 		}
 		close(done)
+		// A retry may mount once rt.mfs is nil, and it clears the serve
+		// failure. Holding recordMu until the clean exit is recorded keeps
+		// that clear after it.
+		s.recordMu.Lock()
 		s.mu.Lock()
 		exited := failed || !rt.stopping && !rt.detached && rt.mfs == mfs
 		if exited {
@@ -311,10 +334,11 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 			rt.state.State = repoStateDegraded
 		}
 		s.mu.Unlock()
+		if exited && !failed {
+			s.recordFailureLocked(cfg, phaseServe, errFUSEServerExited, nextRetry)
+		}
+		s.recordMu.Unlock()
 		if exited {
-			if !failed {
-				s.recordFailure(cfg, phaseServe, errFUSEServerExited, nextRetry)
-			}
 			s.recordRuntimeState(rt)
 		}
 	}()

@@ -54,6 +54,11 @@ var errFUSEServerExited = errors.New("FUSE server exited")
 func (s *Service) recordRuntime(id model.RepoID, update func(*model.RepoRuntimeRecord)) {
 	s.recordMu.Lock()
 	defer s.recordMu.Unlock()
+	s.recordRuntimeLocked(id, update)
+}
+
+// recordRuntimeLocked is recordRuntime for a caller that holds recordMu.
+func (s *Service) recordRuntimeLocked(id model.RepoID, update func(*model.RepoRuntimeRecord)) {
 	s.mu.Lock()
 	rec := s.records[id]
 	if rec == nil {
@@ -114,9 +119,16 @@ func (s *Service) recordStopped(cfg model.RepoConfig) {
 // recordFailure records err, redacted, as a failure of phase that the daemon
 // retries at nextRetry. A zero nextRetry means nothing retries it.
 func (s *Service) recordFailure(cfg model.RepoConfig, phase string, err error, nextRetry time.Time) {
+	s.recordMu.Lock()
+	defer s.recordMu.Unlock()
+	s.recordFailureLocked(cfg, phase, err, nextRetry)
+}
+
+// recordFailureLocked is recordFailure for a caller that holds recordMu.
+func (s *Service) recordFailureLocked(cfg model.RepoConfig, phase string, err error, nextRetry time.Time) {
 	msg := auth.RedactLogString(err.Error(), cfg.RemoteURL)
 	now := time.Now()
-	s.recordRuntime(cfg.ID, func(rec *model.RepoRuntimeRecord) {
+	s.recordRuntimeLocked(cfg.ID, func(rec *model.RepoRuntimeRecord) {
 		if rec.LastErrorPhase == phase && rec.LastError != "" {
 			rec.Attempts++
 		} else {

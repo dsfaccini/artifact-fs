@@ -330,3 +330,34 @@ func TestStatusReportsAFailedPlaceholderMountOnRePrepare(t *testing.T) {
 		t.Fatalf("status after a failed placeholder mount = %+v, want unmounted with the mount failure", st)
 	}
 }
+
+// A connection that fails as its runtime starts keeps its failure in status.
+func TestStatusKeepsAConnectionFailureAtStart(t *testing.T) {
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("connection lost")}
+	close(mfs.exit)
+	svc.mount = func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+		return mfs, nil
+	}
+	// The daemon records the started runtime only after the connection failed.
+	runtimeStarted = func() {
+		waitFor(t, nil, func() bool {
+			svc.mu.Lock()
+			defer svc.mu.Unlock()
+			rec := svc.records["repo"]
+			return rec != nil && rec.State == repoStateDegraded
+		})
+	}
+	t.Cleanup(func() { runtimeStarted = func() {} })
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st, err := ctl.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State != repoStateDegraded || st.LastErrorPhase != phaseServe || st.MountError != "connection lost" {
+		t.Fatalf("status after the connection failed at start = %+v, want degraded with the serve failure", st)
+	}
+}
