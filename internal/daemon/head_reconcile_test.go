@@ -148,10 +148,7 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 	}
 	t.Cleanup(func() { _ = reg.Close() })
 	svc := &Service{
-		root:                 root,
-		logger:               logger,
-		git:                  git,
-		registry:             reg,
+		core:                 &core{root: root, logger: logger, git: git, registry: reg},
 		running:              map[model.RepoID]*repoRuntime{cfg.ID: rt},
 		records:              map[model.RepoID]*model.RepoRuntimeRecord{},
 		headReconcileBackoff: backoff,
@@ -325,7 +322,7 @@ func TestStatusReportsPublishedAndServedGenerationsAfterOverlayFailure(t *testin
 	f.signal()
 	var st model.RepoRuntimeState
 	waitFor(t, nil, func() bool {
-		st, err = f.svc.Status(f.ctx, f.rt.cfg.Name)
+		st, err = f.svc.ctl().Status(f.ctx, f.rt.cfg.Name)
 		return err == nil && st.LastErrorPhase == phaseHEADReconcile
 	})
 	if st.PublishedHEADOID != f.nextOID || st.PublishedGeneration != f.oldGen+1 ||

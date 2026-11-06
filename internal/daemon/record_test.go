@@ -22,7 +22,7 @@ const credentialRemote = "https://user:hunter2secret@example.com/org/repo.git"
 
 // newSyncedDaemon is a daemon, not started, with one repo cloned from a local
 // repository, and a controller on its root.
-func newSyncedDaemon(t *testing.T) (*Service, *Service) {
+func newSyncedDaemon(t *testing.T) (*Service, *Controller) {
 	t.Helper()
 	ctx := context.Background()
 	tmp := t.TempDir()
@@ -41,7 +41,7 @@ func newSyncedDaemon(t *testing.T) (*Service, *Service) {
 	t.Cleanup(func() { _ = svc.Close() })
 	svc.SetMountRoot(filepath.Join(tmp, "mnt"))
 	svc.mount = fakeMount
-	if err := svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", RefreshInterval: time.Hour, Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", RefreshInterval: time.Hour, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	ctl, err := NewController(ctx, root, discardLogger())
@@ -52,7 +52,7 @@ func newSyncedDaemon(t *testing.T) (*Service, *Service) {
 	return svc, ctl
 }
 
-func requireFailure(t *testing.T, ctl *Service, phase string, wantInError string) model.RepoRuntimeState {
+func requireFailure(t *testing.T, ctl *Controller, phase string, wantInError string) model.RepoRuntimeState {
 	t.Helper()
 	st, err := ctl.Status(context.Background(), "repo")
 	if err != nil {

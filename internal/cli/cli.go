@@ -74,7 +74,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				&ucli.StringFlag{Name: "blob-cache-dir", Usage: "directory for hydrated blobs; may be shared between repositories"},
 				&ucli.StringFlag{Name: "fetch-ref", Usage: "ref to fetch during async preparation"},
 			},
-			Action: withService(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Service) error {
+			Action: withController(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Controller) error {
 				name := strings.TrimSpace(c.String("name"))
 				remote := strings.TrimSpace(c.String("remote"))
 				branch := strings.TrimSpace(c.String("branch"))
@@ -151,14 +151,14 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				return nil
 			}),
 		},
-		nameCommand("remove-repo", "remove a repository", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Service, name string, w io.Writer) error {
+		nameCommand("remove-repo", "remove a repository", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Controller, name string, w io.Writer) error {
 			if err := svc.RemoveRepo(c, name); err != nil {
 				return err
 			}
 			fmt.Fprintf(w, "removed %s\n", name)
 			return nil
 		}),
-		nameCommand("status", "show repo status", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Service, name string, w io.Writer) error {
+		nameCommand("status", "show repo status", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Controller, name string, w io.Writer) error {
 			st, err := svc.Status(c, name)
 			if err != nil {
 				return err
@@ -166,14 +166,14 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			fmt.Fprintln(w, formatStatusLine(st))
 			return nil
 		}),
-		nameCommand("fetch", "fetch remote updates", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Service, name string, w io.Writer) error {
+		nameCommand("fetch", "fetch remote updates", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Controller, name string, w io.Writer) error {
 			if err := svc.FetchNow(c, name); err != nil {
 				return err
 			}
 			fmt.Fprintf(w, "fetched %s\n", name)
 			return nil
 		}),
-		nameCommand("prepare", "retry async repository preparation", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Service, name string, w io.Writer) error {
+		nameCommand("prepare", "retry async repository preparation", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Controller, name string, w io.Writer) error {
 			if err := svc.Prepare(c, name); err != nil {
 				return err
 			}
@@ -183,7 +183,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		{
 			Name:  "list-repos",
 			Usage: "list configured repos",
-			Action: withService(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Service) error {
+			Action: withController(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Controller) error {
 				repos, err := svc.ListRepos(ctx)
 				if err != nil {
 					return err
@@ -198,14 +198,14 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				return nil
 			}),
 		},
-		nameCommand("remount", "ask the running daemon to mount a repository again", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Service, name string, w io.Writer) error {
+		nameCommand("remount", "ask the running daemon to mount a repository again", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Controller, name string, w io.Writer) error {
 			if err := svc.Remount(c, name); err != nil {
 				return err
 			}
 			fmt.Fprintf(w, "remounted %s\n", name)
 			return nil
 		}),
-		nameCommand("unmount", "ask the running daemon to unmount a repository until remount", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Service, name string, w io.Writer) error {
+		nameCommand("unmount", "ask the running daemon to unmount a repository until remount", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Controller, name string, w io.Writer) error {
 			if err := svc.Unmount(c, name); err != nil {
 				return err
 			}
@@ -217,7 +217,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			Usage:  "internal fsmonitor hook",
 			Hidden: true,
 			Flags:  []ucli.Flag{&ucli.StringFlag{Name: "name", Usage: "repo name (required)"}},
-			Action: withService(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Service) error {
+			Action: withController(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Controller) error {
 				name := strings.TrimSpace(c.String("name"))
 				if name == "" {
 					return fmt.Errorf("--name required")
@@ -233,7 +233,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				&ucli.StringFlag{Name: "name", Usage: "repo name (required)"},
 				&ucli.StringFlag{Name: "interval", Usage: "refresh interval (required)"},
 			},
-			Action: withService(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Service) error {
+			Action: withController(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Controller) error {
 				name := strings.TrimSpace(c.String("name"))
 				interval := strings.TrimSpace(c.String("interval"))
 				if name == "" || interval == "" {
@@ -277,8 +277,8 @@ func defaultRoot() string {
 	return "/var/lib/artifact-fs"
 }
 
-// withService creates a daemon.Service for the duration of the action.
-func withService(ctx context.Context, root string, stderr io.Writer, fn func(*ucli.Command, *daemon.Service) error) ucli.ActionFunc {
+// withController creates a daemon.Controller for the duration of the action.
+func withController(ctx context.Context, root string, stderr io.Writer, fn func(*ucli.Command, *daemon.Controller) error) ucli.ActionFunc {
 	return func(_ context.Context, c *ucli.Command) error {
 		logger := logging.NewJSONLogger(stderr, slog.LevelInfo)
 		svc, err := daemon.NewController(ctx, root, logger)
@@ -291,12 +291,12 @@ func withService(ctx context.Context, root string, stderr io.Writer, fn func(*uc
 }
 
 // nameCommand builds a subcommand that takes a --name flag and runs fn.
-func nameCommand(name, usage string, ctx context.Context, root string, stderr io.Writer, stdout io.Writer, fn func(context.Context, *daemon.Service, string, io.Writer) error) *ucli.Command {
+func nameCommand(name, usage string, ctx context.Context, root string, stderr io.Writer, stdout io.Writer, fn func(context.Context, *daemon.Controller, string, io.Writer) error) *ucli.Command {
 	return &ucli.Command{
 		Name:  name,
 		Usage: usage,
 		Flags: []ucli.Flag{&ucli.StringFlag{Name: "name", Usage: "repo name (required)"}},
-		Action: withService(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Service) error {
+		Action: withController(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Controller) error {
 			n := strings.TrimSpace(c.String("name"))
 			if n == "" {
 				return fmt.Errorf("--name required")

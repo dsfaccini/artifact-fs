@@ -71,7 +71,7 @@ func startDaemonWithRepo(t *testing.T) *startedDaemon {
 	svc.SetMountRoot(filepath.Join(tmp, "mnt"))
 	svc.mount = d.mounts.mount
 	// A remote refresh never runs during the test, so only the HEAD watcher can start a reconcile.
-	if err := svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: d.workDir, Branch: "main", RefreshInterval: time.Hour, Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: d.workDir, Branch: "main", RefreshInterval: time.Hour, Enabled: true}); err != nil {
 		_ = svc.Close()
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func startDaemonWithRepo(t *testing.T) *startedDaemon {
 		}
 	})
 	waitFor(t, d.startErr, func() bool {
-		st, err := svc.Status(ctx, "repo")
+		st, err := svc.ctl().Status(ctx, "repo")
 		return err == nil && st.State == repoStateMounted && d.mounts.resolver() != nil
 	})
 	return d
@@ -119,7 +119,7 @@ func (d *startedDaemon) moveMain(t *testing.T, oid string) {
 
 func (d *startedDaemon) status(t *testing.T) model.RepoRuntimeState {
 	t.Helper()
-	st, err := d.svc.Status(context.Background(), "repo")
+	st, err := d.svc.ctl().Status(context.Background(), "repo")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -15,7 +15,7 @@ import (
 
 // Status reports name from what the daemon recorded in repo_runtime and from
 // the stores. A record counts only while a daemon holds the daemon lock.
-func (s *Service) Status(ctx context.Context, name string) (model.RepoRuntimeState, error) {
+func (s *Controller) Status(ctx context.Context, name string) (model.RepoRuntimeState, error) {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
 		return model.RepoRuntimeState{}, err
@@ -132,11 +132,6 @@ func applyAheadBehind(st *model.RepoRuntimeState, state aheadBehind) {
 	st.AheadCount = state.ahead
 	st.BehindCount = state.behind
 	st.Diverged = state.diverged
-}
-
-func markFetchSuccess(st *model.RepoRuntimeState, at time.Time, state aheadBehind, mounted bool) {
-	markFetchResult(st, at, "ok", mounted)
-	applyAheadBehind(st, state)
 }
 
 func markFetchResult(st *model.RepoRuntimeState, at time.Time, result string, mounted bool) {

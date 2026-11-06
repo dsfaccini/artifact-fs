@@ -39,7 +39,7 @@ func preparationFailurePhase(err error) string {
 	return preparePhaseUnknown
 }
 
-func (s *Service) configVersionIsCurrent(ctx context.Context, cfg model.RepoConfig) (bool, error) {
+func (s *core) configVersionIsCurrent(ctx context.Context, cfg model.RepoConfig) (bool, error) {
 	latest, err := s.registry.GetRepo(ctx, cfg.Name)
 	if err != nil {
 		return false, err
@@ -104,7 +104,7 @@ func normalizeSourceConfig(cfg *model.RepoConfig) error {
 	return nil
 }
 
-func (s *Service) prepareConfigStillCurrent(ctx context.Context, cfg model.RepoConfig) bool {
+func (s *core) prepareConfigStillCurrent(ctx context.Context, cfg model.RepoConfig) bool {
 	latest, err := s.registry.GetRepo(ctx, cfg.Name)
 	if err != nil {
 		s.logger.Error("repo prepare state refresh failed", "repo", cfg.Name, "error", err)
@@ -120,7 +120,7 @@ func (s *Service) prepareConfigStillCurrent(ctx context.Context, cfg model.RepoC
 // prepareRepo clones the git repo and builds the initial snapshot. It does NOT
 // start a FUSE mount or any background goroutines, so it's safe to call from
 // short-lived CLI commands like add-repo.
-func (s *Service) prepareRepo(ctx context.Context, cfg model.RepoConfig) (retErr error) {
+func (s *core) prepareRepo(ctx context.Context, cfg model.RepoConfig) (retErr error) {
 	started := time.Now()
 	safeRepo := auth.RedactLogString(cfg.Name)
 	safeBranch := auth.RedactLogString(cfg.Branch)
@@ -203,7 +203,7 @@ func (s *Service) prepareRepo(ctx context.Context, cfg model.RepoConfig) (retErr
 	})
 }
 
-func (s *Service) prepareSource(ctx context.Context, cfg model.RepoConfig) (model.PreparedSource, error) {
+func (s *core) prepareSource(ctx context.Context, cfg model.RepoConfig) (model.PreparedSource, error) {
 	if cfg.AdoptGitDir {
 		if err := s.git.ConfigureAdoptedWorktree(ctx, cfg); err != nil {
 			return model.PreparedSource{}, err
@@ -233,7 +233,7 @@ func (s *Service) prepareSource(ctx context.Context, cfg model.RepoConfig) (mode
 	return model.PreparedSource{Ref: headRef, Commit: headOID}, nil
 }
 
-func (s *Service) recordAcquisition(ctx context.Context, cfg model.RepoConfig, source model.PreparedSource) error {
+func (s *core) recordAcquisition(ctx context.Context, cfg model.RepoConfig, source model.PreparedSource) error {
 	if !source.Verified || (!source.Acquired && cfg.AcquiredRef == source.Ref && strings.EqualFold(cfg.AcquiredCommit, source.Commit)) {
 		return nil
 	}
@@ -243,7 +243,7 @@ func (s *Service) recordAcquisition(ctx context.Context, cfg model.RepoConfig, s
 // ensurePreparedRepo makes sure the repo is cloned and has an initial snapshot.
 // The returned snapshot store remains open for callers that need to continue
 // into runtime startup.
-func (s *Service) ensurePreparedRepo(ctx context.Context, cfg model.RepoConfig, pruneOldGenerations bool) (*snapshot.Store, string, string, int64, error) {
+func (s *core) ensurePreparedRepo(ctx context.Context, cfg model.RepoConfig, pruneOldGenerations bool) (*snapshot.Store, string, string, int64, error) {
 	if err := os.MkdirAll(cfg.MountPath, 0o755); err != nil {
 		return nil, "", "", 0, withPreparationPhase(preparePhaseInitializeStorage, err)
 	}
@@ -345,7 +345,7 @@ func (s *Service) supersedePrepare(id model.RepoID) {
 	s.mu.Unlock()
 }
 
-func (s *Service) withPrepareTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+func (s *core) withPrepareTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	if s.prepareContext != nil {
 		return s.prepareContext(ctx)
 	}
@@ -744,7 +744,7 @@ func (s *Service) applyPrepareState(ctx context.Context, cfg model.RepoConfig, s
 	return nil
 }
 
-func (s *Service) publishSnapshot(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, oid string, ref string) (int64, string, error) {
+func (s *core) publishSnapshot(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, oid string, ref string) (int64, string, error) {
 	nodes, err := s.git.BuildTreeIndex(ctx, cfg, oid)
 	if err != nil {
 		return 0, snapshotPhaseBuild, err

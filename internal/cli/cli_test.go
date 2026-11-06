@@ -338,7 +338,7 @@ func TestFSMonitorHookCLIAnswersGitToken(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("ARTIFACT_FS_ROOT", root)
 	ctx := context.Background()
-	svc, err := daemon.New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc, err := daemon.NewController(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -161,25 +161,26 @@ func TestSharedMountReadOnlyTestChangesMountHelper(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = svc.Close() })
 	svc.SetMountRoot(mountDir)
+	ctl := newE2EController(t, root)
 	// AddRepo clones and publishes the first snapshot without mounting.
-	if err := svc.AddRepo(ctx, model.RepoConfig{Name: repoName, RemoteURL: remoteURL, Branch: "main", MountRoot: mountDir, Enabled: true}); err != nil {
+	if err := ctl.AddRepo(ctx, model.RepoConfig{Name: repoName, RemoteURL: remoteURL, Branch: "main", MountRoot: mountDir, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	st, err := svc.Status(ctx, repoName)
+	st, err := ctl.Status(ctx, repoName)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// gitDir does not exist, so a restore that runs anyway fails without
 	// touching a repository.
 	s := &sharedE2ERepo{
-		repo:       &mountedE2ERepo{root: root, svc: svc},
+		repo:       &mountedE2ERepo{root: root, svc: svc, ctl: ctl},
 		gitDir:     filepath.Join(root, "missing-git"),
 		generation: st.SnapshotGeneration,
 	}
 	s.runReadOnly(t, change, func(t *testing.T, repo *mountedE2ERepo) {
 		switch change {
 		case "overlay":
-			repos, err := repo.svc.ListRepos(ctx)
+			repos, err := repo.ctl.ListRepos(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -198,7 +199,7 @@ func TestSharedMountReadOnlyTestChangesMountHelper(t *testing.T) {
 			run(t, writer, "git", "add", "ADVANCED.md")
 			run(t, writer, "git", "-c", "user.name=E2E Test", "-c", "user.email=e2e@test", "commit", "-m", "advance HEAD")
 			run(t, writer, "git", "push", "origin", "main")
-			if err := repo.svc.Prepare(ctx, repoName); err != nil {
+			if err := repo.ctl.Prepare(ctx, repoName); err != nil {
 				t.Fatal(err)
 			}
 		default:

@@ -60,7 +60,7 @@ func TestVerifiedSourceStatusAndRefreshPolicy(t *testing.T) {
 	if err := svc.registry.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.FetchNow(ctx, cfg.Name); err == nil || !strings.Contains(err.Error(), "refresh is disabled") {
+	if err := svc.ctl().FetchNow(ctx, cfg.Name); err == nil || !strings.Contains(err.Error(), "refresh is disabled") {
 		t.Fatalf("FetchNow error = %v, want refresh-disabled rejection", err)
 	}
 }
@@ -335,14 +335,14 @@ func TestStatusReportsMountErrorUntilRetryMounts(t *testing.T) {
 	svc.mount = func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
 		return nil, mountErr
 	}
-	if err := svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
-	st, err := svc.Status(ctx, "repo")
+	st, err := svc.ctl().Status(ctx, "repo")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +366,7 @@ func TestStatusReportsMountErrorUntilRetryMounts(t *testing.T) {
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
-	st, err = svc.Status(ctx, "repo")
+	st, err = svc.ctl().Status(ctx, "repo")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,7 +466,7 @@ func newHookService(t *testing.T, mountPath string) (*Service, model.RepoConfig)
 func hookAnswer(t *testing.T, svc *Service, since string) ([]byte, string, []string) {
 	t.Helper()
 	var out bytes.Buffer
-	if err := svc.FSMonitorHook(t.Context(), "repo", since, &out); err != nil {
+	if err := svc.ctl().FSMonitorHook(t.Context(), "repo", since, &out); err != nil {
 		t.Fatal(err)
 	}
 	fields := strings.Split(strings.TrimSuffix(out.String(), "\x00"), "\x00")
