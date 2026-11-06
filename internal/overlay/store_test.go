@@ -1956,7 +1956,7 @@ func TestLookupDuringFlushShowsCompletedWrites(t *testing.T) {
 	}
 	size := int64(1)
 	stale := 0
-	for i := 0; i < 3000; i++ {
+	for i := range 3000 {
 		// First write commits size+1; the second is coalesced to size+2.
 		for range 2 {
 			if _, err := s.WriteFile(ctx, "f.txt", size, []byte("y")); err != nil {
@@ -2004,7 +2004,7 @@ func TestLookupDuringUnrelatedMkdirShowsCompletedWrites(t *testing.T) {
 	}
 	size := int64(1)
 	stale := 0
-	for i := 0; i < 2000; i++ {
+	for i := range 2000 {
 		for range 2 {
 			if _, err := s.WriteFile(ctx, "f.txt", size, []byte("y")); err != nil {
 				t.Fatal(err)
