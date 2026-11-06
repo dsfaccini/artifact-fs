@@ -61,8 +61,16 @@ func TestHangingUnmountStallsOnlyItsRepo(t *testing.T) {
 		}
 		return fakeMount(ctx, opCtx, cfg, engine, gate, logger)
 	}, "")
-	// Runs before the daemon's cleanup, which stops every repo.
-	t.Cleanup(func() { close(hanging.release) })
+	// Runs before the daemon's cleanup, whose stop of the repo must not meet
+	// the unmount still running.
+	t.Cleanup(func() {
+		close(hanging.release)
+		waitFor(t, nil, func() bool {
+			d.svc.mu.Lock()
+			defer d.svc.mu.Unlock()
+			return len(d.svc.unmounting) == 0
+		})
+	})
 	close(hanging.fail)
 	select {
 	case <-hanging.entered:
