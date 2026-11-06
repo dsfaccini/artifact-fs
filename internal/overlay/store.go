@@ -176,17 +176,15 @@ func commitPendingFromBackingFiles(ctx context.Context, db *sql.DB) error {
 	}
 	defer tx.Rollback()
 	for _, r := range pending {
-		st, err := os.Stat(r.backingPath)
-		if err != nil {
-			continue
+		if st, err := os.Stat(r.backingPath); err == nil {
+			t := st.ModTime().UnixNano()
+			if _, err := tx.ExecContext(ctx, `UPDATE overlay_entries SET size_bytes=?, mtime_unix_ns=?, ctime_unix_ns=? WHERE path=? AND backing_path=?`, st.Size(), t, t, r.path, r.backingPath); err != nil {
+				return err
+			}
 		}
-		t := st.ModTime().UnixNano()
-		if _, err := tx.ExecContext(ctx, `UPDATE overlay_entries SET size_bytes=?, mtime_unix_ns=?, ctime_unix_ns=? WHERE path=? AND backing_path=?`, st.Size(), t, t, r.path, r.backingPath); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_pending WHERE path=?`, r.path); err != nil {
 			return err
 		}
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_pending`); err != nil {
-		return err
 	}
 	return tx.Commit()
 }
@@ -478,33 +476,31 @@ func (s *Store) commitFirstWrite(ctx context.Context, e model.OverlayEntry) erro
 
 // FlushFile commits the size and times of path's writes since its last flush.
 func (s *Store) FlushFile(ctx context.Context, path string) error {
+	path = model.CleanPath(path)
+	// Every close(2) flushes, so a path with nothing to commit skips mu.
+	s.pendingMu.Lock()
+	_, ok := s.pending[path]
+	s.pendingMu.Unlock()
+	if !ok {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.flushLocked(ctx, model.CleanPath(path))
+	return s.flushLocked(ctx, path)
 }
 
 func (s *Store) flushLocked(ctx context.Context, path string) error {
 	s.pendingMu.Lock()
 	p := s.pending[path]
+	var size, t int64
+	if p != nil {
+		size, t = p.size, p.timeUnixNs
+	}
 	s.pendingMu.Unlock()
 	if p == nil {
 		return nil
 	}
-	s.pendingMu.Lock()
-	size, t := p.size, p.timeUnixNs
-	s.pendingMu.Unlock()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE overlay_entries SET size_bytes=?, mtime_unix_ns=?, ctime_unix_ns=? WHERE path=? AND backing_path=?`, size, t, t, path, p.backingPath); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_pending WHERE path=?`, path); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
+	if err := commitSizeAndTimes(ctx, s.db, path, p.backingPath, size, t, t); err != nil {
 		return err
 	}
 	s.pendingMu.Lock()
@@ -550,7 +546,7 @@ func (s *Store) SyncFile(ctx context.Context, path string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := s.upsertEntryDurable(ctx, e); err != nil {
+	if err := s.commitSizeAndTimesDurable(ctx, e); err != nil {
 		return err
 	}
 	s.pendingMu.Lock()
@@ -1624,10 +1620,10 @@ func (s *Store) upsertEntry(ctx context.Context, e model.OverlayEntry) error {
 	return upsertEntryOn(ctx, s.db, e)
 }
 
-// upsertEntryDurable commits e and clears its pending marker with
-// synchronous=FULL, which syncs the WAL and so every commit before it. OpenDB's synchronous=NORMAL syncs only at
-// checkpoints.
-func (s *Store) upsertEntryDurable(ctx context.Context, e model.OverlayEntry) error {
+// commitSizeAndTimesDurable commits e's size and times at synchronous=FULL,
+// which syncs the WAL and with it every earlier commit. OpenDB's
+// synchronous=NORMAL syncs the WAL only at checkpoints.
+func (s *Store) commitSizeAndTimesDurable(ctx context.Context, e model.OverlayEntry) error {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return err
@@ -1636,7 +1632,7 @@ func (s *Store) upsertEntryDurable(ctx context.Context, e model.OverlayEntry) er
 	if _, err := conn.ExecContext(ctx, `PRAGMA synchronous=FULL`); err != nil {
 		return err
 	}
-	err = commitDurable(ctx, conn, e)
+	err = commitSizeAndTimes(ctx, conn, e.Path, e.BackingPath, e.SizeBytes, e.MtimeUnixNs, e.CtimeUnixNs)
 	if _, resetErr := conn.ExecContext(context.Background(), `PRAGMA synchronous=NORMAL`); resetErr != nil {
 		// A pooled connection left at FULL would sync every later commit.
 		conn.Raw(func(any) error { return driver.ErrBadConn })
@@ -1647,16 +1643,21 @@ func (s *Store) upsertEntryDurable(ctx context.Context, e model.OverlayEntry) er
 	return err
 }
 
-func commitDurable(ctx context.Context, conn *sql.Conn, e model.OverlayEntry) error {
-	tx, err := conn.BeginTx(ctx, nil)
+// commitSizeAndTimes commits path's size and times while its entry still
+// names backingPath, and clears its pending marker. It leaves the entry's
+// other fields as another writer committed them.
+func commitSizeAndTimes(ctx context.Context, db interface {
+	BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+}, path, backingPath string, size, mtimeUnixNs, ctimeUnixNs int64) error {
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := upsertEntryOn(ctx, tx, e); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE overlay_entries SET size_bytes=?, mtime_unix_ns=?, ctime_unix_ns=? WHERE path=? AND backing_path=?`, size, mtimeUnixNs, ctimeUnixNs, path, backingPath); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_pending WHERE path=?`, e.Path); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_pending WHERE path=?`, path); err != nil {
 		return err
 	}
 	return tx.Commit()

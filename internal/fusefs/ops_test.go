@@ -13,6 +13,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	overlaystore "github.com/cloudflare/artifact-fs/internal/overlay"
+	"github.com/dsfaccini/fuse/fuseops"
 )
 
 type fakeBatchHydrator struct {
@@ -288,12 +289,7 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 
 	writeDone := make(chan error, 1)
 	go func() {
-		fs.closeCachedFilesForPath("file.txt")
-		_, err := engineWrite(context.Background(), engine, "file.txt", 0, []byte("new"))
-		if err == nil {
-			fs.closeCachedFilesForPath("file.txt")
-		}
-		writeDone <- err
+		writeDone <- fs.WriteFile(context.Background(), &fuseops.WriteFileOp{Handle: 1, Data: []byte("new")})
 	}()
 
 	<-overlay.beforeCopy

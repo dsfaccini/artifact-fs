@@ -882,8 +882,11 @@ func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) 
 		}
 		path := fh.path
 		fh.mu.Unlock()
-		fs.closeCachedFilesForPath(path)
 		n, err := fs.engine.Write(ctx, b, path, op.Offset, op.Data)
+		// A handle that cached the base content before the write promoted the
+		// path, or while another write promoted it, would keep serving the
+		// base. Close those caches before the write returns, failed or not.
+		fs.closeCachedFilesForPath(path)
 		if err != nil {
 			return err
 		}
@@ -891,7 +894,6 @@ func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) 
 			return syscall.EIO
 		}
 		fs.setInodeGeneration(op.Inode, 0)
-		fs.closeCachedFilesForPath(path)
 		return nil
 	})
 }
