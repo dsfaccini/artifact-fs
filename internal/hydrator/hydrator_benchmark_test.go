@@ -260,6 +260,64 @@ func BenchmarkAsyncHydrationGitStore(b *testing.B) {
 	}
 }
 
+// BenchmarkSingleWorkerHydrationGitStore hydrates 2048 blobs one at a time
+// through gitstore with one hydrator worker, after a first blob warms the
+// batch process, and reports the time per blob. It measures the per-blob
+// filesystem and cache bookkeeping cost without parallelism hiding it.
+func BenchmarkSingleWorkerHydrationGitStore(b *testing.B) {
+	const objects = 2048
+	workDir, gitDir := createBenchmarkGitRepo(b, objects)
+	cfg := model.RepoConfig{ID: "repo", GitDir: gitDir}
+	git := gitstore.New(nil)
+	b.Cleanup(func() {
+		git.Close()
+		if err := os.RemoveAll(workDir); err != nil {
+			b.Errorf("remove benchmark repo: %v", err)
+		}
+	})
+	git.SetBatchPoolSize(1)
+	head, _, err := git.ResolveHEAD(context.Background(), cfg)
+	if err != nil {
+		b.Fatalf("ResolveHEAD: %v", err)
+	}
+	nodes, err := git.BuildTreeIndex(context.Background(), cfg, head)
+	if err != nil {
+		b.Fatalf("BuildTreeIndex: %v", err)
+	}
+	var targets []model.BaseNode
+	for _, n := range nodes {
+		if n.Type == "file" && n.ObjectOID != "" {
+			targets = append(targets, n)
+		}
+	}
+	if len(targets) != objects {
+		b.Fatalf("targets = %d, want %d", len(targets), objects)
+	}
+	var total time.Duration
+	b.ResetTimer()
+	for range b.N {
+		b.StopTimer()
+		cfg.BlobCacheDir = b.TempDir()
+		h := New(git)
+		h.Start(1, cfg)
+		if _, _, err := h.EnsureHydrated(context.Background(), cfg, targets[0]); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+		start := time.Now()
+		for _, n := range targets[1:] {
+			if _, _, err := h.EnsureHydrated(context.Background(), cfg, n); err != nil {
+				b.Fatal(err)
+			}
+		}
+		total += time.Since(start)
+		b.StopTimer()
+		h.Stop()
+		b.StartTimer()
+	}
+	b.ReportMetric(float64(total.Microseconds())/float64(b.N*(objects-1)), "us/blob")
+}
+
 // BenchmarkPrefetchBloblessDir hydrates one directory's prefetch from a
 // blobless clone of a local remote, so it measures git's per-fetch cost with no
 // network latency.

@@ -292,7 +292,7 @@ func writeStats(f *os.File, st Stats) error {
 // from the blobs it lists, and returns them with the list. When ctx ends it
 // returns without writing the counters, which leaves them as they were.
 func recountLocked(ctx context.Context, dir string, lock *os.File) (Stats, []candidate, error) {
-	if err := migrateFlat(dir); err != nil {
+	if err := migrateFlat(ctx, dir); err != nil {
 		return Stats{}, nil, err
 	}
 	blobs, err := listBlobs(ctx, dir)
@@ -307,8 +307,9 @@ func recountLocked(ctx context.Context, dir string, lock *os.File) (Stats, []can
 	return st, blobs, writeStats(lock, st)
 }
 
-// migrateFlat moves each blob of the flat layout into its shard.
-func migrateFlat(dir string) error {
+// migrateFlat moves each blob of the flat layout into its shard. It stops
+// between blobs when ctx ends. A blob it already moved stays valid.
+func migrateFlat(ctx context.Context, dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return err
@@ -316,6 +317,9 @@ func migrateFlat(dir string) error {
 	for _, e := range entries {
 		if !e.Type().IsRegular() || !isObjectOIDName(e.Name()) {
 			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		dst := Path(dir, e.Name())
 		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {

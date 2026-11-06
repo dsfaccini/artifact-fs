@@ -134,10 +134,26 @@ func TestEvictKeepsBlobChangedAfterListing(t *testing.T) {
 	}
 }
 
+// cancelOnCall is a context whose Err reports nil until its nth call, then
+// context.Canceled, so cancellation lands partway through a walk.
+type cancelOnCall struct {
+	context.Context
+	calls, n int
+}
+
+func (c *cancelOnCall) Err() error {
+	c.calls++
+	if c.calls >= c.n {
+		return context.Canceled
+	}
+	return nil
+}
+
 func TestEvictLeavesCountersWhenContextEndsDuringRecount(t *testing.T) {
 	dir := t.TempDir()
 	install(t, dir, strings.Repeat("a", 40), 10, time.Now())
-	// An uncounted blob makes a finished recount visible in the counters.
+	// An uncounted blob in a second shard makes a finished recount visible in
+	// the counters.
 	uncounted := Path(dir, strings.Repeat("b", 40))
 	if err := os.MkdirAll(filepath.Dir(uncounted), 0o700); err != nil {
 		t.Fatal(err)
@@ -145,12 +161,35 @@ func TestEvictLeavesCountersWhenContextEndsDuringRecount(t *testing.T) {
 	if err := os.WriteFile(uncounted, []byte(strings.Repeat("x", 1000)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	ctx := &cancelOnCall{Context: context.Background(), n: 2}
 
 	res, err := Evict(ctx, dir, 0)
 	if !errors.Is(err, context.Canceled) || res.Evicted != 0 {
 		t.Fatalf("Evict = %+v, %v; want nothing evicted and context.Canceled", res, err)
 	}
 	requireStats(t, dir, Stats{Blobs: 1, Bytes: 10})
+}
+
+func TestEvictStopsMovingFlatBlobsWhenContextEnds(t *testing.T) {
+	dir := t.TempDir()
+	first, second := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	for _, oid := range []string{first, second} {
+		if err := os.WriteFile(filepath.Join(dir, oid), []byte(oid), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := &cancelOnCall{Context: context.Background(), n: 2}
+
+	if _, err := Evict(ctx, dir, 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Evict err = %v, want context.Canceled", err)
+	}
+	if data, err := os.ReadFile(Path(dir, first)); err != nil || string(data) != first {
+		t.Fatalf("moved blob = %q, %v; want its content in its shard", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, second)); err != nil {
+		t.Fatalf("second flat blob: %v; want it left in place", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(dir, statsName)); err != nil || len(data) >= statsSize {
+		t.Fatalf("stats file = %d bytes, %v; want no counters written", len(data), err)
+	}
 }
