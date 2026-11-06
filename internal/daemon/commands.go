@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
+	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/registry"
@@ -315,4 +316,16 @@ func (s *Service) Unmount(ctx context.Context, name string) error {
 		return err
 	}
 	return s.unmount(cfg.ID)
+}
+
+// EvictCache evicts the least recently accessed blobs from name's blob cache
+// until it holds at most maxBytes. A cache directory that repos share is
+// evicted as a whole.
+func (s *Service) EvictCache(ctx context.Context, name string, maxBytes int64) (blobcache.EvictResult, error) {
+	cfg, err := s.registry.GetRepo(ctx, name)
+	if err != nil {
+		return blobcache.EvictResult{}, err
+	}
+	s.fillPaths(&cfg)
+	return blobcache.Evict(cfg.BlobCacheDir, maxBytes)
 }

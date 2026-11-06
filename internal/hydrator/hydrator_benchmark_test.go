@@ -162,7 +162,7 @@ func BenchmarkQueuedCachedPrefetch(b *testing.B) {
 			b.Fatal(err)
 		}
 		for _, task := range tasks {
-			if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, task.ObjectOID), payload, 0o644); err != nil {
+			if err := os.WriteFile(cacheFile(b, cfg.BlobCacheDir, task.ObjectOID), payload, 0o644); err != nil {
 				b.Fatal(err)
 			}
 		}

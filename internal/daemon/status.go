@@ -2,12 +2,12 @@ package daemon
 
 import (
 	"context"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
@@ -134,50 +134,10 @@ func markFetchFailure(st *model.RepoRuntimeState, result string) {
 	st.LastFetchResult = result
 }
 
+// applyHydrationStats reads the cache counters that the hydrator and
+// evict-cache keep, without walking the cache.
 func applyHydrationStats(st *model.RepoRuntimeState, cacheDir string) {
-	count, bytes := blobCacheStats(cacheDir)
-	st.HydratedBlobCount = count
-	st.HydratedBlobBytes = bytes
-}
-
-func blobCacheStats(cacheDir string) (int64, int64) {
-	if strings.TrimSpace(cacheDir) == "" {
-		return 0, 0
-	}
-	var count int64
-	var bytes int64
-	_ = filepath.WalkDir(cacheDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			return nil
-		}
-		info, statErr := d.Info()
-		if statErr != nil {
-			return nil
-		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-		if !isObjectOIDName(d.Name()) {
-			return nil
-		}
-		count++
-		bytes += info.Size()
-		return nil
-	})
-	return count, bytes
-}
-
-func isObjectOIDName(name string) bool {
-	if len(name) != 40 && len(name) != 64 {
-		return false
-	}
-	for _, c := range name {
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
-			return false
-		}
-	}
-	return true
+	stats, _ := blobcache.ReadStats(cacheDir)
+	st.HydratedBlobCount = stats.Blobs
+	st.HydratedBlobBytes = stats.Bytes
 }

@@ -47,7 +47,7 @@ func TestEnsureHydratedRefetchesTruncatedKnownBlob(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "known", SizeBytes: 7}
-	cachePath := filepath.Join(tmp, node.ObjectOID)
+	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, []byte("bad"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestEnsureHydratedUsesValidKnownBlobCacheHit(t *testing.T) {
 	payload := []byte("content")
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "known", SizeBytes: int64(len(payload))}
-	cachePath := filepath.Join(tmp, node.ObjectOID)
+	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestEnsureHydratedUsesValidUnknownSizeCacheHit(t *testing.T) {
 	payload := []byte("content")
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
-	cachePath := filepath.Join(tmp, node.ObjectOID)
+	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestEnsureHydratedRefetchesUnknownSizeCacheHit(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
-	cachePath := filepath.Join(tmp, node.ObjectOID)
+	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, []byte("bad"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestEnsureHydratedVerifiesUnknownCacheHitOnce(t *testing.T) {
 	payload := []byte("content")
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
-	cachePath := filepath.Join(tmp, node.ObjectOID)
+	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +223,7 @@ func TestVerifyBlobOnceReusesVerificationFinishedAfterCheck(t *testing.T) {
 	payload := []byte("content")
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
-	cachePath := filepath.Join(tmp, node.ObjectOID)
+	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +326,7 @@ func TestQueuedHydrationUsesValidCacheHit(t *testing.T) {
 	tmp := t.TempDir()
 	payload := []byte("content")
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
-	cachePath := filepath.Join(tmp, "blob")
+	cachePath := cacheFile(t, tmp, "blob")
 	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +518,7 @@ func TestQueuedHydrationBatchFetchesOnlyMissingBlobs(t *testing.T) {
 		tasks = append(tasks, model.HydrationTask{RepoID: cfg.ID, Path: oid, ObjectOID: oid, SizeState: "known", SizeBytes: int64(len(payload)), Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()})
 	}
 	for _, oid := range []string{"cached-1", "cached-2"} {
-		if err := os.WriteFile(cachePathFor(cfg, oid), payload, 0o644); err != nil {
+		if err := os.WriteFile(cacheFile(t, cfg.BlobCacheDir, oid), payload, 0o644); err != nil {
 			t.Fatal(err)
 		}
 		tasks = append(tasks, model.HydrationTask{RepoID: cfg.ID, Path: oid, ObjectOID: oid, SizeState: "unknown", Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()})
@@ -552,7 +552,7 @@ func TestQueuedHydrationVerifiesCachedBlobsInParallel(t *testing.T) {
 	h := New(fetcher)
 	var tasks []model.HydrationTask
 	for _, oid := range []string{"cached-1", "cached-2"} {
-		if err := os.WriteFile(cachePathFor(cfg, oid), payload, 0o644); err != nil {
+		if err := os.WriteFile(cacheFile(t, cfg.BlobCacheDir, oid), payload, 0o644); err != nil {
 			t.Fatal(err)
 		}
 		tasks = append(tasks, model.HydrationTask{RepoID: cfg.ID, Path: oid, ObjectOID: oid, SizeState: "known", SizeBytes: int64(len(payload)), Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()})
@@ -752,7 +752,7 @@ func TestReadBatchServesBlobsNeedingNoFetchBeforeItsFetch(t *testing.T) {
 		payload := []byte("content")
 		fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true}
 		started, release := gateBatchFetches(fetcher)
-		if err := os.WriteFile(cachePathFor(cfg, "cached"), payload, 0o644); err != nil {
+		if err := os.WriteFile(cacheFile(t, cfg.BlobCacheDir, "cached"), payload, 0o644); err != nil {
 			t.Fatal(err)
 		}
 		h := New(fetcher)
@@ -801,7 +801,7 @@ func TestReadBatchVerifiesCachedBlobsInParallelBeforeItsFetch(t *testing.T) {
 		}
 		// After a daemon restart the cached blobs are not verified yet.
 		for _, oid := range []string{"cached-0", "cached-1", "cached-2"} {
-			if err := os.WriteFile(cachePathFor(cfg, oid), payload, 0o644); err != nil {
+			if err := os.WriteFile(cacheFile(t, cfg.BlobCacheDir, oid), payload, 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -935,7 +935,7 @@ func TestReadOfVerifiedBlobDoesNotWaitForSiblingFetch(t *testing.T) {
 	h.Start(1, cfg)
 	defer h.Stop()
 	cached := model.BaseNode{RepoID: cfg.ID, Path: "cached", ObjectOID: "cached", SizeState: "unknown"}
-	if err := os.WriteFile(cachePathFor(cfg, "cached"), payload, 0o644); err != nil {
+	if err := os.WriteFile(cacheFile(t, cfg.BlobCacheDir, "cached"), payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := h.EnsureHydrated(context.Background(), cfg, cached); err != nil {
@@ -964,7 +964,7 @@ func TestBlobsNeedingNoFetchDoNotWaitForTheirSiblingsFetch(t *testing.T) {
 		fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true}
 		started, release := gateBatchFetches(fetcher)
 		// After a daemon restart a cached blob is not verified yet.
-		if err := os.WriteFile(cachePathFor(cfg, "cached"), payload, 0o644); err != nil {
+		if err := os.WriteFile(cacheFile(t, cfg.BlobCacheDir, "cached"), payload, 0o644); err != nil {
 			t.Fatal(err)
 		}
 		h := New(fetcher)
@@ -1108,7 +1108,7 @@ func TestEnsureHydratedVerificationIgnoresLeaderTimeout(t *testing.T) {
 	payload := []byte("content")
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
-	cachePath := filepath.Join(tmp, node.ObjectOID)
+	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1158,7 +1158,7 @@ func TestValidateCachedBlobKeepsFileOnVerifyError(t *testing.T) {
 	payload := []byte("content")
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
-	cachePath := filepath.Join(tmp, node.ObjectOID)
+	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1200,7 +1200,7 @@ func TestEnsureHydratedRevalidatesChangedCacheFile(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "known", SizeBytes: 7}
-	cachePath := filepath.Join(tmp, node.ObjectOID)
+	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, []byte("content"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1238,7 +1238,7 @@ func TestValidateCachedBlobRejectsReplacementDuringVerification(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, ObjectOID: "blob", SizeState: "known", SizeBytes: 7}
-	cachePath := filepath.Join(tmp, node.ObjectOID)
+	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, []byte("content"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1278,7 +1278,7 @@ func TestOpenHydratedPinsVerifiedCacheFile(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, ObjectOID: "blob", SizeState: "known", SizeBytes: 7}
-	cachePath := filepath.Join(tmp, node.ObjectOID)
+	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, []byte("content"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1395,7 +1395,7 @@ func TestReadBlobSkipsVerificationForOversizedCache(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "link", ObjectOID: "blob", SizeState: "unknown"}
-	cachePath := filepath.Join(tmp, node.ObjectOID)
+	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, []byte("oversized"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1736,4 +1736,14 @@ func (f *fakeBlobFetcher) VerifyCalls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.verifyCalls
+}
+
+// cacheFile returns oid's cache path in dir, with its shard created.
+func cacheFile(t testing.TB, dir, oid string) string {
+	t.Helper()
+	path := cachePathFor(model.RepoConfig{BlobCacheDir: dir}, oid)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
