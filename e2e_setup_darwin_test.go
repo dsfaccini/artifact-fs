@@ -3,12 +3,11 @@ package main
 import (
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
-	"golang.org/x/sys/unix"
+	"github.com/dsfaccini/fuse"
 )
 
 // wedgedMountRecovery is how macOS clears a stalled mount: nothing unmounts a
@@ -33,13 +32,13 @@ func skipIfNoFUSE(t *testing.T) {
 	}
 	const noFSKit = "FSKit is unavailable; it needs macOS 26 or later and macFUSE 5.5 or later"
 	fskit := fskitAvailable()
-	_, kextErr := unix.SysctlRaw("vfs.generic.macfuse.version.number")
+	kext := fuse.MacFUSEKernelExtensionLoaded()
 	switch {
-	case backend == fusefs.BackendKernel && kextErr != nil:
+	case backend == fusefs.BackendKernel && !kext:
 		t.Skip("skipping: ARTIFACT_FS_FUSE_BACKEND=kernel needs the macFUSE kernel extension loaded; mounting would prompt macOS to load it")
 	case backend == fusefs.BackendFSKit && !fskit:
 		t.Skip("skipping: " + noFSKit)
-	case backend == fusefs.BackendAuto && !fskit && kextErr != nil:
+	case backend == fusefs.BackendAuto && !fskit && !kext:
 		t.Skip("skipping: " + noFSKit + ", and the macFUSE kernel extension is not loaded")
 	}
 	helper := "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse"
@@ -60,19 +59,10 @@ func mountsThroughFSKit() bool {
 	return err == nil && (backend == fusefs.BackendFSKit || backend == fusefs.BackendAuto && fskitAvailable())
 }
 
-// fskitAvailable mirrors the fuse fork's FSKit preflight: the MFMount framework
-// is installed and macOS is 26 or later. Extension approval is only known at mount time.
+// fskitAvailable reports whether fuse.FSKitAvailable finds what an FSKit mount
+// needs. Extension approval is only known at mount time.
 func fskitAvailable() bool {
-	if _, err := os.Stat("/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/Versions/A/MFMount"); err != nil {
-		return false
-	}
-	version, err := unix.Sysctl("kern.osproductversion")
-	if err != nil {
-		return false
-	}
-	major, _, _ := strings.Cut(version, ".")
-	n, err := strconv.Atoi(major)
-	return err == nil && n >= 26
+	return fuse.FSKitAvailable() == nil
 }
 
 // isMounted checks whether the given path is a FUSE mount point.
