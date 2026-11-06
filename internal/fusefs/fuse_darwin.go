@@ -13,7 +13,6 @@ import (
 const setXattrErrno = syscall.EPERM
 
 func platformMountConfig(cfg *fuse.MountConfig) {
-	cfg.FuseImpl = fuse.FUSEImplMacFUSE
 	// noappledouble would make the kernel extension hide tracked ._ and
 	// .DS_Store files.
 	cfg.EnableAppleDouble = true

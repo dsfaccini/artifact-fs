@@ -166,18 +166,22 @@ func (s *Service) EnqueueBatch(tasks []model.HydrationTask) {
 	if len(tasks) == 0 {
 		return
 	}
-	s.mu.Lock()
-	if s.stopped {
-		s.mu.Unlock()
-		return
-	}
-	enqueued := 0
-	for _, task := range tasks {
-		if s.enqueueLocked(task) {
-			enqueued++
+	// FUSE ops enqueue here. The fuse library recovers a panic in an op, so a
+	// panic in the heap operations must not leave s.mu held.
+	enqueued := func() int {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.stopped {
+			return 0
 		}
-	}
-	s.mu.Unlock()
+		n := 0
+		for _, task := range tasks {
+			if s.enqueueLocked(task) {
+				n++
+			}
+		}
+		return n
+	}()
 	for range enqueued {
 		s.signalWork()
 	}
@@ -223,26 +227,28 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, nod
 		return cachePath, size, nil
 	}
 	ch := make(chan result, 1)
-	s.mu.Lock()
-	if s.stopped {
-		s.mu.Unlock()
-		return "", 0, ErrStopped
-	}
-	if _, ok := s.active[key]; ok || len(s.wait[key]) > 0 {
-		s.wait.add(key, ch)
-		raised := s.raiseForReadLocked(key)
-		s.mu.Unlock()
-		if raised {
-			s.signalWork()
+	// FUSE ops hydrate here. The fuse library recovers a panic in an op, so a
+	// panic in the heap operations must not leave s.mu held.
+	signal, err := func() (bool, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.stopped {
+			return false, ErrStopped
 		}
-		return s.awaitHydration(ctx, key, ch)
+		if _, ok := s.active[key]; ok || len(s.wait[key]) > 0 {
+			s.wait.add(key, ch)
+			return s.raiseForReadLocked(key), nil
+		}
+		first := s.wait.add(key, ch)
+		if first {
+			first = s.enqueueLocked(explicitReadTask(repo.ID, node))
+		}
+		return first, nil
+	}()
+	if err != nil {
+		return "", 0, err
 	}
-	first := s.wait.add(key, ch)
-	if first {
-		first = s.enqueueLocked(explicitReadTask(repo.ID, node))
-	}
-	s.mu.Unlock()
-	if first {
+	if signal {
 		s.signalWork()
 	}
 	return s.awaitHydration(ctx, key, ch)
