@@ -38,7 +38,6 @@ type ArtifactFuse struct {
 	fuseutil.NotImplementedFileSystem
 	repo           model.RepoConfig
 	engine         *Engine
-	fskit          bool
 	gitfileContent []byte    // synthesized .git gitfile, computed once
 	syntheticTime  time.Time // timestamps of synthesized entries; changing them can deadlock concurrent FSKit Git reads
 
@@ -78,6 +77,7 @@ type DirHandle struct {
 	gen        int64
 	commitTime int64
 	entries    []ReaddirEntry
+	listed     bool
 }
 
 type FileHandle struct {
@@ -653,13 +653,8 @@ func (fs *ArtifactFuse) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) erro
 		if err != nil {
 			return err
 		}
-		// Eagerly load children at open time to avoid races on concurrent ReadDir.
-		entries, gen, commitTime, err := fs.readDirSnapshot(ctx, ref)
-		if err != nil {
-			return err
-		}
 
-		dh := &DirHandle{inode: ref, gen: gen, commitTime: commitTime, entries: entries}
+		dh := &DirHandle{inode: ref}
 		fs.mu.Lock()
 		handle := fs.nextHandleID
 		fs.nextHandleID++
@@ -681,6 +676,21 @@ func (fs *ArtifactFuse) readDirSnapshot(ctx context.Context, ref *InodeRef) ([]R
 	return entries, gen, commitTime, nil
 }
 
+// listDirHandle lists dh's directory at its first read and at every read from
+// offset 0, which starts an enumeration: FSKit reuses a handle across
+// enumerations, and rewinddir reads from offset 0 again. Callers hold dh.mu.
+func (fs *ArtifactFuse) listDirHandle(ctx context.Context, dh *DirHandle, offset fuseops.DirOffset) error {
+	if offset != 0 && dh.listed {
+		return nil
+	}
+	entries, gen, commitTime, err := fs.readDirSnapshot(ctx, dh.inode)
+	if err != nil {
+		return err
+	}
+	dh.entries, dh.gen, dh.commitTime, dh.listed = entries, gen, commitTime, true
+	return nil
+}
+
 func (fs *ArtifactFuse) ReadDir(ctx context.Context, op *fuseops.ReadDirOp) error {
 	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
 		dh, err := fs.dirHandle(op.Handle)
@@ -689,13 +699,8 @@ func (fs *ArtifactFuse) ReadDir(ctx context.Context, op *fuseops.ReadDirOp) erro
 		}
 		dh.mu.Lock()
 		defer dh.mu.Unlock()
-		// FSKit keeps a directory handle across separate enumerations.
-		if fs.fskit && op.Offset == 0 {
-			entries, gen, commitTime, err := fs.readDirSnapshot(ctx, dh.inode)
-			if err != nil {
-				return err
-			}
-			dh.entries, dh.gen, dh.commitTime = entries, gen, commitTime
+		if err := fs.listDirHandle(ctx, dh, op.Offset); err != nil {
+			return err
 		}
 
 		offset := int(op.Offset)
@@ -718,13 +723,16 @@ func (fs *ArtifactFuse) ReadDir(ctx context.Context, op *fuseops.ReadDirOp) erro
 }
 
 func (fs *ArtifactFuse) ReadDirPlus(ctx context.Context, op *fuseops.ReadDirPlusOp) error {
-	return fs.shared(ctx, func(context.Context, *Blobs) error {
+	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
 		dh, err := fs.dirHandle(op.Handle)
 		if err != nil {
 			return err
 		}
 		dh.mu.Lock()
 		defer dh.mu.Unlock()
+		if err := fs.listDirHandle(ctx, dh, op.Offset); err != nil {
+			return err
+		}
 
 		offset := int(op.Offset)
 		for i := offset; i < len(dh.entries); i++ {
@@ -1235,8 +1243,6 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, l
 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.
 	platformMountConfig(&mountCfg)
 	mount := func(fskit bool) (*fuse.MountedFileSystem, error) {
-		// The server handles operations as soon as the mount starts.
-		fsint.fskit = fskit
 		cfg := mountCfg
 		if fskit {
 			cfg.Options = map[string]string{"backend": "fskit"}

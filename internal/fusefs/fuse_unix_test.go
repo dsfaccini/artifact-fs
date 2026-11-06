@@ -3,6 +3,7 @@
 package fusefs
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -131,6 +132,10 @@ func TestCanceledContextOpensOverlayDirectory(t *testing.T) {
 	t.Cleanup(func() {
 		_ = f.fs.ReleaseDirHandle(context.Background(), &fuseops.ReleaseDirHandleOp{Handle: open.Handle})
 	})
+	read := &fuseops.ReadDirOp{Handle: open.Handle, Dst: make([]byte, 4096)}
+	if err := f.fs.ReadDir(ctx, read); err != nil {
+		t.Fatalf("ReadDir with canceled request context: %v", err)
+	}
 	dir, err := f.fs.dirHandle(open.Handle)
 	if err != nil {
 		t.Fatal(err)
@@ -1420,11 +1425,17 @@ func TestReadDirPlusDoesNotHydrateUnknownSizeBaseFile(t *testing.T) {
 	}
 }
 
-func TestReadDirPlusUsesOpenDirGeneration(t *testing.T) {
+func TestReadDirPlusContinuesInItsListingGeneration(t *testing.T) {
 	repo := model.RepoConfig{ID: "repo", GitDir: "/tmp/repo.git"}
 	snap := &generationSnapshot{nodes: map[int64]map[string]model.BaseNode{}, kids: map[int64]map[string][]model.BaseNode{
-		1: {".": {{Path: "old.txt", Type: "file", Mode: 0o100644, SizeState: "known", SizeBytes: 1}}},
-		2: {".": {{Path: "new.txt", Type: "file", Mode: 0o100644, SizeState: "known", SizeBytes: 2}}},
+		1: {".": {
+			{Path: "a.txt", Type: "file", Mode: 0o100644, SizeState: "known", SizeBytes: 1},
+			{Path: "b.txt", Type: "file", Mode: 0o100644, SizeState: "known", SizeBytes: 1},
+		}},
+		2: {".": {
+			{Path: "c.txt", Type: "file", Mode: 0o100644, SizeState: "known", SizeBytes: 2},
+			{Path: "d.txt", Type: "file", Mode: 0o100644, SizeState: "known", SizeBytes: 2},
+		}},
 	}}
 	r := &Resolver{Snapshot: snap, Overlay: &fakeOverlay{entries: map[string]model.OverlayEntry{}}}
 	r.SetGeneration(1)
@@ -1433,19 +1444,25 @@ func TestReadDirPlusUsesOpenDirGeneration(t *testing.T) {
 	if err := fs.OpenDir(context.Background(), open); err != nil {
 		t.Fatalf("OpenDir: %v", err)
 	}
+	read := func(offset fuseops.DirOffset) {
+		t.Helper()
+		op := &fuseops.ReadDirPlusOp{}
+		op.Handle = open.Handle
+		op.Offset = offset
+		op.Dst = make([]byte, 4096)
+		if err := fs.ReadDirPlus(context.Background(), op); err != nil {
+			t.Fatalf("ReadDirPlus: %v", err)
+		}
+		if op.BytesRead == 0 {
+			t.Fatalf("ReadDirPlus at offset %d wrote no entries", offset)
+		}
+	}
+	read(0)
 	r.SetGeneration(2)
-	op := &fuseops.ReadDirPlusOp{}
-	op.Handle = open.Handle
-	op.Dst = make([]byte, 4096)
-
-	if err := fs.ReadDirPlus(context.Background(), op); err != nil {
-		t.Fatalf("ReadDirPlus: %v", err)
-	}
-	if fs.pathToInode["old.txt"] == 0 {
-		t.Fatal("ReadDirPlus did not use OpenDir generation entry")
-	}
-	if fs.pathToInode["new.txt"] != 0 {
-		t.Fatal("ReadDirPlus used live resolver generation entry")
+	// Offset 2 is the root's .git entry plus a.txt.
+	read(2)
+	if fs.pathToInode["d.txt"] != 0 {
+		t.Fatal("continued ReadDirPlus used the live resolver generation")
 	}
 }
 
@@ -1569,4 +1586,74 @@ func committedOverlay(t *testing.T, dbPath, path string) (size int64, pending in
 		t.Fatal(err)
 	}
 	return size, pending
+}
+
+// Every backend lists a directory at the first ReadDir and again at each
+// ReadDir from offset 0: FSKit reuses a handle across enumerations, and
+// rewinddir reads from offset 0 on the same handle.
+func TestReadDirListsAtEnumerationStart(t *testing.T) {
+	f := newLocalOverlayFuseFixture(t)
+	ctx := context.Background()
+	open := &fuseops.OpenDirOp{Inode: f.nestInode}
+	if err := f.fs.OpenDir(ctx, open); err != nil {
+		t.Fatal(err)
+	}
+	read := func(offset fuseops.DirOffset) []byte {
+		t.Helper()
+		op := &fuseops.ReadDirOp{Handle: open.Handle, Offset: offset, Dst: make([]byte, 4096)}
+		if err := f.fs.ReadDir(ctx, op); err != nil {
+			t.Fatal(err)
+		}
+		return op.Dst[:op.BytesRead]
+	}
+	if _, err := f.store.CreateFile(ctx, "src/nested/opened.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first := read(0)
+	if !bytes.Contains(first, []byte("value.txt\x00")) || !bytes.Contains(first, []byte("opened.txt\x00")) {
+		t.Fatalf("first enumeration %q omitted a file that existed at the first ReadDir", first)
+	}
+	if _, err := f.store.CreateFile(ctx, "src/nested/added.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(2); len(got) != 0 {
+		t.Fatalf("a continued enumeration changed its listing: %q", got)
+	}
+	if !bytes.Contains(read(0), []byte("added.txt\x00")) {
+		t.Fatal("rewound enumeration omitted the new file")
+	}
+	if err := f.store.Remove(ctx, "src/nested/value.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(read(0), []byte("value.txt\x00")) {
+		t.Fatal("rewound enumeration includes the deleted file")
+	}
+	if err := f.fs.ReleaseDirHandle(ctx, &fuseops.ReleaseDirHandleOp{Handle: open.Handle}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The kernel can send CREATE for a name that appeared after its lookup
+// missed, so CreateFile must not replace an entry that exists.
+func TestCreateFileKeepsExistingEntry(t *testing.T) {
+	f := newLocalOverlayFuseFixture(t)
+	ctx := context.Background()
+	base := model.BaseNode{Path: "src/nested/base.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 12}
+	f.resolver.Snapshot = &fakeSnapshot{nodes: map[string]model.BaseNode{base.Path: base}, kids: map[string][]model.BaseNode{}}
+	for _, name := range []string{"value.txt", "base.txt"} {
+		op := &fuseops.CreateFileOp{Parent: f.nestInode, Name: name, Mode: 0o644}
+		if got := kernelErrno(f.fs.CreateFile(ctx, op)); got != syscall.EEXIST {
+			t.Fatalf("CreateFile(%q) over an existing entry = %v, want EEXIST", name, got)
+		}
+	}
+	if entry, ok, err := f.store.Lookup(ctx, "src/nested/value.txt"); err != nil || !ok || entry.SizeBytes != int64(len("overlay content")) {
+		t.Fatalf("overlay file after CreateFile = %+v, %v, %v; want its content kept", entry, ok, err)
+	}
+	if entry, ok, err := f.store.Lookup(ctx, base.Path); err != nil || ok {
+		t.Fatalf("CreateFile over a base file left overlay entry %+v, %v; want the base file kept", entry, err)
+	}
+	attrs := &fuseops.LookUpInodeOp{Parent: f.nestInode, Name: "base.txt"}
+	if err := f.fs.LookUpInode(ctx, attrs); err != nil || attrs.Entry.Attributes.Size != uint64(base.SizeBytes) {
+		t.Fatalf("base file after CreateFile = size %d, %v; want size %d", attrs.Entry.Attributes.Size, err, base.SizeBytes)
+	}
 }

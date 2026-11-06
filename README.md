@@ -74,8 +74,8 @@ file system extension is missing or not enabled. `auto` does not fall back after
 any other FSKit failure, because a retry could mount twice. The daemon logs the
 transport that mounted each repo.
 
-FSKit reuses directory handles across enumerations, so this backend refreshes
-entries when enumeration restarts. Both macOS backends reject extended
+FSKit reuses directory handles across enumerations. Every backend lists a
+directory again when an enumeration restarts. Both macOS backends reject extended
 attributes, so macOS writes no AppleDouble `._` files to store them. macOS
 attaches extended attributes such as `com.apple.provenance` to nearly every local
 file, so copying files onto the mount with `cp` or `ditto` may fail; `cp -X`
@@ -146,7 +146,7 @@ Check the state of a mounted repo with `status`:
 | `remote_refresh` | Whether daemon and manual remote refreshes are enabled |
 | `ahead` / `behind` / `diverged` | Currently zero/false in one-shot CLI status output |
 | `prepare_error` | Last redacted preparation error, if any |
-| `mount_error` | Last redacted FUSE mount error, if any; a successful mount clears it |
+| `mount_error` | Last redacted FUSE mount or connection error, if any; a successful mount clears it |
 | `hydrated_blobs` / `hydrated_bytes` | Blob count and bytes present in the local hydration cache |
 | `overlay_dirty` | `true` if the overlay contains created or modified files; delete-only overlays are not counted |
 | `last_fetch` / `result` | `FETCH_HEAD` modification time and `ok` when present; otherwise `never` |
@@ -170,6 +170,8 @@ ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the 
 Async existing-clone preparation reports remote configuration, fetch, and branch update as separate `configure_remote`, `fetch`, and `update_branch` phases.
 
 Each error the FUSE library reports becomes a `fuse error` record. A reply the kernel refuses, other than with `ENOENT`, logs at `WARN`. A failed FUSE op logs at `DEBUG`, because expected errnos such as `ENOTEMPTY` fail ops too. The daemon logs at `INFO`, so it never emits these lines. The library reports no failed lookup of a missing name, no `GetXattr` or `ListXattr` that fails with `ENOSYS`, `ENODATA` or `ERANGE`, and no request whose opcode the library does not recognize.
+
+A repo's FUSE connection can end while its mount stays in place: after an error fatal to the connection, such as a failed read from the kernel, or after the connection is aborted. The daemon then logs `fuse connection failed, unmounting`, records the connection's error as the repo's `mount_error` (for an abort, which carries no error, `fuse connection ended while the mount point still holds the mount`), unmounts the repo, and mounts it again. While that unmount fails and the mount table still lists the mount point, or the table, the path or the mount point cannot be read, each mount retry tries the unmount again instead of mounting. The daemon looks the mount point up in the kernel's mount table by its absolute path, with symlinks in the parent and a symlinked final component resolved. On macOS the lookup ignores case.
 
 Successful `add-repo`:
 
