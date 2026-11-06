@@ -1576,3 +1576,28 @@ func TestReadDirListsAtEnumerationStart(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The kernel can send CREATE for a name that appeared after its lookup
+// missed, so CreateFile must not replace an entry that exists.
+func TestCreateFileKeepsExistingEntry(t *testing.T) {
+	f := newLocalOverlayFuseFixture(t)
+	ctx := context.Background()
+	base := model.BaseNode{Path: "src/nested/base.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 12}
+	f.resolver.Snapshot = &fakeSnapshot{nodes: map[string]model.BaseNode{base.Path: base}, kids: map[string][]model.BaseNode{}}
+	for _, name := range []string{"value.txt", "base.txt"} {
+		op := &fuseops.CreateFileOp{Parent: f.nestInode, Name: name, Mode: 0o644}
+		if got := kernelErrno(f.fs.CreateFile(ctx, op)); got != syscall.EEXIST {
+			t.Fatalf("CreateFile(%q) over an existing entry = %v, want EEXIST", name, got)
+		}
+	}
+	if entry, ok, err := f.store.Lookup(ctx, "src/nested/value.txt"); err != nil || !ok || entry.SizeBytes != int64(len("overlay content")) {
+		t.Fatalf("overlay file after CreateFile = %+v, %v, %v; want its content kept", entry, ok, err)
+	}
+	if entry, ok, err := f.store.Lookup(ctx, base.Path); err != nil || ok {
+		t.Fatalf("CreateFile over a base file left overlay entry %+v, %v; want the base file kept", entry, err)
+	}
+	attrs := &fuseops.LookUpInodeOp{Parent: f.nestInode, Name: "base.txt"}
+	if err := f.fs.LookUpInode(ctx, attrs); err != nil || attrs.Entry.Attributes.Size != uint64(base.SizeBytes) {
+		t.Fatalf("base file after CreateFile = size %d, %v; want size %d", attrs.Entry.Attributes.Size, err, base.SizeBytes)
+	}
+}
