@@ -40,6 +40,7 @@ Repository-specific guidance for `artifact-fs`.
 - Hold no lock while a blob hydrates. An `Engine` method that needs base content takes a `*Blobs` and returns a `notHydratedError` when a blob is missing. `Engine.Do` then hydrates with no lock held and reruns the method.
 - Open every blob an `Engine` method copies before it changes anything. A directory rename is the one exception: it opens each blob as it copies it, so it may already have promoted some directories and copied some files, all with base content, and the rerun completes it.
 - Take the FUSE locks in this order: `handleOps`, `DirHandle.mu`, the resolver's `transition`, `ArtifactFuse.mu`, `FileHandle.mu`.
+- Release each FUSE lock with `defer`, or hold it only around code that cannot panic. The fuse library recovers a panic in an op and keeps serving, so a lock left held blocks every later op.
 - Wrap an operation error's cause with `%w`, and let `toErrno` map it for the kernel. Do not return `syscall.EIO` for a failure that carries an errno.
 
 ## Writing tests

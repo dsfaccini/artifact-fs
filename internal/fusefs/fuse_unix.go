@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -1131,18 +1132,28 @@ func MountRepo(repo model.RepoConfig, engine *Engine, logger *slog.Logger) (Moun
 var fuseMount = fuse.Mount
 
 // fuseErrorLog writes each line the fuse library logs to logger, with the
-// repo's remote redacted. An op error, which the library logs for expected
-// errnos such as ENOTEMPTY too, goes out at Debug; anything else, such as a
-// failed reply, as a warning.
+// repo's remote redacted. A bug the library answered with EIO goes out as an
+// error. Any other op error, which the library logs for expected errnos such
+// as EEXIST too, goes out at Debug. Anything else, such as a failed reply,
+// goes out as a warning.
 type fuseErrorLog struct {
 	logger *slog.Logger
 	repo   model.RepoConfig
 }
 
+// fuseBugLine matches the op error lines the fuse library writes for a
+// recovered panic, a method that exited through runtime.Goexit, and a
+// BytesRead outside its buffer. Every other op error's message is quoted, so
+// it never matches the panic form.
+var fuseBugLine = regexp.MustCompile(`^Op 0x[0-9a-f]+ \S+\] -> \w+: (panic: |"fuseutil: the method exited without returning: |"\S+\.BytesRead is -?\d+, outside its \d+-byte buffer: )`)
+
 func (l fuseErrorLog) Write(p []byte) (int, error) {
 	msg := strings.TrimSuffix(string(p), "\n")
 	level := slog.LevelWarn
-	if strings.HasPrefix(msg, "Op ") {
+	switch {
+	case fuseBugLine.MatchString(msg):
+		level = slog.LevelError
+	case strings.HasPrefix(msg, "Op "):
 		level = slog.LevelDebug
 	}
 	l.logger.Log(context.Background(), level, "fuse error", "repo", l.repo.Name, "error", auth.RedactLogString(msg, l.repo.RemoteURL))
