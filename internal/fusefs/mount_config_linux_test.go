@@ -14,8 +14,8 @@ import (
 // in a directory.
 func TestMountRepoEnablesParallelDirOps(t *testing.T) {
 	repo := model.RepoConfig{Name: "repo", MountPath: t.TempDir()}
-	for _, cfg := range mountRepoConfigs(t, repo, slog.New(slog.DiscardHandler)) {
-		if !cfg.EnableParallelDirOps {
+	for _, attempt := range mountRepoAttempts(t, repo, slog.New(slog.DiscardHandler)) {
+		if !attempt.cfg.EnableParallelDirOps {
 			t.Fatal("mount config leaves parallel directory ops off")
 		}
 	}

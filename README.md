@@ -68,9 +68,9 @@ file system extension and needs no kernel extension.
 Any other value fails the mount. Linux accepts the same values and ignores them.
 
 A failed FSKit mount logs what to fix, such as enabling the file system
-extensions or upgrading macOS. FSKit counts as unavailable when macFUSE's FSKit
-framework is missing, macOS is too old, the helper tool failed to install, or the
-file system extension is missing or not enabled. `auto` does not fall back after
+extensions or upgrading macOS. FSKit counts as unavailable when macFUSE is older
+than 5.5 or its FSKit framework cannot be loaded, macOS is too old, the helper
+tool failed to install, or the file system extension is missing or not enabled. `auto` does not fall back after
 any other FSKit failure, because a retry could mount twice. The daemon logs the
 transport that mounted each repo.
 

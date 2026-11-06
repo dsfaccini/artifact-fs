@@ -1183,11 +1183,12 @@ func MountBackend() (string, error) {
 
 // mountWithBackend mounts through the transports backend allows and returns the
 // backend that mounted. mount(true) mounts through FSKit, mount(false) through the
-// kernel transport. BackendAuto falls back to the kernel transport only when
-// fskitUnavailable reports that FSKit cannot serve any mount here and kextLoaded
-// reports a loaded macFUSE kernel extension, because mounting through an unloaded
-// one prompts macOS to load it.
-func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileSystem, error), fskitUnavailable func(error) bool, kextLoaded func() bool) (*fuse.MountedFileSystem, string, error) {
+// kernel transport. BackendAuto falls back to the kernel transport only when the
+// FSKit error matches fuse.ErrFSKitUnavailable, which means FSKit cannot serve any
+// mount here, and kextLoaded reports a loaded macFUSE kernel extension, because
+// mounting through an unloaded one prompts macOS to load it. Any other FSKit
+// failure may leave a mount behind, so a retry could mount twice.
+func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileSystem, error), kextLoaded func() bool) (*fuse.MountedFileSystem, string, error) {
 	switch backend {
 	case BackendKernel:
 		mfs, err := mount(false)
@@ -1197,7 +1198,7 @@ func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileS
 		return mfs, BackendFSKit, err
 	}
 	mfs, fskitErr := mount(true)
-	if fskitErr == nil || !fskitUnavailable(fskitErr) {
+	if fskitErr == nil || !errors.Is(fskitErr, fuse.ErrFSKitUnavailable) {
 		return mfs, BackendFSKit, fskitErr
 	}
 	if !kextLoaded() {
@@ -1216,7 +1217,6 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, l
 		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
 	}
 	fsint := NewArtifactFuse(repo, engine)
-	server := fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate))
 
 	mountCfg := fuse.MountConfig{
 		FSName:                  "artifact-fs:" + repo.Name,
@@ -1229,8 +1229,11 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, l
 	mount := func(fskit bool) (*fuse.MountedFileSystem, error) {
 		cfg := mountCfg
 		if fskit {
-			cfg.Options = map[string]string{"backend": "fskit"}
+			cfg.Backend = fuse.BackendFSKit
 		}
+		// A Server must not serve a second mount once a failed one has
+		// answered INIT, so each attempt gets its own.
+		server := fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate))
 		return fuseMount(repo.MountPath, server, &cfg)
 	}
 
