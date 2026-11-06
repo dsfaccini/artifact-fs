@@ -229,13 +229,12 @@ func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.Repo
 }
 
 // ConfigureFSMonitorHook installs ArtifactFS's hook without probing the
-// worktree, which may still be gated during startup.
+// worktree, which may still be gated during startup. It writes only the hook
+// config. An adopted worktree writes it to config.worktree, which
+// ConfigureAdoptedWorktree must have enabled.
 func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfig, stateRoot string) error {
 	configArgs := []string{"config"}
 	if repo.AdoptGitDir {
-		if err := s.ConfigureAdoptedWorktree(ctx, repo); err != nil {
-			return err
-		}
 		configArgs = append(configArgs, "--worktree")
 	}
 	exe, err := os.Executable()
