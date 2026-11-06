@@ -7,21 +7,22 @@ import (
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
+	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
 )
 
 // Under noappledouble the kernel extension hides tracked ._ and .DS_Store
 // files, which FSKit serves.
 func TestMountRepoKeepsAppleDoubleFilesVisible(t *testing.T) {
-	setMacFUSEKextLoaded(t, true)
+	setMacFUSEKernelExtensionLoaded(t, true)
 	repo := model.RepoConfig{Name: "repo", MountPath: t.TempDir()}
 	var kernel bool
-	for _, cfg := range mountRepoConfigs(t, repo, slog.New(slog.DiscardHandler)) {
-		if cfg.Options["backend"] != "fskit" {
+	for _, attempt := range mountRepoAttempts(t, repo, slog.New(slog.DiscardHandler)) {
+		if attempt.cfg.Backend != fuse.BackendFSKit {
 			kernel = true
 		}
-		if !cfg.EnableAppleDouble {
-			t.Fatalf("mount config with options %v keeps noappledouble", cfg.Options)
+		if !attempt.cfg.EnableAppleDouble {
+			t.Fatalf("mount config for backend %q keeps noappledouble", attempt.cfg.Backend)
 		}
 	}
 	if !kernel {

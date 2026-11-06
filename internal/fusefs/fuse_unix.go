@@ -1133,7 +1133,8 @@ var fuseMount = fuse.Mount
 
 // fuseErrorLog writes each line the fuse library logs to logger, with the
 // repo's remote redacted. A bug the library answered with EIO goes out as an
-// error. Any other op error, which the library logs for expected errnos such
+// error. A short FSKit read the library answered with EIO goes out as a
+// warning. Any other op error, which the library logs for expected errnos such
 // as EEXIST too, goes out at Debug. Anything else, such as a failed reply,
 // goes out as a warning.
 type fuseErrorLog struct {
@@ -1147,12 +1148,19 @@ type fuseErrorLog struct {
 // it never matches the panic form.
 var fuseBugLine = regexp.MustCompile(`^Op 0x[0-9a-f]+ \S+\] -> \w+: (panic: |"fuseutil: the method exited without returning: |"\S+\.BytesRead is -?\d+, outside its \d+-byte buffer: )`)
 
+// fuseShortReadLine matches the op error line the fuse library writes when, on
+// FSKit, a read's reply is shorter than the size last reported for the file,
+// which it answers with EIO.
+var fuseShortReadLine = regexp.MustCompile(`^Op 0x[0-9a-f]+ \*fuseops\.ReadFileOp\] -> Error: "read of inode \d+ at offset \d+ returned \d+ bytes, want \d+ for size \d+: `)
+
 func (l fuseErrorLog) Write(p []byte) (int, error) {
 	msg := strings.TrimSuffix(string(p), "\n")
 	level := slog.LevelWarn
 	switch {
 	case fuseBugLine.MatchString(msg):
 		level = slog.LevelError
+	case fuseShortReadLine.MatchString(msg):
+		level = slog.LevelWarn
 	case strings.HasPrefix(msg, "Op "):
 		level = slog.LevelDebug
 	}
@@ -1183,11 +1191,12 @@ func MountBackend() (string, error) {
 
 // mountWithBackend mounts through the transports backend allows and returns the
 // backend that mounted. mount(true) mounts through FSKit, mount(false) through the
-// kernel transport. BackendAuto falls back to the kernel transport only when
-// fskitUnavailable reports that FSKit cannot serve any mount here and kextLoaded
-// reports a loaded macFUSE kernel extension, because mounting through an unloaded
-// one prompts macOS to load it.
-func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileSystem, error), fskitUnavailable func(error) bool, kextLoaded func() bool) (*fuse.MountedFileSystem, string, error) {
+// kernel transport. BackendAuto falls back to the kernel transport only when the
+// FSKit error matches fuse.ErrFSKitUnavailable, which means FSKit cannot serve any
+// mount here, and kextLoaded reports a loaded macFUSE kernel extension, because
+// mounting through an unloaded one prompts macOS to load it. Any other FSKit
+// failure may leave a mount behind, so a retry could mount twice.
+func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileSystem, error), kextLoaded func() bool) (*fuse.MountedFileSystem, string, error) {
 	switch backend {
 	case BackendKernel:
 		mfs, err := mount(false)
@@ -1197,7 +1206,7 @@ func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileS
 		return mfs, BackendFSKit, err
 	}
 	mfs, fskitErr := mount(true)
-	if fskitErr == nil || !fskitUnavailable(fskitErr) {
+	if fskitErr == nil || !errors.Is(fskitErr, fuse.ErrFSKitUnavailable) {
 		return mfs, BackendFSKit, fskitErr
 	}
 	if !kextLoaded() {
@@ -1216,7 +1225,6 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, l
 		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
 	}
 	fsint := NewArtifactFuse(repo, engine)
-	server := fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate))
 
 	mountCfg := fuse.MountConfig{
 		FSName:                  "artifact-fs:" + repo.Name,
@@ -1229,8 +1237,11 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, l
 	mount := func(fskit bool) (*fuse.MountedFileSystem, error) {
 		cfg := mountCfg
 		if fskit {
-			cfg.Options = map[string]string{"backend": "fskit"}
+			cfg.Backend = fuse.BackendFSKit
 		}
+		// A Server must not serve a second mount once a failed one has
+		// answered INIT, so each attempt gets its own.
+		server := fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate))
 		return fuseMount(repo.MountPath, server, &cfg)
 	}
 
