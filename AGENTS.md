@@ -35,6 +35,7 @@ Repository-specific guidance for `artifact-fs`.
 - The watcher polls `HEAD` plus the current HEAD ref path. If you change it, preserve branch-switch and packed-ref behavior covered by `internal/watcher/watcher_test.go`.
 - The overlay stores deletes as SQLite entries with `kind='delete'`; there is no on-disk whiteout file layer.
 - SQLite is `modernc.org/sqlite` in WAL mode via `internal/meta`.
+- Change a store's schema only by appending a migration to its `migrations` list. `meta.Migrate` records each applied migration in `PRAGMA user_version` and never reruns it. An edit to a shipped migration never reaches an existing database. With each new migration, add a fixture at its `user_version` to that store's `migrate_test.go`. That fixture fails the tests when a later edit changes a shipped migration.
 - The FUSE adapter calls only `Engine` methods, one per operation. Do not reach into `engine.Overlay`, `engine.Hydrator`, or the `Resolver` from the adapter.
 - Hold no lock while a blob hydrates. An `Engine` method that needs base content takes a `*Blobs` and returns a `notHydratedError` when a blob is missing. `Engine.Do` then hydrates with no lock held and reruns the method.
 - Open every blob an `Engine` method copies before it changes anything. A directory rename is the one exception: it opens each blob as it copies it, so it may already have promoted some directories and copied some files, all with base content, and the rerun completes it.

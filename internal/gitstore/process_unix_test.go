@@ -51,6 +51,9 @@ func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
 			_, err := store.BuildTreeIndex(ctx, cfg, commit)
 			return err
 		}},
+		{"batch blob fetch", "blob:none", func(ctx context.Context, store *Store, cfg model.RepoConfig, _, blob string) error {
+			return store.FetchMissingBlobs(ctx, cfg, []string{blob})
+		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			isolateLazyFetchEnv(t)

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	iofs "io/fs"
+	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
@@ -816,7 +819,8 @@ func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) er
 		}
 		fh := &FileHandle{inode: ref, path: ref.Path}
 		if ref.Path != ".git" {
-			f, gen, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen)
+			// An open for writing only reads nothing, so it prefetches nothing.
+			f, gen, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen, !op.OpenFlags.IsWriteOnly())
 			if err != nil {
 				return err
 			}
@@ -1107,11 +1111,7 @@ func (fs *ArtifactFuse) ListXattr(_ context.Context, _ *fuseops.ListXattrOp) err
 	return syscall.ENOSYS
 }
 func (fs *ArtifactFuse) SetXattr(_ context.Context, _ *fuseops.SetXattrOp) error {
-	if fs.fskit {
-		// ENOSYS enables native AppleDouble fallback files, including ._.venv.
-		return syscall.EPERM
-	}
-	return syscall.ENOSYS
+	return setXattrErrno
 }
 func (fs *ArtifactFuse) RemoveXattr(_ context.Context, _ *fuseops.RemoveXattrOp) error {
 	return syscall.ENOSYS
@@ -1131,8 +1131,30 @@ func (m *mountedFSWrapper) Unmount() error {
 
 func (m *mountedFSWrapper) Backend() string { return m.backend }
 
-func MountRepo(repo model.RepoConfig, engine *Engine) (MountedFS, error) {
-	return MountRepoWithGate(repo, engine, nil)
+func MountRepo(repo model.RepoConfig, engine *Engine, logger *slog.Logger) (MountedFS, error) {
+	return MountRepoWithGate(repo, engine, nil, logger)
+}
+
+// fuseMount is fuse.Mount. Package tests replace it so they cannot mount.
+var fuseMount = fuse.Mount
+
+// fuseErrorLog writes each line the fuse library logs to logger, with the
+// repo's remote redacted. An op error, which the library logs for expected
+// errnos such as ENOTEMPTY too, goes out at Debug; anything else, such as a
+// failed reply, as a warning.
+type fuseErrorLog struct {
+	logger *slog.Logger
+	repo   model.RepoConfig
+}
+
+func (l fuseErrorLog) Write(p []byte) (int, error) {
+	msg := strings.TrimSuffix(string(p), "\n")
+	level := slog.LevelWarn
+	if strings.HasPrefix(msg, "Op ") {
+		level = slog.LevelDebug
+	}
+	l.logger.Log(context.Background(), level, "fuse error", "repo", l.repo.Name, "error", auth.RedactLogString(msg, l.repo.RemoteURL))
+	return len(p), nil
 }
 
 const backendEnv = "ARTIFACT_FS_FUSE_BACKEND"
@@ -1185,7 +1207,7 @@ func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileS
 	return mfs, BackendKernel, nil
 }
 
-func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate) (MountedFS, error) {
+func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, logger *slog.Logger) (MountedFS, error) {
 	backend, err := MountBackend()
 	if err != nil {
 		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
@@ -1197,6 +1219,7 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate) (
 		FSName:                  "artifact-fs:" + repo.Name,
 		Subtype:                 "artifact-fs",
 		DisableWritebackCaching: true,
+		ErrorLogger:             log.New(fuseErrorLog{logger: logger, repo: repo}, "", 0),
 	}
 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.
 	platformMountConfig(&mountCfg)
@@ -1207,7 +1230,7 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate) (
 		if fskit {
 			cfg.Options = map[string]string{"backend": "fskit"}
 		}
-		return fuse.Mount(repo.MountPath, server, &cfg)
+		return fuseMount(repo.MountPath, server, &cfg)
 	}
 
 	mfs, mounted, err := platformMount(backend, mount)

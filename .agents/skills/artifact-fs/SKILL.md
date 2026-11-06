@@ -23,7 +23,7 @@ go build -o artifact-fs ./cmd/artifact-fs
 - **`add-repo` does not mount.** It registers a blobless clone and exits. `daemon` mounts all registered repos and stays running.
 - **The mounted tree starts from committed Git state.** Remote commits, trees, and refs are the base view. Local edits live in an overlay and appear as dirty state until committed.
 - **One daemon can mount many repos.** Register each repo separately, then start one `daemon --root <mount-root>`.
-- **Unmount a stale mount with the OS's tool.** On macOS run `diskutil unmount <path>`, because macOS denies `umount` from a terminal for FSKit mounts. On Linux run `fusermount3 -u <path>`, because `umount` needs root.
+- **Unmount a stale mount with the OS's tool.** On macOS run `diskutil unmount <path>`, because `umount` fails on an FSKit mount unless the terminal app has the Network Volumes permission. On Linux run `fusermount3 -u <path>`, because `umount` needs root.
 
 ## Quick Reference
 
@@ -62,7 +62,7 @@ if [ "$(uname)" = Darwin ]; then diskutil unmount "$MOUNT_ROOT/workers-sdk"; els
 
 ## Mount Semantics
 
-- Base view = branch `HEAD` from the blobless clone. File contents hydrate on first read.
+- Base view = branch `HEAD` from the blobless clone. File contents hydrate on first read, and the first read in a directory hydrates its other files in the background. Listing directories hydrates nothing.
 - Dirty files are overlay state, not part of the base commit. `./artifact-fs status --name <repo>` reports this as `overlay_dirty=true`.
 - `git add` and `git commit` inside the mount are supported. After commit or checkout, the watcher re-indexes the new `HEAD` and reconciles stale overlay entries.
 

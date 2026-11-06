@@ -3,15 +3,12 @@
 package fusefs
 
 import (
-	"context"
 	"errors"
 	"slices"
 	"strings"
-	"syscall"
 	"testing"
 
 	"github.com/dsfaccini/fuse"
-	"github.com/dsfaccini/fuse/fuseops"
 )
 
 func TestMountBackendRejectsUnknownValues(t *testing.T) {
@@ -112,23 +109,5 @@ func assertMountResult(t *testing.T, mounts []bool, backend string, err error, w
 	}
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want %v", err, wantErr)
-	}
-}
-
-func TestFSKitRejectsXattrFallback(t *testing.T) {
-	for _, test := range []struct {
-		name  string
-		fskit bool
-		want  error
-	}{
-		{name: "ordinary backend", want: syscall.ENOSYS},
-		{name: "FSKit", fskit: true, want: syscall.EPERM},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			fs := &ArtifactFuse{fskit: test.fskit}
-			if err := fs.SetXattr(context.Background(), &fuseops.SetXattrOp{Name: "com.apple.FinderInfo"}); err != test.want {
-				t.Fatalf("SetXattr error=%v, want %v", err, test.want)
-			}
-		})
 	}
 }

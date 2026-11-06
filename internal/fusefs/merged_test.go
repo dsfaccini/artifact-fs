@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -178,7 +179,14 @@ func (f *fakeOverlay) SetMode(_ context.Context, path string, mode uint32) error
 func (f *fakeOverlay) Reconcile(_ context.Context, _ func(string) (model.BaseNode, bool)) error {
 	return nil
 }
-func (f *fakeOverlay) ReconcileChecked(_ context.Context, _ func(string) (model.BaseNode, bool, error)) error {
+func (f *fakeOverlay) ReconcileChecked(_ context.Context, _ func(string) (model.BaseNode, bool, error), lock sync.Locker, switchBase func()) error {
+	if lock != nil {
+		lock.Lock()
+		defer lock.Unlock()
+	}
+	if switchBase != nil {
+		switchBase()
+	}
 	return nil
 }
 func (f *fakeOverlay) DirtyCount(_ context.Context) (int64, error) { return 0, nil }

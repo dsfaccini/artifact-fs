@@ -13,8 +13,12 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
+	"github.com/cloudflare/artifact-fs/internal/hydrator"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	overlaystore "github.com/cloudflare/artifact-fs/internal/overlay"
+	"github.com/cloudflare/artifact-fs/internal/snapshot"
 	"github.com/dsfaccini/fuse/fuseops"
 )
 
@@ -1025,6 +1029,339 @@ func TestLookUpInodeResolvesUnknownBaseAttributeSizes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFirstFileReadPrefetchesItsDirectoryAndListingPrefetchesNothing(t *testing.T) {
+	ctx := context.Background()
+	files := map[string]string{
+		"src/a.go":      "package a\n",
+		"src/b.go":      "package b\n",
+		"src/c.go":      "package c\n",
+		"docs/guide.md": "# guide\n",
+		"top.txt":       "top\n",
+	}
+	tmp := t.TempDir()
+	repo := model.RepoConfig{
+		ID:            "repo",
+		Name:          "repo",
+		GitDir:        filepath.Join(tmp, "repo.git"),
+		RemoteURL:     gittest.PartialCloneRemote(t, files),
+		Branch:        "main",
+		BlobCacheDir:  filepath.Join(tmp, "cache"),
+		OverlayDir:    filepath.Join(tmp, "overlay"),
+		OverlayDBPath: filepath.Join(tmp, "overlay.db"),
+	}
+	git := gitstore.New(nil)
+	t.Cleanup(git.Close)
+	if err := git.CloneBlobless(ctx, repo); err != nil {
+		t.Fatalf("CloneBlobless: %v", err)
+	}
+	head, ref, err := git.ResolveHEAD(ctx, repo)
+	if err != nil {
+		t.Fatalf("ResolveHEAD: %v", err)
+	}
+	nodes, err := git.BuildTreeIndex(ctx, repo, head)
+	if err != nil {
+		t.Fatalf("BuildTreeIndex: %v", err)
+	}
+	oids := map[string]string{}
+	for _, n := range nodes {
+		oids[n.Path] = n.ObjectOID
+	}
+	snap, err := snapshot.New(ctx, filepath.Join(tmp, "snapshot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = snap.Close() })
+	gen, err := snap.PublishGeneration(ctx, head, ref, nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ov, err := overlaystore.New(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ov.Close() })
+	h := hydrator.New(git)
+	t.Cleanup(h.Stop)
+	resolver := &Resolver{Snapshot: snap, Overlay: ov}
+	resolver.SetGeneration(gen)
+	fs := NewArtifactFuse(repo, &Engine{Resolver: resolver, Repo: repo, Overlay: ov, Hydrator: h})
+	packs := packCount(t, repo.GitDir)
+
+	// The hydrator has not started, so anything a listing queued would still
+	// be queued.
+	walkListing(t, fs, fuseops.RootInodeID, ".")
+	if got := h.QueueDepth(repo.ID); got != 0 {
+		t.Fatalf("a listing-only walk queued %d blobs for hydration", got)
+	}
+
+	h.Start(4, repo)
+	src := lookUpInode(t, fs, fuseops.RootInodeID, "src")
+	if got := readWholeFile(t, fs, lookUpInode(t, fs, src, "a.go")); got != files["src/a.go"] {
+		t.Fatalf("src/a.go = %q, want %q", got, files["src/a.go"])
+	}
+	for _, path := range []string{"src/b.go", "src/c.go"} {
+		waitForCachedBlob(t, repo, oids[path])
+	}
+	// One fetch for a.go itself and one for its siblings.
+	if got := packCount(t, repo.GitDir); got != packs+2 {
+		t.Fatalf("packs = %d after reading src/a.go, want %d", got, packs+2)
+	}
+	for _, name := range []string{"b.go", "c.go"} {
+		if got := readWholeFile(t, fs, lookUpInode(t, fs, src, name)); got != files["src/"+name] {
+			t.Fatalf("src/%s = %q, want %q", name, got, files["src/"+name])
+		}
+	}
+	if got := packCount(t, repo.GitDir); got != packs+2 {
+		t.Fatalf("packs = %d after reading the prefetched siblings, want %d", got, packs+2)
+	}
+	for _, path := range []string{"docs/guide.md", "top.txt"} {
+		if _, err := os.Stat(filepath.Join(repo.BlobCacheDir, oids[path])); err == nil {
+			t.Fatalf("%s was hydrated though nothing in its directory was read", path)
+		}
+	}
+}
+
+func TestReadsPrefetchEachDirectoryOncePerGeneration(t *testing.T) {
+	ctx := context.Background()
+	cachePath := filepath.Join(t.TempDir(), "blob")
+	if err := os.WriteFile(cachePath, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := model.BaseNode{Path: "src/a.go", Type: "file", Mode: 0o100644, ObjectOID: "a", SizeState: "unknown"}
+	b := model.BaseNode{Path: "src/b.go", Type: "file", Mode: 0o100644, ObjectOID: "b", SizeState: "unknown"}
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	r := newResolver(&fakeSnapshot{
+		nodes: map[string]model.BaseNode{"src": {Path: "src", Type: "dir", Mode: 0o40755}, a.Path: a, b.Path: b},
+		kids:  map[string][]model.BaseNode{"src": {a, b}},
+	}, ov)
+	h := &fakeBatchHydrator{path: cachePath}
+	engine := &Engine{Resolver: r, Repo: model.RepoConfig{ID: "repo"}, Overlay: ov, Hydrator: h}
+	dst := make([]byte, 16)
+
+	for _, path := range []string{a.Path, b.Path} {
+		if _, err := engineRead(ctx, engine, path, 0, dst); err != nil {
+			t.Fatalf("Read(%s): %v", path, err)
+		}
+	}
+	if len(h.tasks) != 2 {
+		t.Fatalf("prefetch tasks after two reads in src = %d, want 2", len(h.tasks))
+	}
+	// A new generation can hold new blobs.
+	r.SetGeneration(2)
+	if _, err := engineRead(ctx, engine, a.Path, 0, dst); err != nil {
+		t.Fatalf("Read(%s) at generation 2: %v", a.Path, err)
+	}
+	if len(h.tasks) != 4 {
+		t.Fatalf("prefetch tasks after a read at a new generation = %d, want 4", len(h.tasks))
+	}
+}
+
+// newPrefetchFixture serves src/a.go and src/b.go, whose sizes are unknown, from
+// a hydrator that records what is queued.
+func newPrefetchFixture(t *testing.T) (*ArtifactFuse, *Engine, *fakeBatchHydrator) {
+	t.Helper()
+	cachePath := filepath.Join(t.TempDir(), "blob")
+	if err := os.WriteFile(cachePath, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := model.BaseNode{Path: "src", Type: "dir", Mode: 0o40755}
+	a := model.BaseNode{Path: "src/a.go", Type: "file", Mode: 0o100644, ObjectOID: "a", SizeState: "unknown"}
+	b := model.BaseNode{Path: "src/b.go", Type: "file", Mode: 0o100644, ObjectOID: "b", SizeState: "unknown"}
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	r := newResolver(&fakeSnapshot{
+		nodes: map[string]model.BaseNode{src.Path: src, a.Path: a, b.Path: b},
+		kids:  map[string][]model.BaseNode{".": {src}, "src": {a, b}},
+	}, ov)
+	h := &fakeBatchHydrator{path: cachePath}
+	repo := model.RepoConfig{ID: "repo"}
+	engine := &Engine{Resolver: r, Repo: repo, Overlay: ov, Hydrator: h}
+	return NewArtifactFuse(repo, engine), engine, h
+}
+
+func TestLookupAndGetattrDoNotPrefetch(t *testing.T) {
+	fs, _, h := newPrefetchFixture(t)
+	src := lookUpInode(t, fs, fuseops.RootInodeID, "src")
+	a := lookUpInode(t, fs, src, "a.go")
+	if err := fs.GetInodeAttributes(context.Background(), &fuseops.GetInodeAttributesOp{Inode: a}); err != nil {
+		t.Fatalf("GetInodeAttributes: %v", err)
+	}
+	if h.calls == 0 {
+		t.Fatal("lookup did not hydrate src/a.go, whose size is unknown")
+	}
+	if len(h.tasks) != 0 {
+		t.Fatalf("lookup and getattr queued %d prefetch tasks for src", len(h.tasks))
+	}
+}
+
+func TestWriteOnlyOpenDoesNotPrefetch(t *testing.T) {
+	fs, _, h := newPrefetchFixture(t)
+	ctx := context.Background()
+	a := lookUpInode(t, fs, lookUpInode(t, fs, fuseops.RootInodeID, "src"), "a.go")
+	open := &fuseops.OpenFileOp{Inode: a, OpenFlags: syscall.O_WRONLY | syscall.O_TRUNC}
+	if err := fs.OpenFile(ctx, open); err != nil {
+		t.Fatalf("OpenFile(O_WRONLY|O_TRUNC): %v", err)
+	}
+	_ = fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: open.Handle})
+	if len(h.tasks) != 0 {
+		t.Fatalf("a write-only open queued %d prefetch tasks for src", len(h.tasks))
+	}
+	readWholeFile(t, fs, a)
+	if len(h.tasks) != 2 {
+		t.Fatalf("a read queued %d prefetch tasks for src, want 2", len(h.tasks))
+	}
+}
+
+func TestReadsAtTwoGenerationsPrefetchADirectoryOnce(t *testing.T) {
+	_, engine, h := newPrefetchFixture(t)
+	engine.Resolver.SetGeneration(2)
+	// A handle opened before a HEAD change reads at the previous generation.
+	for _, gen := range []int64{1, 2, 1, 2} {
+		if err := engineBaseCacheFile(context.Background(), engine, "src/a.go", gen); err != nil {
+			t.Fatalf("BaseCacheFile at generation %d: %v", gen, err)
+		}
+	}
+	if len(h.tasks) != 2 {
+		t.Fatalf("reads at generations 1 and 2 queued %d prefetch tasks, want 2", len(h.tasks))
+	}
+}
+
+func TestFirstReadHydratesItsBlobBeforeItPrefetches(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name string
+		read func(t *testing.T, fs *ArtifactFuse, engine *Engine)
+	}{
+		{name: "open and read a file", read: func(t *testing.T, fs *ArtifactFuse, _ *Engine) {
+			readWholeFile(t, fs, lookUpInode(t, fs, lookUpInode(t, fs, fuseops.RootInodeID, "src"), "a.go"))
+		}},
+		{name: "read a path", read: func(t *testing.T, _ *ArtifactFuse, engine *Engine) {
+			if _, err := engineRead(ctx, engine, "src/a.go", 0, make([]byte, 16)); err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+		}},
+		{name: "read through a handle", read: func(t *testing.T, _ *ArtifactFuse, engine *Engine) {
+			if err := engineBaseCacheFile(ctx, engine, "src/a.go", 0); err != nil {
+				t.Fatalf("BaseCacheFile: %v", err)
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs, engine, h := newPrefetchFixture(t)
+			rec := &queuedAtOpenHydrator{fakeBatchHydrator: h}
+			engine.Hydrator = rec
+			tt.read(t, fs, engine)
+			if len(h.tasks) != 2 {
+				t.Fatalf("prefetch tasks = %d, want 2", len(h.tasks))
+			}
+			if len(rec.queuedAtOpen) == 0 || rec.queuedAtOpen[0] != 0 {
+				t.Fatalf("prefetch tasks queued when src/a.go started to hydrate = %v, want 0: the read would wait in its directory's speculative batch", rec.queuedAtOpen)
+			}
+		})
+	}
+}
+
+// queuedAtOpenHydrator records how many tasks were queued each time a blob
+// started to hydrate for an open.
+type queuedAtOpenHydrator struct {
+	*fakeBatchHydrator
+	queuedAtOpen []int
+}
+
+func (h *queuedAtOpenHydrator) OpenHydrated(ctx context.Context, repo model.RepoConfig, node model.BaseNode) (*os.File, int64, error) {
+	h.queuedAtOpen = append(h.queuedAtOpen, len(h.tasks))
+	return h.fakeBatchHydrator.OpenHydrated(ctx, repo, node)
+}
+
+// engineBaseCacheFile opens and closes path's base content at generation gen,
+// as a file handle's read does.
+func engineBaseCacheFile(ctx context.Context, e *Engine, path string, gen int64) error {
+	return e.Do(ctx, nil, func(ctx context.Context, b *Blobs) error {
+		f, _, _, err := e.BaseCacheFile(ctx, b, path, gen)
+		if f != nil {
+			_ = f.Close()
+		}
+		return err
+	})
+}
+
+// walkListing opens and lists every directory under inode, and looks up only
+// directories, as find and ls -R do.
+func walkListing(t *testing.T, fs *ArtifactFuse, inode fuseops.InodeID, path string) {
+	t.Helper()
+	ctx := context.Background()
+	open := &fuseops.OpenDirOp{Inode: inode}
+	if err := fs.OpenDir(ctx, open); err != nil {
+		t.Fatalf("OpenDir(%s): %v", path, err)
+	}
+	if err := fs.ReadDir(ctx, &fuseops.ReadDirOp{Handle: open.Handle, Dst: make([]byte, 64*1024)}); err != nil {
+		t.Fatalf("ReadDir(%s): %v", path, err)
+	}
+	plus := &fuseops.ReadDirPlusOp{}
+	plus.Handle = open.Handle
+	plus.Dst = make([]byte, 64*1024)
+	if err := fs.ReadDirPlus(ctx, plus); err != nil {
+		t.Fatalf("ReadDirPlus(%s): %v", path, err)
+	}
+	if err := fs.ReleaseDirHandle(ctx, &fuseops.ReleaseDirHandleOp{Handle: open.Handle}); err != nil {
+		t.Fatalf("ReleaseDirHandle(%s): %v", path, err)
+	}
+	entries, _, _, err := fs.engine.ReadDir(ctx, path)
+	if err != nil {
+		t.Fatalf("ReadDir(%s): %v", path, err)
+	}
+	for _, e := range entries {
+		if e.Type == "dir" {
+			walkListing(t, fs, lookUpInode(t, fs, inode, e.Name), model.CleanPath(filepath.Join(path, e.Name)))
+		}
+	}
+}
+
+func lookUpInode(t *testing.T, fs *ArtifactFuse, parent fuseops.InodeID, name string) fuseops.InodeID {
+	t.Helper()
+	op := &fuseops.LookUpInodeOp{Parent: parent, Name: name}
+	if err := fs.LookUpInode(context.Background(), op); err != nil {
+		t.Fatalf("LookUpInode(%s): %v", name, err)
+	}
+	return op.Entry.Child
+}
+
+func readWholeFile(t *testing.T, fs *ArtifactFuse, inode fuseops.InodeID) string {
+	t.Helper()
+	ctx := context.Background()
+	open := &fuseops.OpenFileOp{Inode: inode}
+	if err := fs.OpenFile(ctx, open); err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer func() { _ = fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: open.Handle}) }()
+	read := &fuseops.ReadFileOp{Handle: open.Handle, Size: 4096, Dst: make([]byte, 4096)}
+	if err := fs.ReadFile(ctx, read); err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	return string(read.Dst[:read.BytesRead])
+}
+
+// waitForCachedBlob polls until oid's blob is in repo's cache; go test
+// -timeout is its only bound.
+func waitForCachedBlob(t *testing.T, repo model.RepoConfig, oid string) {
+	t.Helper()
+	for {
+		if _, err := os.Stat(filepath.Join(repo.BlobCacheDir, oid)); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func packCount(t *testing.T, gitDir string) int {
+	t.Helper()
+	packs, err := filepath.Glob(filepath.Join(gitDir, "objects", "pack", "*.pack"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(packs)
 }
 
 func TestReadDirPlusUsesReaddirMetadataWithoutHydration(t *testing.T) {

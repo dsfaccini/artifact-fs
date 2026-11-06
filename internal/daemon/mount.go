@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -17,8 +18,9 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 )
 
-// mountFunc mounts a repo's filesystem. A nil gate mounts it ungated.
-type mountFunc func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate) (fusefs.MountedFS, error)
+// mountFunc mounts a repo's filesystem. A nil gate mounts it ungated. The
+// fuse library logs its errors to the logger.
+type mountFunc func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error)
 
 // defaultMount is what New installs as Service.mount. Package tests replace it so they cannot mount.
 var defaultMount mountFunc = fusefs.MountRepoWithGate
@@ -83,7 +85,7 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		baseLookup := func(path string) (model.BaseNode, bool, error) {
 			return snap.LookupNode(prepareCtx, gen, path)
 		}
-		if err := ov.ReconcileChecked(prepareCtx, baseLookup); err != nil {
+		if err := ov.ReconcileChecked(prepareCtx, baseLookup, nil, nil); err != nil {
 			ov.Close()
 			ov = nil
 			snap.Close()
@@ -159,7 +161,7 @@ func (s *Service) startMountedRepo(ctx context.Context, cfg model.RepoConfig, sn
 // mountFS mounts cfg through s.mount and logs which backend serves the mount.
 // It persists the mount error that status reports, and clears it on success.
 func (s *Service) mountFS(ctx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate) (fusefs.MountedFS, error) {
-	mfs, err := s.mount(cfg, engine, gate)
+	mfs, err := s.mount(cfg, engine, gate, s.logger)
 	mountErr := ""
 	if err != nil {
 		mountErr = auth.RedactLogString(err.Error(), cfg.RemoteURL)

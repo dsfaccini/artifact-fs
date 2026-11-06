@@ -9,10 +9,10 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -213,7 +213,7 @@ func TestReconcileDoesNotDeleteConcurrentModeChange(t *testing.T) {
 	lookups := 0
 	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
 		lookups++
-		if lookups == 2 {
+		if lookups == 1 {
 			if err := concurrent.SetMode(ctx, path, 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -285,40 +285,6 @@ func TestRenameBaseSymlinkReconcilesAfterCommit(t *testing.T) {
 	}
 	if _, ok := s.Get("link"); ok {
 		t.Fatal("committed symlink rename destination should be removed from overlay")
-	}
-}
-
-func TestNewBackfillsOverlayMetadata(t *testing.T) {
-	s, cfg := testStore(t)
-	ctx := context.Background()
-
-	if _, err := s.CreateFile(ctx, "old.txt", 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET mode=?, source_oid=?, ctime_unix_ns=0 WHERE path=?`, 0o100644, "base-oid", "old.txt"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.ExecContext(ctx, `ALTER TABLE overlay_entries DROP COLUMN source_mode`); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	reopened, err := New(ctx, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { reopened.Close() })
-	got, ok := reopened.Get("old.txt")
-	if !ok {
-		t.Fatal("expected entry")
-	}
-	if got.CtimeUnixNs == 0 {
-		t.Fatal("expected zero ctime to be repaired")
-	}
-	if got.SourceMode != 0o100644 {
-		t.Fatalf("source mode = %#o, want legacy entry mode", got.SourceMode)
 	}
 }
 
@@ -1669,39 +1635,211 @@ func TestReadChangesSinceDistrustsALogMissingATrigger(t *testing.T) {
 	}
 }
 
-// Another connection holds the write lock briefly, as each overlay write does.
-// New must wait it out within busy_timeout instead of failing.
-func TestNewWaitsOutAnotherConnectionsWriteLock(t *testing.T) {
-	ctx := context.Background()
+// Writes that land while a reconcile looks up the base must end as if they
+// had landed before it: none lost, none left classified against the old base.
+func TestReconcileClassifiesWritesThatLandDuringItsLookups(t *testing.T) {
 	s, cfg := testStore(t)
-	s.Close()
-	holder, err := meta.OpenDB(cfg.OverlayDBPath)
+	ctx := context.Background()
+	original := []byte("original")
+	originalOID := testBlobOID(original)
+	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, originalOID), original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "committed.txt", model.BaseNode{Path: "committed.txt", Type: "file", Mode: 0o100644, ObjectOID: originalOID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Truncate(ctx, "committed.txt", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, "committed.txt", 0, []byte("committed")); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{"src", "src/sub"} {
+		if err := s.Mkdir(ctx, dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{"src/sub/b.txt", "src/sub/c.txt"} {
+		if _, err := s.CreateFile(ctx, path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.WriteFile(ctx, path, 0, []byte(filepath.Base(path))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	file := func(path string, content string) model.BaseNode {
+		return model.BaseNode{Path: path, Type: "file", Mode: 0o100644, ObjectOID: testBlobOID([]byte(content))}
+	}
+	base := map[string]model.BaseNode{
+		"committed.txt": file("committed.txt", "committed"),
+		"new.txt":       file("new.txt", "theirs"),
+		"dst":           {Path: "dst", Type: "dir", Mode: 0o40000},
+		"dst/sub":       {Path: "dst/sub", Type: "dir", Mode: 0o40000},
+		"dst/sub/c.txt": file("dst/sub/c.txt", "c.txt"),
+	}
+
+	before := changesSince(t, cfg, 0).Seq
+	var logged []string
+	var once sync.Once
+	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+		once.Do(func() {
+			if _, err := s.WriteFile(ctx, "committed.txt", int64(len("committed")), []byte(" and more")); err != nil {
+				t.Error(err)
+			}
+			if _, err := s.CreateFile(ctx, "new.txt", 0o644); err != nil {
+				t.Error(err)
+			}
+			if _, err := s.WriteFile(ctx, "new.txt", 0, []byte("mine")); err != nil {
+				t.Error(err)
+			}
+			// A tree rename logs only both roots and one path per
+			// directory, so the log never names dst/sub/c.txt.
+			if err := s.Rename(ctx, "src", "dst", false); err != nil {
+				t.Error(err)
+			}
+			logged = changesSince(t, cfg, before).Paths
+		})
+		n, ok := base[path]
+		return n, ok
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(logged, "dst/sub/c.txt") {
+		t.Fatalf("the tree rename logged dst/sub/c.txt, so the test proves nothing about unlogged paths: %q", logged)
+	}
+
+	if e, ok := s.Get("committed.txt"); !ok || e.Kind != model.OverlayKindModify || e.SourceOID != base["committed.txt"].ObjectOID {
+		t.Errorf("committed.txt after reconcile = %+v, %t; want a modify of the new base", e, ok)
+	} else if got, err := os.ReadFile(e.BackingPath); err != nil || string(got) != "committed and more" {
+		t.Errorf("committed.txt content = %q, %v; want the write that landed during reconcile", got, err)
+	}
+	if e, ok := s.Get("new.txt"); !ok || e.Kind != model.OverlayKindModify || e.SourceOID != base["new.txt"].ObjectOID {
+		t.Errorf("new.txt after reconcile = %+v, %t; want a modify of the new base", e, ok)
+	}
+	if e, ok := s.Get("dst/sub/c.txt"); ok {
+		t.Errorf("dst/sub/c.txt after reconcile = %+v; want it gone, as the new base matches it", e)
+	}
+	if e, ok := s.Get("dst/sub/b.txt"); !ok || e.Kind != model.OverlayKindCreate {
+		t.Errorf("dst/sub/b.txt after reconcile = %+v, %t; want the create kept", e, ok)
+	}
+	if got := changesSince(t, cfg, before).Paths; !slices.Equal(got, logged) {
+		t.Errorf("changed paths after reconcile = %q, want only the writes' %q", got, logged)
+	}
+}
+
+func createWithContent(t *testing.T, s *Store, path, content string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.CreateFile(ctx, path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, path, 0, []byte(content)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func baseFile(path, content string) model.BaseNode {
+	return model.BaseNode{Path: path, Type: "file", Mode: 0o100644, ObjectOID: testBlobOID([]byte(content))}
+}
+
+// Another Store's reconcile changes a row without logging it, so only the
+// DELETE guard keeps this reconcile from deleting the row it rebased.
+func TestReconcileGuardKeepsAnotherStoresUnloggedRebase(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "x.txt", "mine")
+	other, err := New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer holder.Close()
-	conn, err := holder.Conn(ctx)
+	t.Cleanup(func() { other.Close() })
+	theirs := baseFile("x.txt", "theirs")
+	var once sync.Once
+	if err := s.Reconcile(ctx, func(string) (model.BaseNode, bool) {
+		once.Do(func() {
+			if err := other.Reconcile(ctx, func(string) (model.BaseNode, bool) { return theirs, true }); err != nil {
+				t.Error(err)
+			}
+		})
+		return baseFile("x.txt", "mine"), true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := s.Get("x.txt"); !ok || e.SourceOID != theirs.ObjectOID {
+		t.Fatalf("x.txt = %+v, %t; want the other reconcile's rebase kept", e, ok)
+	}
+}
+
+// A write that removes an entry's backing file while the plan hashes it must
+// not fail the reconcile: the apply phase classifies the entry the write left.
+func TestReconcileClassifiesAnEntryWhoseBackingFileVanishedDuringItsLookups(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "x.txt", "mine")
+	before := changesSince(t, cfg, 0).Seq
+	var once sync.Once
+	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+		once.Do(func() {
+			if err := s.Remove(ctx, "x.txt"); err != nil {
+				t.Error(err)
+			}
+		})
+		return baseFile("x.txt", "theirs"), true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := s.Get("x.txt"); !ok || e.Kind != model.OverlayKindDelete {
+		t.Fatalf("x.txt = %+v, %t; want the delete marker", e, ok)
+	}
+	if got := changesSince(t, cfg, before).Paths; !slices.Equal(got, []string{"x.txt"}) {
+		t.Fatalf("changed paths = %q, want only the write's [x.txt]", got)
+	}
+}
+
+// Another Store's reconcile rebases a row without logging it while this
+// reconcile plans to rebase the same row onto another base. Only the UPDATE
+// guard keeps the other store's rebase.
+func TestReconcileUpdateGuardKeepsAnotherStoresUnloggedRebase(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "x.txt", "mine")
+	other, err := New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+	t.Cleanup(func() { other.Close() })
+	theirs := baseFile("x.txt", "theirs")
+	var once sync.Once
+	if err := s.Reconcile(ctx, func(string) (model.BaseNode, bool) {
+		once.Do(func() {
+			if err := other.Reconcile(ctx, func(string) (model.BaseNode, bool) { return theirs, true }); err != nil {
+				t.Error(err)
+			}
+		})
+		return baseFile("x.txt", "ours"), true
+	}); err != nil {
 		t.Fatal(err)
 	}
-	// The hold is far below busy_timeout, so it cannot make a waiting New
-	// fail. A New that does not wait fails before the commit, unless the
-	// machine delays it past the hold; then the test passes without proof.
-	committed := make(chan error, 1)
-	time.AfterFunc(200*time.Millisecond, func() {
-		_, err := conn.ExecContext(ctx, `COMMIT`)
-		committed <- err
-	})
-	reopened, err := New(ctx, cfg)
-	if err != nil {
-		t.Fatalf("New while another connection held the write lock: %v", err)
+	if e, ok := s.Get("x.txt"); !ok || e.SourceOID != theirs.ObjectOID {
+		t.Fatalf("x.txt = %+v, %t; want the other reconcile's rebase kept", e, ok)
 	}
-	reopened.Close()
-	if err := <-committed; err != nil {
+}
+
+// A backing file that vanished with no logged write fails the reconcile, as
+// it did when the whole reconcile ran under the lock, and leaves the entry.
+func TestReconcileFailsOnABackingFileMissingWithNoWrite(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "x.txt", "mine")
+	before, _ := s.Get("x.txt")
+	if err := os.Remove(before.BackingPath); err != nil {
 		t.Fatal(err)
+	}
+	err := s.Reconcile(ctx, func(string) (model.BaseNode, bool) { return baseFile("x.txt", "theirs"), true })
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Reconcile = %v, want the missing backing file's ErrNotExist", err)
+	}
+	if after, ok := s.Get("x.txt"); !ok || after != before {
+		t.Fatalf("x.txt after the failed reconcile = %+v, %t; want it unchanged: %+v", after, ok, before)
 	}
 }

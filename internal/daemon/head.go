@@ -4,8 +4,6 @@ import (
 	"cmp"
 	"context"
 	"time"
-
-	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
 func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
@@ -69,24 +67,13 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 			return err
 		}
 	}
-	baseLookup := func(path string) (model.BaseNode, bool, error) {
-		return rt.snapshot.LookupNode(ctx, gen, path)
-	}
 	commitTime := int64(0)
 	if ts, timestampErr := s.git.CommitTimestamp(ctx, cfg, oid); timestampErr == nil {
 		commitTime = ts
 	} else if ctx.Err() == nil {
 		s.logger.Warn("commit timestamp unavailable", "repo", cfg.Name, "error", timestampErr)
 	}
-	err = rt.resolver.Transition(func() error {
-		if err := rt.overlay.ReconcileChecked(ctx, baseLookup); err != nil {
-			return err
-		}
-		rt.resolver.SetCommitTime(commitTime)
-		rt.resolver.SetGeneration(gen)
-		return nil
-	})
-	if err != nil {
+	if err := rt.resolver.SwitchGeneration(ctx, gen, commitTime); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}

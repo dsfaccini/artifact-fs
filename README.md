@@ -75,11 +75,22 @@ any other FSKit failure, because a retry could mount twice. The daemon logs the
 transport that mounted each repo.
 
 FSKit reuses directory handles across enumerations. Every backend lists a
-directory again when an enumeration restarts. FSKit rejects extended attributes to prevent
-AppleDouble metadata files; use `cp -X` when copying files with Finder metadata.
+directory again when an enumeration restarts. Both macOS backends reject extended
+attributes, so macOS writes no AppleDouble `._` files to store them. macOS
+attaches extended attributes such as `com.apple.provenance` to nearly every local
+file, so copying files onto the mount with `cp` or `ditto` may fail; `cp -X`
+skips extended attributes and should avoid it. On an NFS mount that rejects
+extended attributes the same way, `cp` exits 1 after copying the data and
+`ditto` fails without leaving the file. None of this is measured on a FUSE
+mount yet, and `cp -X` is not measured at all. Both
+backends serve tracked `._*` and `.DS_Store` files. A `.DS_Store` that Finder
+writes lands in the overlay as an untracked file.
 The native mount API has no supported cancellation for a permanently stalled
-system mount service. `umount` from a terminal cannot unmount an FSKit mount;
-use `diskutil unmount <path>`.
+system mount service. macOS treats an FSKit mount as a network volume, so
+`umount <path>` returns `Operation not permitted` unless the terminal app has
+the Network Volumes permission (Privacy & Security → Files & Folders). The daemon
+unmounts through the same `unmount(2)` call. `diskutil unmount <path>` removes an
+FSKit mount that `umount` cannot.
 
 Quick start against a public repo:
 
@@ -140,13 +151,13 @@ Check the state of a mounted repo with `status`:
 | `overlay_dirty` | `true` if the overlay contains created or modified files; delete-only overlays are not counted |
 | `last_fetch` / `result` | `FETCH_HEAD` modification time and `ok` when present; otherwise `never` |
 
-Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The daemon prioritizes code and manifests (`package.json`, `go.mod`, `README.md`) over binary files.
+Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The first read of a file in a directory also queues up to 256 of that directory's files for background hydration, ranking code and manifests (`package.json`, `go.mod`, `README.md`) ahead of binary files. Listing or walking directories queues nothing. A blobless clone knows a file's size only once its blob is local, so the first `stat` of a file hydrates that one file. A worker takes up to 256 queued blobs, all reads or all prefetches, and fetches the missing ones with one `git fetch` from the promisor remote, so a blobless clone pays one fetch per batch, not one per blob. Queued reads go ahead of queued prefetches, and a blob a prefetch has already downloaded is copied into the cache before more prefetches download. With more than one worker, one worker takes only reads and those copies, so a read never waits for an unrelated prefetch download, though it can wait for one copy of a blob already on disk. With a single worker, a read can wait for a running prefetch download. A read of a file whose own prefetch is downloading waits for that download.
 
-For every repo, ArtifactFS reads blobs (`git cat-file --batch`) and trees (`git ls-tree`) without a controlling terminal, with `GIT_TERMINAL_PROMPT=0` and an empty `SSH_ASKPASS`. When one of these reads lazily fetches a missing object, a remote that needs an interactive password or passphrase prompt makes the fetch fail instead of prompting. The repo's `core.sshCommand`, credential helpers, and any program set through `GIT_ASKPASS` or `core.askPass` still run. Git Credential Manager can still show its GUI prompt unless `GCM_INTERACTIVE=never` is set.
+For every repo, ArtifactFS reads blobs (`git cat-file --batch`) and trees (`git ls-tree`), and fetches queued blobs in batches (`git fetch --stdin`), without a controlling terminal, with `GIT_TERMINAL_PROMPT=0` and an empty `SSH_ASKPASS`. When a batch fetch runs, or a read lazily fetches a missing object, a remote that needs an interactive password or passphrase prompt makes the fetch fail instead of prompting. The repo's `core.sshCommand`, credential helpers, and any program set through `GIT_ASKPASS` or `core.askPass` still run. Git Credential Manager can still show its GUI prompt unless `GCM_INTERACTIVE=never` is set.
 
 When the Git index matches the published snapshot and the overlay is empty, startup marks snapshot entries valid for Git's filesystem monitor before opening the mount. This lets the first `git status` use the daemon's change list instead of reading every tracked blob, and each later `git status` receives only the paths the overlay changed since Git's previous query. Paths under `text=auto` are marked, and so are paths under `-text` or `binary` without `eol=lf`. Paths under `text`, `text=input` or `eol=lf` without `text=auto` stay unmarked, because Git's check-in turns CRLF into LF and a blob that holds CRLF then differs from its file; Git compares those paths itself. `-text eol=lf` stays unmarked too, because `git check-attr` prints it like the literal `text=unset`, which Git converts under `eol=lf`. A `git status` that runs while the worktree is unmounted sees the empty mountpoint, so Git's next query gets a rescan. When startup marks the baseline again, its own query takes that rescan, and the first `git status` after the mount receives only the overlay's changes. ArtifactFS skips this baseline when the index or a `.gitattributes` blob is uncertain, when `core.attributesFile` is configured or `core.autocrlf` is set to anything but false, when an `eol=crlf`, `crlf`, `filter`, `ident` or `working-tree-encoding` attribute applies, or when staged work or overlay changes exist; Git then performs its normal status scan.
 
-Use `--hydration-concurrency` to control the number of parallel blob-fetch workers (default 4). Each worker maintains a persistent `git cat-file --batch` process, so higher values trade memory for faster bulk hydration:
+Use `--hydration-concurrency` to control the number of parallel blob-fetch workers (default 4). Each worker maintains a persistent `git cat-file --batch` process that copies fetched blobs into the cache, so higher values trade memory for faster bulk hydration:
 
 ```bash
 ./artifact-fs daemon --root /tmp --hydration-concurrency 8
@@ -157,6 +168,8 @@ Use `--hydration-concurrency` to control the number of parallel blob-fetch worke
 ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the mode, source, attempt, phase, state, duration, and deadline. Clone and fetch operations retry known transient transport failures up to three total attempts. Preparation has a 30-minute timeout. Caller cancellation stops the active Git command and retry backoff; synchronous preparation records a redacted `prepare canceled` status, while daemon shutdown leaves async preparation queued for restart.
 
 Async existing-clone preparation reports remote configuration, fetch, and branch update as separate `configure_remote`, `fetch`, and `update_branch` phases.
+
+Each error the FUSE library reports becomes a `fuse error` record. A reply the kernel refuses, other than with `ENOENT`, logs at `WARN`. A failed FUSE op logs at `DEBUG`, because expected errnos such as `ENOTEMPTY` fail ops too. The daemon logs at `INFO`, so it never emits these lines. The library reports no failed lookup of a missing name, no `GetXattr` or `ListXattr` that fails with `ENOSYS`, `ENODATA` or `ERANGE`, and no request whose opcode the library does not recognize.
 
 Successful `add-repo`:
 
@@ -353,11 +366,11 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 
 3. **Mount** -- The FUSE layer exposes the tree immediately. A synthesized `.git` gitfile points at the real gitdir so git commands work inside the mount.
 
-4. **Read** -- The Resolver merges the snapshot (base tree) with the overlay (local writes). For base files, reads block until the Hydrator fetches the blob via a persistent `git cat-file --batch` process and streams it to the blob cache.
+4. **Read** -- The Resolver merges the snapshot (base tree) with the overlay (local writes). For base files, reads block until the Hydrator fetches the blob and streams it to the blob cache through a persistent `git cat-file --batch` process. Blobs queued together are fetched with one `git fetch --stdin`; the first read in a directory queues its other files the same way.
 
 5. **Write** -- The Engine promotes base files to the overlay via copy-on-write (hydrate, then copy to the `upper/` directory). Subsequent reads come from the overlay. Deletes are recorded as whiteouts; deleting a file copies it first only while a handle on it is open. No FUSE operation holds a lock while a blob hydrates, so a slow fetch stalls neither a HEAD switch nor other operations. A failed operation returns the errno of its cause, such as `ENOSPC`, and an interrupted one returns `EINTR`.
 
-6. **Background** -- For ordinary workspaces, a watcher polls HEAD/refs every 500ms and republishes HEAD changes. Repositories with `--require-commit` do not run this watcher, so their verified base commit remains fixed. Remote polling is controlled separately by `--refresh`.
+6. **Background** -- For ordinary workspaces, a watcher polls HEAD/refs every 500ms and republishes HEAD changes. A HEAD change compares the overlay with the new generation while reads and writes continue; they wait only while the result is applied. Repositories with `--require-commit` do not run this watcher, so their verified base commit remains fixed. Remote polling is controlled separately by `--refresh`.
 
 ### Subsystems
 
@@ -368,7 +381,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 | `gitstore` | Git CLI wrapper: clone, fetch, ls-tree, batch pool for `cat-file --batch` |
 | `snapshot` | SQLite store for `base_nodes` keyed by `(generation, path)` |
 | `overlay` | SQLite metadata + `upper/` directory for local writes, whiteouts, reconciliation |
-| `hydrator` | Priority queue with deduped waiters; workers block on a `workReady` channel |
+| `hydrator` | Priority queue with deduped waiters; workers fetch queued blobs in batches. With more than one worker, a reserved worker takes only reads and copies of local blobs and blocks on `reservedReady`; the others block on `workReady` |
 | `watcher` | Polls gitdir mtimes (HEAD, index, refs) at 500ms intervals |
 | `registry` | SQLite-backed repo config persistence |
 | `model` | Shared types and canonical interfaces (`GitStore`, `SnapshotStore`, `OverlayStore`, `Hydrator`) |
@@ -381,9 +394,9 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 
 | Operation | Status | Notes |
 |-----------|--------|-------|
-| `ls` (root and subdirectories) | Supported | Includes synthesized `.git` gitfile |
+| `ls` (root and subdirectories) | Supported | Includes synthesized `.git` gitfile; hydrates nothing |
 | `cat` / read file | Supported | Triggers on-demand hydration for unhydrated blobs |
-| `stat` (file size, mode) | Supported | Sizes resolved via `git cat-file --batch-check` |
+| `stat` (file size, mode) | Supported | Sizes resolved via `git cat-file --batch-check` when the blob is local; otherwise the first `stat` hydrates the file |
 | `mkdir` | Supported | Persisted in writable overlay |
 | Create new file | Supported | Persisted in writable overlay |
 | Write / append to file | Supported | Copy-on-write for tracked files |

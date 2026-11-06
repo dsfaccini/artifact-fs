@@ -5,10 +5,14 @@ package fusefs
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"syscall"
 	"testing"
@@ -350,7 +354,7 @@ func TestHydrationHoldsNoLock(t *testing.T) {
 				t.Fatalf("op returned before hydration: %v", err)
 			}
 
-			if err := f.resolver.Transition(func() error { return nil }); err != nil {
+			if err := f.resolver.SwitchGeneration(context.Background(), f.resolver.Generation(), f.resolver.CommitTime()); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := f.resolver.ResolvePath("other.txt"); err != nil {
@@ -529,10 +533,7 @@ func TestHEADSwitchDuringHydrationUsesNewBlob(t *testing.T) {
 	case err := <-done:
 		t.Fatalf("WriteFile returned before hydration: %v", err)
 	}
-	if err := f.resolver.Transition(func() error {
-		f.resolver.SetGeneration(2)
-		return nil
-	}); err != nil {
+	if err := f.resolver.SwitchGeneration(context.Background(), 2, f.resolver.CommitTime()); err != nil {
 		t.Fatal(err)
 	}
 	close(release)
@@ -877,5 +878,160 @@ func TestSyntheticGitFileRejectsWrites(t *testing.T) {
 	}
 	if got := f.read(t, inode, handle); got != string(f.fs.gitfileContent) {
 		t.Fatalf(".git reads %q, want the synthesized gitfile %q", got, f.fs.gitfileContent)
+	}
+}
+
+// pausingSnapshot pauses the first lookup at generation gen until resume
+// closes.
+type pausingSnapshot struct {
+	model.SnapshotStore
+	gen    int64
+	once   sync.Once
+	paused chan struct{}
+	resume chan struct{}
+}
+
+func (s *pausingSnapshot) LookupNode(ctx context.Context, gen int64, path string) (model.BaseNode, bool, error) {
+	if gen == s.gen {
+		s.once.Do(func() {
+			close(s.paused)
+			<-s.resume
+		})
+	}
+	return s.SnapshotStore.LookupNode(ctx, gen, path)
+}
+
+// observedLock calls locked right after it takes the lock, and unlocking
+// right before it releases the lock.
+type observedLock struct {
+	sync.Locker
+	locked    func()
+	unlocking func()
+}
+
+func (l observedLock) Lock() {
+	l.Locker.Lock()
+	l.locked()
+}
+
+func (l observedLock) Unlock() {
+	l.unlocking()
+	l.Locker.Unlock()
+}
+
+// lockObserver observes the lock each reconcile holds while it applies.
+type lockObserver struct {
+	model.OverlayStore
+	locked    func()
+	unlocking func()
+}
+
+func (o *lockObserver) ReconcileChecked(ctx context.Context, baseLookup func(string) (model.BaseNode, bool, error), lock sync.Locker, switchBase func()) error {
+	return o.OverlayStore.ReconcileChecked(ctx, baseLookup, observedLock{Locker: lock, locked: o.locked, unlocking: o.unlocking}, switchBase)
+}
+
+func blobOID(content string) string {
+	h := sha1.New()
+	_, _ = fmt.Fprintf(h, "blob %d\x00%s", len(content), content)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// A reader during a HEAD switch sees the old overlay with the old generation,
+// or the new overlay with the new one. Generation 2 drops link, which the
+// overlay deletes: the new overlay with the old generation would show link.
+// Generation 2 also commits committed.txt, so the switch removes its overlay
+// entry and backing file.
+func TestSwitchGenerationServesReadsWhileItLooksUpTheBase(t *testing.T) {
+	f := newTrackedFixture(t)
+	ctx := context.Background()
+	delete(f.snapshot.nodes[2], "link")
+	f.snapshot.kids[2]["."] = slices.DeleteFunc(f.snapshot.kids[2]["."], func(n model.BaseNode) bool { return n.Path == "link" })
+	if err := f.store.Remove(ctx, "link"); err != nil {
+		t.Fatal(err)
+	}
+	committed := model.BaseNode{RepoID: "repo", Path: "committed.txt", Type: "file", Mode: 0o100644, ObjectOID: blobOID("committed"), SizeState: "known", SizeBytes: int64(len("committed"))}
+	f.snapshot.nodes[2][committed.Path] = committed
+	f.snapshot.kids[2]["."] = append(f.snapshot.kids[2]["."], committed)
+	if _, err := f.store.CreateFile(ctx, committed.Path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.WriteFile(ctx, committed.Path, 0, []byte("committed")); err != nil {
+		t.Fatal(err)
+	}
+	entry, _, err := f.store.Lookup(ctx, committed.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backing := entry.BackingPath
+	inode := f.lookup(t, fuseops.RootInodeID, "file.txt")
+	snapshot := &pausingSnapshot{SnapshotStore: f.snapshot, gen: 2, paused: make(chan struct{}), resume: make(chan struct{})}
+	f.resolver.Snapshot = snapshot
+	type observation struct {
+		readersLockedOut bool
+		markerGone       bool
+		backingKept      bool
+		generation       int64
+	}
+	observe := func() observation {
+		o := observation{generation: f.resolver.Generation()}
+		if f.resolver.transition.TryRLock() {
+			f.resolver.transition.RUnlock()
+		} else {
+			o.readersLockedOut = true
+		}
+		_, marked, _ := f.store.Lookup(ctx, "link")
+		o.markerGone = !marked
+		_, err := os.Stat(backing)
+		o.backingKept = err == nil
+		return o
+	}
+	var atLock, atUnlock observation
+	f.resolver.Overlay = &lockObserver{
+		OverlayStore: f.store,
+		locked:       func() { atLock = observe() },
+		unlocking:    func() { atUnlock = observe() },
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- f.resolver.SwitchGeneration(ctx, 2, 0) }()
+	select {
+	case <-snapshot.paused:
+	case err := <-done:
+		t.Fatalf("SwitchGeneration returned before it looked up the new base: %v", err)
+	}
+	if _, gen, _, err := f.resolver.ResolvePathState("link"); !errors.Is(err, fs.ErrNotExist) || gen != 1 {
+		t.Fatalf("link during the lookups = generation %d, %v; want generation 1, ErrNotExist", gen, err)
+	}
+	if err := f.fs.LookUpInode(ctx, &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "link"}); kernelErrno(err) != syscall.ENOENT {
+		t.Fatalf("LookUpInode(link) during the lookups = %v, want ENOENT", err)
+	}
+	if got := f.read(t, inode, f.open(t, inode)); got != "file one" {
+		t.Fatalf("file.txt during the lookups = %q, want generation 1's content", got)
+	}
+	close(snapshot.resume)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	// The lock covers applying the overlay and switching the generation,
+	// and no reader waits for the backing file to be deleted.
+	if want := (observation{readersLockedOut: true, backingKept: true, generation: 1}); atLock != want {
+		t.Errorf("when SwitchGeneration took the lock = %+v, want %+v", atLock, want)
+	}
+	if want := (observation{readersLockedOut: true, markerGone: true, backingKept: true, generation: 2}); atUnlock != want {
+		t.Errorf("when SwitchGeneration released the lock = %+v, want %+v", atUnlock, want)
+	}
+	if _, err := os.Stat(backing); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("committed.txt backing file after the switch: %v, want ErrNotExist", err)
+	}
+	if _, gen, _, err := f.resolver.ResolvePathState("link"); !errors.Is(err, fs.ErrNotExist) || gen != 2 {
+		t.Fatalf("link after the switch = generation %d, %v; want generation 2, ErrNotExist", gen, err)
+	}
+	// An inode serves the generation it was sized at until getattr resizes it.
+	if err := f.fs.GetInodeAttributes(ctx, &fuseops.GetInodeAttributesOp{Inode: inode}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.read(t, inode, f.open(t, inode)); got != "file two" {
+		t.Fatalf("file.txt after the switch = %q, want generation 2's content", got)
 	}
 }
