@@ -14,8 +14,8 @@ import (
 // in a directory.
 func TestMountRepoEnablesParallelDirOps(t *testing.T) {
 	repo := model.RepoConfig{Name: "repo", MountPath: t.TempDir()}
-	for _, cfg := range mountRepoConfigs(t, repo, slog.New(slog.DiscardHandler)) {
-		if !cfg.EnableParallelDirOps {
+	for _, attempt := range mountRepoAttempts(t, repo, slog.New(slog.DiscardHandler)) {
+		if !attempt.cfg.EnableParallelDirOps {
 			t.Fatal("mount config leaves parallel directory ops off")
 		}
 	}
@@ -32,9 +32,9 @@ func TestSetXattrIsUnsupported(t *testing.T) {
 // file's cached pages when its mtime changes, not only its size.
 func TestMountRepoEnablesAutoInvalData(t *testing.T) {
 	repo := model.RepoConfig{Name: "repo", MountPath: t.TempDir()}
-	for _, cfg := range mountRepoConfigs(t, repo, slog.New(slog.DiscardHandler)) {
-		if !cfg.EnableAutoInvalData || !cfg.DisableWritebackCaching {
-			t.Fatalf("mount config: EnableAutoInvalData %t, DisableWritebackCaching %t; want both", cfg.EnableAutoInvalData, cfg.DisableWritebackCaching)
+	for _, attempt := range mountRepoAttempts(t, repo, slog.New(slog.DiscardHandler)) {
+		if !attempt.cfg.EnableAutoInvalData || !attempt.cfg.DisableWritebackCaching {
+			t.Fatalf("mount config: EnableAutoInvalData %t, DisableWritebackCaching %t; want both", attempt.cfg.EnableAutoInvalData, attempt.cfg.DisableWritebackCaching)
 		}
 	}
 }

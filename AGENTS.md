@@ -45,7 +45,7 @@ Repository-specific guidance for `artifact-fs`.
 - Wrap an operation error's cause with `%w`, and let `toErrno` map it for the kernel. Do not return `syscall.EIO` for a failure that carries an errno.
 - Switch a runtime's generation only through `Service.switchGeneration`. It sends the kernel the invalidations the switch needs through `MountedFS.InvalidateChanged`.
 - Never wait on a kernel invalidation inside an op or while holding a lock an op takes. The kernel can hold a directory lock while it waits for that op's reply, and the invalidation waits for the same lock.
-- Record every entry or attribute reply with `allocEntry`, `allocInode` or `setReported`. `InvalidateChanged` compares what the kernel received with the merged view.
+- Record every entry reply with `allocEntry` and every attribute reply with `setReported`. `InvalidateChanged` compares what the kernel received with the merged view, and `allocEntry` drops the name's negative entry record.
 - Prune snapshot generations only through `Service.pruneGenerations`. An inode reads the generation of its last reported attributes, so a retired generation stays readable for `defaultGenerationRetention`.
 
 ## Writing tests

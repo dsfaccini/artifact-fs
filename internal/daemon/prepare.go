@@ -281,7 +281,7 @@ func (s *Service) ensurePreparedRepo(ctx context.Context, cfg model.RepoConfig, 
 		}
 		if pruneOldGenerations {
 			failurePhase = preparePhaseCleanupSnapshot
-			return snap.PruneGenerations(ctx, gen)
+			return s.pruneGenerations(ctx, nil, snap, gen)
 		}
 		return nil
 	})

@@ -4,6 +4,7 @@ package fusefs
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -41,8 +42,7 @@ func TestMountBackendRejectsUnknownValues(t *testing.T) {
 }
 
 func TestMountWithBackendFallsBackOnlyWhenFSKitIsUnavailable(t *testing.T) {
-	unavailable := errors.New("FSKit unavailable")
-	fskitUnavailable := func(err error) bool { return errors.Is(err, unavailable) }
+	unavailable := fmt.Errorf("mount: %w: dlopen failed", fuse.ErrFSKitUnavailable)
 	kernelFailure := errors.New("kernel mount failed")
 	otherFailure := errors.New("FSKit transport failed")
 	tests := []struct {
@@ -75,7 +75,7 @@ func TestMountWithBackendFallsBackOnlyWhenFSKitIsUnavailable(t *testing.T) {
 				}
 				return nil, test.kernelErr
 			}
-			_, backend, err := mountWithBackend(test.backend, mount, fskitUnavailable, func() bool { return test.kextLoaded })
+			_, backend, err := mountWithBackend(test.backend, mount, func() bool { return test.kextLoaded })
 			if !slices.Equal(mounts, test.wantMounts) {
 				t.Fatalf("mount attempts (true is FSKit) = %v, want %v", mounts, test.wantMounts)
 			}
@@ -92,6 +92,42 @@ func TestMountWithBackendFallsBackOnlyWhenFSKitIsUnavailable(t *testing.T) {
 				if !errors.Is(err, want) {
 					t.Fatalf("error = %v, want it to wrap %v", err, want)
 				}
+			}
+		})
+	}
+}
+
+func TestMountWithBackendFallsBackOnlyOnMachineWideFSKitFailures(t *testing.T) {
+	result := func(code int32) error {
+		return fmt.Errorf("mount (background): %w", fuse.FSKitMountError{Result: code})
+	}
+	for name, test := range map[string]struct {
+		fskitErr     error
+		wantFallback bool
+	}{
+		"framework unavailable":       {fskitErr: fmt.Errorf("mount: %w: dlopen failed", fuse.ErrFSKitUnavailable), wantFallback: true},
+		"unsupported OS version":      {fskitErr: result(fuse.FSKitMountResultUnsupportedOSVersion), wantFallback: true},
+		"helper tools install failed": {fskitErr: result(fuse.FSKitMountResultHelperToolsInstallationFailed), wantFallback: true},
+		"extension not found":         {fskitErr: result(fuse.FSKitMountResultFileSystemExtensionNotFound), wantFallback: true},
+		"extension requires approval": {fskitErr: result(fuse.FSKitMountResultFileSystemExtensionRequiresApproval), wantFallback: true},
+		"mount point failure":         {fskitErr: result(fuse.FSKitMountResultCreatingMountPointFailed)},
+		"unexpected failure":          {fskitErr: result(fuse.FSKitMountResultUnexpectedFailure)},
+		"other failure":               {fskitErr: errors.New("FSKit transport failed")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var mounts []bool
+			mount := func(fskit bool) (*fuse.MountedFileSystem, error) {
+				mounts = append(mounts, fskit)
+				if fskit {
+					return nil, test.fskitErr
+				}
+				return nil, nil
+			}
+			_, backend, err := mountWithBackend(BackendAuto, mount, func() bool { return true })
+			if test.wantFallback {
+				assertMountResult(t, mounts, backend, err, []bool{true, false}, BackendKernel, nil)
+			} else {
+				assertMountResult(t, mounts, backend, err, []bool{true}, BackendFSKit, test.fskitErr)
 			}
 		})
 	}

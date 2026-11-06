@@ -3,6 +3,7 @@
 package fusefs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -116,7 +117,7 @@ func newCacheFixtureOn(t *testing.T, backend string, nodes ...model.BaseNode) *c
 	}
 	f.fs = f.mount.(*mountedFSWrapper).fs
 	f.notifier = newRecordingNotifier()
-	f.fs.notifier = f.notifier
+	f.fs.setNotifier(f.notifier)
 	return f
 }
 
@@ -286,5 +287,102 @@ func TestInvalidateChangedDropsWhatTheSwitchChanged(t *testing.T) {
 	}
 	if got := entrySet(entries); !maps.Equal(got, want) {
 		t.Errorf("invalidated entries = %v, want %v", got, want)
+	}
+}
+
+// A write through the mount makes the kernel's view of a file come from the
+// overlay. A commit of that content makes reconcile drop the overlay entry, so
+// the path is base again. A later switch that removes the path still
+// invalidates the kernel's entry for it.
+func TestInvalidateChangedDropsVanishedNameLastReportedFromOverlay(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-a", 0o100644))
+	var root fuseops.InodeID = fuseops.RootInodeID
+	inode := f.lookup(root, "file.txt")
+	if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: inode, Handle: f.open(inode).Handle, Data: []byte("xxxxxx")}); err != nil {
+		t.Fatal(err)
+	}
+	f.switchTo(baseFile("file.txt", blobOID("xxxxxx"), 0o100644))
+	if _, ok, err := f.resolver.Overlay.Lookup(f.ctx, "file.txt"); err != nil || ok {
+		t.Fatalf("overlay holds file.txt after its content was committed: %t, %v", ok, err)
+	}
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if _, entries := f.notifier.recorded(); len(entries) != 0 {
+		t.Fatalf("invalidated entries after the commit = %v, want none", entries)
+	}
+
+	f.switchTo()
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if _, entries := f.notifier.recorded(); !slices.Equal(entries, []kernelEntry{{root, "file.txt"}}) {
+		t.Fatalf("invalidated entries after file.txt vanished = %v, want file.txt", entries)
+	}
+}
+
+// failingLookupOf fails the overlay lookup of one path.
+type failingLookupOf struct {
+	model.OverlayStore
+	path string
+}
+
+func (o failingLookupOf) Lookup(ctx context.Context, path string) (model.OverlayEntry, bool, error) {
+	if path == o.path {
+		return model.OverlayEntry{}, false, errors.New("injected lookup failure")
+	}
+	return o.OverlayStore.Lookup(ctx, path)
+}
+
+// A path whose identity cannot be resolved skips only its own invalidation.
+// The pass still invalidates every other changed inode, and returns the error.
+func TestInvalidateChangedContinuesPastAResolveError(t *testing.T) {
+	f := newCacheFixture(t, baseFile("edited.txt", "edited-1", 0o100644), baseFile("broken.txt", "broken", 0o100644))
+	var root fuseops.InodeID = fuseops.RootInodeID
+	edited := f.lookup(root, "edited.txt")
+	f.lookup(root, "broken.txt")
+	f.switchTo(baseFile("edited.txt", "edited-2", 0o100644), baseFile("broken.txt", "broken", 0o100644))
+	f.resolver.Overlay = failingLookupOf{OverlayStore: f.resolver.Overlay, path: "broken.txt"}
+
+	err := f.mount.InvalidateChanged()
+	if err == nil {
+		t.Fatal("InvalidateChanged hid the resolve error")
+	}
+	if inodes, _ := f.notifier.recorded(); !slices.Equal(inodes, []fuseops.InodeID{edited}) {
+		t.Fatalf("invalidated inodes = %v, want edited.txt (%d) despite the error on broken.txt", inodes, edited)
+	}
+}
+
+// Two attribute replies race a switch: one computed before it is recorded
+// after one computed after it. The switch's InvalidateInode makes the kernel
+// discard the older reply, so reads keep serving the newer generation.
+//
+// The race falls between the moment an op computes its reply and the moment
+// it records it, and an op holds no lock or hook there to pause it. So the
+// test computes the older reply with Engine.Attrs and records it with
+// setReported, as GetInodeAttributes does.
+func TestLateReplyKeepsTheNewerGeneration(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "old-content", 0o100644))
+	inode := f.lookup(fuseops.RootInodeID, "file.txt")
+	older, err := f.fs.engine.Attrs(&Blobs{}, "file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.switchTo(baseFile("file.txt", "new", 0o100644))
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	getattr := &fuseops.GetInodeAttributesOp{Inode: inode}
+	if err := f.fs.GetInodeAttributes(f.ctx, getattr); err != nil {
+		t.Fatal(err)
+	}
+	f.fs.setReported(inode, older)
+
+	read := &fuseops.ReadFileOp{Inode: inode, Handle: f.open(inode).Handle, Size: 64}
+	if err := f.fs.ReadFile(f.ctx, read); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(bytes.Join(read.Data, nil)); got != "new" || uint64(len(got)) != getattr.Attributes.Size {
+		t.Fatalf("read after the kernel took the %d-byte size of the newer reply = %q, want %q", getattr.Attributes.Size, got, "new")
 	}
 }

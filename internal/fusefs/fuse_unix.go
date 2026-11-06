@@ -87,7 +87,8 @@ type ArtifactFuse struct {
 	negatives       map[kernelEntry]time.Time
 	negativeSweepAt int
 
-	// notifier is nil when nothing should reach the kernel.
+	// notifier is nil when nothing should reach the kernel. fs.mu guards it:
+	// the mount publishes it after ops may have started.
 	notifier kernelNotifier
 }
 
@@ -115,7 +116,14 @@ type InodeRef struct {
 
 // report records attrs as what the kernel last received for ref. Reads then
 // serve attrs.Gen, so the kernel's pages may mix two blobs when the blob changes.
+//
+// A reply computed before a generation switch can be recorded after a reply
+// computed after it. The switch's InvalidateInode makes the kernel discard
+// the older reply, so report keeps the newer generation.
 func (ref *InodeRef) report(attrs Attrs) {
+	if attrs.Gen != 0 && ref.Gen > attrs.Gen {
+		return
+	}
 	if attrs.Blob != ref.Blob {
 		ref.PageBlob = ""
 	}
@@ -235,46 +243,55 @@ func (fs *ArtifactFuse) recordNegative(parent fuseops.InodeID, name string) {
 }
 
 // takeNegative removes the live record of a negative entry for path and
-// returns it, or false when the kernel holds none.
-func (fs *ArtifactFuse) takeNegative(path string) (kernelEntry, bool) {
+// returns it with the notifier to drop it, or false when the kernel holds none
+// or nothing reaches the kernel.
+func (fs *ArtifactFuse) takeNegative(path string) (kernelEntry, kernelNotifier, bool) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	parent, ok := fs.pathToInode[model.CleanPath(filepath.Dir(path))]
 	if !ok {
-		return kernelEntry{}, false
+		return kernelEntry{}, nil, false
 	}
 	e := kernelEntry{parent, filepath.Base(path)}
 	lapses, ok := fs.negatives[e]
 	delete(fs.negatives, e)
-	return e, ok && lapses.After(time.Now())
+	return e, fs.notifier, ok && lapses.After(time.Now()) && fs.notifier != nil
 }
 
-// invalidateChanged implements MountedFS.InvalidateChanged. It compares each
-// inode whose identity the kernel received from the base snapshot with the
-// merged view. An overlay entry changes only through the mount, which keeps
-// the kernel's view of it current.
+// setNotifier publishes the Notifier of the attempt that mounted.
+func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.notifier = n
+}
+
+// invalidateChanged implements MountedFS.InvalidateChanged. Every inode the
+// kernel holds gets the check for a name that vanished or changed type. Only
+// an inode whose identity the kernel received from the base snapshot gets the
+// identity comparison: an overlay entry changes only through the mount, which
+// keeps the kernel's view of it current. A failure skips only what it
+// concerns, and the first one is returned.
 func (fs *ArtifactFuse) invalidateChanged() error {
-	if fs.notifier == nil {
-		return nil
-	}
 	type known struct {
 		id       fuseops.InodeID
 		entry    kernelEntry
 		path     string
 		reported Identity
+		base     bool
 	}
 	now := time.Now()
 	fs.mu.RLock()
+	notifier := fs.notifier
 	var inodes, negatives []known
 	for id, ref := range fs.inodes {
-		if ref.IsRoot || ref.Stale || ref.Gen == 0 || ref.Path == ".git" {
+		if ref.IsRoot || ref.Stale || ref.Path == ".git" {
 			continue
 		}
 		parent, ok := fs.pathToInode[model.CleanPath(filepath.Dir(ref.Path))]
 		if !ok {
 			continue
 		}
-		inodes = append(inodes, known{id: id, entry: kernelEntry{parent, filepath.Base(ref.Path)}, path: ref.Path, reported: ref.identity()})
+		inodes = append(inodes, known{id: id, entry: kernelEntry{parent, filepath.Base(ref.Path)}, path: ref.Path, reported: ref.identity(), base: ref.Gen != 0})
 	}
 	for e, lapses := range fs.negatives {
 		if parent := fs.inodes[e.parent]; parent != nil && !parent.Stale && lapses.After(now) {
@@ -282,25 +299,36 @@ func (fs *ArtifactFuse) invalidateChanged() error {
 		}
 	}
 	fs.mu.RUnlock()
+	if notifier == nil {
+		return nil
+	}
 
+	var firstErr error
+	failed := func(err error, what string) {
+		if err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("%s: %w", what, err)
+		}
+	}
 	var entries []kernelEntry
 	var changed []fuseops.InodeID
 	for _, k := range inodes {
 		current, exists, err := fs.engine.Identity(k.path)
 		if err != nil {
-			return err
+			failed(err, "resolve "+k.path)
+			continue
 		}
 		switch {
 		case !exists || current.Type != k.reported.Type:
 			entries = append(entries, k.entry)
-		case current != k.reported:
+		case k.base && current != k.reported:
 			changed = append(changed, k.id)
 		}
 	}
 	for _, k := range negatives {
 		_, exists, err := fs.engine.Identity(k.path)
 		if err != nil {
-			return err
+			failed(err, "resolve "+k.path)
+			continue
 		}
 		if exists {
 			entries = append(entries, k.entry)
@@ -309,19 +337,17 @@ func (fs *ArtifactFuse) invalidateChanged() error {
 			fs.mu.Unlock()
 		}
 	}
-	// ENOENT means the kernel no longer holds the entry or inode. Any other
-	// failure skips only its own invalidation.
-	var firstErr error
-	failed := func(err error, what string) {
-		if err != nil && !errors.Is(err, syscall.ENOENT) && firstErr == nil {
-			firstErr = fmt.Errorf("invalidate %s: %w", what, err)
+	// ENOENT means the kernel no longer holds the entry or inode.
+	sent := func(err error, what string) {
+		if !errors.Is(err, syscall.ENOENT) {
+			failed(err, "invalidate "+what)
 		}
 	}
 	for _, e := range entries {
-		failed(fs.notifier.InvalidateEntry(e.parent, e.name), fmt.Sprintf("entry %q", e.name))
+		sent(notifier.InvalidateEntry(e.parent, e.name), fmt.Sprintf("entry %q", e.name))
 	}
 	for _, id := range changed {
-		failed(fs.notifier.InvalidateInode(id, 0, 0), fmt.Sprintf("inode %d", id))
+		sent(notifier.InvalidateInode(id, 0, 0), fmt.Sprintf("inode %d", id))
 	}
 	return firstErr
 }
@@ -1110,8 +1136,8 @@ func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) 
 		fs.closeCachedFilesForPath(path)
 		// A write recreates a path that vanished while the handle was open.
 		// No reply tells the kernel the name exists again.
-		if e, ok := fs.takeNegative(path); ok && fs.notifier != nil {
-			go func() { _ = fs.notifier.InvalidateEntry(e.parent, e.name) }()
+		if e, notifier, ok := fs.takeNegative(path); ok {
+			go func() { _ = notifier.InvalidateEntry(e.parent, e.name) }()
 		}
 		return nil
 	})
@@ -1355,9 +1381,14 @@ func MountRepo(repo model.RepoConfig, engine *Engine, logger *slog.Logger) (Moun
 // fuseMount is fuse.Mount. Package tests replace it so they cannot mount.
 var fuseMount = fuse.Mount
 
+// newNotifier is fuse.NewNotifier. Package tests replace it to tell the
+// Notifiers of two mount attempts apart.
+var newNotifier = fuse.NewNotifier
+
 // fuseErrorLog writes each line the fuse library logs to logger, with the
 // repo's remote redacted. A bug the library answered with EIO goes out as an
-// error. Any other op error, which the library logs for expected errnos such
+// error. A short FSKit read the library answered with EIO goes out as a
+// warning. Any other op error, which the library logs for expected errnos such
 // as EEXIST too, goes out at Debug. Anything else, such as a failed reply,
 // goes out as a warning.
 type fuseErrorLog struct {
@@ -1371,12 +1402,19 @@ type fuseErrorLog struct {
 // it never matches the panic form.
 var fuseBugLine = regexp.MustCompile(`^Op 0x[0-9a-f]+ \S+\] -> \w+: (panic: |"fuseutil: the method exited without returning: |"\S+\.BytesRead is -?\d+, outside its \d+-byte buffer: )`)
 
+// fuseShortReadLine matches the op error line the fuse library writes when, on
+// FSKit, a read's reply is shorter than the size last reported for the file,
+// which it answers with EIO.
+var fuseShortReadLine = regexp.MustCompile(`^Op 0x[0-9a-f]+ \*fuseops\.ReadFileOp\] -> Error: "read of inode \d+ at offset \d+ returned \d+ bytes, want \d+ for size \d+: `)
+
 func (l fuseErrorLog) Write(p []byte) (int, error) {
 	msg := strings.TrimSuffix(string(p), "\n")
 	level := slog.LevelWarn
 	switch {
 	case fuseBugLine.MatchString(msg):
 		level = slog.LevelError
+	case fuseShortReadLine.MatchString(msg):
+		level = slog.LevelWarn
 	case strings.HasPrefix(msg, "Op "):
 		level = slog.LevelDebug
 	}
@@ -1407,11 +1445,12 @@ func MountBackend() (string, error) {
 
 // mountWithBackend mounts through the transports backend allows and returns the
 // backend that mounted. mount(true) mounts through FSKit, mount(false) through the
-// kernel transport. BackendAuto falls back to the kernel transport only when
-// fskitUnavailable reports that FSKit cannot serve any mount here and kextLoaded
-// reports a loaded macFUSE kernel extension, because mounting through an unloaded
-// one prompts macOS to load it.
-func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileSystem, error), fskitUnavailable func(error) bool, kextLoaded func() bool) (*fuse.MountedFileSystem, string, error) {
+// kernel transport. BackendAuto falls back to the kernel transport only when the
+// FSKit error matches fuse.ErrFSKitUnavailable, which means FSKit cannot serve any
+// mount here, and kextLoaded reports a loaded macFUSE kernel extension, because
+// mounting through an unloaded one prompts macOS to load it. Any other FSKit
+// failure may leave a mount behind, so a retry could mount twice.
+func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileSystem, error), kextLoaded func() bool) (*fuse.MountedFileSystem, string, error) {
 	switch backend {
 	case BackendKernel:
 		mfs, err := mount(false)
@@ -1421,7 +1460,7 @@ func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileS
 		return mfs, BackendFSKit, err
 	}
 	mfs, fskitErr := mount(true)
-	if fskitErr == nil || !fskitUnavailable(fskitErr) {
+	if fskitErr == nil || !errors.Is(fskitErr, fuse.ErrFSKitUnavailable) {
 		return mfs, BackendFSKit, fskitErr
 	}
 	if !kextLoaded() {
@@ -1440,9 +1479,6 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, l
 		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
 	}
 	fsint := NewArtifactFuse(repo, engine)
-	notifier := fuse.NewNotifier()
-	fsint.notifier = notifier
-	server := fuse.NewServerWithNotifier(notifier, fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate)))
 
 	mountCfg := fuse.MountConfig{
 		FSName:                  "artifact-fs:" + repo.Name,
@@ -1452,11 +1488,22 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, l
 	}
 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.
 	platformMountConfig(&mountCfg)
+	// notifiers holds each attempt's Notifier, keyed by whether the attempt
+	// went through FSKit.
+	notifiers := map[bool]*fuse.Notifier{}
 	mount := func(fskit bool) (*fuse.MountedFileSystem, error) {
 		cfg := mountCfg
 		if fskit {
-			cfg.Options = map[string]string{"backend": "fskit"}
+			cfg.Backend = fuse.BackendFSKit
 		}
+		// A Server must not serve a second mount once a failed one has
+		// answered INIT, so each attempt gets its own. The failed Server can
+		// keep serving after fuse.Mount returns, so each attempt gets its own
+		// Notifier too: a shared one could hand a notification to the failed
+		// Server.
+		notifier := newNotifier()
+		notifiers[fskit] = notifier
+		server := fuse.NewServerWithNotifier(notifier, fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate)))
 		return fuseMount(repo.MountPath, server, &cfg)
 	}
 
@@ -1464,6 +1511,7 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, l
 	if err != nil {
 		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
 	}
+	fsint.setNotifier(notifiers[mounted == BackendFSKit])
 
 	return &mountedFSWrapper{MountedFileSystem: mfs, fs: fsint, mountPoint: repo.MountPath, backend: mounted}, nil
 }

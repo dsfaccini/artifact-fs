@@ -68,9 +68,9 @@ file system extension and needs no kernel extension.
 Any other value fails the mount. Linux accepts the same values and ignores them.
 
 A failed FSKit mount logs what to fix, such as enabling the file system
-extensions or upgrading macOS. FSKit counts as unavailable when macFUSE's FSKit
-framework is missing, macOS is too old, the helper tool failed to install, or the
-file system extension is missing or not enabled. `auto` does not fall back after
+extensions or upgrading macOS. FSKit counts as unavailable when macFUSE is older
+than 5.5 or its FSKit framework cannot be loaded, macOS is too old, the helper
+tool failed to install, or the file system extension is missing or not enabled. `auto` does not fall back after
 any other FSKit failure, because a retry could mount twice. The daemon logs the
 transport that mounted each repo.
 
@@ -194,7 +194,7 @@ Async existing-clone preparation reports remote configuration, fetch, and branch
 Each error the FUSE library reports becomes a `fuse error` record:
 
 - `ERROR`: a bug the library answers with `EIO`. That is a panic it recovers from an op, logged with its stack; an op that exits through `runtime.Goexit`; or a reply whose byte count falls outside its buffer.
-- `WARN`: a reply the kernel refuses, other than with `ENOENT`. On Linux, also a mount whose `FUSE_POLL` setup failed.
+- `WARN`: a reply the kernel refuses, other than with `ENOENT`. On FSKit, a read whose reply is shorter than the size last reported for the file, which the library answers with `EIO`. On Linux, a mount whose `FUSE_POLL` setup failed.
 - `DEBUG`: every other failed op, including a request the library cannot decode, because expected errnos such as `EEXIST` fail ops too.
 
 The daemon logs at `INFO`, so it drops the `DEBUG` records. The library reports no `ENOSYS` or `EINTR` from any op, no `ENOENT` from a lookup, no `ENOTEMPTY` from `rmdir` or `rename`, and no `ENODATA` or `ERANGE` from `GetXattr` or `ListXattr`.
@@ -417,9 +417,9 @@ it at a later HEAD change.
 
 | Backend | After a HEAD change |
 |---------|---------------------|
-| Linux | The mount invalidates three things at once: the attributes and cached pages of each inode the kernel holds whose type, permission bits or blob changed; the entry of each name that vanished or changed type; and each negative entry whose name now exists. The mount caches a missing name as a negative entry for 1 s. A name made through the mount replaces its negative entry, and a write that recreates a vanished file invalidates it. The mount negotiates `FUSE_AUTO_INVAL_DATA` without writeback caching, so the kernel drops a file's cached pages when its size or mtime changes. The kernel keeps a base file's pages across opens only while its opens serve the same blob. For up to 1 s, a reader can still see attributes the mount does not invalidate, such as the old mtime of a file whose blob did not change, or of a directory. |
-| macFUSE kernel extension | The mount sends the same invalidations as on Linux. The extension mounts with `novncache`, so it caches no names and the mount caches no negative entries. Every open drops the file's cached pages. For up to 1 s, a reader can still see the old mtime of a file whose blob did not change, and of a directory. |
-| FSKit | FSKit takes no invalidations, so the mount sends none and caches no negative entries. FSKit keeps what it cached until it asks again, which the mount cannot hasten. Until then, a reader can see the old commit's names, sizes and modes, and an inode reads the old generation while the daemon keeps it. After that, the inode reads the current content. The fuse library answers EIO to a read inside the size it last reported that the current content does not fill. A read that FSKit sends before a reply reporting a smaller size reaches it can still get a short reply without EIO. |
+| Linux | The mount invalidates three things at once: the attributes and cached pages of each inode the kernel holds whose type, permission bits or blob changed; the entry of each name that vanished or changed type; and each negative entry whose name now exists. The mount caches a missing name as a negative entry for 1 s. A name made through the mount replaces its negative entry, and a write that recreates a vanished file invalidates it. The mount negotiates `FUSE_AUTO_INVAL_DATA` without writeback caching, so the kernel drops a file's cached pages when its size or mtime changes. The kernel keeps a base file's pages across opens only while its opens serve the same blob. For up to 1 s, a reader can still see attributes the mount does not invalidate, such as the old mtime of a file whose blob did not change, or of a directory. A lookup or getattr that races the switch can leave old names and sizes for up to 1 s, and old pages within one open. |
+| macFUSE kernel extension | The mount sends the same invalidations as on Linux. The extension mounts with `novncache`, so it caches no names and the mount caches no negative entries. It drops a file's cached attributes and pages on each `InvalidateInode`. A changed size only resizes its page cache: a smaller size drops the pages past the new end. An open does not drop the pages, and `KeepPageCache` has no effect. So a lookup or getattr that races the switch can leave the old blob's pages beyond one open, until the next invalidation of that inode or a smaller size. For up to 1 s, a reader can still see the old mtime of a file whose blob did not change, and of a directory. macFUSE 5's extension is closed source, so this row follows the open-source [osxfuse extension](https://github.com/osxfuse/kext/blob/534773bd3135f04b7f6fb801faa2f8991daf4a6b/osxfuse/fuse_vnops.c#L2356-L2390). |
+| FSKit | FSKit takes no invalidations, so the mount sends none and caches no negative entries. FSKit keeps what it cached until it asks again, which the mount cannot hasten. FSKit keeps its own attribute cache, and artifact-fs knows no bound for it. Until then, a reader can see the old commit's names, sizes and modes, and an inode reads the old generation while the daemon keeps it. After that, the inode reads the current content. The fuse library answers EIO to a read inside the size it last reported that the current content does not fill. A read that FSKit sends before a reply reporting a smaller size reaches it can still get a short reply without EIO. |
 
 ### Subsystems
 
