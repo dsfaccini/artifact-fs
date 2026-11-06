@@ -6,12 +6,6 @@ import (
 	"github.com/dsfaccini/fuse"
 )
 
-// negativeLookupEntries answers a lookup of a missing name with a negative
-// entry. Creating the name through the mount replaces the kernel's negative
-// dentry, so the cache hides only names that appear outside the mount, such
-// as after a HEAD change, and only for the entry TTL.
-const negativeLookupEntries = true
-
 // setXattrErrno answers every SetXattr: the overlay stores no extended attributes.
 const setXattrErrno = syscall.ENOSYS
 

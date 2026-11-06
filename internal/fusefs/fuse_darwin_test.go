@@ -1,13 +1,10 @@
 package fusefs
 
 import (
-	"context"
 	"fmt"
-	"syscall"
 	"testing"
 
 	"github.com/dsfaccini/fuse"
-	"github.com/dsfaccini/fuse/fuseops"
 )
 
 func setMacFUSEKextLoaded(t *testing.T, loaded bool) {
@@ -46,15 +43,5 @@ func TestPlatformMountReachesFSKit(t *testing.T) {
 			})
 			assertMountResult(t, mounts, backend, err, test.wantMounts, test.wantBackend, test.wantErr)
 		})
-	}
-}
-
-// Whether FSKit honors negative entries is unverified, so darwin answers a
-// missing name with ENOENT on every backend.
-func TestLookUpMissingNameReturnsENOENT(t *testing.T) {
-	f := newLocalOverlayFuseFixture(t)
-	op := &fuseops.LookUpInodeOp{Parent: f.nestInode, Name: "missing"}
-	if got := kernelErrno(f.fs.LookUpInode(context.Background(), op)); got != syscall.ENOENT {
-		t.Fatalf("lookup of a missing name = %v, want ENOENT", got)
 	}
 }

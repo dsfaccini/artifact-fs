@@ -7,10 +7,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// negativeLookupEntries is off: whether FSKit honors negative entries is
-// unverified, so every darwin backend answers a missing name with ENOENT.
-const negativeLookupEntries = false
-
 // setXattrErrno answers every SetXattr. ENOSYS would make macOS store the
 // attributes in AppleDouble ._ files beside each file, so darwin fails the
 // write instead.
