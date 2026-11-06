@@ -163,6 +163,7 @@ func TestE2E(t *testing.T) {
 		}
 	}()
 	svc.SetMountRoot(mountDir)
+	ctl := newE2EController(t, root)
 
 	cfg := model.RepoConfig{
 		Name:              repoName,
@@ -174,7 +175,7 @@ func TestE2E(t *testing.T) {
 		MountRoot:         mountDir,
 		Enabled:           true,
 	}
-	if err := svc.AddRepo(ctx, cfg); err != nil {
+	if err := ctl.AddRepo(ctx, cfg); err != nil {
 		t.Fatalf("add-repo: %v", err)
 	}
 
@@ -182,7 +183,7 @@ func TestE2E(t *testing.T) {
 	errCh := startE2EDaemon(ctx, svc)
 
 	// Wait for the FUSE mount to appear
-	if err := waitForMount(svc, mountPath, 60*time.Second); err != nil {
+	if err := waitForMount(ctl, mountPath, 60*time.Second); err != nil {
 		cancel()
 		t.Fatal(err)
 	}
@@ -1125,7 +1126,8 @@ func TestE2EVerifiedSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstSvc.SetMountRoot(mountDir)
-	if err := firstSvc.AddRepo(firstCtx, cfg); err != nil {
+	ctl := newE2EController(t, root)
+	if err := ctl.AddRepo(firstCtx, cfg); err != nil {
 		firstCancel()
 		_ = firstSvc.Close()
 		t.Fatalf("add verified repo: %v", err)
@@ -1145,7 +1147,7 @@ func TestE2EVerifiedSource(t *testing.T) {
 	}
 
 	firstErrCh := startE2EDaemon(firstCtx, firstSvc)
-	if err := waitForMount(firstSvc, mountPath, 60*time.Second); err != nil {
+	if err := waitForMount(ctl, mountPath, 60*time.Second); err != nil {
 		firstCancel()
 		_ = firstSvc.Close()
 		t.Fatalf("verified-source mount: %v", err)
@@ -1164,14 +1166,14 @@ func TestE2EVerifiedSource(t *testing.T) {
 		t.Fatalf("verified Git index through mount = %v, want [README.md]", got)
 	}
 
-	assertVerifiedSourceStatus(t, firstSvc, requiredCommit)
+	assertVerifiedSourceStatus(t, ctl, requiredCommit)
 	if got := readFileStr(t, filepath.Join(mountPath, "README.md")); !strings.Contains(got, "Test Repo") {
 		t.Fatalf("README.md = %q", got)
 	}
 	if _, err := os.Stat(readmeCachePath); err != nil {
 		t.Fatalf("mounted read did not hydrate README: %v", err)
 	}
-	status, err := firstSvc.Status(context.Background(), repoName)
+	status, err := ctl.Status(context.Background(), repoName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1186,7 +1188,7 @@ func TestE2EVerifiedSource(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mountPath, "local-only.txt"), []byte("overlay\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	status, err = firstSvc.Status(context.Background(), repoName)
+	status, err = ctl.Status(context.Background(), repoName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1210,7 +1212,7 @@ func TestE2EVerifiedSource(t *testing.T) {
 	run(t, updateWork, "git", "-c", "user.name=E2E Test", "-c", "user.email=e2e@test", "commit", "-m", "advance remote")
 	run(t, updateWork, "git", "push", "origin", "main")
 	time.Sleep(time.Second)
-	assertVerifiedSourceStatus(t, firstSvc, requiredCommit)
+	assertVerifiedSourceStatus(t, ctl, requiredCommit)
 	if _, err := os.Stat(filepath.Join(mountPath, "REMOTE-ONLY.md")); !os.IsNotExist(err) {
 		t.Fatalf("disabled refresh exposed remote-only file: %v", err)
 	}
@@ -1226,7 +1228,7 @@ func TestE2EVerifiedSource(t *testing.T) {
 	))
 	gitCmd(t, mountPath, "update-ref", "--no-deref", "HEAD", alternateCommit)
 	time.Sleep(time.Second)
-	assertVerifiedSourceStatus(t, firstSvc, requiredCommit)
+	assertVerifiedSourceStatus(t, ctl, requiredCommit)
 
 	stopE2EDaemon(t, firstSvc, firstCancel, firstErrCh, mountPath)
 	firstStopped = true
@@ -1238,7 +1240,7 @@ func TestE2EVerifiedSource(t *testing.T) {
 	}
 	secondSvc.SetMountRoot(mountDir)
 	secondErrCh := startE2EDaemon(secondCtx, secondSvc)
-	if err := waitForMount(secondSvc, mountPath, 60*time.Second); err != nil {
+	if err := waitForMount(ctl, mountPath, 60*time.Second); err != nil {
 		secondCancel()
 		_ = secondSvc.Close()
 		t.Fatalf("verified-source mount after restart: %v", err)
@@ -1246,7 +1248,7 @@ func TestE2EVerifiedSource(t *testing.T) {
 	defer stopE2EDaemon(t, secondSvc, secondCancel, secondErrCh, mountPath)
 	primeE2EMountPolling(t, mountPath)
 
-	assertVerifiedSourceStatus(t, secondSvc, requiredCommit)
+	assertVerifiedSourceStatus(t, ctl, requiredCommit)
 	if head := strings.TrimSpace(gitCmd(t, mountPath, "rev-parse", "HEAD")); head != requiredCommit {
 		t.Fatalf("HEAD after restart = %q, want required commit %q", head, requiredCommit)
 	}
@@ -1262,9 +1264,9 @@ func TestE2EVerifiedSource(t *testing.T) {
 	})
 }
 
-func assertVerifiedSourceStatus(t *testing.T, svc *daemon.Service, requiredCommit string) {
+func assertVerifiedSourceStatus(t *testing.T, ctl *daemon.Controller, requiredCommit string) {
 	t.Helper()
-	status, err := svc.Status(context.Background(), repoName)
+	status, err := ctl.Status(context.Background(), repoName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1304,6 +1306,18 @@ func stopE2EDaemon(t *testing.T, svc *daemon.Service, cancel context.CancelFunc,
 
 // --- helpers (platform-independent) ---
 
+// newE2EController opens the controller that CLI commands on root run on,
+// which reads status the way the status command does. The test closes it.
+func newE2EController(t testing.TB, root string) *daemon.Controller {
+	t.Helper()
+	ctl, err := daemon.NewController(context.Background(), root, logging.NewJSONLogger(os.Stderr, slog.LevelWarn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ctl.Close() })
+	return ctl
+}
+
 // mountErrorGrace is how long waitForMount tolerates a reported mount error.
 // The daemon retries a failed mount at its next registry sync, 3s later, so an
 // error that outlasts that retry is not transient.
@@ -1318,16 +1332,17 @@ func startE2EDaemon(ctx context.Context, svc *daemon.Service) chan error {
 	return errCh
 }
 
-// waitForMount waits for svc to mount repoName at path. It returns the
-// daemon's mount error once that error outlasts mountErrorGrace.
-func waitForMount(svc *daemon.Service, path string, timeout time.Duration) error {
+// waitForMount waits for the daemon to mount repoName at path, reading its
+// status through ctl. It returns the daemon's mount error once that error
+// outlasts mountErrorGrace.
+func waitForMount(ctl *daemon.Controller, path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var failingSince time.Time
 	for time.Now().Before(deadline) {
 		if isMounted(path) {
 			return nil
 		}
-		st, err := svc.Status(context.Background(), repoName)
+		st, err := ctl.Status(context.Background(), repoName)
 		switch {
 		case err != nil || st.MountError == "":
 			failingSince = time.Time{}
