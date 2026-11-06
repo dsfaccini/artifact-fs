@@ -145,7 +145,7 @@ Check the state of a mounted repo with `status`:
 | `base_commit` | The served commit while the daemon serves the repo, otherwise the published one |
 | `served_commit` / `served_generation` | Commit and snapshot generation the daemon's mount serves; `none`/`0` when no daemon serves the repo |
 | `published_commit` / `published_generation` | Commit and generation the snapshot store last published. After a failed overlay transition they run ahead of the served ones until the daemon's retry succeeds |
-| `phase` | The step the daemon's runtime for the repo is in: `prepare` (async preparation), `mount`, `serve` or `unmount`; `none` before the daemon records one |
+| `phase` | The step the daemon's runtime for the repo is in: `prepare` (async preparation), `mount` (including retries of a FUSE mount that failed), `serve` (a mount is served) or `unmount`; `none` when no daemon runs or before it records one |
 | `remote_refresh` | Whether daemon and manual remote refreshes are enabled |
 | `ahead` / `behind` / `diverged` | Divergence from the remote at the daemon's last successful refresh |
 | `prepare_error` | Last redacted preparation error, if any |
