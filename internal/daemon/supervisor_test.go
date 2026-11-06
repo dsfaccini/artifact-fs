@@ -3,9 +3,13 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -16,9 +20,10 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
-// resolverMount stands in for a successful mount and keeps the resolver that
-// the mount would serve.
+// resolverMount mounts through next and keeps the resolver that the mount
+// would serve.
 type resolverMount struct {
+	next     mountFunc
 	mu       sync.Mutex
 	resolved *fusefs.Resolver
 }
@@ -27,7 +32,7 @@ func (m *resolverMount) mount(cfg model.RepoConfig, engine *fusefs.Engine, gate 
 	m.mu.Lock()
 	m.resolved = engine.Resolver
 	m.mu.Unlock()
-	return fakeMount(cfg, engine, gate, logger)
+	return m.next(cfg, engine, gate, logger)
 }
 
 func (m *resolverMount) resolver() *fusefs.Resolver {
@@ -51,10 +56,17 @@ type startedDaemon struct {
 
 func startDaemonWithRepo(t *testing.T) *startedDaemon {
 	t.Helper()
+	return startDaemonWithMount(t, fakeMount, "")
+}
+
+// startDaemonWithMount starts a daemon that mounts the repo at mountPath
+// through mount. An empty mountPath mounts it under the test's mount root.
+func startDaemonWithMount(t *testing.T, mount mountFunc, mountPath string) *startedDaemon {
+	t.Helper()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	d := &startedDaemon{
-		mounts:  &resolverMount{},
+		mounts:  &resolverMount{next: mount},
 		logs:    &lockedBuffer{},
 		root:    filepath.Join(tmp, "artifact-fs"),
 		workDir: filepath.Join(tmp, "work"),
@@ -71,7 +83,7 @@ func startDaemonWithRepo(t *testing.T) *startedDaemon {
 	svc.SetMountRoot(filepath.Join(tmp, "mnt"))
 	svc.mount = d.mounts.mount
 	// A remote refresh never runs during the test, so only the HEAD watcher can start a reconcile.
-	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: d.workDir, Branch: "main", RefreshInterval: time.Hour, Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: d.workDir, Branch: "main", MountPath: mountPath, RefreshInterval: time.Hour, Enabled: true}); err != nil {
 		_ = svc.Close()
 		t.Fatal(err)
 	}
@@ -188,4 +200,231 @@ func TestStartRetriesHEADReconcileAfterSnapshotLock(t *testing.T) {
 	}
 
 	d.waitForServedHEAD(t, want, initial.SnapshotGeneration+1, "README.md", d.blobOID(t, want, "README.md"))
+}
+
+// connFailureMounts first mounts a mount whose connection fails once fail is
+// closed, then fake mounts. A failed connection leaves its mount in place
+// until it unmounts. It records each mount and unmount in order.
+type connFailureMounts struct {
+	fail chan struct{}
+	// release lets the remount return, so a test can observe the state before it.
+	release     chan struct{}
+	releaseOnce sync.Once
+	mu          sync.Mutex
+	calls       []string
+	// unmountFails is how many unmounts of the failed mount fail first.
+	unmountFails int
+	// abort makes the failed connection's Join return nil, as after an
+	// abort. Set it before closing fail.
+	abort bool
+}
+
+// startConnFailureDaemon starts a daemon whose repo, mounted at mountPath,
+// mounts through a connFailureMounts.
+func startConnFailureDaemon(t *testing.T, unmountFails int, mountPath string) (*startedDaemon, *connFailureMounts) {
+	t.Helper()
+	m := &connFailureMounts{fail: make(chan struct{}), release: make(chan struct{}), unmountFails: unmountFails}
+	d := startDaemonWithMount(t, m.mount, mountPath)
+	// Runs before the daemon's cleanup, which waits for a remount.
+	t.Cleanup(m.releaseRemount)
+	return d, m
+}
+
+func (m *connFailureMounts) releaseRemount() { m.releaseOnce.Do(func() { close(m.release) }) }
+
+func (m *connFailureMounts) mount(cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+	m.mu.Lock()
+	remount := len(m.calls) > 0
+	m.calls = append(m.calls, "mount")
+	m.mu.Unlock()
+	if remount {
+		<-m.release
+		return fakeMount(cfg, engine, gate, logger)
+	}
+	return &failedConnectionMount{m: m, err: fmt.Errorf("readMessage: transport to %s failed", cfg.RemoteURL)}, nil
+}
+
+func (m *connFailureMounts) recorded() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.calls)
+}
+
+type failedConnectionMount struct {
+	m   *connFailureMounts
+	err error
+}
+
+func (f *failedConnectionMount) Backend() string { return "fake" }
+
+func (f *failedConnectionMount) Join(ctx context.Context) error {
+	select {
+	case <-f.m.fail:
+		if f.m.abort {
+			return nil
+		}
+		return f.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (f *failedConnectionMount) Unmount() error {
+	f.m.mu.Lock()
+	defer f.m.mu.Unlock()
+	if f.m.unmountFails > 0 {
+		f.m.unmountFails--
+		f.m.calls = append(f.m.calls, "unmount failed")
+		return errors.New("busy")
+	}
+	f.m.calls = append(f.m.calls, "unmount")
+	return nil
+}
+
+// failConnectionUntilRemount fails the mounted repo's connection and returns
+// the mount calls up to the remount, with the remount still in progress.
+func failConnectionUntilRemount(t *testing.T, d *startedDaemon, m *connFailureMounts) []string {
+	t.Helper()
+	close(m.fail)
+	waitFor(t, d.startErr, func() bool { return slices.Contains(m.recorded()[1:], "mount") })
+	return m.recorded()
+}
+
+func TestStartUnmountsFailedConnectionBeforeRemount(t *testing.T) {
+	d, m := startConnFailureDaemon(t, 0, "")
+
+	calls := failConnectionUntilRemount(t, d, m)
+	if want := []string{"mount", "unmount", "mount"}; !slices.Equal(calls, want) {
+		t.Fatalf("calls = %q, want %q", calls, want)
+	}
+	st := d.status(t)
+	if want := "readMessage: transport to REDACTED_REMOTE failed"; st.State != repoStateDegraded || st.MountError != want {
+		t.Fatalf("state = %q, mount_error = %q; want %q, %q", st.State, st.MountError, repoStateDegraded, want)
+	}
+	for line := range strings.SplitSeq(d.logs.String(), "\n") {
+		if strings.Contains(line, "fuse connection failed") && (strings.Contains(line, d.workDir) || !strings.Contains(line, "REDACTED_REMOTE")) {
+			t.Fatalf("connection failure log is not redacted: %s", line)
+		}
+	}
+}
+
+func TestStartRemountsAfterFailedUnmountWhenNothingIsMounted(t *testing.T) {
+	// Nothing is mounted under the test's mount root, so the failed unmount leaves no mount behind.
+	d, m := startConnFailureDaemon(t, 1, "")
+
+	calls := failConnectionUntilRemount(t, d, m)
+	if want := []string{"mount", "unmount failed", "mount"}; !slices.Equal(calls, want) {
+		t.Fatalf("calls = %q, want %q", calls, want)
+	}
+}
+
+func TestStartRemountsWithoutUnmountWhenConnectionEndsUnmounted(t *testing.T) {
+	// Nothing is mounted under the test's mount root, as after an external unmount.
+	d, m := startConnFailureDaemon(t, 0, "")
+	m.abort = true
+
+	calls := failConnectionUntilRemount(t, d, m)
+	if want := []string{"mount", "mount"}; !slices.Equal(calls, want) {
+		t.Fatalf("calls = %q, want %q", calls, want)
+	}
+}
+
+func TestStartRetriesFailedConnectionUnmountBeforeRemount(t *testing.T) {
+	// "/" is always in the mount table, so the failed unmount leaves a mount behind.
+	d, m := startConnFailureDaemon(t, 1, "/")
+
+	calls := failConnectionUntilRemount(t, d, m)
+	if want := []string{"mount", "unmount failed", "unmount", "mount"}; !slices.Equal(calls, want) {
+		t.Fatalf("calls = %q, want %q", calls, want)
+	}
+}
+
+func TestStartUnmountsAbortedConnectionBeforeRemount(t *testing.T) {
+	// "/" is always in the mount table, so the aborted connection's mount stays in place.
+	d, m := startConnFailureDaemon(t, 0, "/")
+	m.abort = true
+
+	calls := failConnectionUntilRemount(t, d, m)
+	if want := []string{"mount", "unmount", "mount"}; !slices.Equal(calls, want) {
+		t.Fatalf("calls = %q, want %q", calls, want)
+	}
+	if st := d.status(t); st.State != repoStateDegraded || st.MountError != errConnectionEndedMounted.Error() {
+		t.Fatalf("state = %q, mount_error = %q; want %q, %q", st.State, st.MountError, repoStateDegraded, errConnectionEndedMounted)
+	}
+}
+
+func TestRemoveRepoUnmountsFailedConnectionLeftMounted(t *testing.T) {
+	d, m := startConnFailureDaemon(t, 2, "/")
+	close(m.fail)
+	// The daemon unmounts once after the failure and once more in the
+	// supervisor's retry, which then backs off.
+	waitFor(t, d.startErr, func() bool { return len(m.recorded()) >= 3 })
+
+	// A remount after the retry's backoff returns at once, so it fails the
+	// call sequence below instead of blocking the daemon's poll.
+	m.releaseRemount()
+	// remove-repo runs in its own process, so the daemon's registry poll stops the runtime.
+	ctx := context.Background()
+	cliSvc, err := New(ctx, d.root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cliSvc.RemoveRepo(ctx, "repo")
+	if closeErr := cliSvc.Close(); err != nil || closeErr != nil {
+		t.Fatalf("CLI remove-repo: %v, close: %v", err, closeErr)
+	}
+	waitFor(t, d.startErr, func() bool {
+		d.svc.mu.Lock()
+		defer d.svc.mu.Unlock()
+		return len(d.svc.running) == 0
+	})
+	if want := []string{"mount", "unmount failed", "unmount failed", "unmount"}; !slices.Equal(m.recorded(), want) {
+		t.Fatalf("calls = %q, want %q", m.recorded(), want)
+	}
+}
+
+func TestMountPointHeld(t *testing.T) {
+	// /dev is a mount point on macOS and Linux. The mount table lists it only
+	// by its absolute resolved path.
+	tmp := t.TempDir()
+	rootLink, devLink := filepath.Join(tmp, "root"), filepath.Join(tmp, "dev")
+	for link, target := range map[string]string{rootLink: "/", devLink: "/dev"} {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	file := filepath.Join(tmp, "file")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"parent symlink", filepath.Join(rootLink, "dev"), true},
+		{"final symlink", devLink, true},
+		{"relative", "dev", true},
+		{"unresolvable parent", filepath.Join(tmp, "gone", "repo"), true},
+		{"unmounted", filepath.Join(tmp, "repo"), false},
+		{"unreadable mount point", filepath.Join(file, "repo"), true},
+	}
+	if runtime.GOOS == "darwin" {
+		tests = append(tests, struct {
+			name string
+			path string
+			want bool
+		}{"other case", "/DEV", true})
+	}
+	t.Chdir("/")
+	// The mount table must not depend on mount(8) being on PATH, as under launchd.
+	t.Setenv("PATH", "")
+	if !isMounted("/dev") {
+		t.Error("isMounted(/dev) = false with an empty PATH")
+	}
+	for _, tt := range tests {
+		if got := mountPointHeld(tt.path); got != tt.want {
+			t.Errorf("%s: mountPointHeld(%q) = %t, want %t", tt.name, tt.path, got, tt.want)
+		}
+	}
 }

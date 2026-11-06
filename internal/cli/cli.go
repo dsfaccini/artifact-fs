@@ -261,11 +261,28 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		stubCommand("prefetch", "prefetch blobs", stdout),
 	}
 
+	app.OnUsageError = showUsage
+	for _, cmd := range app.Commands {
+		cmd.OnUsageError = showUsage
+	}
+
 	if err := app.Run(ctx, append([]string{"artifact-fs"}, args...)); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
 	return 0
+}
+
+// showUsage prints a usage error and the command's help on stdout, and
+// returns the error, which Run prints once on stderr.
+func showUsage(ctx context.Context, cmd *ucli.Command, err error, isSubcommand bool) error {
+	fmt.Fprintf(cmd.Root().Writer, "Incorrect Usage: %s\n\n", err)
+	if isSubcommand {
+		_ = ucli.ShowCommandHelp(ctx, cmd.Root(), cmd.Name)
+	} else {
+		_ = ucli.ShowRootCommandHelp(cmd)
+	}
+	return err
 }
 
 func defaultRoot() string {
@@ -319,9 +336,9 @@ func formatStatusLine(st model.RepoRuntimeState) string {
 	if st.RemoteRefreshDisabled {
 		remoteRefresh = "disabled"
 	}
-	return fmt.Sprintf("repo=%s state=%s head=%s ref=%s source_ref=%s required_commit=%s acquisition=%s base_commit=%s served_commit=%s served_generation=%d published_commit=%s published_generation=%d remote_refresh=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s prepare_error=%s mount_error=%s last_error=%s last_error_phase=%s last_error_at=%s next_retry=%s attempts=%d hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
+	return fmt.Sprintf("repo=%s state=%s head=%s ref=%s source_ref=%s required_commit=%s acquisition=%s base_commit=%s served_commit=%s served_generation=%d published_commit=%s published_generation=%d phase=%s remote_refresh=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s prepare_error=%s mount_error=%s last_error=%s last_error_phase=%s last_error_at=%s next_retry=%s attempts=%d hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
 		st.RepoID, st.State, st.CurrentHEADOID, st.CurrentHEADRef, st.SourceRef, requiredCommit, acquisition, st.CurrentHEADOID,
-		formatNone(st.ServedHEADOID), st.ServedGeneration, formatNone(st.PublishedHEADOID), st.PublishedGeneration, remoteRefresh,
+		formatNone(st.ServedHEADOID), st.ServedGeneration, formatNone(st.PublishedHEADOID), st.PublishedGeneration, formatNone(st.Phase), remoteRefresh,
 		st.AheadCount, st.BehindCount, st.Diverged,
 		formatLastFetchAt(st.LastFetchAt), formatLastFetchResult(st.LastFetchResult),
 		formatStatusError(st.PrepareError), formatStatusError(st.MountError),

@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -89,6 +88,9 @@ type core struct {
 // daemon only through the registry, repo_runtime and the control socket.
 type Controller struct {
 	*core
+	// requestTimeout bounds the wait of Unmount and Remount; zero means
+	// mountRequestTimeout.
+	requestTimeout time.Duration
 }
 
 // Service is the daemon: it holds the daemon lock and mounts and serves every
@@ -200,6 +202,10 @@ func (s *Service) hydrationWorkers() int {
 	return DefaultHydrationConcurrency
 }
 
+// Close unmounts every repo and releases the registry, the git processes and
+// the daemon lock, also when an unmount fails. It returns the first error. A
+// runtime that failed to unmount keeps its workers, so Close does not wait
+// for its preparation.
 func (s *Service) Close() error {
 	s.mu.Lock()
 	s.closing = true
@@ -214,14 +220,20 @@ func (s *Service) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	if len(errs) > 0 {
-		return errors.Join(errs...)
+	if len(errs) == 0 {
+		s.prepareWorkers.Wait()
 	}
-	s.prepareWorkers.Wait()
 	s.git.Close()
-	err := s.registry.Close()
-	s.lock.Close()
-	return err
+	if err := s.registry.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := s.lock.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return errs[0]
+	}
+	return nil
 }
 
 func (s *core) fillPaths(cfg *model.RepoConfig) {

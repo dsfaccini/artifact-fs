@@ -24,8 +24,14 @@ const credentialRemote = "https://user:hunter2secret@example.com/org/repo.git"
 // repository, and a controller on its root.
 func newSyncedDaemon(t *testing.T) (*Service, *Controller) {
 	t.Helper()
+	return newSyncedDaemonIn(t, t.TempDir())
+}
+
+// newSyncedDaemonIn is newSyncedDaemon with its state root and repositories
+// under tmp.
+func newSyncedDaemonIn(t *testing.T, tmp string) (*Service, *Controller) {
+	t.Helper()
 	ctx := context.Background()
-	tmp := t.TempDir()
 	remote := filepath.Join(tmp, "remote")
 	runCmd(t, "git", "init", "--initial-branch", "main", remote)
 	if err := os.WriteFile(filepath.Join(remote, "README.md"), []byte("main\n"), 0o644); err != nil {
@@ -80,8 +86,8 @@ func TestStatusReportsAFailureBeforeTheFUSEMount(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := requireFailure(t, ctl, phaseMount, "upgrade artifact-fs")
-	if st.State != repoStateUnmounted || st.MountError != st.LastError || time.Until(st.NextRetryAt) < 20*time.Second {
-		t.Fatalf("status = %+v, want unmounted with the mount backoff", st)
+	if st.State != repoStateUnmounted || st.Phase != phaseMount || st.MountError != st.LastError || time.Until(st.NextRetryAt) < 20*time.Second {
+		t.Fatalf("status = %+v, want unmounted in the mount phase with the mount backoff", st)
 	}
 }
 
@@ -216,4 +222,26 @@ func TestStatusReportsAFailedRefresh(t *testing.T) {
 	if st := requireFailure(t, ctl, phaseFetch, "fetch"); st.LastFetchResult != fetchResultFailed {
 		t.Fatalf("fetch result = %q, want %q", st.LastFetchResult, fetchResultFailed)
 	}
+}
+
+// A failed unmount leaves its mount behind, but a later daemon on the root
+// must still start.
+func TestCloseReleasesTheDaemonLockAfterAFailedUnmount(t *testing.T) {
+	svc, _ := newSyncedDaemon(t)
+	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("busy")}
+	t.Cleanup(func() { close(mfs.exit) })
+	svc.mount = func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+		return mfs, nil
+	}
+	if err := svc.syncRepos(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Close(); err == nil || !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("Close = %v, want the unmount failure", err)
+	}
+	next, err := New(context.Background(), svc.root, discardLogger())
+	if err != nil {
+		t.Fatalf("daemon after a Close that failed to unmount: %v", err)
+	}
+	next.Close()
 }

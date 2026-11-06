@@ -1,12 +1,13 @@
 package daemon
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,6 +26,10 @@ type mountFunc func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.L
 
 // defaultMount is what New installs as Service.mount. Package tests replace it so they cannot mount.
 var defaultMount mountFunc = fusefs.MountRepoWithGate
+
+// errConnectionEndedMounted is the mount error of a connection that ended
+// with no error while the mount point still holds its mount.
+var errConnectionEndedMounted = errors.New("fuse connection ended while the mount point still holds the mount")
 
 type mountFailure struct {
 	lastAttempt time.Time
@@ -269,23 +274,108 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 	rt.joinDone = done
 	s.mu.Unlock()
 	go func() {
-		joinErr := mfs.Join(context.Background())
+		// Join's error is fatal to the connection, and the dead mount can
+		// still hold the mount point. Join also returns nil after an abort,
+		// which leaves the dead mount in place.
+		connErr := mfs.Join(context.Background())
+		if connErr == nil && mountPointHeld(rt.cfg.MountPath) {
+			connErr = errConnectionEndedMounted
+		}
+		s.mu.Lock()
+		failed := connErr != nil && !rt.stopping && !rt.detached && rt.mfs == mfs
+		if failed {
+			rt.failedMount = mfs
+			rt.mounts.Add(1)
+		}
+		cfg := rt.cfg
+		s.mu.Unlock()
+		// The next registry sync mounts the runtime again.
+		nextRetry := time.Now().Add(registrySyncInterval)
+		if failed {
+			defer rt.mounts.Done()
+			s.logger.Error("fuse connection failed, unmounting", "repo", cfg.Name, "error", auth.RedactLogString(connErr.Error(), cfg.RemoteURL))
+			s.recordFailure(cfg, phaseServe, connErr, nextRetry)
+			if err := s.unmountFailedMount(rt); err != nil {
+				s.logger.Error("fuse unmount failed, runtime will retry", "repo", cfg.Name, "error", auth.RedactLogString(err.Error(), cfg.RemoteURL))
+			}
+		}
 		close(done)
 		s.mu.Lock()
-		exited := !rt.stopping && !rt.detached && rt.mfs == mfs
+		exited := failed || !rt.stopping && !rt.detached && rt.mfs == mfs
 		if exited {
 			rt.mfs = nil
 			rt.joinDone = nil
 			rt.state.State = repoStateDegraded
 		}
-		cfg := rt.cfg
 		s.mu.Unlock()
 		if exited {
-			// The next registry sync mounts the runtime again.
-			s.recordFailure(cfg, phaseServe, cmp.Or(joinErr, errFUSEServerExited), time.Now().Add(registrySyncInterval))
+			if !failed {
+				s.recordFailure(cfg, phaseServe, errFUSEServerExited, nextRetry)
+			}
 			s.recordRuntimeState(rt, "")
 		}
 	}()
+}
+
+// unmountFailedMount unmounts the mount whose connection failed, so that no
+// mount lands on top of it. A failed unmount leaves it for the next call
+// unless the mount point no longer holds a mount. The caller holds rt.mounts.
+func (s *Service) unmountFailedMount(rt *repoRuntime) error {
+	s.mu.Lock()
+	mfs := rt.failedMount
+	s.mu.Unlock()
+	if mfs == nil {
+		return nil
+	}
+	if err := mfs.Unmount(); err != nil && mountPointHeld(rt.cfg.MountPath) {
+		return fmt.Errorf("unmount %s after its connection failed: %w", rt.cfg.Name, err)
+	}
+	s.mu.Lock()
+	rt.failedMount = nil
+	s.mu.Unlock()
+	return nil
+}
+
+// isMounted reports whether path is an active mount point, and false when it cannot tell.
+func isMounted(path string) bool {
+	mounted, _ := mountTableHas(path)
+	return mounted
+}
+
+// mountPointHeld reports whether path still holds a mount, and true when it
+// cannot tell. The mount table lists absolute resolved paths, so it looks up
+// path with its parent's symlinks resolved. Only when the table does not list
+// it does it touch path itself, to resolve a symlinked final component; a dead
+// mount point can fail with ENOTCONN.
+func mountPointHeld(path string) bool {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return true
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return true
+	}
+	path = filepath.Join(parent, filepath.Base(path))
+	if mounted, err := mountTableHas(path); mounted || err != nil {
+		return true
+	}
+	fi, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false
+	}
+	if err != nil {
+		return true
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		return false
+	}
+	target, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return true
+	}
+	mounted, err := mountTableHas(target)
+	return mounted || err != nil
 }
 
 func (s *Service) retryRuntimeMount(rt *repoRuntime) {
@@ -304,7 +394,13 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 	s.mu.Unlock()
 	defer rt.mounts.Done()
 
-	mfs, err := s.mountFS(rt.ctx, cfg, engine, gate)
+	err := s.unmountFailedMount(rt)
+	var mfs fusefs.MountedFS
+	if err != nil {
+		s.logger.Error("fuse unmount failed, runtime will retry", "repo", cfg.Name, "error", auth.RedactLogString(err.Error(), cfg.RemoteURL))
+	} else {
+		mfs, err = s.mountFS(rt.ctx, cfg, engine, gate)
+	}
 	s.mu.Lock()
 	if err != nil {
 		mf = s.mountFailures[cfg.ID]

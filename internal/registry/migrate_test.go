@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -163,6 +162,7 @@ var legacyRegistries = map[string]struct {
 			  fetch_ref TEXT NOT NULL DEFAULT '',
 			  prepare_state TEXT NOT NULL DEFAULT '',
 			  prepare_error TEXT NOT NULL DEFAULT '',
+			  mount_error TEXT NOT NULL DEFAULT '',
 			  required_commit TEXT NOT NULL DEFAULT '',
 			  history_depth INTEGER NOT NULL DEFAULT 0,
 			  refresh_disabled INTEGER NOT NULL DEFAULT 0,
@@ -194,7 +194,8 @@ var legacyRegistries = map[string]struct {
 			  mount_request TEXT NOT NULL DEFAULT '',
 			  updated_at_ns INTEGER NOT NULL DEFAULT 0
 			)`,
-			strings.Replace(strings.Replace(fullRepoRow, "prepare_error, mount_error,", "prepare_error, mount_request,", 1), "'clone failed', 'mount failed',", "'clone failed', 'request-1',", 1),
+			fullRepoRow,
+			`UPDATE repos SET mount_request = 'request-1'`,
 			`PRAGMA user_version = 3`,
 		},
 		want: fullRepoWithRequest,

@@ -17,9 +17,10 @@ func (s *Service) Start(ctx context.Context) error {
 	if err := s.registry.ClearRuntime(ctx); err != nil {
 		return err
 	}
+	// The socket only wakes the sync loop early, so the daemon runs without it.
 	control, err := s.listenControl()
 	if err != nil {
-		return err
+		s.logger.Warn("control socket unavailable; CLI commands wait for the registry poll", "error", auth.RedactLogString(err.Error()))
 	}
 	if control != nil {
 		defer control.Close()
@@ -91,6 +92,7 @@ func (s *Service) syncRepos(ctx context.Context) error {
 			continue
 		}
 		if shouldMountAsync(repo) {
+			s.recordPhase(repo, phaseMount)
 			if err := s.mountAsyncRepo(ctx, repo); err != nil {
 				s.logger.Error("repo async mount failed", "repo", repo.Name, "error", auth.RedactLogString(err.Error(), repo.RemoteURL))
 				s.recordMountFailure(repo, repoStateUnmounted, err, time.Now().Add(registrySyncInterval))
@@ -106,6 +108,7 @@ func (s *Service) syncRepos(ctx context.Context) error {
 			continue
 		}
 		s.logger.Info("mounting repo", "repo", repo.Name)
+		s.recordPhase(repo, phaseMount)
 		if err := s.mountRepo(ctx, repo); err != nil {
 			s.logger.Error("repo mount failed", "repo", repo.Name, "error", auth.RedactLogString(err.Error(), repo.RemoteURL))
 			mf := s.mountFailures[repo.ID]
@@ -174,6 +177,9 @@ func (s *Service) stopRepo(repo model.RepoConfig, stopped string, logMsg string)
 	rec := s.records[repo.ID]
 	recorded := rec != nil && rec.State == repoStateUnmounted && rec.MountRequest == stopped
 	s.mu.Unlock()
+	if running {
+		s.recordPhase(repo, phaseUnmount)
+	}
 	if err := s.unmount(repo.ID); err != nil {
 		s.logger.Error(logMsg, "repo", repo.Name, "error", auth.RedactLogString(err.Error(), repo.RemoteURL))
 		s.recordFailure(repo, phaseUnmount, err, time.Now().Add(registrySyncInterval))
@@ -212,12 +218,12 @@ func (s *Service) restartRunningPrepareIfCurrent(ctx context.Context, repo model
 		return
 	}
 	if active || !configMatches {
-		if err := s.unmount(latest.ID); err != nil {
-			s.logger.Error("repo prepare remount unmount failed", "repo", latest.Name, "error", err)
+		if !s.stopRepo(latest, runtimeCfg.MountRequest, "repo prepare remount unmount failed") {
 			return
 		}
 		if err := s.mountAsyncRepo(ctx, latest); err != nil {
-			s.logger.Error("repo async remount failed", "repo", latest.Name, "error", err)
+			s.logger.Error("repo async remount failed", "repo", latest.Name, "error", auth.RedactLogString(err.Error(), latest.RemoteURL))
+			s.recordMountFailure(latest, repoStateUnmounted, err, time.Now().Add(registrySyncInterval))
 			return
 		}
 		s.supersedePrepare(latest.ID)

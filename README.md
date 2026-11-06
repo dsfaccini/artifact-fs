@@ -74,8 +74,8 @@ file system extension is missing or not enabled. `auto` does not fall back after
 any other FSKit failure, because a retry could mount twice. The daemon logs the
 transport that mounted each repo.
 
-FSKit reuses directory handles across enumerations, so this backend refreshes
-entries when enumeration restarts. Both macOS backends reject extended
+FSKit reuses directory handles across enumerations. Every backend lists a
+directory again when an enumeration restarts. Both macOS backends reject extended
 attributes, so macOS writes no AppleDouble `._` files to store them. macOS
 attaches extended attributes such as `com.apple.provenance` to nearly every local
 file, so copying files onto the mount with `cp` or `ditto` may fail; `cp -X`
@@ -137,7 +137,7 @@ Check the state of a mounted repo with `status`:
 
 | Field | Meaning |
 |-------|---------|
-| `state` | `mounted`, `degraded` (the FUSE mount is down or the last remote refresh failed), `unmounted`, `preparing`, or `failed`. `unmounted` whenever no daemon runs on the state root |
+| `state` | `mounted`, `degraded` (the FUSE mount is down or the last remote refresh failed), `unmounted`, `preparing`, or `failed`. Without a running daemon, `preparing` or `failed` while preparation is pending or has failed, and `unmounted` otherwise |
 | `head` / `ref` | Backward-compatible aliases for the current base commit and Git HEAD ref |
 | `source_ref` | Canonical remote ref selected during acquisition |
 | `required_commit` | Required source commit, or `none` |
@@ -148,8 +148,8 @@ Check the state of a mounted repo with `status`:
 | `remote_refresh` | Whether daemon and manual remote refreshes are enabled |
 | `ahead` / `behind` / `diverged` | Divergence from the remote at the daemon's last successful refresh |
 | `prepare_error` | Last redacted preparation error, if any |
-| `mount_error` | `last_error` when the mount phase failed last; a successful mount clears it |
-| `last_error` / `last_error_phase` / `last_error_at` | Last redacted failure the daemon retries, the phase that failed (`mount`, `serve`, `unmount`, `head_reconcile`, `fetch` or `registry_sync`) and when. A success of that phase clears it |
+| `mount_error` | `last_error` when the FUSE mount or its connection failed last; a successful mount clears it |
+| `last_error` / `last_error_phase` / `last_error_at` | Last redacted failure the daemon retries, the phase that failed (`mount`, `serve`, `unmount`, `head_reconcile`, `fetch` or `registry_sync`) and when. `serve` is a FUSE connection that failed or exited. A success of that phase clears it |
 | `next_retry` / `attempts` | When the daemon retries the failed phase, and how many times in a row it failed; `next_retry` is `none` when no daemon runs |
 | `hydrated_blobs` / `hydrated_bytes` | Blob count and bytes present in the local hydration cache |
 | `overlay_dirty` | `true` if the overlay contains created or modified files; delete-only overlays are not counted |
@@ -159,14 +159,23 @@ Check the state of a mounted repo with `status`:
 state from any process. Only one daemon runs per state root: it holds a lock on
 `config/daemon.lock`, and a second `daemon` on that root exits with an error.
 
+When you upgrade, stop the running daemon before you start the new one. A
+daemon from a build without the daemon lock takes no lock, so a new daemon
+would start beside it on the same state root.
+
 ## Unmounting and remounting a repo
 
 `unmount` asks the running daemon to unmount a repo and keep it unmounted, also
 across daemon restarts, until `remount`. `remount` asks it to mount the repo
 again, unmounting it first if it is mounted. Both wait until the daemon reports
-the outcome and exit non-zero when the daemon failed, when no daemon runs on the
-state root, or after two minutes without an outcome. The daemon retries a
-failed unmount or mount; `status` shows the retry.
+the outcome. They exit non-zero when the daemon failed, when no daemon runs on
+the state root, when a later `unmount` or `remount` replaced the request, or
+after two minutes without an outcome. The daemon retries a failed unmount or
+mount; `status` shows the retry.
+
+A request stays in the registry until the daemon carries it out, also after the
+command timed out or the daemon stopped. A later `unmount` or `remount` replaces
+it.
 
 ```bash
 ./artifact-fs unmount --name workers-sdk
@@ -197,6 +206,8 @@ ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the 
 Async existing-clone preparation reports remote configuration, fetch, and branch update as separate `configure_remote`, `fetch`, and `update_branch` phases.
 
 Each error the FUSE library reports becomes a `fuse error` record. A reply the kernel refuses, other than with `ENOENT`, logs at `WARN`. A failed FUSE op logs at `DEBUG`, because expected errnos such as `ENOTEMPTY` fail ops too. The daemon logs at `INFO`, so it never emits these lines. The library reports no failed lookup of a missing name, no `GetXattr` or `ListXattr` that fails with `ENOSYS`, `ENODATA` or `ERANGE`, and no request whose opcode the library does not recognize.
+
+A repo's FUSE connection can end while its mount stays in place: after an error fatal to the connection, such as a failed read from the kernel, or after the connection is aborted. The daemon then logs `fuse connection failed, unmounting`, records the connection's error as the repo's `mount_error` (for an abort, which carries no error, `fuse connection ended while the mount point still holds the mount`), unmounts the repo, and mounts it again. While that unmount fails and the mount table still lists the mount point, or the table, the path or the mount point cannot be read, each mount retry tries the unmount again instead of mounting. The daemon looks the mount point up in the kernel's mount table by its absolute path, with symlinks in the parent and a symlinked final component resolved. On macOS the lookup ignores case.
 
 Successful `add-repo`:
 

@@ -40,6 +40,9 @@ var migrations = []meta.Migration{
 	meta.SQL(`ALTER TABLE repos DROP COLUMN remote_url_secret_ref`),
 	// The daemon records what it observes in repo_runtime, which replaces
 	// mount_error. mount_request carries the CLI's unmount and remount intents.
+	// mount_error stays, unused: a daemon of an earlier build, still running
+	// when a newer command migrates the database, keeps reading it. A later
+	// migration drops it.
 	meta.SQL(
 		`CREATE TABLE repo_runtime (
 		  repo_id TEXT PRIMARY KEY,
@@ -62,7 +65,6 @@ var migrations = []meta.Migration{
 		  updated_at_ns INTEGER NOT NULL DEFAULT 0
 		)`,
 		`ALTER TABLE repos ADD COLUMN mount_request TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE repos DROP COLUMN mount_error`,
 	),
 }
 

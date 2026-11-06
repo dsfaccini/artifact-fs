@@ -51,7 +51,7 @@ func persistedStatus(ctx context.Context, cfg model.RepoConfig, rec model.RepoRu
 		st.ServedHEADOID, st.ServedHEADRef, st.ServedGeneration = rec.ServedCommit, rec.ServedRef, rec.ServedGeneration
 		st.AheadCount, st.BehindCount, st.Diverged = rec.AheadCount, rec.BehindCount, rec.Diverged
 	}
-	if rec.LastErrorPhase == phaseMount {
+	if rec.LastErrorPhase == phaseMount || rec.LastErrorPhase == phaseServe {
 		st.MountError = rec.LastError
 	}
 	if !rec.LastFetchAt.IsZero() || rec.LastFetchResult != "" {

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -288,7 +289,8 @@ func (s *Controller) Remount(ctx context.Context, name string) error {
 
 // requestMount records the intent in the registry, nudges the daemon over its
 // control socket, and waits until repo_runtime shows the daemon carried out
-// the request.
+// the request. The intent stays in the registry when the wait ends early, so
+// the daemon still carries it out unless a later request replaces it.
 func (s *Controller) requestMount(ctx context.Context, name string, mount bool) error {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
@@ -312,11 +314,19 @@ func (s *Controller) requestMount(ctx context.Context, name string, mount bool) 
 	if mount {
 		op = "remount"
 	}
-	ctx, cancel := context.WithTimeout(ctx, mountRequestTimeout)
-	defer cancel()
+	pending := fmt.Sprintf("the request stays pending until the daemon carries it out; run status --name %s", name)
+	timeout := time.NewTimer(cmp.Or(s.requestTimeout, mountRequestTimeout))
+	defer timeout.Stop()
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		latest, err := s.registry.GetRepo(ctx, name)
+		if err != nil {
+			return err
+		}
+		if latest.MountRequest != request {
+			return fmt.Errorf("%s %s: a later unmount or remount request superseded this one", op, name)
+		}
 		rec, ok, err := s.registry.GetRuntime(ctx, cfg.ID)
 		if err != nil {
 			return err
@@ -324,7 +334,7 @@ func (s *Controller) requestMount(ctx context.Context, name string, mount bool) 
 		if ok && rec.MountRequest == request {
 			failed := !rec.LastErrorAt.Before(requested) && (rec.LastErrorPhase == phaseUnmount || mount && rec.LastErrorPhase == phaseMount)
 			if failed {
-				return fmt.Errorf("%s %s failed in phase %s: %s; the daemon retries it", op, name, rec.LastErrorPhase, rec.LastError)
+				return fmt.Errorf("%s %s failed in phase %s: %s; the daemon retries it until it succeeds or a later request replaces it", op, name, rec.LastErrorPhase, rec.LastError)
 			}
 			if !mount && rec.State == repoStateUnmounted || mount && rec.State != repoStateUnmounted {
 				return nil
@@ -333,11 +343,13 @@ func (s *Controller) requestMount(ctx context.Context, name string, mount bool) 
 		if live, err := daemonRunning(s.root); err != nil {
 			return err
 		} else if !live {
-			return fmt.Errorf("%s %s: the daemon stopped before it carried out the request", op, name)
+			return fmt.Errorf("%s %s: the daemon stopped before it carried out the request; %s", op, name, pending)
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("%s %s: the daemon did not carry out the request in time; run status --name %s", op, name, name)
+			return fmt.Errorf("%s %s: %w; %s", op, name, ctx.Err(), pending)
+		case <-timeout.C:
+			return fmt.Errorf("%s %s: the daemon did not carry out the request within %s; %s", op, name, cmp.Or(s.requestTimeout, mountRequestTimeout), pending)
 		case <-ticker.C:
 		}
 	}

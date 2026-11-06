@@ -286,7 +286,8 @@ func TestPrepareCLIReportsQueuedPrepare(t *testing.T) {
 func TestMountCommandsFailWithoutDaemon(t *testing.T) {
 	for _, command := range []string{"unmount", "remount"} {
 		t.Run(command, func(t *testing.T) {
-			t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+			root := t.TempDir()
+			t.Setenv("ARTIFACT_FS_ROOT", root)
 			ctx := context.Background()
 			var stdout, stderr bytes.Buffer
 			if code := Run(ctx, []string{"add-repo", "--name", "repo", "--remote", "https://github.com/example/repo.git", "--async"}, &stdout, &stderr); code != 0 {
@@ -303,7 +304,34 @@ func TestMountCommandsFailWithoutDaemon(t *testing.T) {
 			if !strings.Contains(stderr.String(), daemon.ErrNoDaemon.Error()) {
 				t.Fatalf("stderr = %q, want %q", stderr.String(), daemon.ErrNoDaemon)
 			}
+			reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := reg.GetRepo(ctx, "repo")
+			if closeErr := reg.Close(); err != nil || closeErr != nil {
+				t.Fatalf("read registry: %v, close: %v", err, closeErr)
+			}
+			if !cfg.Enabled || cfg.MountRequest != "" {
+				t.Fatalf("registry after %s without a daemon = enabled %t, request %q; want it unchanged", command, cfg.Enabled, cfg.MountRequest)
+			}
 		})
+	}
+}
+
+// urfave/cli prints a usage error itself unless OnUsageError handles it, and
+// Run prints the returned error again.
+func TestUsageErrorPrintsOnce(t *testing.T) {
+	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	if code := Run(context.Background(), []string{"status", "--nam", "repo"}, &stdout, &stderr); code == 0 {
+		t.Fatalf("status with an unknown flag exit = 0, stdout=%q", stdout.String())
+	}
+	if got := strings.Count(stderr.String(), "flag provided but not defined"); got != 1 {
+		t.Fatalf("stderr = %q, want the usage error once", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Incorrect Usage") || !strings.Contains(stdout.String(), "--name") {
+		t.Fatalf("stdout = %q, want the usage error and the command's help", stdout.String())
 	}
 }
 

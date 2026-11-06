@@ -9,8 +9,12 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
-// The phases a recorded failure names.
+// The phases of a repo's runtime, which the record's Phase names, and of a
+// recorded failure. A runtime goes through prepare (async preparation), mount,
+// serve and unmount. A failure can also name registry_sync, head_reconcile
+// or fetch, which run while the runtime serves.
 const (
+	phasePrepare       = "prepare"
 	phaseRegistrySync  = "registry_sync"
 	phaseMount         = "mount"
 	phaseServe         = "serve"
@@ -18,6 +22,23 @@ const (
 	phaseHEADReconcile = "head_reconcile"
 	phaseFetch         = "fetch"
 )
+
+// runtimePhase is the phase of a runtime in state.
+func runtimePhase(state string) string {
+	switch state {
+	case model.PrepareStatePreparing, model.PrepareStateFailed:
+		return phasePrepare
+	case repoStateUnmounted:
+		return phaseUnmount
+	default:
+		return phaseServe
+	}
+}
+
+// recordPhase records that the daemon entered phase for cfg.
+func (s *Service) recordPhase(cfg model.RepoConfig, phase string) {
+	s.recordRuntime(cfg.ID, func(rec *model.RepoRuntimeRecord) { rec.Phase = phase })
+}
 
 // errFUSEServerExited stands in for the error of a FUSE server that exited
 // cleanly while the daemon still served its repo.
@@ -59,6 +80,7 @@ func (s *Service) recordRuntimeState(rt *repoRuntime, clear string) {
 		}
 		st := rt.state
 		rec.State = st.State
+		rec.Phase = runtimePhase(st.State)
 		rec.ServedGeneration = st.SnapshotGeneration
 		rec.ServedCommit = st.CurrentHEADOID
 		rec.ServedRef = st.CurrentHEADRef
@@ -75,7 +97,7 @@ func (s *Service) recordRuntimeState(rt *repoRuntime, clear string) {
 // recordStopped records that the daemon serves cfg no more.
 func (s *Service) recordStopped(cfg model.RepoConfig) {
 	s.recordRuntime(cfg.ID, func(rec *model.RepoRuntimeRecord) {
-		*rec = model.RepoRuntimeRecord{RepoID: cfg.ID, State: repoStateUnmounted, MountRequest: cfg.MountRequest,
+		*rec = model.RepoRuntimeRecord{RepoID: cfg.ID, State: repoStateUnmounted, Phase: phaseUnmount, MountRequest: cfg.MountRequest,
 			LastError: rec.LastError, LastErrorPhase: rec.LastErrorPhase, LastErrorAt: rec.LastErrorAt, Attempts: rec.Attempts}
 		clearFailure(rec, phaseUnmount)
 		// Nothing retries a stopped repo's runtime.
@@ -104,6 +126,7 @@ func (s *Service) recordMountFailure(cfg model.RepoConfig, state string, err err
 	s.recordFailure(cfg, phaseMount, err, nextRetry)
 	s.recordRuntime(cfg.ID, func(rec *model.RepoRuntimeRecord) {
 		rec.State = state
+		rec.Phase = phaseMount
 		rec.MountRequest = cfg.MountRequest
 	})
 }

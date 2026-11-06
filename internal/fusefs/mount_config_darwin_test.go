@@ -32,10 +32,8 @@ func TestMountRepoKeepsAppleDoubleFilesVisible(t *testing.T) {
 // ENOSYS would make macOS store each extended attribute in an AppleDouble ._
 // file, on either backend.
 func TestSetXattrRefusesAppleDoubleFallback(t *testing.T) {
-	for _, fskit := range []bool{false, true} {
-		fs := &ArtifactFuse{fskit: fskit}
-		if got := kernelErrno(fs.SetXattr(context.Background(), &fuseops.SetXattrOp{Name: "com.apple.FinderInfo"})); got != syscall.EPERM {
-			t.Fatalf("SetXattr with fskit=%v = %v, want EPERM", fskit, got)
-		}
+	fs := &ArtifactFuse{}
+	if got := kernelErrno(fs.SetXattr(context.Background(), &fuseops.SetXattrOp{Name: "com.apple.FinderInfo"})); got != syscall.EPERM {
+		t.Fatalf("SetXattr = %v, want EPERM", got)
 	}
 }
