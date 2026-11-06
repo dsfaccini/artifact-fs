@@ -471,8 +471,8 @@ func sameFileInfo(a, b os.FileInfo) bool {
 
 func (s *Service) rememberVerified(key string, info os.FileInfo) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.rememberVerifiedLocked(key, info)
-	s.mu.Unlock()
 }
 
 // rememberVerifiedLocked records info as verified. At the cap it first drops
