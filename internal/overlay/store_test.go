@@ -3,11 +3,13 @@ package overlay
 import (
 	"context"
 	"crypto/sha1"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1858,6 +1860,7 @@ func TestLookupShowsUnflushedWriteSize(t *testing.T) {
 	}
 }
 
+// SyncFile commits through the live store, not through the next open.
 func TestSyncFileCommitsUnflushedWrites(t *testing.T) {
 	s, cfg := testStore(t)
 	ctx := context.Background()
@@ -1868,17 +1871,23 @@ func TestSyncFileCommitsUnflushedWrites(t *testing.T) {
 	if err := s.SyncFile(ctx, "f.txt"); err != nil {
 		t.Fatal(err)
 	}
-	other, err := New(ctx, cfg)
+	if e, _ := s.Get("f.txt"); e.SizeBytes != 6 {
+		t.Fatalf("live f.txt after SyncFile = %d, want 6", e.SizeBytes)
+	} else if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "onetwo" {
+		t.Fatalf("backing file = %q, %v; want onetwo", data, err)
+	}
+	db, err := sql.Open("sqlite", cfg.OverlayDBPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { other.Close() })
-	e, ok := other.Get("f.txt")
-	if !ok || e.SizeBytes != 6 {
-		t.Fatalf("committed f.txt = %+v, %t; want size 6", e, ok)
+	defer db.Close()
+	var size int64
+	var pending int
+	if err := db.QueryRow(`SELECT size_bytes, (SELECT COUNT(*) FROM overlay_pending) FROM overlay_entries WHERE path='f.txt'`).Scan(&size, &pending); err != nil {
+		t.Fatal(err)
 	}
-	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "onetwo" {
-		t.Fatalf("backing file = %q, %v; want onetwo", data, err)
+	if size != 6 || pending != 0 {
+		t.Fatalf("committed size %d, pending rows %d; want 6 and 0", size, pending)
 	}
 }
 
@@ -1933,5 +1942,119 @@ func TestNewCommitsWritesAProcessLeftUncommitted(t *testing.T) {
 	}
 	if got := changesSince(t, cfg, changesSince(t, cfg, 0).Seq).Paths; len(got) != 0 {
 		t.Fatalf("pending paths after restart = %q, want none", got)
+	}
+}
+
+// A Lookup that runs while another handle's close flushes must still report
+// the size of writes that completed before the Lookup began.
+func TestLookupDuringFlushShowsCompletedWrites(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "f.txt", "x")
+	if err := s.FlushFile(ctx, "f.txt"); err != nil {
+		t.Fatal(err)
+	}
+	size := int64(1)
+	stale := 0
+	for i := 0; i < 3000; i++ {
+		// First write commits size+1; the second is coalesced to size+2.
+		for range 2 {
+			if _, err := s.WriteFile(ctx, "f.txt", size, []byte("y")); err != nil {
+				t.Fatal(err)
+			}
+			size++
+		}
+		done := make(chan error, 1)
+		go func() { done <- s.FlushFile(ctx, "f.txt") }()
+	loop:
+		for {
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+				break loop
+			default:
+			}
+			e, ok, err := s.Lookup(ctx, "f.txt")
+			if err != nil || !ok {
+				t.Fatal(ok, err)
+			}
+			if e.SizeBytes != size {
+				stale++
+				if stale == 1 {
+					t.Logf("iteration %d: Lookup size %d after writes reached %d", i, e.SizeBytes, size)
+				}
+			}
+		}
+	}
+	if stale > 0 {
+		t.Fatalf("%d Lookups during a flush returned a size older than completed writes", stale)
+	}
+}
+
+// An unrelated mutation flushes every pending path, so a stat of a file being
+// written can go stale while another process creates a directory.
+func TestLookupDuringUnrelatedMkdirShowsCompletedWrites(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "f.txt", "x")
+	if err := s.FlushFile(ctx, "f.txt"); err != nil {
+		t.Fatal(err)
+	}
+	size := int64(1)
+	stale := 0
+	for i := 0; i < 2000; i++ {
+		for range 2 {
+			if _, err := s.WriteFile(ctx, "f.txt", size, []byte("y")); err != nil {
+				t.Fatal(err)
+			}
+			size++
+		}
+		done := make(chan error, 1)
+		go func() { done <- s.Mkdir(ctx, "d"+strconv.Itoa(i), 0o755) }()
+	loop:
+		for {
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+				break loop
+			default:
+			}
+			e, _, err := s.Lookup(ctx, "f.txt")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if e.SizeBytes != size {
+				stale++
+			}
+		}
+	}
+	if stale > 0 {
+		t.Fatalf("%d Lookups during an unrelated Mkdir returned a size older than completed writes", stale)
+	}
+}
+
+func TestListByPrefixShowsUnflushedWriteSize(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "d/f.txt", "one")
+	if err := s.FlushFile(ctx, "d/f.txt"); err != nil {
+		t.Fatal(err)
+	}
+	for _, data := range []string{"two", "six"} {
+		e, _ := s.Get("d/f.txt")
+		if _, err := s.WriteFile(ctx, "d/f.txt", e.SizeBytes, []byte(data)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := s.ListByPrefix(ctx, "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].SizeBytes != 9 {
+		t.Fatalf("ListByPrefix(d) = %+v, want d/f.txt with size 9", entries)
 	}
 }
