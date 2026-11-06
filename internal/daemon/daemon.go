@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/registry"
@@ -23,6 +24,10 @@ const (
 	prepareStateWriteTimeout = 5 * time.Second
 	repoConfigLockRetry      = 25 * time.Millisecond
 	sizeUpdateFlushInterval  = 100 * time.Millisecond
+	// defaultGenerationRetention keeps a generation readable for two
+	// fusefs.CacheTTL after the resolver stops serving it, so attributes the
+	// kernel received just before or just after the switch expire first.
+	defaultGenerationRetention = 2 * fusefs.CacheTTL
 )
 
 const (
@@ -82,6 +87,9 @@ type core struct {
 	logger         *slog.Logger
 	registry       *registry.Store
 	git            *gitstore.Store
+	// generationRetention is how long a retired generation stays readable;
+	// zero means defaultGenerationRetention.
+	generationRetention time.Duration
 }
 
 // Controller carries out one CLI command. It never mounts. It reaches the

@@ -1047,8 +1047,9 @@ func TestSwitchGenerationServesReadsWhileItLooksUpTheBase(t *testing.T) {
 	if _, gen, _, err := f.resolver.ResolvePathState("link"); !errors.Is(err, fs.ErrNotExist) || gen != 1 {
 		t.Fatalf("link during the lookups = generation %d, %v; want generation 1, ErrNotExist", gen, err)
 	}
-	if err := f.fs.LookUpInode(ctx, &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "link"}); kernelErrno(err) != syscall.ENOENT {
-		t.Fatalf("LookUpInode(link) during the lookups = %v, want ENOENT", err)
+	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "link"}
+	if err := f.fs.LookUpInode(ctx, lookup); !lookupMissed(err, lookup) {
+		t.Fatalf("LookUpInode(link) during the lookups = inode %d, %v; want a miss", lookup.Entry.Child, err)
 	}
 	if got := f.read(t, inode, f.open(t, inode)); got != "file one" {
 		t.Fatalf("file.txt during the lookups = %q, want generation 1's content", got)

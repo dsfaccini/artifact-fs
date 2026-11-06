@@ -39,6 +39,15 @@ type repoRuntime struct {
 	mounts      sync.WaitGroup
 	// failedMount is a mount whose connection failed and that still holds the mount point.
 	failedMount fusefs.MountedFS
+	// retired holds the generations the resolver stopped serving, with when.
+	// retiredMu guards it, and is taken alone.
+	retiredMu sync.Mutex
+	retired   []retiredGeneration
+}
+
+type retiredGeneration struct {
+	gen int64
+	at  time.Time
 }
 
 func (s *Service) startRuntime(rt *repoRuntime) {

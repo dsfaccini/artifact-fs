@@ -30,6 +30,34 @@ type MountedFS interface {
 	Backend() string
 	Join(ctx context.Context) error
 	Unmount() error
+	// InvalidateChanged tells the kernel to drop what it caches for the mount
+	// and the merged view no longer matches: the attributes and pages of an
+	// inode whose type, permission bits or blob changed, the entry of a name
+	// that vanished or changed type, and a negative entry whose name now
+	// exists. Call it after a generation switch, holding no lock an op takes.
+	// FSKit takes no invalidations, so it sends nothing there.
+	InvalidateChanged() error
+}
+
+// CacheTTL is how long the kernel may cache the entries, negative entries and
+// attributes that the mount reports, except those of the synthesized .git
+// file, which never change.
+const CacheTTL = time.Second
+
+// negativeRecordTTL is how long a negative entry stays recorded. The kernel
+// starts an entry's TTL when the reply reaches it, a little after it is sent.
+const negativeRecordTTL = 2 * CacheTTL
+
+// kernelNotifier sends cache invalidations to the kernel. *fuse.Notifier is one.
+type kernelNotifier interface {
+	InvalidateInode(inode fuseops.InodeID, offset, length int64) error
+	InvalidateEntry(parent fuseops.InodeID, name string) error
+}
+
+// kernelEntry is a name in a directory inode, as the kernel caches it.
+type kernelEntry struct {
+	parent fuseops.InodeID
+	name   string
 }
 
 // ArtifactFuse is the FUSE adapter following the tigrisfs GoofysFuse pattern:
@@ -54,6 +82,14 @@ type ArtifactFuse struct {
 	dirHandles   map[fuseops.HandleID]*DirHandle
 	fileHandles  map[fuseops.HandleID]*FileHandle
 	nextHandleID fuseops.HandleID
+	// negatives holds each negative entry the kernel may still cache, with
+	// the time its record lapses.
+	negatives       map[kernelEntry]time.Time
+	negativeSweepAt int
+
+	// notifier is nil when nothing should reach the kernel. fs.mu guards it:
+	// the mount publishes it after ops may have started.
+	notifier kernelNotifier
 }
 
 type InodeRef struct {
@@ -65,11 +101,37 @@ type InodeRef struct {
 	// this inode, or 0 when the kernel's view came from the overlay. Base reads
 	// serve Gen so their length matches the size the kernel holds after a HEAD
 	// change, until a new reply reports the current generation.
-	Gen     int64
-	Refcnt  int64
-	IsRoot  bool
-	Overlay bool
-	Stale   bool
+	Gen int64
+	// Blob is the Attrs.Blob last reported for this inode. Type, Mode and Blob
+	// are the identity the kernel holds.
+	Blob string
+	// PageBlob is the base blob that the inode's last open served, while the
+	// kernel's cached pages can hold only that blob. It is empty otherwise.
+	PageBlob string
+	Refcnt   int64
+	IsRoot   bool
+	Overlay  bool
+	Stale    bool
+}
+
+// report records attrs as what the kernel last received for ref. Reads then
+// serve attrs.Gen, so the kernel's pages may mix two blobs when the blob changes.
+//
+// A reply computed before a generation switch can be recorded after a reply
+// computed after it. The switch's InvalidateInode makes the kernel discard
+// the older reply, so report keeps the newer generation.
+func (ref *InodeRef) report(attrs Attrs) {
+	if attrs.Gen != 0 && ref.Gen > attrs.Gen {
+		return
+	}
+	if attrs.Blob != ref.Blob {
+		ref.PageBlob = ""
+	}
+	ref.Type, ref.Mode, ref.Gen, ref.Blob = attrs.Type, attrs.Mode, attrs.Gen, attrs.Blob
+}
+
+func (ref *InodeRef) identity() Identity {
+	return Identity{Type: ref.Type, Perm: ref.Mode & 0o777, Blob: ref.Blob}
 }
 
 type DirHandle struct {
@@ -127,6 +189,7 @@ func NewArtifactFuse(repo model.RepoConfig, engine *Engine) *ArtifactFuse {
 		dirHandles:     make(map[fuseops.HandleID]*DirHandle),
 		fileHandles:    make(map[fuseops.HandleID]*FileHandle),
 		nextHandleID:   1,
+		negatives:      make(map[kernelEntry]time.Time),
 	}
 	root := &InodeRef{ID: fuseops.RootInodeID, Path: ".", Type: "dir", Mode: 0o755, Refcnt: 1, IsRoot: true}
 	fs.inodes[fuseops.RootInodeID] = root
@@ -134,21 +197,176 @@ func NewArtifactFuse(repo model.RepoConfig, engine *Engine) *ArtifactFuse {
 	return fs
 }
 
-func (fs *ArtifactFuse) allocInode(path, typ string, mode uint32, gen int64) *InodeRef {
-	// Caller must hold fs.mu write lock.
+// allocInode returns the inode of path with one more lookup, and records attrs
+// as what the kernel last received for it. Caller must hold fs.mu write lock.
+func (fs *ArtifactFuse) allocInode(path string, attrs Attrs) *InodeRef {
 	if id, ok := fs.pathToInode[path]; ok {
 		if ref, ok := fs.inodes[id]; ok {
 			ref.Refcnt++
-			ref.Gen = gen
+			ref.report(attrs)
 			return ref
 		}
 	}
 	id := fs.nextInodeID
 	fs.nextInodeID++
-	ref := &InodeRef{ID: id, Path: path, Type: typ, Mode: mode, Gen: gen, Refcnt: 1}
+	ref := &InodeRef{ID: id, Path: path, Refcnt: 1}
+	ref.report(attrs)
 	fs.inodes[id] = ref
 	fs.pathToInode[path] = id
 	return ref
+}
+
+// allocEntry returns the inode of the name in parent at path, for an entry
+// reply that carries attrs. The reply replaces any negative entry the kernel
+// holds for the name. Caller must hold fs.mu write lock.
+func (fs *ArtifactFuse) allocEntry(parent fuseops.InodeID, name, path string, attrs Attrs) *InodeRef {
+	delete(fs.negatives, kernelEntry{parent, name})
+	return fs.allocInode(path, attrs)
+}
+
+// recordNegative records a negative entry for name in parent, which the
+// kernel caches for CacheTTL. Expired records go in sweeps whose cost each
+// record pays for once.
+func (fs *ArtifactFuse) recordNegative(parent fuseops.InodeID, name string) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	now := time.Now()
+	if len(fs.negatives) >= fs.negativeSweepAt {
+		for e, lapses := range fs.negatives {
+			if !lapses.After(now) {
+				delete(fs.negatives, e)
+			}
+		}
+		fs.negativeSweepAt = max(2*len(fs.negatives), 1024)
+	}
+	fs.negatives[kernelEntry{parent, name}] = now.Add(negativeRecordTTL)
+}
+
+// takeNegative removes the live record of a negative entry for path and
+// returns it with the notifier to drop it, or false when the kernel holds none
+// or nothing reaches the kernel.
+func (fs *ArtifactFuse) takeNegative(path string) (kernelEntry, kernelNotifier, bool) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	parent, ok := fs.pathToInode[model.CleanPath(filepath.Dir(path))]
+	if !ok {
+		return kernelEntry{}, nil, false
+	}
+	e := kernelEntry{parent, filepath.Base(path)}
+	lapses, ok := fs.negatives[e]
+	delete(fs.negatives, e)
+	return e, fs.notifier, ok && lapses.After(time.Now()) && fs.notifier != nil
+}
+
+// setNotifier publishes the Notifier of the attempt that mounted.
+func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.notifier = n
+}
+
+// invalidateChanged implements MountedFS.InvalidateChanged. Every inode the
+// kernel holds gets the check for a name that vanished or changed type. An
+// inode whose identity the kernel received from the base snapshot gets the
+// identity comparison. One the kernel last saw from the overlay is invalidated
+// when it now resolves to a base blob, whose bytes can differ from what was
+// written. An overlay entry itself changes only through the mount, which keeps
+// the kernel's view of it current. A failure skips only what it concerns, and
+// the first one is returned.
+func (fs *ArtifactFuse) invalidateChanged() error {
+	type known struct {
+		id       fuseops.InodeID
+		entry    kernelEntry
+		path     string
+		reported Identity
+		base     bool
+	}
+	now := time.Now()
+	fs.mu.RLock()
+	notifier := fs.notifier
+	var inodes, negatives []known
+	for id, ref := range fs.inodes {
+		if ref.IsRoot || ref.Stale || ref.Path == ".git" {
+			continue
+		}
+		parent, ok := fs.pathToInode[model.CleanPath(filepath.Dir(ref.Path))]
+		if !ok {
+			continue
+		}
+		inodes = append(inodes, known{id: id, entry: kernelEntry{parent, filepath.Base(ref.Path)}, path: ref.Path, reported: ref.identity(), base: ref.Gen != 0})
+	}
+	for e, lapses := range fs.negatives {
+		if parent := fs.inodes[e.parent]; parent != nil && !parent.Stale && lapses.After(now) {
+			negatives = append(negatives, known{entry: e, path: cleanChildPath(parent.Path, e.name)})
+		}
+	}
+	fs.mu.RUnlock()
+	if notifier == nil {
+		return nil
+	}
+
+	var firstErr error
+	failed := func(err error, what string) {
+		if err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("%s: %w", what, err)
+		}
+	}
+	var entries []kernelEntry
+	var changed []fuseops.InodeID
+	for _, k := range inodes {
+		current, exists, err := fs.engine.Identity(k.path)
+		if err != nil {
+			failed(err, "resolve "+k.path)
+			continue
+		}
+		switch {
+		case !exists || current.Type != k.reported.Type:
+			entries = append(entries, k.entry)
+		case k.base && current != k.reported, !k.base && current.Blob != "":
+			changed = append(changed, k.id)
+		}
+	}
+	for _, k := range negatives {
+		_, exists, err := fs.engine.Identity(k.path)
+		if err != nil {
+			failed(err, "resolve "+k.path)
+			continue
+		}
+		if exists {
+			entries = append(entries, k.entry)
+			fs.mu.Lock()
+			delete(fs.negatives, k.entry)
+			fs.mu.Unlock()
+		}
+	}
+	// ENOENT means the kernel no longer holds the entry or inode.
+	sent := func(err error, what string) {
+		if !errors.Is(err, syscall.ENOENT) {
+			failed(err, "invalidate "+what)
+		}
+	}
+	for _, e := range entries {
+		sent(notifier.InvalidateEntry(e.parent, e.name), fmt.Sprintf("entry %q", e.name))
+	}
+	for _, id := range changed {
+		sent(notifier.InvalidateInode(id, 0, 0), fmt.Sprintf("inode %d", id))
+	}
+	return firstErr
+}
+
+// openedBlob records that an open of id serves blob, which is empty for an
+// overlay file. It reports whether the kernel may keep the inode's cached
+// pages: only when they can hold nothing but that same base blob.
+func (fs *ArtifactFuse) openedBlob(id fuseops.InodeID, blob string) bool {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	ref := fs.inodes[id]
+	if ref == nil {
+		return false
+	}
+	keep := keepBasePageCache && blob != "" && ref.PageBlob == blob
+	ref.PageBlob = blob
+	return keep
 }
 
 func (fs *ArtifactFuse) requireInode(id fuseops.InodeID, missing error) (*InodeRef, error) {
@@ -172,10 +390,21 @@ func (fs *ArtifactFuse) inodeGeneration(id fuseops.InodeID) int64 {
 	return 0
 }
 
-func (fs *ArtifactFuse) setInodeGeneration(id fuseops.InodeID, gen int64) {
+// markWritten records a write through id. Reads then serve the overlay, and
+// the kernel's cached pages hold the written bytes, not any base blob.
+func (fs *ArtifactFuse) markWritten(id fuseops.InodeID) {
 	fs.mu.Lock()
 	if ref := fs.inodes[id]; ref != nil {
-		ref.Gen = gen
+		ref.Gen, ref.PageBlob = 0, ""
+	}
+	fs.mu.Unlock()
+}
+
+// setReported records attrs as what the kernel last received for id.
+func (fs *ArtifactFuse) setReported(id fuseops.InodeID, attrs Attrs) {
+	fs.mu.Lock()
+	if ref := fs.inodes[id]; ref != nil {
+		ref.report(attrs)
 	}
 	fs.mu.Unlock()
 }
@@ -531,7 +760,7 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 		// Synthesize .git gitfile in root
 		if isGitfile(parent, op.Name) {
 			fs.mu.Lock()
-			ref := fs.allocInode(".git", "file", 0o644, fs.engine.Generation())
+			ref := fs.allocEntry(op.Parent, op.Name, ".git", Attrs{Type: "file", Mode: 0o644, Gen: fs.engine.Generation()})
 			fs.mu.Unlock()
 			op.Entry.Child = ref.ID
 			op.Entry.Attributes = fs.gitFileAttrs()
@@ -540,17 +769,24 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 		}
 
 		attrs, err := fs.engine.Attrs(b, childPath)
+		if negativeLookupEntries && errors.Is(err, iofs.ErrNotExist) {
+			// Child 0 is a negative entry, which the kernel caches.
+			op.Entry = fuseops.ChildInodeEntry{}
+			setChildEntryExpiry(&op.Entry, CacheTTL)
+			fs.recordNegative(op.Parent, op.Name)
+			return nil
+		}
 		if err != nil {
 			return err
 		}
 
 		fs.mu.Lock()
-		ref := fs.allocInode(childPath, attrs.Type, attrs.Mode, attrs.Gen)
+		ref := fs.allocEntry(op.Parent, op.Name, childPath, attrs)
 		fs.mu.Unlock()
 
 		op.Entry.Child = ref.ID
 		op.Entry.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
-		setChildEntryExpiry(&op.Entry, time.Second)
+		setChildEntryExpiry(&op.Entry, CacheTTL)
 		return nil
 	})
 }
@@ -566,12 +802,12 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 			if fs.engine != nil {
 				if attrs, err := fs.engine.Attrs(b, ref.Path); err == nil {
 					op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
-					op.AttributesExpiration = attrExpiry(time.Second)
+					op.AttributesExpiration = attrExpiry(CacheTTL)
 					return nil
 				}
 			}
 			op.Attributes = inodeAttrs(ref.Mode, 4096, "dir", fs.syntheticTime, fs.syntheticTime)
-			op.AttributesExpiration = attrExpiry(time.Second)
+			op.AttributesExpiration = attrExpiry(CacheTTL)
 			return nil
 		}
 
@@ -585,9 +821,9 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 		if err != nil {
 			return err
 		}
-		fs.setInodeGeneration(op.Inode, attrs.Gen)
+		fs.setReported(op.Inode, attrs)
 		op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
-		op.AttributesExpiration = attrExpiry(time.Second)
+		op.AttributesExpiration = attrExpiry(CacheTTL)
 		return nil
 	})
 }
@@ -622,9 +858,9 @@ func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetI
 		if err != nil {
 			return err
 		}
-		fs.setInodeGeneration(op.Inode, attrs.Gen)
+		fs.setReported(op.Inode, attrs)
 		op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
-		op.AttributesExpiration = attrExpiry(time.Second)
+		op.AttributesExpiration = attrExpiry(CacheTTL)
 		return nil
 	})
 }
@@ -736,7 +972,7 @@ func (fs *ArtifactFuse) ReadDirPlus(ctx context.Context, op *fuseops.ReadDirPlus
 		for i := offset; i < len(dh.entries); i++ {
 			e := dh.entries[i]
 			childPath := cleanChildPath(dh.inode.Path, e.Name)
-			entry := fs.childEntryFromReaddir(childPath, dh.gen, dh.commitTime, e)
+			entry := fs.childEntryFromReaddir(dh.inode.ID, childPath, dh.gen, dh.commitTime, e)
 			dirent := fuseutil.DirentPlus{
 				Dirent: fuseutil.Dirent{
 					Offset: fuseops.DirOffset(i + 1),
@@ -757,28 +993,29 @@ func (fs *ArtifactFuse) ReadDirPlus(ctx context.Context, op *fuseops.ReadDirPlus
 	})
 }
 
-func (fs *ArtifactFuse) childEntryFromReaddir(path string, gen, commitTime int64, e ReaddirEntry) fuseops.ChildInodeEntry {
+func (fs *ArtifactFuse) childEntryFromReaddir(parent fuseops.InodeID, path string, gen, commitTime int64, e ReaddirEntry) fuseops.ChildInodeEntry {
 	if path == ".git" {
 		fs.mu.Lock()
-		ref := fs.allocInode(path, "file", 0o644, gen)
+		ref := fs.allocEntry(parent, e.Name, path, Attrs{Type: "file", Mode: 0o644, Gen: gen})
 		fs.mu.Unlock()
 		entry := fuseops.ChildInodeEntry{Child: ref.ID, Attributes: fs.gitFileAttrs()}
 		setChildEntryExpiry(&entry, time.Minute)
 		return entry
 	}
 	mode, size, typ, mtime, ctime := readdirAttrs(e, gen, commitTime)
-	refGen := gen
-	if e.FromOverlay {
-		refGen = 0
+	attrs := Attrs{Type: typ, Mode: mode}
+	if !e.FromOverlay {
+		attrs.Gen = gen
+		attrs.Blob = baseBlob(model.BaseNode{Type: typ, ObjectOID: e.ObjectOID})
 	}
 	fs.mu.Lock()
-	ref := fs.allocInode(path, typ, mode, refGen)
+	ref := fs.allocEntry(parent, e.Name, path, attrs)
 	fs.mu.Unlock()
 	entry := fuseops.ChildInodeEntry{
 		Child:      ref.ID,
 		Attributes: inodeAttrs(mode, uint64(size), typ, mtime, ctime),
 	}
-	setChildEntryExpiry(&entry, time.Second)
+	setChildEntryExpiry(&entry, CacheTTL)
 	return entry
 }
 
@@ -813,11 +1050,12 @@ func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) er
 		fh := &FileHandle{inode: ref, path: ref.Path}
 		if ref.Path != ".git" {
 			// An open for writing only reads nothing, so it prefetches nothing.
-			f, gen, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen, !op.OpenFlags.IsWriteOnly())
+			f, gen, blob, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen, !op.OpenFlags.IsWriteOnly())
 			if err != nil {
 				return err
 			}
 			fh.cacheFile, fh.cacheGeneration = f, gen
+			op.KeepPageCache = fs.openedBlob(op.Inode, blob)
 		}
 		fs.mu.Lock()
 		handle := fs.nextHandleID
@@ -825,7 +1063,6 @@ func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) er
 		fs.fileHandles[handle] = fh
 		fs.mu.Unlock()
 		op.Handle = handle
-		op.KeepPageCache = false
 		return nil
 	})
 }
@@ -899,8 +1136,13 @@ func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) 
 		if n != len(op.Data) {
 			return syscall.EIO
 		}
-		fs.setInodeGeneration(op.Inode, 0)
+		fs.markWritten(op.Inode)
 		fs.closeCachedFilesForPath(path)
+		// A write recreates a path that vanished while the handle was open.
+		// No reply tells the kernel the name exists again.
+		if e, notifier, ok := fs.takeNegative(path); ok {
+			go func() { _ = notifier.InvalidateEntry(e.parent, e.name) }()
+		}
 		return nil
 	})
 }
@@ -915,7 +1157,7 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 			return err
 		}
 		fs.mu.Lock()
-		ref := fs.allocInode(childPath, "file", uint32(op.Mode), 0)
+		ref := fs.allocEntry(op.Parent, op.Name, childPath, Attrs{Type: "file", Mode: uint32(op.Mode)})
 		fh := &FileHandle{inode: ref, path: childPath}
 		handle := fs.nextHandleID
 		fs.nextHandleID++
@@ -925,7 +1167,7 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 		op.Entry.Child = ref.ID
 		now := time.Now()
 		op.Entry.Attributes = inodeAttrs(uint32(op.Mode), 0, "file", now, now)
-		setChildEntryExpiry(&op.Entry, time.Second)
+		setChildEntryExpiry(&op.Entry, CacheTTL)
 		op.Handle = handle
 		return nil
 	})
@@ -944,13 +1186,13 @@ func (fs *ArtifactFuse) CreateSymlink(ctx context.Context, op *fuseops.CreateSym
 			return err
 		}
 		fs.mu.Lock()
-		ref := fs.allocInode(childPath, "symlink", 0o120000, 0)
+		ref := fs.allocEntry(op.Parent, op.Name, childPath, Attrs{Type: "symlink", Mode: 0o120000})
 		fs.mu.Unlock()
 
 		op.Entry.Child = ref.ID
 		now := time.Now()
 		op.Entry.Attributes = inodeAttrs(0o120000, uint64(len(op.Target)), "symlink", now, now)
-		setChildEntryExpiry(&op.Entry, time.Second)
+		setChildEntryExpiry(&op.Entry, CacheTTL)
 		return nil
 	})
 }
@@ -965,13 +1207,13 @@ func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
 			return err
 		}
 		fs.mu.Lock()
-		ref := fs.allocInode(childPath, "dir", uint32(op.Mode), 0)
+		ref := fs.allocEntry(op.Parent, op.Name, childPath, Attrs{Type: "dir", Mode: uint32(op.Mode)})
 		fs.mu.Unlock()
 
 		op.Entry.Child = ref.ID
 		now := time.Now()
 		op.Entry.Attributes = inodeAttrs(uint32(op.Mode)|uint32(os.ModeDir), 4096, "dir", now, now)
-		setChildEntryExpiry(&op.Entry, time.Second)
+		setChildEntryExpiry(&op.Entry, CacheTTL)
 		return nil
 	})
 }
@@ -1027,6 +1269,10 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 		if oldPath == newPath {
 			return nil
 		}
+		fs.mu.Lock()
+		// The kernel moves its dentry over any negative entry for the new name.
+		delete(fs.negatives, kernelEntry{op.NewParent, op.NewName})
+		fs.mu.Unlock()
 		fs.moveInodePath(oldPath, newPath)
 		fs.detachOpenHandles(newPath)
 		fs.moveOpenHandles(oldPath, newPath)
@@ -1114,6 +1360,7 @@ func (fs *ArtifactFuse) RemoveXattr(_ context.Context, _ *fuseops.RemoveXattrOp)
 
 type mountedFSWrapper struct {
 	*fuse.MountedFileSystem
+	fs         *ArtifactFuse
 	mountPoint string
 	backend    string
 }
@@ -1124,12 +1371,23 @@ func (m *mountedFSWrapper) Unmount() error {
 
 func (m *mountedFSWrapper) Backend() string { return m.backend }
 
+func (m *mountedFSWrapper) InvalidateChanged() error {
+	if m.backend == BackendFSKit {
+		return nil
+	}
+	return m.fs.invalidateChanged()
+}
+
 func MountRepo(repo model.RepoConfig, engine *Engine, logger *slog.Logger) (MountedFS, error) {
 	return MountRepoWithGate(repo, engine, nil, logger)
 }
 
 // fuseMount is fuse.Mount. Package tests replace it so they cannot mount.
 var fuseMount = fuse.Mount
+
+// newNotifier is fuse.NewNotifier. Package tests replace it to tell the
+// Notifiers of two mount attempts apart.
+var newNotifier = fuse.NewNotifier
 
 // fuseErrorLog writes each line the fuse library logs to logger, with the
 // repo's remote redacted. A bug the library answered with EIO goes out as an
@@ -1234,14 +1492,22 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, l
 	}
 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.
 	platformMountConfig(&mountCfg)
+	// notifiers holds each attempt's Notifier, keyed by whether the attempt
+	// went through FSKit.
+	notifiers := map[bool]*fuse.Notifier{}
 	mount := func(fskit bool) (*fuse.MountedFileSystem, error) {
 		cfg := mountCfg
 		if fskit {
 			cfg.Backend = fuse.BackendFSKit
 		}
 		// A Server must not serve a second mount once a failed one has
-		// answered INIT, so each attempt gets its own.
-		server := fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate))
+		// answered INIT, so each attempt gets its own. The failed Server can
+		// keep serving after fuse.Mount returns, so each attempt gets its own
+		// Notifier too: a shared one could hand a notification to the failed
+		// Server.
+		notifier := newNotifier()
+		notifiers[fskit] = notifier
+		server := fuse.NewServerWithNotifier(notifier, fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate)))
 		return fuseMount(repo.MountPath, server, &cfg)
 	}
 
@@ -1249,8 +1515,9 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, l
 	if err != nil {
 		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
 	}
+	fsint.setNotifier(notifiers[mounted == BackendFSKit])
 
-	return &mountedFSWrapper{MountedFileSystem: mfs, mountPoint: repo.MountPath, backend: mounted}, nil
+	return &mountedFSWrapper{MountedFileSystem: mfs, fs: fsint, mountPoint: repo.MountPath, backend: mounted}, nil
 }
 
 func TryUnmount(mountPoint string) error {

@@ -255,7 +255,8 @@ type failedConnectionMount struct {
 	err error
 }
 
-func (f *failedConnectionMount) Backend() string { return "fake" }
+func (f *failedConnectionMount) Backend() string          { return "fake" }
+func (f *failedConnectionMount) InvalidateChanged() error { return nil }
 
 func (f *failedConnectionMount) Join(ctx context.Context) error {
 	select {

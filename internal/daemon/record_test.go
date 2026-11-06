@@ -121,7 +121,8 @@ type exitingMount struct {
 	err  error
 }
 
-func (m *exitingMount) Backend() string { return "fake" }
+func (m *exitingMount) Backend() string          { return "fake" }
+func (m *exitingMount) InvalidateChanged() error { return nil }
 
 func (m *exitingMount) Join(ctx context.Context) error {
 	select {

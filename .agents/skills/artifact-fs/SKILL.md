@@ -67,6 +67,7 @@ if [ "$(uname)" = Darwin ]; then diskutil unmount "$MOUNT_ROOT/workers-sdk"; els
 - Base view = branch `HEAD` from the blobless clone. File contents hydrate on first read, and the first read in a directory hydrates its other files in the background. Listing directories hydrates nothing.
 - Dirty files are overlay state, not part of the base commit. `./artifact-fs status --name <repo>` reports this as `overlay_dirty=true`.
 - `git add` and `git commit` inside the mount are supported. After commit or checkout, the watcher re-indexes the new `HEAD` and reconciles stale overlay entries.
+- For a moment after a `HEAD` change, the mount can still show the old commit's attributes. On macOS with FSKit it can also show old names, sizes and content, for as long as FSKit caches them. The README section "Kernel caches after a HEAD change" lists what each backend shows.
 
 ## Quick Start: Multiple Repos
 

@@ -216,6 +216,45 @@ type Attrs struct {
 	// Gen is the snapshot generation the attributes came from, or 0 when they
 	// came from the overlay.
 	Gen int64
+	// Blob is the blob of a base file or symlink, and empty for a directory
+	// or an overlay entry.
+	Blob string
+}
+
+// Identity is what the kernel holds about a path apart from its size and
+// timestamps: its type, its permission bits, and its Attrs.Blob.
+type Identity struct {
+	Type string
+	Perm uint32
+	Blob string
+}
+
+func (a Attrs) identity() Identity {
+	return Identity{Type: a.Type, Perm: a.Mode & 0o777, Blob: a.Blob}
+}
+
+// Identity returns the identity of path in the merged view, and false when
+// path does not exist. It hydrates nothing.
+func (e *Engine) Identity(path string) (Identity, bool, error) {
+	n, err := e.Resolver.ResolvePath(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return Identity{}, false, nil
+	}
+	if err != nil {
+		return Identity{}, false, err
+	}
+	if n.FromOverlay {
+		return Identity{Type: n.Overlay.NodeType(), Perm: n.Overlay.Mode & 0o777}, true, nil
+	}
+	return Identity{Type: n.Base.Type, Perm: normalizeMode(n.Base.Mode, n.Base.Type) & 0o777, Blob: baseBlob(n.Base)}, true, nil
+}
+
+// baseBlob returns the blob of a base file or symlink, and empty for a directory.
+func baseBlob(n model.BaseNode) string {
+	if n.Type == "dir" {
+		return ""
+	}
+	return n.ObjectOID
 }
 
 // Attrs returns the attributes of path. A base file or symlink whose size the
@@ -246,7 +285,7 @@ func (e *Engine) Attrs(b *Blobs, path string) (Attrs, error) {
 		commitTime = gen // fallback: commit time unavailable
 	}
 	mt := time.Unix(commitTime, 0)
-	return Attrs{Mode: normalizeMode(n.Base.Mode, n.Base.Type), Size: size, Type: n.Base.Type, Mtime: mt, Ctime: mt, Gen: gen}, nil
+	return Attrs{Mode: normalizeMode(n.Base.Mode, n.Base.Type), Size: size, Type: n.Base.Type, Mtime: mt, Ctime: mt, Gen: gen, Blob: baseBlob(n.Base)}, nil
 }
 
 // ReadDir lists path with the generation and commit time it listed.
@@ -291,32 +330,33 @@ func (e *Engine) copyOnWrite(ctx context.Context, path string, base model.BaseNo
 
 // OpenFile opens path's content for a new file handle: the overlay file, as
 // generation -1, or else the base blob of generation gen, or of the current
-// generation when gen is 0, with the generation it opened. forRead says the
-// handle may read, so opening a base file prefetches its directory.
-func (e *Engine) OpenFile(ctx context.Context, b *Blobs, path string, gen int64, forRead bool) (*os.File, int64, error) {
+// generation when gen is 0, with the generation and the blob it opened.
+// forRead says the handle may read, so opening a base file prefetches its
+// directory.
+func (e *Engine) OpenFile(ctx context.Context, b *Blobs, path string, gen int64, forRead bool) (*os.File, int64, string, error) {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
 	path = model.CleanPath(path)
 	if ov, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	} else if ok {
 		if ov.IsDeleted() {
-			return nil, 0, os.ErrNotExist
+			return nil, 0, "", os.ErrNotExist
 		}
 		f, err := os.OpenFile(ov.BackingPath, os.O_RDWR, 0)
 		if err != nil {
 			f, err = os.Open(ov.BackingPath)
 		}
-		return f, -1, err
+		return f, -1, "", err
 	}
-	f, gen, err := e.openBase(ctx, b, path, gen)
+	f, n, gen, err := e.openBase(ctx, b, path, gen)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 	if forRead {
 		e.prefetchSiblings(ctx, path)
 	}
-	return f, gen, nil
+	return f, gen, n.ObjectOID, nil
 }
 
 // Read fills dst from path at off and returns the filled prefix of dst.
@@ -360,7 +400,7 @@ func (e *Engine) BaseCacheFile(ctx context.Context, b *Blobs, path string, gen i
 		}
 		return nil, 0, false, nil
 	}
-	f, gen, err := e.openBase(ctx, b, path, gen)
+	f, _, gen, err := e.openBase(ctx, b, path, gen)
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -370,8 +410,8 @@ func (e *Engine) BaseCacheFile(ctx context.Context, b *Blobs, path string, gen i
 
 // openBase opens the base blob of path at generation gen, or at the current
 // generation when gen is 0 or HEAD reconciliation pruned gen, and returns the
-// generation it opened. The caller holds the transition read lock.
-func (e *Engine) openBase(ctx context.Context, b *Blobs, path string, gen int64) (*os.File, int64, error) {
+// node and the generation it opened. The caller holds the transition read lock.
+func (e *Engine) openBase(ctx context.Context, b *Blobs, path string, gen int64) (*os.File, model.BaseNode, int64, error) {
 	current := e.Resolver.Generation()
 	if gen == 0 {
 		gen = current
@@ -383,16 +423,16 @@ func (e *Engine) openBase(ctx context.Context, b *Blobs, path string, gen int64)
 		n, ok, err = e.Resolver.Snapshot.LookupNode(ctx, gen, path)
 	}
 	if err != nil {
-		return nil, 0, err
+		return nil, model.BaseNode{}, 0, err
 	}
 	if !ok {
-		return nil, 0, fs.ErrNotExist
+		return nil, model.BaseNode{}, 0, fs.ErrNotExist
 	}
 	f, err := b.open(n)
 	if err != nil {
-		return nil, 0, err
+		return nil, model.BaseNode{}, 0, err
 	}
-	return f, gen, nil
+	return f, n, gen, nil
 }
 
 func (e *Engine) Write(ctx context.Context, b *Blobs, path string, off int64, data []byte) (int, error) {

@@ -281,7 +281,7 @@ func (s *core) ensurePreparedRepo(ctx context.Context, cfg model.RepoConfig, pru
 		}
 		if pruneOldGenerations {
 			failurePhase = preparePhaseCleanupSnapshot
-			return snap.PruneGenerations(ctx, gen)
+			return s.pruneGenerations(ctx, nil, snap, gen)
 		}
 		return nil
 	})
@@ -591,7 +591,10 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 			if !current {
 				return registry.ErrRepoChanged
 			}
-			return snap.PruneGenerations(cleanupCtx, min(prevGen, gen-1))
+			s.mu.Lock()
+			rt := s.running[cfg.ID]
+			s.mu.Unlock()
+			return s.pruneGenerations(cleanupCtx, rt, snap, min(prevGen, gen-1))
 		})
 		if cleanupErr != nil && !errors.Is(cleanupErr, registry.ErrRepoChanged) {
 			s.logger.Warn("snapshot generation cleanup failed", "repo", cfg.Name, "error", cleanupErr)
@@ -674,7 +677,7 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	} else {
 		s.logger.Warn("commit timestamp unavailable", "repo", cfg.Name, "error", err)
 	}
-	if err := rt.resolver.SwitchGeneration(ctx, gen, commitTime); err != nil {
+	if err := s.switchGeneration(ctx, rt, gen, commitTime); err != nil {
 		return err
 	}
 	if !s.prepareConfigStillCurrent(ctx, cfg) {

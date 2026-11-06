@@ -657,8 +657,8 @@ func TestCreateAndReadOverlaySymlink(t *testing.T) {
 func TestMoveInodePathPreservesSourceIdentityAndStalesReplacement(t *testing.T) {
 	fs := NewArtifactFuse(model.RepoConfig{}, nil)
 	fs.mu.Lock()
-	source := fs.allocInode("source.txt", "file", 0o100644, 1)
-	replaced := fs.allocInode("destination.txt", "file", 0o100644, 1)
+	source := fs.allocInode("source.txt", Attrs{Type: "file", Mode: 0o100644, Gen: 1})
+	replaced := fs.allocInode("destination.txt", Attrs{Type: "file", Mode: 0o100644, Gen: 1})
 	fs.mu.Unlock()
 
 	fs.moveInodePath("source.txt", "destination.txt")
@@ -688,11 +688,11 @@ func TestMoveInodePathPreservesSourceIdentityAndStalesReplacement(t *testing.T) 
 func TestMoveInodePathRewritesDirectoryDescendants(t *testing.T) {
 	fs := NewArtifactFuse(model.RepoConfig{}, nil)
 	fs.mu.Lock()
-	source := fs.allocInode("source", "dir", 0o755, 1)
-	child := fs.allocInode("source/nested/file.txt", "file", 0o100644, 1)
-	sibling := fs.allocInode("source-other/file.txt", "file", 0o100644, 1)
-	replaced := fs.allocInode("destination", "dir", 0o755, 1)
-	replacedChild := fs.allocInode("destination/nested/file.txt", "file", 0o100644, 1)
+	source := fs.allocInode("source", Attrs{Type: "dir", Mode: 0o755, Gen: 1})
+	child := fs.allocInode("source/nested/file.txt", Attrs{Type: "file", Mode: 0o100644, Gen: 1})
+	sibling := fs.allocInode("source-other/file.txt", Attrs{Type: "file", Mode: 0o100644, Gen: 1})
+	replaced := fs.allocInode("destination", Attrs{Type: "dir", Mode: 0o755, Gen: 1})
+	replacedChild := fs.allocInode("destination/nested/file.txt", Attrs{Type: "file", Mode: 0o100644, Gen: 1})
 	fs.dirHandles[1] = &DirHandle{inode: &InodeRef{Path: "source/nested"}}
 	fs.fileHandles[2] = &FileHandle{path: "source/nested/file.txt"}
 	fs.mu.Unlock()
