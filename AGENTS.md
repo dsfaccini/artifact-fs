@@ -36,7 +36,7 @@ Repository-specific guidance for `artifact-fs`.
 - Unmount a repo only through `startUnmount`. It runs one unmount per repo on its own goroutine, because `unmount(2)` can hang on a dead FSKit volume. Wait only for an unmount you started, and at most `unmountTimeout` plus `unmountReturnSlack`.
 - Build a runtime only with `startRuntime`. Mount it only with `attachMount`, which checks every mount precondition. A dead mount whose unmount failed blocks a new mount while the mount table lists its mount point.
 - Mount with the runtime's op context. Only a stop cancels it, never the end of `Start`'s context. A stop unmounts first, then cancels the op context, which cancels the ops in flight, then closes the runtime's stores and its `git cat-file --batch` processes.
-- Unmount a mount the daemon did not make only when the daemon process before this one ran the repo and the mount is FUSE, or when it is an abandoned mount the fuse library failed to unmount. Leave every other mount alone.
+- Unmount a mount the daemon did not make only when the daemon process before this one ran the repo and `ownsLeftover` matches the mount, or when it is an abandoned mount the fuse library failed to unmount. Leave every other mount alone. Record each repo a clean shutdown unmounted as stopped, so the next daemon claims none of its mounts.
 - Back off a retried mount, HEAD reconcile or remote refresh with `retrier`. `status` shows each failure with its next attempt.
 - `git.CloneBlobless` already populates the git index with `read-tree HEAD`; be careful about extra index resets because they can discard staged state.
 
