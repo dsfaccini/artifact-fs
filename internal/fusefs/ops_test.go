@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -311,6 +312,60 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 	}
 	if string(after) != "new" {
 		t.Fatalf("read after write = %q, want new", after)
+	}
+}
+
+// failingWriteOverlay promotes a path into backingPath, and its WriteFile
+// writes the data and then fails, as a write that runs out of space does.
+type failingWriteOverlay struct {
+	*fakeOverlay
+	backingPath string
+}
+
+func (o *failingWriteOverlay) EnsureCopyOnWriteFrom(_ context.Context, _ model.RepoConfig, path string, base model.BaseNode, _ *os.File) (model.OverlayEntry, error) {
+	e := model.OverlayEntry{Path: model.CleanPath(path), Kind: model.OverlayKindModify, BackingPath: o.backingPath, Mode: base.Mode, SourceOID: base.ObjectOID}
+	o.entries[e.Path] = e
+	return e, nil
+}
+
+func (o *failingWriteOverlay) WriteFile(_ context.Context, path string, off int64, data []byte) (int, error) {
+	f, err := os.OpenFile(o.backingPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	n, err := f.WriteAt(data, off)
+	if err != nil {
+		return n, err
+	}
+	e := o.entries[model.CleanPath(path)]
+	e.SizeBytes = off + int64(n)
+	o.entries[e.Path] = e
+	return n, syscall.ENOSPC
+}
+
+func TestFailedWriteThatPromotedClosesCachedBase(t *testing.T) {
+	tmp := t.TempDir()
+	baseCache := filepath.Join(tmp, "base")
+	if err := os.WriteFile(baseCache, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	overlay := &failingWriteOverlay{fakeOverlay: &fakeOverlay{entries: map[string]model.OverlayEntry{}}, backingPath: filepath.Join(tmp, "overlay")}
+	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": {Path: "file.txt", Type: "file", ObjectOID: "blob", Mode: 0o644}}}, overlay.fakeOverlay)
+	engine := &Engine{Repo: model.RepoConfig{ID: "repo"}, Resolver: resolver, Overlay: overlay, Hydrator: &fakeBatchHydrator{path: baseCache}}
+	fs := NewArtifactFuse(model.RepoConfig{ID: "repo"}, engine)
+	fh := &FileHandle{path: "file.txt"}
+	fs.fileHandles[1] = fh
+	defer fh.closeCachedFile()
+	if got, err := handleRead(context.Background(), engine, fh, 0, 0, make([]byte, 3)); err != nil || string(got) != "old" {
+		t.Fatalf("first read = %q, %v", got, err)
+	}
+	err := fs.WriteFile(context.Background(), &fuseops.WriteFileOp{Handle: 1, Data: []byte("new")})
+	if got := kernelErrno(err); got != syscall.ENOSPC {
+		t.Fatalf("write errno = %v, want ENOSPC", got)
+	}
+	if got, err := handleRead(context.Background(), engine, fh, 0, 0, make([]byte, 3)); err != nil || string(got) != "new" {
+		t.Fatalf("read after the failed write = %q, %v; want the overlay's new", got, err)
 	}
 }
 
