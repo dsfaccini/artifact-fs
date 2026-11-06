@@ -332,14 +332,25 @@ func isMounted(path string) bool {
 }
 
 // mountPointHeld reports whether path still holds a mount, and true when it
-// cannot tell. The mount table lists resolved paths, so it resolves the
-// parent's symlinks; a dead mount point itself can fail with ENOTCONN.
+// cannot tell. The mount table lists absolute resolved paths, so it resolves
+// the parent's symlinks, and a final component that is a symlink. It does not
+// resolve the mount point itself, which can fail with ENOTCONN when dead.
 func mountPointHeld(path string) bool {
-	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	path, err := filepath.Abs(path)
 	if err != nil {
 		return true
 	}
-	mounted, err := mountTableHas(filepath.Join(parent, filepath.Base(path)))
+	if fi, lstatErr := os.Lstat(path); lstatErr == nil && fi.Mode()&os.ModeSymlink != 0 {
+		path, err = filepath.EvalSymlinks(path)
+	} else {
+		var parent string
+		parent, err = filepath.EvalSymlinks(filepath.Dir(path))
+		path = filepath.Join(parent, filepath.Base(path))
+	}
+	if err != nil {
+		return true
+	}
+	mounted, err := mountTableHas(path)
 	return mounted || err != nil
 }
 

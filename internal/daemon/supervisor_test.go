@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -207,9 +208,10 @@ func TestStartRetriesHEADReconcileAfterSnapshotLock(t *testing.T) {
 type connFailureMounts struct {
 	fail chan struct{}
 	// release lets the remount return, so a test can observe the state before it.
-	release chan struct{}
-	mu      sync.Mutex
-	calls   []string
+	release     chan struct{}
+	releaseOnce sync.Once
+	mu          sync.Mutex
+	calls       []string
 	// unmountFails is how many unmounts of the failed mount fail first.
 	unmountFails int
 	// abort makes the failed connection's Join return nil, as after an
@@ -224,9 +226,11 @@ func startConnFailureDaemon(t *testing.T, unmountFails int, mountPath string) (*
 	m := &connFailureMounts{fail: make(chan struct{}), release: make(chan struct{}), unmountFails: unmountFails}
 	d := startDaemonWithMount(t, m.mount, mountPath)
 	// Runs before the daemon's cleanup, which waits for a remount.
-	t.Cleanup(func() { close(m.release) })
+	t.Cleanup(m.releaseRemount)
 	return d, m
 }
+
+func (m *connFailureMounts) releaseRemount() { m.releaseOnce.Do(func() { close(m.release) }) }
 
 func (m *connFailureMounts) mount(cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
 	m.mu.Lock()
@@ -356,6 +360,9 @@ func TestRemoveRepoUnmountsFailedConnectionLeftMounted(t *testing.T) {
 	// supervisor's retry, which then backs off.
 	waitFor(t, d.startErr, func() bool { return len(m.recorded()) == 3 })
 
+	// A remount after the retry's backoff returns at once, so it fails the
+	// call sequence below instead of blocking the daemon's poll.
+	m.releaseRemount()
 	// remove-repo runs in its own process, so the daemon's registry poll stops the runtime.
 	ctx := context.Background()
 	cliSvc, err := New(ctx, d.root, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -376,14 +383,43 @@ func TestRemoveRepoUnmountsFailedConnectionLeftMounted(t *testing.T) {
 	}
 }
 
-func TestMountPointHeldResolvesParentSymlinks(t *testing.T) {
-	// /dev is a mount point on macOS and Linux. The mount table lists it only by its resolved path.
-	link := filepath.Join(t.TempDir(), "root")
-	if err := os.Symlink("/", link); err != nil {
-		t.Fatal(err)
+func TestMountPointHeld(t *testing.T) {
+	// /dev is a mount point on macOS and Linux. The mount table lists it only
+	// by its absolute resolved path.
+	tmp := t.TempDir()
+	rootLink, devLink := filepath.Join(tmp, "root"), filepath.Join(tmp, "dev")
+	for link, target := range map[string]string{rootLink: "/", devLink: "/dev"} {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
 	}
-	path := filepath.Join(link, "dev")
-	if isMounted(path) || !mountPointHeld(path) {
-		t.Fatalf("isMounted(%q) = %t, mountPointHeld = %t; want false, true", path, isMounted(path), mountPointHeld(path))
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"parent symlink", filepath.Join(rootLink, "dev"), true},
+		{"final symlink", devLink, true},
+		{"relative", "dev", true},
+		{"unresolvable parent", filepath.Join(tmp, "gone", "repo"), true},
+		{"unmounted", filepath.Join(tmp, "repo"), false},
+	}
+	if runtime.GOOS == "darwin" {
+		tests = append(tests, struct {
+			name string
+			path string
+			want bool
+		}{"other case", "/DEV", true})
+	}
+	t.Chdir("/")
+	// The mount table must not depend on mount(8) being on PATH, as under launchd.
+	t.Setenv("PATH", "")
+	if !isMounted("/dev") {
+		t.Error("isMounted(/dev) = false with an empty PATH")
+	}
+	for _, tt := range tests {
+		if got := mountPointHeld(tt.path); got != tt.want {
+			t.Errorf("%s: mountPointHeld(%q) = %t, want %t", tt.name, tt.path, got, tt.want)
+		}
 	}
 }
