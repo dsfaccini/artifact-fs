@@ -49,10 +49,10 @@ func mountRepoAttempts(t *testing.T, repo model.RepoConfig, logger *slog.Logger)
 }
 
 // The fuse library reports op errors and failed replies only to an
-// ErrorLogger. A bug it answered with EIO reaches the daemon log as an error.
-// Any other op error, which the library also logs for expected errnos, goes out
-// at Debug, and a failed reply as a warning. Each carries the repo, with its
-// remote redacted.
+// ErrorLogger. A bug it answered with EIO reaches the daemon log as an error,
+// and a short FSKit read it answered with EIO as a warning. Any other op error,
+// which the library also logs for expected errnos, goes out at Debug, and a
+// failed reply as a warning. Each carries the repo, with its remote redacted.
 func TestMountRepoLogsFuseErrorsRedacted(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
