@@ -1,9 +1,9 @@
-github.com/dsfaccini/fuse v0.0.0-20261105014119-9ae31829722a h1:fW9o+pPulCkmLU1ApIKApXeJeRm0GYgkxnrgApVPhcM=
-github.com/dsfaccini/fuse v0.0.0-20261105014119-9ae31829722a/go.mod h1:9o0fheuyiR7E1hDAmiw6HiVcP5OUDvo66DFBut8B1so=
+github.com/dsfaccini/fuse v0.0.0-20261106042817-6ff0a8ba657a h1:4b1Gk2aBIXUjMB9L9Y2Zi/dOeZp63XXd47bagRxRD0c=
+github.com/dsfaccini/fuse v0.0.0-20261106042817-6ff0a8ba657a/go.mod h1:QzWjMOileZnsTdsRdFBYqgHIIkLVtRnVA5boKqp2tIw=
 github.com/dustin/go-humanize v1.1.0 h1:dbKTrvD0klcbBV/h4AWJdMuZogJACoMlvWIWZ5b2xWg=
 github.com/dustin/go-humanize v1.1.0/go.mod h1:hc1CvRkJMsgxqjmjMQF3QNRAZBwY8AXBAzKYoSX9sFI=
-github.com/ebitengine/purego v0.10.2 h1:W809HbnvzAxgdm+aOvlSekrM16wGCdT/e76+9tS7gzE=
-github.com/ebitengine/purego v0.10.2/go.mod h1:iIjxzd6CiRiOG0UyXP+V1+jWqUXVjPKLAI0mRfJZTmQ=
+github.com/ebitengine/purego v0.11.2 h1:WWiTx8rD8zYdOwSj8O/NiNbsOvSAgJMTlyV1XlbUSeU=
+github.com/ebitengine/purego v0.11.2/go.mod h1:DCHPP08djqhNSoTfImcnHYQRZmd0qhakvrozqaEYhGQ=
 github.com/google/pprof v0.0.0-20261016150608-1facf8f91b50 h1:PlNWJRxu5APSV0pWqfIsZ0qt9OOGHSWfZQ4zvx+WgWs=
 github.com/google/pprof v0.0.0-20261016150608-1facf8f91b50/go.mod h1:yUo1AMMpsPIDFGuwDK8nLcf8+vvAd5l2O6JDZ6hpwrM=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=

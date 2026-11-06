@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
+	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/logging"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -1139,7 +1140,7 @@ func TestE2EVerifiedSource(t *testing.T) {
 		t.Fatalf("verified Git index before mount = %v, want [README.md]", got)
 	}
 	readmeOID := strings.TrimSpace(run(t, "", "git", "--git-dir", gitDir, "rev-parse", "HEAD:README.md"))
-	readmeCachePath := filepath.Join(blobCacheDir, readmeOID)
+	readmeCachePath := blobcache.Path(blobCacheDir, readmeOID)
 	if _, err := os.Stat(readmeCachePath); !os.IsNotExist(err) {
 		firstCancel()
 		_ = firstSvc.Close()

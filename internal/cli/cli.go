@@ -255,7 +255,27 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				return nil
 			}),
 		},
-		stubCommand("evict-cache", "evict blob cache", stdout),
+		{
+			Name:  "evict-cache",
+			Usage: "evict least recently accessed blobs until the blob cache fits a byte budget",
+			Flags: []ucli.Flag{
+				&ucli.StringFlag{Name: "name", Usage: "repo name (required)"},
+				&ucli.Int64Flag{Name: "max-bytes", Required: true, Usage: "byte budget the blob cache must fit (required)"},
+			},
+			Action: withController(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Controller) error {
+				name := strings.TrimSpace(c.String("name"))
+				if name == "" {
+					return fmt.Errorf("--name required")
+				}
+				res, err := svc.EvictCache(ctx, name, c.Int64("max-bytes"))
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(stdout, "evicted_blobs=%d evicted_bytes=%d hydrated_blobs=%d hydrated_bytes=%d\n",
+					res.Evicted, res.EvictedBytes, res.Remaining.Blobs, res.Remaining.Bytes)
+				return nil
+			}),
+		},
 		stubCommand("gc", "garbage collect", stdout),
 		stubCommand("doctor", "check repo health", stdout),
 		stubCommand("prefetch", "prefetch blobs", stdout),

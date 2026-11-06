@@ -52,7 +52,7 @@ This fork depends on `github.com/dsfaccini/fuse`, a fork of `jacobsa/fuse` that
 loads macFUSE's FSKit framework at run time, with no cgo. Every macOS build has
 the FSKit backend.
 
-FSKit needs macOS 26 or later and macFUSE 5.3 or later. Enable the `macFUSE`
+FSKit needs macOS 26 or later and macFUSE 5.5 or later. Enable the `macFUSE`
 and `macFUSE (local)` file system extensions under System Settings > General >
 Login Items & Extensions > File System Extensions. FSKit uses this user-space
 file system extension and needs no kernel extension.
@@ -149,10 +149,10 @@ Check the state of a mounted repo with `status`:
 | `remote_refresh` | Whether daemon and manual remote refreshes are enabled |
 | `ahead` / `behind` / `diverged` | Divergence from the remote at the daemon's last successful refresh |
 | `prepare_error` | Last redacted preparation error, if any |
-| `mount_error` | `last_error` when the FUSE mount or its connection failed last; a successful mount clears it |
+| `mount_error` | `last_error` when mounting the repo failed last (phase `mount`: opening its stores, reconciling the overlay, preparing the index or the FUSE mount itself) or its FUSE connection failed (phase `serve`); a mount that serves clears it |
 | `last_error` / `last_error_phase` / `last_error_at` | Last redacted failure the daemon retries, the phase that failed (`mount`, `serve`, `unmount`, `head_reconcile`, `fetch` or `registry_sync`) and when. `serve` is a FUSE connection that failed or exited. A success of that phase clears it |
 | `next_retry` / `attempts` | When the daemon retries the failed phase, and how many times in a row it failed; `next_retry` is `none` when no daemon runs |
-| `hydrated_blobs` / `hydrated_bytes` | Blob count and bytes present in the local hydration cache |
+| `hydrated_blobs` / `hydrated_bytes` | Blob count and bytes in the repo's blob cache, read from counters kept with the cache (see [Evicting the blob cache](#evicting-the-blob-cache)) |
 | `overlay_dirty` | `true` if the overlay contains created or modified files; delete-only overlays are not counted |
 | `last_fetch` / `result` | Time and result (`ok` or `failed`) of the daemon's last remote refresh, or of a later `fetch` command; otherwise `never` |
 
@@ -200,13 +200,39 @@ Use `--hydration-concurrency` to control the number of parallel blob-fetch worke
 ./artifact-fs daemon --root /tmp --hydration-concurrency 8
 ```
 
+### Evicting the blob cache
+
+The blob cache keeps every hydrated blob until you evict it. Nothing evicts automatically. `evict-cache` removes the least recently accessed blobs, by file access time, until the cache holds at most `--max-bytes` bytes. The flag is required and has no default; `--max-bytes 0` empties the cache:
+
+```bash
+./artifact-fs evict-cache --name workers-sdk --max-bytes 1073741824
+# evicted_blobs=812 evicted_bytes=402653184 hydrated_blobs=2210 hydrated_bytes=1073610752
+```
+
+It is safe while the daemon runs. A file already open keeps reading its blob, and the next open of an evicted file hydrates it again. A blob whose access time changes after `evict-cache` lists the cache stays. Repos that share a `--blob-cache-dir` share one budget, and evicting through any of them evicts the shared directory.
+
+Eviction follows the access times the filesystem records, so its order depends on the mount:
+
+- `noatime`: reads never update the access time, so eviction removes the oldest-hydrated blobs first.
+- `relatime`, the Linux default: after the first read, a read updates the access time only when it is more than a day old, so eviction order is accurate to about a day.
+- APFS on macOS: a read updates the access time only while it is not newer than the modification time, so only the first read after hydration counts, and eviction removes the blobs first read longest ago.
+- The kernel can serve repeated reads of a mounted file from its page cache without reading the blob file, and those reads leave its access time unchanged.
+
+The cache shards blobs by the first two hex characters of their object ID, `<blob-cache-dir>/<2 hex>/<oid>`. When a repo mounts, the daemon moves blobs of the earlier flat layout into their shards and recounts the cache. `evict-cache` does the same before it evicts, and `status` does it once for a cache that has no counters yet. While one of them recounts, hydration into the same cache waits, so mounting a repo stalls hydration for every repo that shares its `--blob-cache-dir` for one walk of the directory, about half a second per 100,000 blobs on an APFS laptop. Hydration and eviction update the counters `status` reports as they add and remove blobs, under a lock on the cache's `stats` file, so `status` never walks the cache. The recount corrects counters that a crash between a blob change and its counter update, or a change made by hand, left wrong.
+
 ## Logging
 
 ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the mode, source, attempt, phase, state, duration, and deadline. Clone and fetch operations retry known transient transport failures up to three total attempts. Preparation has a 30-minute timeout. Caller cancellation stops the active Git command and retry backoff; synchronous preparation records a redacted `prepare canceled` status, while daemon shutdown leaves async preparation queued for restart.
 
 Async existing-clone preparation reports remote configuration, fetch, and branch update as separate `configure_remote`, `fetch`, and `update_branch` phases.
 
-Each error the FUSE library reports becomes a `fuse error` record. A reply the kernel refuses, other than with `ENOENT`, logs at `WARN`. A failed FUSE op logs at `DEBUG`, because expected errnos such as `ENOTEMPTY` fail ops too. The daemon logs at `INFO`, so it never emits these lines. The library reports no failed lookup of a missing name, no `GetXattr` or `ListXattr` that fails with `ENOSYS`, `ENODATA` or `ERANGE`, and no request whose opcode the library does not recognize.
+Each error the FUSE library reports becomes a `fuse error` record:
+
+- `ERROR`: a bug the library answers with `EIO`. That is a panic it recovers from an op, logged with its stack; an op that exits through `runtime.Goexit`; or a reply whose byte count falls outside its buffer.
+- `WARN`: a reply the kernel refuses, other than with `ENOENT`. On Linux, also a mount whose `FUSE_POLL` setup failed.
+- `DEBUG`: every other failed op, including a request the library cannot decode, because expected errnos such as `EEXIST` fail ops too.
+
+The daemon logs at `INFO`, so it drops the `DEBUG` records. The library reports no `ENOSYS` or `EINTR` from any op, no `ENOENT` from a lookup, no `ENOTEMPTY` from `rmdir` or `rename`, and no `ENODATA` or `ERANGE` from `GetXattr` or `ListXattr`.
 
 A repo's FUSE connection can end while its mount stays in place: after an error fatal to the connection, such as a failed read from the kernel, or after the connection is aborted. The daemon then logs `fuse connection failed, unmounting`, records the connection's error as the repo's `mount_error` (for an abort, which carries no error, `fuse connection ended while the mount point still holds the mount`), unmounts the repo, and mounts it again. While that unmount fails and the mount table still lists the mount point, or the table, the path or the mount point cannot be read, each mount retry tries the unmount again instead of mounting. The daemon looks the mount point up in the kernel's mount table by its absolute path, with symlinks in the parent and a symlinked final component resolved. On macOS the lookup ignores case.
 
@@ -420,6 +446,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 | `gitstore` | Git CLI wrapper: clone, fetch, ls-tree, batch pool for `cat-file --batch` |
 | `snapshot` | SQLite store for `base_nodes` keyed by `(generation, path)` |
 | `overlay` | SQLite metadata + `upper/` directory for local writes, whiteouts, reconciliation |
+| `blobcache` | Blob cache layout (sharded by object ID), its counters, and LRU eviction for `evict-cache` |
 | `hydrator` | Priority queue with deduped waiters; workers fetch queued blobs in batches. With more than one worker, a reserved worker takes only reads and copies of local blobs and blocks on `reservedReady`; the others block on `workReady` |
 | `watcher` | Polls gitdir mtimes (HEAD, index, refs) at 500ms intervals |
 | `registry` | SQLite-backed repo config persistence |

@@ -6,8 +6,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -41,9 +43,10 @@ func mountRepoConfigs(t *testing.T, repo model.RepoConfig, logger *slog.Logger) 
 }
 
 // The fuse library reports op errors and failed replies only to an
-// ErrorLogger. An op error, which the library also logs for expected errnos,
-// reaches the daemon log at Debug, and a failed reply as a warning. Each
-// carries the repo, with its remote redacted.
+// ErrorLogger. A bug it answered with EIO reaches the daemon log as an error.
+// Any other op error, which the library also logs for expected errnos, goes out
+// at Debug, and a failed reply as a warning. Each carries the repo, with its
+// remote redacted.
 func TestMountRepoLogsFuseErrorsRedacted(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -66,6 +69,36 @@ func TestMountRepoLogsFuseErrorsRedacted(t *testing.T) {
 				wantLevel: "DEBUG",
 				wantText:  "*fuseops.ReadFileOp",
 				remote:    true,
+			},
+			{
+				log: func() {
+					cfg.ErrorLogger.Printf("Op 0x%08x %T] -> %s: panic: %v\n%s", 3, &fuseops.LookUpInodeOp{}, "Error", "fetch "+repo.RemoteURL+": nil map", "goroutine 7 [running]:\nruntime/debug.Stack()")
+				},
+				wantLevel: "ERROR",
+				wantText:  "panic: fetch",
+				remote:    true,
+			},
+			{
+				log: func() {
+					cfg.ErrorLogger.Printf("Op 0x%08x %T] -> %s: panic: %v\n%s", 4, &fuseops.WriteFileOp{}, "Callback", "callback for "+repo.RemoteURL, "goroutine 8 [running]:")
+				},
+				wantLevel: "ERROR",
+				wantText:  "Callback: panic",
+				remote:    true,
+			},
+			{
+				log: func() {
+					cfg.ErrorLogger.Printf("Op 0x%08x %T] -> %s: %q", 5, &fuseops.OpenFileOp{}, "Error", fmt.Errorf("fuseutil: the method exited without returning: %w", syscall.EIO))
+				},
+				wantLevel: "ERROR",
+				wantText:  "exited without returning",
+			},
+			{
+				log: func() {
+					cfg.ErrorLogger.Printf("Op 0x%08x %T] -> %s: %q", 6, &fuseops.ReadDirOp{}, "Error", fmt.Errorf("%T.BytesRead is %d, outside its %d-byte buffer: %w", &fuseops.ReadDirOp{}, 5000, 4096, syscall.EIO))
+				},
+				wantLevel: "ERROR",
+				wantText:  "outside its 4096-byte buffer",
 			},
 			{
 				log: func() {

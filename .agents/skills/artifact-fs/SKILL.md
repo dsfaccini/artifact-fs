@@ -35,6 +35,7 @@ go build -o artifact-fs ./cmd/artifact-fs
 | List registered repos | `./artifact-fs list-repos` |
 | Unmount a repo until remount | `./artifact-fs unmount --name <name>`; waits for the running daemon and exits non-zero if it failed or no daemon runs |
 | Mount a repo again | `./artifact-fs remount --name <name>` |
+| Shrink a repo's blob cache | `./artifact-fs evict-cache --name <name> --max-bytes <bytes>`; evicts least recently accessed blobs, never automatic |
 | Unmount and remove a repo | `./artifact-fs remove-repo --name <name>`; the running daemon unmounts it at its next registry poll |
 
 ## Quick Start: One Repo
