@@ -120,6 +120,15 @@ type repoRuntime struct {
 	stopping bool
 	// stopRunning is set while a stop runs.
 	stopRunning bool
+	// retired holds the generations the resolver stopped serving, with when.
+	// retiredMu guards it, and is taken alone.
+	retiredMu sync.Mutex
+	retired   []retiredGeneration
+}
+
+type retiredGeneration struct {
+	gen int64
+	at  time.Time
 }
 
 // reportedState is the runtime's state in status: the prepare state while an

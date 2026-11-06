@@ -74,6 +74,8 @@ tool failed to install, or the file system extension is missing or not enabled. 
 any other FSKit failure, because a retry could mount twice. The daemon logs the
 transport that mounted each repo.
 
+After a HEAD change, an FSKit mount can show the old commit for longer than the
+other backends; see [Kernel caches after a HEAD change](#kernel-caches-after-a-head-change).
 FSKit reuses directory handles across enumerations. Every backend lists a
 directory again when an enumeration restarts. Both macOS backends reject extended
 attributes, so macOS writes no AppleDouble `._` files to store them. macOS
@@ -436,6 +438,25 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 5. **Write** -- The Engine promotes base files to the overlay via copy-on-write (hydrate, then copy to the `upper/` directory). Subsequent reads come from the overlay. Deletes are recorded as whiteouts; deleting a file copies it first only while a handle on it is open. No FUSE operation holds a lock while a blob hydrates, so a slow fetch stalls neither a HEAD switch nor other operations. A failed operation returns the errno of its cause, such as `ENOSPC`, and an interrupted one returns `EINTR`.
 
 6. **Background** -- For ordinary workspaces, a watcher polls HEAD/refs every 500ms and republishes HEAD changes. A HEAD change compares the overlay with the new generation while reads and writes continue; they wait only while the result is applied. Repositories with `--require-commit` do not run this watcher, so their verified base commit remains fixed. Remote polling is controlled separately by `--refresh`.
+
+### Kernel caches after a HEAD change
+
+A HEAD change switches the mount to a new snapshot generation. The kernel may
+still cache what the mount reported before: names, missing names, attributes
+and file pages. The mount reports entries, negative entries and attributes with
+a 1 s TTL. The synthesized `.git` file never changes. A base file's mtime is the
+time of its commit.
+
+On every backend, an inode reads the generation of the attributes the kernel
+last received for it, so its reads match the size the kernel holds. The daemon
+keeps a generation readable for 2 s after the mount stops serving it, and prunes
+it at a later HEAD change.
+
+| Backend | After a HEAD change |
+|---------|---------------------|
+| Linux | The mount invalidates three things at once: the attributes and cached pages of each inode the kernel holds whose type, permission bits or blob changed; the entry of each name that vanished or changed type; and each negative entry whose name now exists. The mount caches a missing name as a negative entry for 1 s. A name made through the mount replaces its negative entry, and a write that recreates a vanished file invalidates it. The mount negotiates `FUSE_AUTO_INVAL_DATA` without writeback caching, so the kernel drops a file's cached pages when its size or mtime changes. The kernel keeps a base file's pages across opens only while its opens serve the same blob. For up to 1 s, a reader can still see attributes the mount does not invalidate, such as the old mtime of a file whose blob did not change, or of a directory. A lookup or getattr that races the switch can leave old names and sizes for up to 1 s, and old pages within one open. |
+| macFUSE kernel extension | The mount sends the same invalidations as on Linux. The extension mounts with `novncache`, so it caches no names and the mount caches no negative entries. It drops a file's cached attributes and pages on each `InvalidateInode`, and a getattr that reports a size other than the one it holds drops all the file's cached pages. A lookup leaves a held file's size alone. An open does not drop the pages, and `KeepPageCache` has no effect. So a lookup or getattr that races the switch can leave the old blob's pages beyond one open, until the next invalidation of that inode or a getattr that reports a different size. For up to 1 s, a reader can still see the old mtime of a file whose blob did not change, and of a directory. macFUSE 5's extension is closed source, so this row follows the open-source [osxfuse extension](https://github.com/osxfuse/kext/tree/534773bd3135f04b7f6fb801faa2f8991daf4a6b). |
+| FSKit | FSKit takes no invalidations, so the mount sends none and caches no negative entries. FSKit keeps what it cached until it asks again, which the mount cannot hasten. FSKit keeps its own attribute cache, and artifact-fs knows no bound for it. Until then, a reader can see the old commit's names, sizes and modes, and an inode reads the old generation while the daemon keeps it. After that, the inode reads the current content. The fuse library answers EIO to a read inside the size it last reported that the current content does not fill. A read that FSKit sends before a reply reporting a smaller size reaches it can still get a short reply without EIO. |
 
 ### Subsystems
 
