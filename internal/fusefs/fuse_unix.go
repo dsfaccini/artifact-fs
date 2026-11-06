@@ -38,7 +38,6 @@ type ArtifactFuse struct {
 	fuseutil.NotImplementedFileSystem
 	repo           model.RepoConfig
 	engine         *Engine
-	fskit          bool
 	gitfileContent []byte    // synthesized .git gitfile, computed once
 	syntheticTime  time.Time // timestamps of synthesized entries; changing them can deadlock concurrent FSKit Git reads
 
@@ -1217,8 +1216,6 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, l
 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.
 	platformMountConfig(&mountCfg)
 	mount := func(fskit bool) (*fuse.MountedFileSystem, error) {
-		// The server handles operations as soon as the mount starts.
-		fsint.fskit = fskit
 		cfg := mountCfg
 		if fskit {
 			cfg.Options = map[string]string{"backend": "fskit"}
