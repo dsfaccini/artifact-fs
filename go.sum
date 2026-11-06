@@ -4,8 +4,8 @@ github.com/cpuguy83/go-md2man/v2 v2.0.7/go.mod h1:oOW0eioCTA6cOiMLiUPZOpcVxMig6N
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/dsfaccini/fuse v0.0.0-20261104225906-b9a5ada24ca0 h1:YU4e5jKcqjo87Lh5UL7wuL3xw1I/GmW6XDTqhI7f8J8=
-github.com/dsfaccini/fuse v0.0.0-20261104225906-b9a5ada24ca0/go.mod h1:9o0fheuyiR7E1hDAmiw6HiVcP5OUDvo66DFBut8B1so=
+github.com/dsfaccini/fuse v0.0.0-20261105014119-9ae31829722a h1:fW9o+pPulCkmLU1ApIKApXeJeRm0GYgkxnrgApVPhcM=
+github.com/dsfaccini/fuse v0.0.0-20261105014119-9ae31829722a/go.mod h1:9o0fheuyiR7E1hDAmiw6HiVcP5OUDvo66DFBut8B1so=
 github.com/dustin/go-humanize v1.1.0 h1:dbKTrvD0klcbBV/h4AWJdMuZogJACoMlvWIWZ5b2xWg=
 github.com/dustin/go-humanize v1.1.0/go.mod h1:hc1CvRkJMsgxqjmjMQF3QNRAZBwY8AXBAzKYoSX9sFI=
 github.com/ebitengine/purego v0.10.2 h1:W809HbnvzAxgdm+aOvlSekrM16wGCdT/e76+9tS7gzE=
