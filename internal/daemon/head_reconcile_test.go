@@ -52,7 +52,7 @@ func (m *delayedUnmountFailure) Backend() string            { return "fake" }
 func (m *delayedUnmountFailure) InvalidateChanged() error   { return nil }
 func (m *delayedUnmountFailure) Join(context.Context) error { return nil }
 
-func (m *delayedUnmountFailure) Unmount() error {
+func (m *delayedUnmountFailure) Unmount(context.Context) error {
 	close(m.started)
 	<-m.release
 	return errors.New("busy")
@@ -141,7 +141,9 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 		overlay:     ov,
 		resolver:    resolver,
 		headChanges: make(chan struct{}, 1),
-		state:       newRuntimeState(cfg.ID, oldOID, "main", oldGen),
+		head:        servedHead{oid: oldOID, ref: "main", gen: oldGen},
+		fetch:       fetchStatus{state: fetchNever},
+		mount:       mountNone,
 	}
 	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
 	if err != nil {
@@ -151,6 +153,8 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 	svc := &Service{
 		core:                 &core{root: root, logger: logger, git: git, registry: reg},
 		running:              map[model.RepoID]*repoRuntime{cfg.ID: rt},
+		unmounting:           map[model.RepoID]*unmountOp{},
+		mountPointEntry:      heldMountPoint,
 		records:              map[model.RepoID]*model.RepoRuntimeRecord{},
 		headReconcileBackoff: backoff,
 	}
@@ -203,9 +207,9 @@ func (f *headReconcileFixture) waitForHead(oid, ref string, generation int64) {
 	waitFor(f.t, nil, func() bool {
 		f.svc.mu.Lock()
 		defer f.svc.mu.Unlock()
-		return f.rt.state.CurrentHEADOID == oid &&
-			f.rt.state.CurrentHEADRef == ref &&
-			f.rt.state.SnapshotGeneration == generation &&
+		return f.rt.head.oid == oid &&
+			f.rt.head.ref == ref &&
+			f.rt.head.gen == generation &&
 			f.rt.resolver.Generation() == generation
 	})
 }
@@ -382,7 +386,7 @@ func TestHeadReconcilePersistsSameOIDRefBeforeUpdatingRuntime(t *testing.T) {
 	f.signal()
 	f.waitForLog("snapshot publish failed")
 	f.svc.mu.Lock()
-	gotRef := f.rt.state.CurrentHEADRef
+	gotRef := f.rt.head.ref
 	f.svc.mu.Unlock()
 	if gotRef != "main" {
 		t.Fatalf("runtime ref advanced before persistence: got %q", gotRef)
@@ -464,7 +468,7 @@ func TestHeadReconcileResumesAfterUnmountFailure(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	f.svc.mu.Lock()
-	f.rt.mfs = mfs
+	f.rt.mfs, f.rt.mount = mfs, mountServing
 	f.svc.mu.Unlock()
 
 	errCh := make(chan error, 1)
@@ -562,7 +566,7 @@ func TestHeadReconcileInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 	f := newHeadReconcileFixture(t)
 	mount := &invalidatingMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, resolver: f.rt.resolver, gens: make(chan int64, 1)}
 	f.svc.mu.Lock()
-	f.rt.mfs = mount
+	f.rt.mfs, f.rt.mount = mount, mountServing
 	f.svc.mu.Unlock()
 
 	f.updateMain(f.nextOID)

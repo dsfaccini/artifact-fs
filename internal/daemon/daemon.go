@@ -105,7 +105,15 @@ type Controller struct {
 // registered repo.
 type Service struct {
 	*core
-	mount                mountFunc
+	mount mountFunc
+	// unmountPath unmounts a mount the daemon did not make.
+	unmountPath func(string) error
+	// mountPointEntry reports whether a mount point holds a mount, and what
+	// the mount table lists for it. Tests replace it to stand in for the
+	// kernel's mount table.
+	mountPointEntry func(string) (mountEntry, bool)
+	// mountTimeout bounds the wait for one FUSE mount; zero means mountTimeout.
+	mountTimeout         time.Duration
 	hydrationConcurrency int
 	// Test hooks, nil in production. runtimeStarted runs between starting a
 	// runtime and recording it. mountReleased runs in a join goroutine after
@@ -120,9 +128,16 @@ type Service struct {
 	preparing            map[model.RepoID]int64
 	prepareAttempts      map[model.RepoID]int64
 	prepareSeq           int64
-	mountFailures        map[model.RepoID]*mountFailure
-	prepareWorkers       sync.WaitGroup
-	closing              bool
+	// leftovers holds the repos the daemon process before this one ran and
+	// whose mounts it may have left. Before the daemon mounts such a repo,
+	// it unmounts the mount at its mount point when ownsLeftover matches it.
+	leftovers map[model.RepoID]bool
+	// mountRetries backs off the mounts of each repo whose mount failed.
+	mountRetries map[model.RepoID]*mountRetry
+	// unmounting holds each repo's unmount that has not returned.
+	unmounting     map[model.RepoID]*unmountOp
+	prepareWorkers sync.WaitGroup
+	closing        bool
 	// lock is the daemon lock on root, held until Close.
 	lock *os.File
 	// wake carries control socket nudges to the sync loop.
@@ -155,10 +170,14 @@ func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error
 	return &Service{
 		core:            c,
 		mount:           defaultMount,
+		unmountPath:     defaultUnmountPath,
+		mountPointEntry: mountPointEntry,
 		running:         map[model.RepoID]*repoRuntime{},
 		preparing:       map[model.RepoID]int64{},
 		prepareAttempts: map[model.RepoID]int64{},
-		mountFailures:   map[model.RepoID]*mountFailure{},
+		leftovers:       map[model.RepoID]bool{},
+		mountRetries:    map[model.RepoID]*mountRetry{},
+		unmounting:      map[model.RepoID]*unmountOp{},
 		lock:            lock,
 		wake:            make(chan struct{}, 1),
 		records:         map[model.RepoID]*model.RepoRuntimeRecord{},
@@ -222,16 +241,32 @@ func (s *Service) hydrationWorkers() int {
 func (s *Service) Close() error {
 	s.mu.Lock()
 	s.closing = true
-	ids := make([]model.RepoID, 0, len(s.running))
-	for id := range s.running {
-		ids = append(ids, id)
+	cfgs := make([]model.RepoConfig, 0, len(s.running))
+	for _, rt := range s.running {
+		cfgs = append(cfgs, rt.cfg)
 	}
 	s.mu.Unlock()
 	var errs []error
-	for _, id := range ids {
-		if err := s.unmount(id); err != nil {
+	for _, cfg := range cfgs {
+		if err := s.unmount(cfg.ID); err != nil {
 			errs = append(errs, err)
+			continue
 		}
+		s.mu.Lock()
+		claimed := s.leftovers[cfg.ID]
+		s.mu.Unlock()
+		if claimed {
+			// The earlier daemon's mount may still be at the mount point, so
+			// the next daemon claims it too.
+			continue
+		}
+		// The next daemon on the root finds no mount of this one's to
+		// unmount. The record keeps the last refresh, which status shows
+		// while no daemon runs.
+		s.recordRuntime(cfg.ID, func(rec *model.RepoRuntimeRecord) {
+			rec.State = repoStateUnmounted
+			clearFailure(rec, phaseUnmount)
+		})
 	}
 	if len(errs) == 0 {
 		s.prepareWorkers.Wait()

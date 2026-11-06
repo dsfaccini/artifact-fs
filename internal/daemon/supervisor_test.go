@@ -28,11 +28,11 @@ type resolverMount struct {
 	resolved *fusefs.Resolver
 }
 
-func (m *resolverMount) mount(cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+func (m *resolverMount) mount(ctx, opCtx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
 	m.mu.Lock()
 	m.resolved = engine.Resolver
 	m.mu.Unlock()
-	return m.next(cfg, engine, gate, logger)
+	return m.next(ctx, opCtx, cfg, engine, gate, logger)
 }
 
 func (m *resolverMount) resolver() *fusefs.Resolver {
@@ -232,14 +232,14 @@ func startConnFailureDaemon(t *testing.T, unmountFails int, mountPath string) (*
 
 func (m *connFailureMounts) releaseRemount() { m.releaseOnce.Do(func() { close(m.release) }) }
 
-func (m *connFailureMounts) mount(cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+func (m *connFailureMounts) mount(ctx, opCtx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
 	m.mu.Lock()
 	remount := len(m.calls) > 0
 	m.calls = append(m.calls, "mount")
 	m.mu.Unlock()
 	if remount {
 		<-m.release
-		return fakeMount(cfg, engine, gate, logger)
+		return fakeMount(ctx, opCtx, cfg, engine, gate, logger)
 	}
 	return &failedConnectionMount{m: m, err: fmt.Errorf("readMessage: transport to %s failed", cfg.RemoteURL)}, nil
 }
@@ -270,7 +270,7 @@ func (f *failedConnectionMount) Join(ctx context.Context) error {
 	}
 }
 
-func (f *failedConnectionMount) Unmount() error {
+func (f *failedConnectionMount) Unmount(context.Context) error {
 	f.m.mu.Lock()
 	defer f.m.mu.Unlock()
 	if f.m.unmountFails > 0 {

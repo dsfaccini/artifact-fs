@@ -11,14 +11,18 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
-// fetchResultFailed is the fetch result of a failed refresh, whose error the
-// runtime record holds.
-const fetchResultFailed = "failed"
-
 type aheadBehind struct {
 	ahead    int
 	behind   int
 	diverged bool
+}
+
+// newRefreshRetrier backs off the remote refreshes of a repo refreshed every
+// interval: twice the interval after the first failure, doubling up to
+// fetchRetryMax, or up to the interval when it is longer.
+func newRefreshRetrier(interval time.Duration) *retrier {
+	limit := max(fetchRetryMax, interval)
+	return newRetrier(phaseFetch, min(2*interval, limit), limit)
 }
 
 func (s *Service) refreshLoop(rt *repoRuntime) {
@@ -28,8 +32,8 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 	if baseInterval <= 0 {
 		baseInterval = 30 * time.Second
 	}
-	backoff := baseInterval
-	ticker := time.NewTicker(backoff)
+	retry := newRefreshRetrier(baseInterval)
+	ticker := time.NewTicker(baseInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -40,8 +44,8 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 				continue
 			}
 			baseInterval = interval
-			backoff = interval
-			ticker.Reset(backoff)
+			retry = newRefreshRetrier(baseInterval)
+			ticker.Reset(baseInterval)
 		case <-ticker.C:
 			s.mu.Lock()
 			cfg := rt.cfg
@@ -52,31 +56,22 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 			ctx, cancel := context.WithTimeout(rt.ctx, 30*time.Second)
 			err := s.git.Fetch(ctx, cfg)
 			if err != nil {
-				s.mu.Lock()
-				markFetchFailure(&rt.state, fetchResultFailed)
-				s.mu.Unlock()
 				cancel()
-				// Exponential backoff on failure, capped at maxBackoff
-				maxBackoff := max(10*time.Minute, baseInterval)
-				if backoff >= maxBackoff/2 {
-					backoff = maxBackoff
-				} else {
-					backoff *= 2
-				}
-				ticker.Reset(backoff)
-				s.recordFailure(cfg, phaseFetch, err, time.Now().Add(backoff))
+				s.mu.Lock()
+				rt.fetch.state = fetchFailed
+				s.mu.Unlock()
+				ticker.Reset(s.retryFailure(cfg, retry, err))
 				s.recordRuntimeState(rt)
 				continue
 			}
 			state, abErr := s.fetchState(ctx, cfg)
 			cancel()
-			// Reset backoff on success
-			backoff = baseInterval
-			ticker.Reset(backoff)
+			retry.succeed()
+			ticker.Reset(baseInterval)
 			s.mu.Lock()
-			markFetchResult(&rt.state, time.Now(), "ok", rt.mfs != nil)
+			rt.fetch.state, rt.fetch.at = fetchOK, time.Now()
 			if abErr == nil {
-				applyAheadBehind(&rt.state, state)
+				rt.fetch.ahead, rt.fetch.behind, rt.fetch.diverged = state.ahead, state.behind, state.diverged
 			}
 			s.mu.Unlock()
 			s.recordRuntimeState(rt, phaseFetch)

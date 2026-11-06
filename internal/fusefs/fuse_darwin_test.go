@@ -1,6 +1,7 @@
 package fusefs
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"testing"
@@ -99,7 +100,7 @@ func TestMountRepoInvalidatesThroughTheMountedAttemptsNotifier(t *testing.T) {
 	}
 	t.Cleanup(func() { newNotifier = savedNotifier })
 	savedMount := fuseMount
-	fuseMount = func(_ string, _ fuse.Server, cfg *fuse.MountConfig) (*fuse.MountedFileSystem, error) {
+	fuseMount = func(_ context.Context, _ string, _ fuse.Server, cfg *fuse.MountConfig) (*fuse.MountedFileSystem, error) {
 		if cfg.Backend == fuse.BackendFSKit {
 			return nil, fuse.ErrFSKitUnavailable
 		}
@@ -107,7 +108,7 @@ func TestMountRepoInvalidatesThroughTheMountedAttemptsNotifier(t *testing.T) {
 	}
 	t.Cleanup(func() { fuseMount = savedMount })
 
-	m, err := MountRepoWithGate(model.RepoConfig{Name: "repo", MountPath: t.TempDir()}, nil, nil, slog.New(slog.DiscardHandler))
+	m, err := MountRepoWithGate(context.Background(), context.Background(), model.RepoConfig{Name: "repo", MountPath: t.TempDir()}, nil, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}

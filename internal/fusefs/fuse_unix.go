@@ -29,7 +29,9 @@ type MountedFS interface {
 	// Backend returns the backend that mounted the filesystem: BackendFSKit or BackendKernel.
 	Backend() string
 	Join(ctx context.Context) error
-	Unmount() error
+	// Unmount retries a busy mount until ctx ends, and forces the unmount
+	// once Join has returned. ctx cannot interrupt an unmount(2) that hangs.
+	Unmount(ctx context.Context) error
 	// InvalidateChanged tells the kernel to drop what it caches for the mount
 	// and the merged view no longer matches: the attributes and pages of an
 	// inode whose type, permission bits or blob changed, the entry of a name
@@ -59,6 +61,16 @@ type kernelEntry struct {
 	parent fuseops.InodeID
 	name   string
 }
+
+// AbandonedMount is the error of a mount whose context ended before the mount
+// completed. The mount ends in the background, and its server may get ops
+// until it has, so Wait for it before mounting at the same path again.
+type AbandonedMount interface {
+	error
+	Wait(ctx context.Context) error
+}
+
+var _ AbandonedMount = (*fuse.AbandonedMountError)(nil)
 
 // ArtifactFuse is the FUSE adapter following the tigrisfs GoofysFuse pattern:
 // embed NotImplementedFileSystem + core state, thin operation wrappers. Engine
@@ -1360,13 +1372,8 @@ func (fs *ArtifactFuse) RemoveXattr(_ context.Context, _ *fuseops.RemoveXattrOp)
 
 type mountedFSWrapper struct {
 	*fuse.MountedFileSystem
-	fs         *ArtifactFuse
-	mountPoint string
-	backend    string
-}
-
-func (m *mountedFSWrapper) Unmount() error {
-	return TryUnmount(m.mountPoint)
+	fs      *ArtifactFuse
+	backend string
 }
 
 func (m *mountedFSWrapper) Backend() string { return m.backend }
@@ -1378,12 +1385,25 @@ func (m *mountedFSWrapper) InvalidateChanged() error {
 	return m.fs.invalidateChanged()
 }
 
-func MountRepo(repo model.RepoConfig, engine *Engine, logger *slog.Logger) (MountedFS, error) {
-	return MountRepoWithGate(repo, engine, nil, logger)
+func MountRepo(ctx, opCtx context.Context, repo model.RepoConfig, engine *Engine, logger *slog.Logger) (MountedFS, error) {
+	return MountRepoWithGate(ctx, opCtx, repo, engine, nil, logger)
 }
 
-// fuseMount is fuse.Mount. Package tests replace it so they cannot mount.
-var fuseMount = fuse.Mount
+// fuseMount is fuse.MountContext. Package tests replace it so they cannot mount.
+var fuseMount = fuse.MountContext
+
+// FSName is the file system name of repo's mount, which the Linux mount
+// table lists as the mount's source.
+func FSName(repo string) string { return "artifact-fs:" + repo }
+
+// FSSubtype is the subtype of every mount, which the Linux mount table lists
+// as the type fuse.artifact-fs.
+const FSSubtype = "artifact-fs"
+
+// UnmountPath unmounts the mount at dir without the MountedFS that mounted
+// it, such as one a daemon process that stopped left behind. It does not
+// retry a busy mount.
+func UnmountPath(dir string) error { return fuse.Unmount(dir) }
 
 // newNotifier is fuse.NewNotifier. Package tests replace it to tell the
 // Notifiers of two mount attempts apart.
@@ -1477,7 +1497,11 @@ func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileS
 	return mfs, BackendKernel, nil
 }
 
-func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, logger *slog.Logger) (MountedFS, error) {
+// MountRepoWithGate mounts repo, gated by gate unless it is nil. ctx bounds
+// the wait for the mount: when it ends first, the error is an AbandonedMount.
+// opCtx is the parent of every op's context, so ending it cancels the ops in
+// flight.
+func MountRepoWithGate(ctx, opCtx context.Context, repo model.RepoConfig, engine *Engine, gate *ReadyGate, logger *slog.Logger) (MountedFS, error) {
 	backend, err := MountBackend()
 	if err != nil {
 		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
@@ -1485,10 +1509,11 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, l
 	fsint := NewArtifactFuse(repo, engine)
 
 	mountCfg := fuse.MountConfig{
-		FSName:                  "artifact-fs:" + repo.Name,
-		Subtype:                 "artifact-fs",
+		FSName:                  FSName(repo.Name),
+		Subtype:                 FSSubtype,
 		DisableWritebackCaching: true,
 		ErrorLogger:             log.New(fuseErrorLog{logger: logger, repo: repo}, "", 0),
+		OpContext:               opCtx,
 	}
 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.
 	platformMountConfig(&mountCfg)
@@ -1508,7 +1533,7 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, l
 		notifier := newNotifier()
 		notifiers[fskit] = notifier
 		server := fuse.NewServerWithNotifier(notifier, fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate)))
-		return fuseMount(repo.MountPath, server, &cfg)
+		return fuseMount(ctx, repo.MountPath, server, &cfg)
 	}
 
 	mfs, mounted, err := platformMount(backend, mount)
@@ -1517,19 +1542,7 @@ func MountRepoWithGate(repo model.RepoConfig, engine *Engine, gate *ReadyGate, l
 	}
 	fsint.setNotifier(notifiers[mounted == BackendFSKit])
 
-	return &mountedFSWrapper{MountedFileSystem: mfs, fs: fsint, mountPoint: repo.MountPath, backend: mounted}, nil
-}
-
-func TryUnmount(mountPoint string) error {
-	var err error
-	for range 20 {
-		err = fuse.Unmount(mountPoint)
-		if err == nil {
-			return nil
-		}
-		time.Sleep(time.Second)
-	}
-	return err
+	return &mountedFSWrapper{MountedFileSystem: mfs, fs: fsint, backend: mounted}, nil
 }
 
 func inodeAttrs(mode uint32, size uint64, typ string, mtime time.Time, ctime time.Time) fuseops.InodeAttributes {

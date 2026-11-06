@@ -4,6 +4,7 @@ package fusefs
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,7 +32,7 @@ func mountRepoAttempts(t *testing.T, repo model.RepoConfig, logger *slog.Logger)
 	t.Setenv(backendEnv, "")
 	var attempts []mountAttempt
 	saved := fuseMount
-	fuseMount = func(_ string, server fuse.Server, cfg *fuse.MountConfig) (*fuse.MountedFileSystem, error) {
+	fuseMount = func(_ context.Context, _ string, server fuse.Server, cfg *fuse.MountConfig) (*fuse.MountedFileSystem, error) {
 		attempts = append(attempts, mountAttempt{cfg: *cfg, server: server})
 		if cfg.Backend == fuse.BackendFSKit {
 			return nil, fuse.ErrFSKitUnavailable
@@ -39,7 +40,7 @@ func mountRepoAttempts(t *testing.T, repo model.RepoConfig, logger *slog.Logger)
 		return nil, errors.New("package tests do not mount")
 	}
 	t.Cleanup(func() { fuseMount = saved })
-	if _, err := MountRepoWithGate(repo, nil, nil, logger); err == nil {
+	if _, err := MountRepoWithGate(context.Background(), context.Background(), repo, nil, nil, logger); err == nil {
 		t.Fatal("MountRepoWithGate succeeded without a mount")
 	}
 	if len(attempts) == 0 {
@@ -135,5 +136,28 @@ func TestMountRepoLogsFuseErrorsRedacted(t *testing.T) {
 				t.Fatalf("log output %q does not redact the remote", buf.String())
 			}
 		}
+	}
+}
+
+// The mount waits only as long as ctx, and every op's context derives from
+// opCtx, so the daemon cancels a stopped runtime's ops in flight.
+func TestMountRepoBoundsTheMountAndParentsOpsOnOpContext(t *testing.T) {
+	t.Setenv(backendEnv, BackendFSKit)
+	type key struct{}
+	ctx := context.WithValue(context.Background(), key{}, "mount")
+	opCtx := context.WithValue(context.Background(), key{}, "ops")
+	saved := fuseMount
+	t.Cleanup(func() { fuseMount = saved })
+	var mountCtx, gotOpCtx context.Context
+	fuseMount = func(c context.Context, _ string, _ fuse.Server, cfg *fuse.MountConfig) (*fuse.MountedFileSystem, error) {
+		mountCtx, gotOpCtx = c, cfg.OpContext
+		return nil, errors.New("package tests do not mount")
+	}
+	repo := model.RepoConfig{Name: "repo", MountPath: t.TempDir()}
+	if _, err := MountRepoWithGate(ctx, opCtx, repo, nil, nil, slog.New(slog.DiscardHandler)); err == nil {
+		t.Fatal("MountRepoWithGate succeeded without a mount")
+	}
+	if mountCtx == nil || mountCtx.Value(key{}) != "mount" || gotOpCtx == nil || gotOpCtx.Value(key{}) != "ops" {
+		t.Fatalf("mount context %v and op context %v, want the mount bounded by ctx and ops parented on opCtx", mountCtx, gotOpCtx)
 	}
 }

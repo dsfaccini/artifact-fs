@@ -13,10 +13,19 @@ import (
 const registrySyncInterval = 3 * time.Second
 
 func (s *Service) Start(ctx context.Context) error {
-	// A record a stopped daemon left behind describes nothing this daemon serves.
-	if err := s.registry.ClearRuntime(ctx); err != nil {
+	// A record a stopped daemon left behind describes nothing this daemon
+	// serves, but names the repos whose mounts that daemon may have left.
+	previous, err := s.registry.ClearRuntime(ctx)
+	if err != nil {
 		return err
 	}
+	s.mu.Lock()
+	for _, rec := range previous {
+		if rec.State != "" && rec.State != repoStateUnmounted {
+			s.leftovers[rec.RepoID] = true
+		}
+	}
+	s.mu.Unlock()
 	// The socket only wakes the sync loop early, so the daemon runs without it.
 	control, err := s.listenControl()
 	if err != nil {
@@ -78,17 +87,29 @@ func (s *Service) syncRepos(ctx context.Context) error {
 				continue
 			}
 			s.supersedePrepare(repo.ID)
-			delete(s.mountFailures, repo.ID)
+			s.mu.Lock()
+			delete(s.mountRetries, repo.ID)
+			s.mu.Unlock()
 			running = false
 			alreadyPreparing = false
 		}
 		if running {
-			s.retryRuntimeMount(rt)
+			s.retryMount(rt)
 			s.updateRuntimeRefresh(rt, repo.RefreshInterval, repo.RemoteRefreshDisabled)
 			s.restartRunningPrepareIfCurrent(ctx, repo, rt, alreadyPreparing)
 			continue
 		}
 		if repo.PrepareState == model.PrepareStateSyncPreparing {
+			continue
+		}
+		// A remount request retries at once.
+		if !s.mountDue(repo) {
+			continue
+		}
+		// Preparation creates the mount point, which fails on a dead mount.
+		if err := s.releaseLeftoverMount(repo); err != nil {
+			s.logger.Error("repo mount failed", "repo", repo.Name, "error", auth.RedactLogString(err.Error(), repo.RemoteURL))
+			s.recordMountFailure(repo, repoStateUnmounted, err, s.backoffMount(repo))
 			continue
 		}
 		if shouldMountAsync(repo) {
@@ -103,29 +124,11 @@ func (s *Service) syncRepos(ctx context.Context) error {
 			}
 			continue
 		}
-		// A remount request retries at once.
-		if mf, ok := s.mountFailures[repo.ID]; ok && mf.request == repo.MountRequest && time.Since(mf.lastAttempt) < mf.backoff {
-			continue
-		}
 		s.logger.Info("mounting repo", "repo", repo.Name)
 		s.recordPhase(repo, phaseMount)
 		if err := s.mountRepo(ctx, repo); err != nil {
 			s.logger.Error("repo mount failed", "repo", repo.Name, "error", auth.RedactLogString(err.Error(), repo.RemoteURL))
-			mf := s.mountFailures[repo.ID]
-			if mf == nil {
-				mf = &mountFailure{}
-				s.mountFailures[repo.ID] = mf
-			}
-			mf.lastAttempt = time.Now()
-			mf.request = repo.MountRequest
-			if mf.backoff == 0 {
-				mf.backoff = 30 * time.Second
-			} else {
-				mf.backoff = min(mf.backoff*2, 5*time.Minute)
-			}
-			s.recordMountFailure(repo, repoStateUnmounted, err, mf.lastAttempt.Add(mf.backoff))
-		} else {
-			delete(s.mountFailures, repo.ID)
+			s.recordMountFailure(repo, repoStateUnmounted, err, s.backoffMount(repo))
 		}
 	}
 
@@ -142,16 +145,14 @@ func (s *Service) syncRepos(ctx context.Context) error {
 		s.logger.Info("unmounting removed repo", "repo", id)
 		if err := s.unmount(id); err != nil {
 			s.logger.Error("removed repo unmount failed", "repo", id, "error", auth.RedactLogString(err.Error()))
-			continue
-		}
-		delete(s.mountFailures, id)
-	}
-	for id := range s.mountFailures {
-		if !registered[id] {
-			delete(s.mountFailures, id)
 		}
 	}
 	s.mu.Lock()
+	for id := range s.mountRetries {
+		if _, running := s.running[id]; !registered[id] && !running {
+			delete(s.mountRetries, id)
+		}
+	}
 	var forgotten []model.RepoID
 	for id := range s.records {
 		if _, running := s.running[id]; !registered[id] && !running {

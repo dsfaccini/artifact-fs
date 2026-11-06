@@ -361,8 +361,7 @@ func (s *Service) resetRunningPrepareState(cfg model.RepoConfig) bool {
 	}
 	rt.gate.Reset()
 	rt.cfg = cfg
-	rt.state.State = model.PrepareStatePreparing
-	rt.state.PrepareError = ""
+	rt.prepare = model.PrepareStatePreparing
 	s.mu.Unlock()
 	s.recordRuntimeState(rt)
 	return true
@@ -691,9 +690,8 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	rt.cfg = cfg
 	rt.cfg.PrepareState = model.PrepareStateReady
 	rt.cfg.PrepareError = ""
-	setHeadState(&rt.state, headOID, headRef, gen)
-	rt.state.State = repoStateMounted
-	rt.state.PrepareError = ""
+	rt.head = servedHead{oid: headOID, ref: headRef, gen: gen}
+	rt.prepare = model.PrepareStateReady
 	s.mu.Unlock()
 	rt.gate.MarkReady()
 	s.recordRuntimeState(rt)
@@ -701,7 +699,7 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	return nil
 }
 
-func (s *Service) setPrepareState(ctx context.Context, cfg model.RepoConfig, state string, stateErr error) error {
+func (s *Service) setPrepareState(ctx context.Context, cfg model.RepoConfig, state model.PrepareState, stateErr error) error {
 	return s.applyPrepareState(ctx, cfg, state, stateErr, true)
 }
 
@@ -709,7 +707,7 @@ func (s *Service) setPrepareStateBeforeReadyGate(ctx context.Context, cfg model.
 	return s.applyPrepareState(ctx, cfg, model.PrepareStateReady, nil, false)
 }
 
-func (s *Service) applyPrepareState(ctx context.Context, cfg model.RepoConfig, state string, stateErr error, applyReadyRuntime bool) error {
+func (s *Service) applyPrepareState(ctx context.Context, cfg model.RepoConfig, state model.PrepareState, stateErr error, applyReadyRuntime bool) error {
 	msg := ""
 	if stateErr != nil {
 		msg = auth.RedactLogString(stateErr.Error(), cfg.RemoteURL)
@@ -726,9 +724,8 @@ func (s *Service) applyPrepareState(ctx context.Context, cfg model.RepoConfig, s
 		defer s.recordRuntimeState(rt)
 		rt.cfg.PrepareState = state
 		rt.cfg.PrepareError = msg
-		rt.state.PrepareError = msg
 		if state != model.PrepareStateReady || applyReadyRuntime {
-			rt.state.State = runtimeStateForPrepareState(state)
+			rt.prepare = state
 		}
 		if rt.gate != nil {
 			switch state {
@@ -763,7 +760,7 @@ func isAsyncRepo(cfg model.RepoConfig) bool {
 	if cfg.PreparedGitDir {
 		return true
 	}
-	switch strings.TrimSpace(cfg.PrepareState) {
+	switch cfg.PrepareState {
 	case model.PrepareStatePreparing, model.PrepareStateReady, model.PrepareStateFailed:
 		return true
 	default:
@@ -775,20 +772,13 @@ func shouldMountAsync(cfg model.RepoConfig) bool {
 	return isPendingOrFailedPrepareState(cfg.PrepareState)
 }
 
-func isPendingOrFailedPrepareState(state string) bool {
-	switch strings.TrimSpace(state) {
+func isPendingOrFailedPrepareState(state model.PrepareState) bool {
+	switch state {
 	case model.PrepareStatePreparing, model.PrepareStateFailed:
 		return true
 	default:
 		return false
 	}
-}
-
-func runtimeStateForPrepareState(state string) string {
-	if state == model.PrepareStateReady {
-		return repoStateMounted
-	}
-	return state
 }
 
 func prepareGateError(msg string) error {

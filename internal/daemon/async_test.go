@@ -145,7 +145,7 @@ func TestSyncRegistrationIsNotMountedWhilePreparing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.State != model.PrepareStatePreparing {
+	if status.State != string(model.PrepareStatePreparing) {
 		t.Fatalf("status state = %q, want preparing", status.State)
 	}
 	if err := svc.syncRepos(ctx); err != nil {
@@ -443,11 +443,7 @@ func TestSyncReposSkipsResetWhilePrepareWorkerInFlight(t *testing.T) {
 		cfg:    cfg,
 		gate:   gate,
 		active: true,
-		state: model.RepoRuntimeState{
-			RepoID:       cfg.ID,
-			State:        repoStateMounted,
-			PrepareError: "",
-		},
+		mount:  mountServing,
 	}
 	svc.mu.Lock()
 	svc.running[cfg.ID] = rt
@@ -457,8 +453,8 @@ func TestSyncReposSkipsResetWhilePrepareWorkerInFlight(t *testing.T) {
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if rt.state.State != repoStateMounted {
-		t.Fatalf("runtime state = %q, want mounted", rt.state.State)
+	if got := rt.reportedState(); got != repoStateMounted {
+		t.Fatalf("runtime state = %q, want mounted", got)
 	}
 	if err := gate.Wait(ctx); err != nil {
 		t.Fatalf("gate was reset while prepare worker was in flight: %v", err)
@@ -504,18 +500,15 @@ func TestRestartRunningPrepareSkipsStalePreparingSnapshot(t *testing.T) {
 		cfg:    latest,
 		gate:   gate,
 		active: true,
-		state: model.RepoRuntimeState{
-			RepoID: latest.ID,
-			State:  repoStateMounted,
-		},
+		mount:  mountServing,
 	}
 	svc.mu.Lock()
 	svc.running[latest.ID] = rt
 	svc.mu.Unlock()
 
 	svc.restartRunningPrepareIfCurrent(ctx, stale, rt, false)
-	if rt.state.State != repoStateMounted {
-		t.Fatalf("runtime state = %q, want mounted", rt.state.State)
+	if got := rt.reportedState(); got != repoStateMounted {
+		t.Fatalf("runtime state = %q, want mounted", got)
 	}
 	if err := gate.Wait(ctx); err != nil {
 		t.Fatalf("gate was reset from stale registry snapshot: %v", err)
@@ -1343,7 +1336,7 @@ func TestRunPrepareDoesNotOpenGateWhenReadyPersistenceFails(t *testing.T) {
 	}
 	defer db.Close()
 	if _, err := db.ExecContext(ctx, `CREATE TRIGGER reject_ready BEFORE UPDATE OF prepare_state ON repos
-		WHEN NEW.prepare_state = '`+model.PrepareStateReady+`' BEGIN SELECT RAISE(ABORT, '`+writeErr+`'); END`); err != nil {
+		WHEN NEW.prepare_state = '`+string(model.PrepareStateReady)+`' BEGIN SELECT RAISE(ABORT, '`+writeErr+`'); END`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1577,7 +1570,7 @@ func expirePrepareOnFile(svc *Service, path string) {
 	}
 }
 
-func waitForPrepareState(t *testing.T, svc *Service, name string, state string) model.RepoConfig {
+func waitForPrepareState(t *testing.T, svc *Service, name string, state model.PrepareState) model.RepoConfig {
 	t.Helper()
 	var got model.RepoConfig
 	waitFor(t, nil, func() bool {

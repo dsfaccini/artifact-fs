@@ -107,11 +107,11 @@ func newCacheFixtureOn(t *testing.T, backend string, nodes ...model.BaseNode) *c
 
 	t.Setenv(backendEnv, backend)
 	saved := fuseMount
-	fuseMount = func(string, fuse.Server, *fuse.MountConfig) (*fuse.MountedFileSystem, error) {
+	fuseMount = func(context.Context, string, fuse.Server, *fuse.MountConfig) (*fuse.MountedFileSystem, error) {
 		return &fuse.MountedFileSystem{}, nil
 	}
 	t.Cleanup(func() { fuseMount = saved })
-	f.mount, err = MountRepoWithGate(repo, engine, nil, slog.New(slog.DiscardHandler))
+	f.mount, err = MountRepoWithGate(context.Background(), context.Background(), repo, engine, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}

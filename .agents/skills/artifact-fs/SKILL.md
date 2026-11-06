@@ -23,7 +23,7 @@ go build -o artifact-fs ./cmd/artifact-fs
 - **`add-repo` does not mount.** It registers a blobless clone and exits. `daemon` mounts all registered repos and stays running.
 - **The mounted tree starts from committed Git state.** Remote commits, trees, and refs are the base view. Local edits live in an overlay and appear as dirty state until committed.
 - **One daemon can mount many repos.** Register each repo separately, then start one `daemon --root <mount-root>`. A second daemon on the same `ARTIFACT_FS_ROOT` exits with an error.
-- **Unmount a stale mount with the OS's tool.** A stale mount is one no running daemon serves, so `unmount` cannot reach it. On macOS run `diskutil unmount <path>`, because `umount` fails on an FSKit mount unless the terminal app has the Network Volumes permission. On Linux run `fusermount3 -u <path>`, because `umount` needs root.
+- **Unmount a stale mount with the OS's tool.** A stale mount is one no running daemon serves, so `unmount` cannot reach it. A daemon that starts on the same state root unmounts the stale mounts the stopped daemon left at its repos' mount points. Without a daemon, on macOS run `diskutil unmount <path>`, because `umount` fails on an FSKit mount unless the terminal app has the Network Volumes permission. On Linux run `fusermount3 -u <path>`, because `umount` needs root.
 
 ## Quick Reference
 
