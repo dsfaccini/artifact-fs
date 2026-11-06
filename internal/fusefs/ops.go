@@ -414,9 +414,17 @@ func (e *Engine) Sync(ctx context.Context, path string) error {
 	return e.Overlay.SyncFile(ctx, path)
 }
 
+// Create makes an empty file at path. A name that exists in the merged view
+// returns fs.ErrExist and stays untouched: the kernel can send CREATE for a
+// name that appeared after its lookup missed, such as after a HEAD change.
 func (e *Engine) Create(ctx context.Context, path string, mode uint32) error {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
+	if _, err := e.Resolver.resolvePath(path); err == nil {
+		return fs.ErrExist
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	_, err := e.Overlay.CreateFile(ctx, path, mode)
 	return err
 }

@@ -74,8 +74,8 @@ file system extension is missing or not enabled. `auto` does not fall back after
 any other FSKit failure, because a retry could mount twice. The daemon logs the
 transport that mounted each repo.
 
-FSKit reuses directory handles across enumerations, so this backend refreshes
-entries when enumeration restarts. Both macOS backends reject extended
+FSKit reuses directory handles across enumerations. Every backend lists a
+directory again when an enumeration restarts. Both macOS backends reject extended
 attributes, so macOS writes no AppleDouble `._` files to store them. macOS
 attaches extended attributes such as `com.apple.provenance` to nearly every local
 file, so copying files onto the mount with `cp` or `ditto` may fail; `cp -X`
