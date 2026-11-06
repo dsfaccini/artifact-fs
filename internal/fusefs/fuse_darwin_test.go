@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/dsfaccini/fuse"
+	"github.com/dsfaccini/fuse/fuseops"
 )
 
 func setMacFUSEKextLoaded(t *testing.T, loaded bool) {
@@ -43,5 +44,18 @@ func TestPlatformMountReachesFSKit(t *testing.T) {
 			})
 			assertMountResult(t, mounts, backend, err, test.wantMounts, test.wantBackend, test.wantErr)
 		})
+	}
+}
+
+// FSKit takes no invalidations, so a mount through it sends none.
+func TestInvalidateChangedSendsNothingOnFSKit(t *testing.T) {
+	f := newCacheFixtureOn(t, BackendFSKit, baseFile("file.txt", "old", 0o100644))
+	f.lookup(fuseops.RootInodeID, "file.txt")
+	f.switchTo()
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if inodes, entries := f.notifier.recorded(); len(inodes) != 0 || len(entries) != 0 {
+		t.Fatalf("FSKit mount sent invalidations: inodes %v, entries %v", inodes, entries)
 	}
 }

@@ -27,3 +27,14 @@ func TestSetXattrIsUnsupported(t *testing.T) {
 		t.Fatalf("SetXattr = %v, want ENOSYS", got)
 	}
 }
+
+// With DisableWritebackCaching, FUSE_AUTO_INVAL_DATA makes the kernel drop a
+// file's cached pages when its mtime changes, not only its size.
+func TestMountRepoEnablesAutoInvalData(t *testing.T) {
+	repo := model.RepoConfig{Name: "repo", MountPath: t.TempDir()}
+	for _, cfg := range mountRepoConfigs(t, repo, slog.New(slog.DiscardHandler)) {
+		if !cfg.EnableAutoInvalData || !cfg.DisableWritebackCaching {
+			t.Fatalf("mount config: EnableAutoInvalData %t, DisableWritebackCaching %t; want both", cfg.EnableAutoInvalData, cfg.DisableWritebackCaching)
+		}
+	}
+}

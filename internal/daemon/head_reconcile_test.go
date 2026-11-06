@@ -48,6 +48,7 @@ type delayedUnmountFailure struct {
 }
 
 func (m *delayedUnmountFailure) Backend() string            { return "fake" }
+func (m *delayedUnmountFailure) InvalidateChanged() error   { return nil }
 func (m *delayedUnmountFailure) Join(context.Context) error { return nil }
 
 func (m *delayedUnmountFailure) Unmount() error {
@@ -503,5 +504,83 @@ func TestHeadReconcileServesReadsMatchingReportedSize(t *testing.T) {
 	}
 	if got := read(inode, open(inode)); got != "next\n" || uint64(len(got)) != reported {
 		t.Errorf("read through handle opened after getattr = %q, want the new content getattr sized at %d bytes", got, reported)
+	}
+}
+
+// invalidatingMount records the generation the resolver serves each time the
+// daemon asks the mount to invalidate the kernel's caches.
+type invalidatingMount struct {
+	*fakeMountedFS
+	resolver *fusefs.Resolver
+	gens     chan int64
+}
+
+func (m *invalidatingMount) InvalidateChanged() error {
+	m.gens <- m.resolver.Generation()
+	return nil
+}
+
+func TestHeadReconcileInvalidatesKernelCacheAfterSwitch(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	mount := &invalidatingMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, resolver: f.rt.resolver, gens: make(chan int64, 1)}
+	f.svc.mu.Lock()
+	f.rt.mfs = mount
+	f.svc.mu.Unlock()
+
+	f.updateMain(f.nextOID)
+	f.signal()
+	if gen := <-mount.gens; gen != f.oldGen+1 {
+		t.Fatalf("mount invalidated while the resolver served generation %d, want the new generation %d", gen, f.oldGen+1)
+	}
+}
+
+// An inode whose attributes came from a generation keeps reading it after two
+// switches inside the retention window. Once the window lapses, the next
+// switch prunes it.
+func TestHeadReconcileKeepsRetiredGenerationReadable(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		retention time.Duration
+		want      string
+	}{
+		{name: "within retention", retention: time.Hour, want: "old\n"},
+		{name: "after retention", retention: time.Nanosecond, want: "last\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newHeadReconcileFixture(t)
+			f.svc.generationRetention = tt.retention
+			repo := f.rt.cfg
+			repo.BlobCacheDir = t.TempDir()
+			h := hydrator.New(f.svc.git)
+			h.Start(1, repo)
+			t.Cleanup(h.Stop)
+			fs := fusefs.NewArtifactFuse(repo, &fusefs.Engine{Resolver: f.rt.resolver, Repo: repo, Overlay: f.rt.overlay, Hydrator: h})
+			lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "README.md"}
+			if err := fs.LookUpInode(f.ctx, lookup); err != nil {
+				t.Fatalf("LookUpInode: %v", err)
+			}
+
+			f.updateMain(f.nextOID)
+			f.signal()
+			f.waitForHead(f.nextOID, "main", f.oldGen+1)
+			f.updateMain(f.lastOID)
+			f.signal()
+			f.waitForHead(f.lastOID, "main", f.oldGen+2)
+
+			open := &fuseops.OpenFileOp{Inode: lookup.Entry.Child}
+			if err := fs.OpenFile(f.ctx, open); err != nil {
+				t.Fatalf("OpenFile: %v", err)
+			}
+			t.Cleanup(func() {
+				_ = fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: open.Handle})
+			})
+			read := &fuseops.ReadFileOp{Inode: lookup.Entry.Child, Handle: open.Handle, Size: 64}
+			if err := fs.ReadFile(f.ctx, read); err != nil {
+				t.Fatalf("ReadFile: %v", err)
+			}
+			if got := string(bytes.Join(read.Data, nil)); got != tt.want {
+				t.Fatalf("read through the inode looked up before both switches = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

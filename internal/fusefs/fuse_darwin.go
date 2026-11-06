@@ -12,6 +12,14 @@ import (
 // write instead.
 const setXattrErrno = syscall.EPERM
 
+// negativeLookupEntries is off: the kernel extension mounts with novncache,
+// which disables its name cache, and FSKit takes no invalidations to drop a
+// negative entry when the name appears.
+const negativeLookupEntries = false
+
+// keepBasePageCache is off: every open drops the file's cached pages.
+const keepBasePageCache = false
+
 func platformMountConfig(cfg *fuse.MountConfig) {
 	// noappledouble would make the kernel extension hide tracked ._ and
 	// .DS_Store files.

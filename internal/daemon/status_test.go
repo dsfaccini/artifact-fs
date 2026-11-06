@@ -408,7 +408,8 @@ func (m *blockingMountedFS) Join(ctx context.Context) error {
 	}
 }
 
-func (m *blockingMountedFS) Backend() string { return "fake" }
+func (m *blockingMountedFS) Backend() string          { return "fake" }
+func (m *blockingMountedFS) InvalidateChanged() error { return nil }
 
 func (m *blockingMountedFS) Unmount() error { return m.unmountErr }
 
