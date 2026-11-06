@@ -236,31 +236,39 @@ func (s *Store) RequestMount(ctx context.Context, repoID model.RepoID, enabled b
 // PutRuntime replaces the daemon's record of rec.RepoID.
 func (s *Store) PutRuntime(ctx context.Context, rec model.RepoRuntimeRecord) error {
 	_, err := s.db.ExecContext(ctx, `
-	INSERT OR REPLACE INTO repo_runtime (repo_id, state, phase, last_error, last_error_phase, last_error_at_ns, next_retry_at_ns, attempts, served_generation, served_commit, served_ref, last_fetch_at_ns, last_fetch_result, ahead, behind, diverged, mount_request, updated_at_ns)
+	INSERT OR REPLACE INTO repo_runtime (`+runtimeColumns+`)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, string(rec.RepoID), rec.State, rec.Phase, rec.LastError, rec.LastErrorPhase, unixNano(rec.LastErrorAt), unixNano(rec.NextRetryAt), rec.Attempts, rec.ServedGeneration, rec.ServedCommit, rec.ServedRef, unixNano(rec.LastFetchAt), rec.LastFetchResult, rec.AheadCount, rec.BehindCount, boolToInt(rec.Diverged), rec.MountRequest, time.Now().UnixNano())
 	return err
 }
 
+const runtimeColumns = `repo_id, state, phase, last_error, last_error_phase, last_error_at_ns, next_retry_at_ns, attempts, served_generation, served_commit, served_ref, last_fetch_at_ns, last_fetch_result, ahead, behind, diverged, mount_request, updated_at_ns`
+
 // GetRuntime returns the daemon's record of repoID, and false when it has none.
 func (s *Store) GetRuntime(ctx context.Context, repoID model.RepoID) (model.RepoRuntimeRecord, bool, error) {
-	var rec model.RepoRuntimeRecord
-	var lastErrorAt, nextRetryAt, lastFetchAt, updatedAt int64
-	var diverged int
-	err := s.db.QueryRowContext(ctx, `SELECT repo_id, state, phase, last_error, last_error_phase, last_error_at_ns, next_retry_at_ns, attempts, served_generation, served_commit, served_ref, last_fetch_at_ns, last_fetch_result, ahead, behind, diverged, mount_request, updated_at_ns FROM repo_runtime WHERE repo_id=?`, string(repoID)).
-		Scan(&rec.RepoID, &rec.State, &rec.Phase, &rec.LastError, &rec.LastErrorPhase, &lastErrorAt, &nextRetryAt, &rec.Attempts, &rec.ServedGeneration, &rec.ServedCommit, &rec.ServedRef, &lastFetchAt, &rec.LastFetchResult, &rec.AheadCount, &rec.BehindCount, &diverged, &rec.MountRequest, &updatedAt)
+	rec, err := scanRuntime(s.db.QueryRowContext(ctx, `SELECT `+runtimeColumns+` FROM repo_runtime WHERE repo_id=?`, string(repoID)))
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.RepoRuntimeRecord{}, false, nil
 	}
 	if err != nil {
 		return model.RepoRuntimeRecord{}, false, err
 	}
+	return rec, true, nil
+}
+
+func scanRuntime(row interface{ Scan(...any) error }) (model.RepoRuntimeRecord, error) {
+	var rec model.RepoRuntimeRecord
+	var lastErrorAt, nextRetryAt, lastFetchAt, updatedAt int64
+	var diverged int
+	if err := row.Scan(&rec.RepoID, &rec.State, &rec.Phase, &rec.LastError, &rec.LastErrorPhase, &lastErrorAt, &nextRetryAt, &rec.Attempts, &rec.ServedGeneration, &rec.ServedCommit, &rec.ServedRef, &lastFetchAt, &rec.LastFetchResult, &rec.AheadCount, &rec.BehindCount, &diverged, &rec.MountRequest, &updatedAt); err != nil {
+		return model.RepoRuntimeRecord{}, err
+	}
 	rec.LastErrorAt = fromUnixNano(lastErrorAt)
 	rec.NextRetryAt = fromUnixNano(nextRetryAt)
 	rec.LastFetchAt = fromUnixNano(lastFetchAt)
 	rec.UpdatedAt = fromUnixNano(updatedAt)
 	rec.Diverged = diverged == 1
-	return rec, true, nil
+	return rec, nil
 }
 
 // DeleteRuntime removes the daemon's record of repoID.
@@ -269,11 +277,38 @@ func (s *Store) DeleteRuntime(ctx context.Context, repoID model.RepoID) error {
 	return err
 }
 
-// ClearRuntime removes every daemon record. A starting daemon serves nothing
-// yet, so a record a stopped daemon left behind is stale.
-func (s *Store) ClearRuntime(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM repo_runtime`)
-	return err
+// ClearRuntime removes every daemon record and returns them. A starting
+// daemon serves nothing yet, so a record a stopped daemon left behind is
+// stale, but it tells which repos that daemon ran.
+func (s *Store) ClearRuntime(ctx context.Context) ([]model.RepoRuntimeRecord, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT `+runtimeColumns+` FROM repo_runtime ORDER BY repo_id`)
+	if err != nil {
+		return nil, err
+	}
+	var recs []model.RepoRuntimeRecord
+	for rows.Next() {
+		rec, err := scanRuntime(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		recs = append(recs, rec)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM repo_runtime`); err != nil {
+		return nil, err
+	}
+	return recs, tx.Commit()
 }
 
 func unixNano(t time.Time) int64 {

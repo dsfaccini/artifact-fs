@@ -157,52 +157,59 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 	return nil
 }
 
+// mountEntry is what the mount table lists for a mount point: the mount's
+// source and its file system type.
+type mountEntry struct {
+	source string
+	fstype string
+}
+
 // isMounted reports whether path is an active mount point, and false when it cannot tell.
 func isMounted(path string) bool {
-	_, mounted, _ := mountTableSource(path)
+	_, mounted, _ := mountTableEntry(path)
 	return mounted
 }
 
 // mountPointHeld reports whether path still holds a mount, and true when it
 // cannot tell.
 func mountPointHeld(path string) bool {
-	_, held := mountPointSource(path)
+	_, held := mountPointEntry(path)
 	return held
 }
 
-// mountPointSource reports whether path still holds a mount, and true when it
-// cannot tell, with the source the mount table names for that mount. The
-// mount table lists absolute resolved paths, so it looks up path with its
-// parent's symlinks resolved. Only when the table does not list it does it
-// touch path itself, to resolve a symlinked final component; a dead mount
-// point can fail with ENOTCONN.
-func mountPointSource(path string) (string, bool) {
+// mountPointEntry reports whether path still holds a mount, and true when it
+// cannot tell, with what the mount table lists for that mount. The mount
+// table lists absolute resolved paths, so it looks up path with its parent's
+// symlinks resolved. Only when the table does not list it does it touch path
+// itself, to resolve a symlinked final component; a dead mount point can fail
+// with ENOTCONN.
+func mountPointEntry(path string) (mountEntry, bool) {
 	path, err := filepath.Abs(path)
 	if err != nil {
-		return "", true
+		return mountEntry{}, true
 	}
 	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
 	if err != nil {
-		return "", true
+		return mountEntry{}, true
 	}
 	path = filepath.Join(parent, filepath.Base(path))
-	if source, mounted, err := mountTableSource(path); mounted || err != nil {
-		return source, true
+	if entry, mounted, err := mountTableEntry(path); mounted || err != nil {
+		return entry, true
 	}
 	fi, err := os.Lstat(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return "", false
+		return mountEntry{}, false
 	}
 	if err != nil {
-		return "", true
+		return mountEntry{}, true
 	}
 	if fi.Mode()&os.ModeSymlink == 0 {
-		return "", false
+		return mountEntry{}, false
 	}
 	target, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return "", true
+		return mountEntry{}, true
 	}
-	source, mounted, err := mountTableSource(target)
-	return source, mounted || err != nil
+	entry, mounted, err := mountTableEntry(target)
+	return entry, mounted || err != nil
 }

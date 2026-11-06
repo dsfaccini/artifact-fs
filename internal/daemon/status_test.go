@@ -416,7 +416,7 @@ func TestJoinRuntimeMountIsNotCanceledWithWorkers(t *testing.T) {
 		runtimeCtx, cancel := context.WithCancel(context.Background())
 		mfs := &blockingMountedFS{started: make(chan context.Context, 1), release: make(chan struct{})}
 		rt := &repoRuntime{ctx: runtimeCtx, mfs: mfs, mount: mountServing, stopping: true}
-		svc := &Service{mountPointSource: func(string) (string, bool) { return "", false }}
+		svc := &Service{mountPointEntry: func(string) (mountEntry, bool) { return mountEntry{}, false }}
 		svc.joinMount(rt, mfs)
 		joinCtx := <-mfs.started
 		cancel()
@@ -438,7 +438,7 @@ func TestStopRuntimeKeepsWorkersAliveWhenUnmountFails(t *testing.T) {
 		mount:  mountServing,
 		cfg:    model.RepoConfig{Name: "repo"},
 	}
-	if err := (&Service{unmounting: map[model.RepoID]*unmountOp{}}).stopRuntime(rt); err == nil {
+	if err := (&Service{unmounting: map[model.RepoID]*unmountOp{}, mountPointEntry: heldMountPoint}).stopRuntime(rt); err == nil {
 		t.Fatal("expected unmount failure")
 	}
 	if err := runtimeCtx.Err(); err != nil {

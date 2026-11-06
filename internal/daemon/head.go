@@ -111,10 +111,11 @@ func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, co
 	s.mu.Lock()
 	mfs := rt.mfs
 	serving := rt.mount == mountServing
+	name := rt.cfg.Name
 	s.mu.Unlock()
 	if serving {
 		if err := mfs.InvalidateChanged(); err != nil {
-			s.logger.Warn("kernel cache invalidation failed", "repo", rt.cfg.Name, "error", err)
+			s.logger.Warn("kernel cache invalidation failed", "repo", name, "error", err)
 		}
 	}
 	return nil

@@ -7,15 +7,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/metatest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -82,24 +85,24 @@ func TestHangingUnmountStallsOnlyItsRepo(t *testing.T) {
 }
 
 // recordingMountTable stands in for the kernel's mount table: it lists a
-// mount with source at path until something unmounts path.
+// mount of type fstype at path until something unmounts path.
 type recordingMountTable struct {
 	mu     sync.Mutex
 	path   string
-	source string
+	fstype string
 	held   bool
 	// unmountErr fails every unmount, which leaves the mount listed.
 	unmountErr error
 	calls      []string
 }
 
-func (m *recordingMountTable) mountPointSource(path string) (string, bool) {
+func (m *recordingMountTable) mountPointEntry(path string) (mountEntry, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if path == m.path && m.held {
-		return m.source, true
+		return mountEntry{source: "macfuse://2E221B83-5BAF-4BA5-83B4-4CBE7746AB82", fstype: m.fstype}, true
 	}
-	return "", false
+	return mountEntry{}, false
 }
 
 func (m *recordingMountTable) unmountPath(path string) error {
@@ -128,35 +131,64 @@ func (m *recordingMountTable) recorded() []string {
 	return slices.Clone(m.calls)
 }
 
-// A mount that a daemon process which stopped without unmounting left at a
-// repo's mount point is unmounted before the daemon mounts the repo, so the
-// new mount never lands on top of it. Any other mount stays.
-func TestSyncUnmountsAMountAnEarlierDaemonLeft(t *testing.T) {
+// ownFUSEType is the file system type the mount table lists for one of the
+// daemon's mounts on this OS.
+func ownFUSEType() string {
+	if runtime.GOOS == "darwin" {
+		return "macfuse"
+	}
+	return "fuse.artifact-fs"
+}
+
+// A FUSE mount at the mount point of a repo that the daemon process before
+// this one ran is the mount that process left, whatever source the mount
+// table names for it. The daemon unmounts it before it mounts the repo, so
+// the new mount never lands on top of it. Any other mount stays: a mount
+// that is not FUSE, and a FUSE mount of a repo the earlier daemon did not
+// run, such as a daemon's on another state root.
+func TestStartUnmountsAMountTheEarlierDaemonLeft(t *testing.T) {
 	for _, tt := range []struct {
 		name       string
-		source     string
+		recorded   string
+		fstype     string
 		unmountErr error
 		wantCalls  func(path string) []string
-		wantState  string
 	}{
 		{
-			name:      "left by a daemon",
-			source:    fusefs.FSName("repo"),
+			name:      "left by the earlier daemon",
+			recorded:  repoStateMounted,
+			fstype:    ownFUSEType(),
 			wantCalls: func(path string) []string { return []string{"unmount " + path, "mount"} },
-			wantState: repoStateMounted,
+		},
+		{
+			name:      "left by the earlier daemon while degraded",
+			recorded:  repoStateDegraded,
+			fstype:    ownFUSEType(),
+			wantCalls: func(path string) []string { return []string{"unmount " + path, "mount"} },
 		},
 		{
 			name:       "unmount fails",
-			source:     fusefs.FSName("repo"),
+			recorded:   repoStateMounted,
+			fstype:     ownFUSEType(),
 			unmountErr: errors.New("busy"),
 			wantCalls:  func(path string) []string { return []string{"unmount " + path} },
-			wantState:  repoStateUnmounted,
+		},
+		{
+			name:      "repo the earlier daemon had unmounted",
+			recorded:  repoStateUnmounted,
+			fstype:    ownFUSEType(),
+			wantCalls: func(string) []string { return []string{"mount"} },
+		},
+		{
+			name:      "repo the earlier daemon did not run",
+			fstype:    ownFUSEType(),
+			wantCalls: func(string) []string { return []string{"mount"} },
 		},
 		{
 			name:      "another file system",
-			source:    "/dev/disk3s1",
+			recorded:  repoStateMounted,
+			fstype:    "apfs",
 			wantCalls: func(string) []string { return []string{"mount"} },
-			wantState: repoStateMounted,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -166,25 +198,32 @@ func TestSyncUnmountsAMountAnEarlierDaemonLeft(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			table := &recordingMountTable{path: cfg.MountPath, source: tt.source, held: true, unmountErr: tt.unmountErr}
-			svc.mountPointSource = table.mountPointSource
+			if tt.recorded != "" {
+				if err := svc.registry.PutRuntime(ctx, model.RepoRuntimeRecord{RepoID: cfg.ID, State: tt.recorded, Phase: phaseServe}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			table := &recordingMountTable{path: cfg.MountPath, fstype: tt.fstype, held: true, unmountErr: tt.unmountErr}
+			svc.mountPointEntry = table.mountPointEntry
 			svc.unmountPath = table.unmountPath
 			svc.mount = table.mount
-			if err := svc.syncRepos(ctx); err != nil {
-				t.Fatal(err)
-			}
-			if got, want := table.recorded(), tt.wantCalls(cfg.MountPath); !slices.Equal(got, want) {
-				t.Fatalf("calls = %q, want %q", got, want)
-			}
-			st, err := ctl.Status(ctx, "repo")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if st.State != tt.wantState {
-				t.Fatalf("state = %q, want %q", st.State, tt.wantState)
-			}
+			done := startService(t, svc)
+			want := tt.wantCalls(cfg.MountPath)
+			waitFor(t, done, func() bool { return len(table.recorded()) >= len(want) })
 			if tt.unmountErr != nil {
+				waitFor(t, done, func() bool {
+					st, err := ctl.Status(ctx, "repo")
+					return err == nil && st.LastErrorPhase == phaseMount
+				})
 				requireFailure(t, ctl, phaseMount, "busy")
+			} else {
+				waitFor(t, done, func() bool {
+					st, err := ctl.Status(ctx, "repo")
+					return err == nil && st.State == repoStateMounted
+				})
+			}
+			if got := table.recorded(); !slices.Equal(got, want) {
+				t.Fatalf("calls = %q, want %q", got, want)
 			}
 		})
 	}
@@ -195,6 +234,7 @@ func TestSyncUnmountsAMountAnEarlierDaemonLeft(t *testing.T) {
 // race detector reports the unlocked read.
 func TestStopReadsTheConfigUnderTheLock(t *testing.T) {
 	svc, _ := newSyncedDaemon(t)
+	svc.mountPointEntry = heldMountPoint
 	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("busy")}
 	t.Cleanup(func() { close(mfs.exit) })
 	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
@@ -536,5 +576,257 @@ func TestAdoptedMountRetryRefusesANonEmptyMountPoint(t *testing.T) {
 	}
 	if mounts.Load() != 1 || st.LastErrorPhase != phaseMount || !strings.Contains(st.LastError, "adopted mountpoint must be empty") {
 		t.Fatalf("after a native file appeared: %d mounts, status %+v; want no second mount and the mount failure", mounts.Load(), st)
+	}
+}
+
+// failedCleanupAbandonedMount is an abandoned mount that completed late and
+// whose force-unmount failed, so its mount stays at the mount point.
+type failedCleanupAbandonedMount struct{ ctxErr error }
+
+func (e *failedCleanupAbandonedMount) Error() string { return "mount abandoned: " + e.ctxErr.Error() }
+
+func (e *failedCleanupAbandonedMount) Unwrap() error { return e.ctxErr }
+
+func (e *failedCleanupAbandonedMount) Wait(context.Context) error {
+	return errors.New("unmounting the abandoned mount: resource busy")
+}
+
+// An abandoned mount whose cleanup failed stays at the mount point, and the
+// mount table names it macfuse://<UUID> on FSKit. The daemon unmounts the
+// mount point by path before it mounts again, and mounts nothing while that
+// unmount fails.
+func TestAbandonedMountLeftInPlaceIsUnmountedBeforeTheNextMount(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		unmountErr error
+		wantCalls  func(path string) []string
+	}{
+		{name: "unmount succeeds", wantCalls: func(path string) []string { return []string{"mount", "unmount " + path, "mount"} }},
+		{name: "unmount fails", unmountErr: errors.New("busy"), wantCalls: func(path string) []string { return []string{"mount", "unmount " + path} }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, ctl := newSyncedDaemon(t)
+			ctx := context.Background()
+			cfg, err := svc.registry.GetRepo(ctx, "repo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			table := &recordingMountTable{path: cfg.MountPath, fstype: ownFUSEType(), unmountErr: tt.unmountErr}
+			svc.mountPointEntry = table.mountPointEntry
+			svc.unmountPath = table.unmountPath
+			svc.mountTimeout = time.Millisecond
+			var mounts atomic.Int32
+			svc.mount = func(ctx, opCtx context.Context, c model.RepoConfig, e *fusefs.Engine, g *fusefs.ReadyGate, l *slog.Logger) (fusefs.MountedFS, error) {
+				if mounts.Add(1) > 1 {
+					return table.mount(ctx, opCtx, c, e, g, l)
+				}
+				table.mu.Lock()
+				table.calls = append(table.calls, "mount")
+				table.mu.Unlock()
+				<-ctx.Done()
+				// The late mount lands and its cleanup fails: the table lists it.
+				table.mu.Lock()
+				table.held = true
+				table.mu.Unlock()
+				return nil, &failedCleanupAbandonedMount{ctxErr: ctx.Err()}
+			}
+			for range 2 {
+				if err := svc.syncRepos(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got, want := table.recorded(), tt.wantCalls(cfg.MountPath); !slices.Equal(got, want) {
+				t.Fatalf("calls = %q, want %q", got, want)
+			}
+			if tt.unmountErr != nil {
+				requireFailure(t, ctl, phaseMount, "busy")
+			}
+		})
+	}
+}
+
+// opCtxAtUnmount is a live mount that records whether its op context was
+// already cancelled when the daemon unmounted it.
+type opCtxAtUnmount struct {
+	*fakeMountedFS
+	opCtx context.Context
+	// cancelled holds the op context's state at the unmount; nil before it.
+	cancelled atomic.Pointer[bool]
+}
+
+func (m *opCtxAtUnmount) Unmount(ctx context.Context) error {
+	cancelled := m.opCtx.Err() != nil
+	m.cancelled.Store(&cancelled)
+	return m.fakeMountedFS.Unmount(ctx)
+}
+
+// A shutdown cancels Start's context before Close stops each repo. The ops
+// in flight stay live until the unmount, as for any other stop.
+func TestShutdownUnmountsBeforeCancellingOps(t *testing.T) {
+	svc, _ := newSyncedDaemon(t)
+	ctx := context.Background()
+	var mount atomic.Pointer[opCtxAtUnmount]
+	svc.mount = func(_, opCtx context.Context, _ model.RepoConfig, _ *fusefs.Engine, _ *fusefs.ReadyGate, _ *slog.Logger) (fusefs.MountedFS, error) {
+		m := &opCtxAtUnmount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, opCtx: opCtx}
+		mount.Store(m)
+		return m, nil
+	}
+	startCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- svc.Start(startCtx) }()
+	waitFor(t, done, func() bool { return mount.Load() != nil })
+	// SIGINT and SIGTERM cancel Start's context; the daemon command then
+	// runs Close.
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start = %v, want context canceled", err)
+	}
+	if err := svc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m := mount.Load()
+	if cancelled := m.cancelled.Load(); cancelled == nil || *cancelled {
+		t.Fatalf("op context cancelled at the shutdown's unmount = %v, want live (nil means no unmount)", cancelled)
+	}
+	if m.opCtx.Err() == nil {
+		t.Fatal("op context still live after the shutdown")
+	}
+}
+
+// The refresh backoff doubles from twice the interval up to fetchRetryMax,
+// or up to an interval longer than that.
+func TestRefreshRetrierBacksOffFromTheInterval(t *testing.T) {
+	for _, tt := range []struct {
+		interval time.Duration
+		want     []time.Duration
+	}{
+		{30 * time.Second, []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 10 * time.Minute}},
+		{4 * time.Minute, []time.Duration{8 * time.Minute, 10 * time.Minute, 10 * time.Minute}},
+		{6 * time.Minute, []time.Duration{10 * time.Minute, 10 * time.Minute}},
+		{20 * time.Minute, []time.Duration{20 * time.Minute, 20 * time.Minute}},
+	} {
+		r := newRefreshRetrier(tt.interval)
+		now := time.Unix(0, 0)
+		var got []time.Duration
+		for range tt.want {
+			got = append(got, r.fail(now).Sub(now))
+		}
+		if !slices.Equal(got, tt.want) {
+			t.Errorf("refresh every %s: delays %v, want %v", tt.interval, got, tt.want)
+		}
+	}
+}
+
+// While the dead mount's unmount has not returned, status shows the mount
+// waiting for it, retried at the next sync.
+func TestStatusShowsAMountWaitingForAnUnmount(t *testing.T) {
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	hanging := &hangingUnmountMount{fail: make(chan struct{}), release: make(chan struct{}), entered: make(chan struct{})}
+	t.Cleanup(func() { close(hanging.release) })
+	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+		return hanging, nil
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	close(hanging.fail)
+	<-hanging.entered
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st := requireFailure(t, ctl, phaseMount, errUnmountInProgress.Error())
+	if !st.NextRetryAt.After(st.LastErrorAt) || st.NextRetryAt.Sub(st.LastErrorAt) > registrySyncInterval {
+		t.Fatalf("next retry %s after the failure, want the next sync", st.NextRetryAt.Sub(st.LastErrorAt))
+	}
+}
+
+// externallyUnmounted is a live mount that someone else unmounts while the
+// daemon's own unmount runs: the daemon's unmount(2) then fails with EINVAL,
+// as it does for a path that no longer holds a mount, and Join returns.
+type externallyUnmounted struct {
+	*fakeMountedFS
+	once   sync.Once
+	joined chan struct{}
+}
+
+func (m *externallyUnmounted) Unmount(context.Context) error {
+	m.once.Do(func() {
+		close(m.unmounted)
+		// The join sees the connection end while the stop runs.
+		<-m.joined
+	})
+	return &os.PathError{Op: "unmount", Path: "/mnt/repo", Err: syscall.EINVAL}
+}
+
+// A stop whose unmount fails because the mount is already gone finishes:
+// the failure counts only while the mount table lists the mount point.
+func TestStopFinishesAfterAnExternalUnmount(t *testing.T) {
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	joined := make(chan struct{}, 8)
+	svc.joinFinished = func() { joined <- struct{}{} }
+	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+		return &externallyUnmounted{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, joined: joined}, nil
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.registry.RequestMount(ctx, "repo", false, "unmount-request"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.Lock()
+	_, running := svc.running["repo"]
+	svc.mu.Unlock()
+	st, err := ctl.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if running || st.State != repoStateUnmounted || st.LastError != "" {
+		t.Fatalf("after the stop: running %t, status %+v; want the repo stopped with no failure", running, st)
+	}
+}
+
+// A runtime that starts ends the mount backoff that failures before it built
+// up, so its own mount retries back off from the start.
+func TestRuntimeStartResetsTheMountBackoff(t *testing.T) {
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+		return nil, errors.New("refused")
+	}
+	// An overlay store a newer build migrated fails the mount before any
+	// runtime starts.
+	metatest.Exec(t, cfg.OverlayDBPath, `PRAGMA user_version = 99`)
+	for range 2 {
+		if err := svc.syncRepos(ctx); err != nil {
+			t.Fatal(err)
+		}
+		// The backoff has passed.
+		svc.mu.Lock()
+		svc.mountRetries[cfg.ID].next = time.Time{}
+		svc.mu.Unlock()
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if err := os.Remove(cfg.OverlayDBPath + suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+	}
+	// The runtime starts, and its first mount fails; the next one backs off.
+	for range 2 {
+		if err := svc.syncRepos(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := requireFailure(t, ctl, phaseMount, "refused")
+	if delay := st.NextRetryAt.Sub(st.LastErrorAt); delay > mountRetryMin+time.Second {
+		t.Fatalf("mount retry delay after the runtime started = %s, want %s", delay, mountRetryMin)
 	}
 }

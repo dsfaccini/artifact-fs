@@ -108,9 +108,10 @@ type Service struct {
 	mount mountFunc
 	// unmountPath unmounts a mount the daemon did not make.
 	unmountPath func(string) error
-	// mountPointSource reports whether a mount point holds a mount, and its
-	// source. Tests replace it to stand in for the kernel's mount table.
-	mountPointSource func(string) (string, bool)
+	// mountPointEntry reports whether a mount point holds a mount, and what
+	// the mount table lists for it. Tests replace it to stand in for the
+	// kernel's mount table.
+	mountPointEntry func(string) (mountEntry, bool)
 	// mountTimeout bounds the wait for one FUSE mount; zero means mountTimeout.
 	mountTimeout         time.Duration
 	hydrationConcurrency int
@@ -127,6 +128,10 @@ type Service struct {
 	preparing            map[model.RepoID]int64
 	prepareAttempts      map[model.RepoID]int64
 	prepareSeq           int64
+	// leftovers holds the repos the daemon process before this one ran. A
+	// FUSE mount at such a repo's mount point is that process's, and the
+	// daemon unmounts it before it mounts the repo.
+	leftovers map[model.RepoID]bool
 	// mountRetries backs off the mounts of each repo whose mount failed.
 	mountRetries map[model.RepoID]*mountRetry
 	// unmounting holds each repo's unmount that has not returned.
@@ -163,18 +168,19 @@ func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error
 		return nil, err
 	}
 	return &Service{
-		core:             c,
-		mount:            defaultMount,
-		unmountPath:      defaultUnmountPath,
-		mountPointSource: mountPointSource,
-		running:          map[model.RepoID]*repoRuntime{},
-		preparing:        map[model.RepoID]int64{},
-		prepareAttempts:  map[model.RepoID]int64{},
-		mountRetries:     map[model.RepoID]*mountRetry{},
-		unmounting:       map[model.RepoID]*unmountOp{},
-		lock:             lock,
-		wake:             make(chan struct{}, 1),
-		records:          map[model.RepoID]*model.RepoRuntimeRecord{},
+		core:            c,
+		mount:           defaultMount,
+		unmountPath:     defaultUnmountPath,
+		mountPointEntry: mountPointEntry,
+		running:         map[model.RepoID]*repoRuntime{},
+		preparing:       map[model.RepoID]int64{},
+		prepareAttempts: map[model.RepoID]int64{},
+		leftovers:       map[model.RepoID]bool{},
+		mountRetries:    map[model.RepoID]*mountRetry{},
+		unmounting:      map[model.RepoID]*unmountOp{},
+		lock:            lock,
+		wake:            make(chan struct{}, 1),
+		records:         map[model.RepoID]*model.RepoRuntimeRecord{},
 	}, nil
 }
 

@@ -154,6 +154,7 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 		core:                 &core{root: root, logger: logger, git: git, registry: reg},
 		running:              map[model.RepoID]*repoRuntime{cfg.ID: rt},
 		unmounting:           map[model.RepoID]*unmountOp{},
+		mountPointEntry:      heldMountPoint,
 		records:              map[model.RepoID]*model.RepoRuntimeRecord{},
 		headReconcileBackoff: backoff,
 	}

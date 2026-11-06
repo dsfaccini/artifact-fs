@@ -17,6 +17,14 @@ type aheadBehind struct {
 	diverged bool
 }
 
+// newRefreshRetrier backs off the remote refreshes of a repo refreshed every
+// interval: twice the interval after the first failure, doubling up to
+// fetchRetryMax, or up to the interval when it is longer.
+func newRefreshRetrier(interval time.Duration) *retrier {
+	limit := max(fetchRetryMax, interval)
+	return newRetrier(phaseFetch, min(2*interval, limit), limit)
+}
+
 func (s *Service) refreshLoop(rt *repoRuntime) {
 	s.mu.Lock()
 	baseInterval := rt.cfg.RefreshInterval
@@ -24,7 +32,7 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 	if baseInterval <= 0 {
 		baseInterval = 30 * time.Second
 	}
-	retry := newRetrier(phaseFetch, 2*baseInterval, max(fetchRetryMax, baseInterval))
+	retry := newRefreshRetrier(baseInterval)
 	ticker := time.NewTicker(baseInterval)
 	defer ticker.Stop()
 	for {
@@ -36,7 +44,7 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 				continue
 			}
 			baseInterval = interval
-			retry = newRetrier(phaseFetch, 2*baseInterval, max(fetchRetryMax, baseInterval))
+			retry = newRefreshRetrier(baseInterval)
 			ticker.Reset(baseInterval)
 		case <-ticker.C:
 			s.mu.Lock()

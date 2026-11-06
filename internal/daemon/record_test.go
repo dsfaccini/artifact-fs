@@ -174,6 +174,7 @@ func startService(t *testing.T, svc *Service) <-chan error {
 
 func TestUnmountReportsTheDaemonsFailure(t *testing.T) {
 	svc, ctl := newSyncedDaemon(t)
+	svc.mountPointEntry = heldMountPoint
 	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("unmount " + credentialRemote + ": busy")}
 	t.Cleanup(func() { close(mfs.exit) })
 	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
@@ -242,6 +243,7 @@ func TestStatusReportsAFailedRefresh(t *testing.T) {
 // must still start.
 func TestCloseReleasesTheDaemonLockAfterAFailedUnmount(t *testing.T) {
 	svc, _ := newSyncedDaemon(t)
+	svc.mountPointEntry = heldMountPoint
 	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("busy")}
 	t.Cleanup(func() { close(mfs.exit) })
 	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {

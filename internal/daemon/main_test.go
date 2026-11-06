@@ -38,6 +38,10 @@ func TestGitIgnoresMachineConfig(t *testing.T) { gittest.RequireConfigIsolated(t
 // registry connection.
 func (s *Service) ctl() *Controller { return &Controller{core: s.core} }
 
+// heldMountPoint stands in for a mount table that lists every mount point, so
+// a failed unmount of a fake mount counts.
+func heldMountPoint(string) (mountEntry, bool) { return mountEntry{}, true }
+
 // fakeMount stands in for a successful mount.
 func fakeMount(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
 	return &fakeMountedFS{unmounted: make(chan struct{})}, nil

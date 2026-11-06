@@ -6,22 +6,26 @@ import (
 	"strings"
 )
 
-// mountTableSource reports whether the given path is an active mount point,
-// and the source the mount table names for it. Reads /proc/mounts first (fast,
-// no subprocess), falls back to mount(8).
-func mountTableSource(path string) (string, bool, error) {
+// mountTableEntry reports whether the given path is an active mount point,
+// and what the mount table lists for it. Reads /proc/mounts first (fast, no
+// subprocess), falls back to mount(8).
+func mountTableEntry(path string) (mountEntry, bool, error) {
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
 		out, err := exec.Command("mount").Output()
 		if err != nil {
-			return "", false, err
+			return mountEntry{}, false, err
 		}
-		source, found := matchMountOutput(string(out), path)
-		return source, found, nil
+		entry, found := matchMountOutput(string(out), path)
+		return entry, found, nil
 	}
-	source, found := matchProcMounts(string(data), path)
-	return source, found, nil
+	entry, found := matchProcMounts(string(data), path)
+	return entry, found, nil
 }
+
+// isFUSEType reports whether fstype is a FUSE file system: fuse, or
+// fuse.<subtype> for a mount with a subtype, such as fuse.artifact-fs.
+func isFUSEType(fstype string) bool { return fstype == "fuse" || strings.HasPrefix(fstype, "fuse.") }
 
 // procMountsEscaper undoes the octal escapes /proc/mounts writes for these bytes in a path.
 var procMountsEscaper = strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
@@ -29,25 +33,32 @@ var procMountsEscaper = strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "
 // matchProcMounts checks /proc/mounts where each line is:
 // <device> <mountpoint> <fstype> <options> <dump> <pass>
 // A later line for the same path is mounted on top of an earlier one.
-func matchProcMounts(output, path string) (string, bool) {
-	source, found := "", false
+func matchProcMounts(output, path string) (mountEntry, bool) {
+	var entry mountEntry
+	found := false
 	for line := range strings.SplitSeq(output, "\n") {
 		fields := strings.Fields(line)
-		if len(fields) >= 2 && procMountsEscaper.Replace(fields[1]) == path {
-			source, found = procMountsEscaper.Replace(fields[0]), true
+		if len(fields) >= 3 && procMountsEscaper.Replace(fields[1]) == path {
+			entry = mountEntry{source: procMountsEscaper.Replace(fields[0]), fstype: fields[2]}
+			found = true
 		}
 	}
-	return source, found
+	return entry, found
 }
 
 // matchMountOutput checks mount(8) output where each line is:
 // <device> on <mountpoint> type <fstype> (<options>)
-func matchMountOutput(output, path string) (string, bool) {
-	source, found := "", false
+func matchMountOutput(output, path string) (mountEntry, bool) {
+	var entry mountEntry
+	found := false
 	for line := range strings.SplitSeq(output, "\n") {
-		if device, _, ok := strings.Cut(line, " on "+path+" type "); ok {
-			source, found = device, true
+		device, rest, ok := strings.Cut(line, " on "+path+" type ")
+		if !ok {
+			continue
 		}
+		fstype, _, _ := strings.Cut(rest, " ")
+		entry = mountEntry{source: device, fstype: fstype}
+		found = true
 	}
-	return source, found
+	return entry, found
 }

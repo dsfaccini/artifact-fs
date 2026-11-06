@@ -83,15 +83,19 @@ type fetchStatus struct {
 
 type repoRuntime struct {
 	// Set when the runtime starts, then read-only. ctx ends when the runtime
-	// stops, and is the parent of every FUSE op's context.
-	ctx      context.Context
-	cancel   context.CancelFunc
-	snapshot *snapshot.Store
-	overlay  *overlay.Store
-	hydrator *hydrator.Service
-	sizes    *sizeUpdateBatcher
-	resolver *fusefs.Resolver
-	engine   *fusefs.Engine
+	// stops or the daemon shuts down, and stops the runtime's workers.
+	ctx    context.Context
+	cancel context.CancelFunc
+	// opCtx is the parent of every FUSE op's context. Only a stop ends it,
+	// after the unmount, so a shutdown unmounts before it cancels ops.
+	opCtx     context.Context
+	cancelOps context.CancelFunc
+	snapshot  *snapshot.Store
+	overlay   *overlay.Store
+	hydrator  *hydrator.Service
+	sizes     *sizeUpdateBatcher
+	resolver  *fusefs.Resolver
+	engine    *fusefs.Engine
 	// gate holds FUSE ops while an async repo prepares; nil for a sync repo.
 	gate    *fusefs.ReadyGate
 	refresh chan time.Duration
@@ -170,6 +174,7 @@ func (s *Service) startRuntime(ctx context.Context, cfg model.RepoConfig, snap *
 		s.refreshCommitTime(ctx, cfg, head.oid, resolver, "commit timestamp unavailable, mtime will use generation fallback")
 	}
 	runtimeCtx, cancel := context.WithCancel(ctx)
+	opCtx, cancelOps := context.WithCancel(context.WithoutCancel(ctx))
 	sizes := newSizeUpdateBatcher(snap, s.logger, cfg.Name)
 	sizes.Start(runtimeCtx)
 	h.SetOnHydrated(func(_ model.RepoID, objectOID string, size int64) {
@@ -181,31 +186,32 @@ func (s *Service) startRuntime(ctx context.Context, cfg model.RepoConfig, snap *
 		prepare = model.PrepareStatePreparing
 	}
 	rt := &repoRuntime{
-		ctx:      runtimeCtx,
-		cancel:   cancel,
-		snapshot: snap,
-		overlay:  ov,
-		hydrator: h,
-		sizes:    sizes,
-		resolver: resolver,
-		engine:   &fusefs.Engine{Resolver: resolver, Repo: cfg, Overlay: ov, Hydrator: h},
-		gate:     gate,
-		refresh:  make(chan time.Duration, 1),
-		cfg:      cfg,
-		prepare:  prepare,
-		head:     head,
-		fetch:    fetchStatus{state: fetchNever},
-		mount:    mountNone,
+		ctx:       runtimeCtx,
+		cancel:    cancel,
+		opCtx:     opCtx,
+		cancelOps: cancelOps,
+		snapshot:  snap,
+		overlay:   ov,
+		hydrator:  h,
+		sizes:     sizes,
+		resolver:  resolver,
+		engine:    &fusefs.Engine{Resolver: resolver, Repo: cfg, Overlay: ov, Hydrator: h},
+		gate:      gate,
+		refresh:   make(chan time.Duration, 1),
+		cfg:       cfg,
+		prepare:   prepare,
+		head:      head,
+		fetch:     fetchStatus{state: fetchNever},
+		mount:     mountNone,
 	}
 	s.mu.Lock()
 	s.running[cfg.ID] = rt
 	s.mu.Unlock()
-	// The next registry sync retries a first mount that failed; later
-	// failures back off.
-	if attached, err := s.attachMount(rt); err != nil {
+	// A runtime that starts ends the backoff of the mounts before it. The next
+	// registry sync retries a first mount that failed; later failures back off.
+	s.mountSucceeded(cfg.ID)
+	if _, err := s.attachMount(rt); err != nil {
 		s.recordFailure(cfg, phaseMount, err, time.Now().Add(registrySyncInterval))
-	} else if attached {
-		s.mountSucceeded(cfg.ID)
 	}
 	runHook(s.runtimeStarted)
 	s.recordRuntimeState(rt)
@@ -222,6 +228,10 @@ func (s *Service) retryMount(rt *repoRuntime) {
 		return
 	}
 	attached, err := s.attachMount(rt)
+	if _, settling := errors.AsType[*settlingError](err); settling {
+		s.recordFailure(cfg, phaseMount, err, time.Now().Add(registrySyncInterval))
+		return
+	}
 	if err != nil {
 		s.recordFailure(cfg, phaseMount, err, s.backoffMount(cfg))
 		return
@@ -240,34 +250,36 @@ func (s *Service) retryMount(rt *repoRuntime) {
 //   - an adopted worktree's mount point is empty, because a mount would hide
 //     its native files.
 //
-// It reports whether it mounted rt. A precondition that is still settling,
-// such as an unmount that runs, returns false and no error, and the next
-// attempt checks again. The mount waits at most mountTimeout, and rt's
+// It reports whether it mounted rt. A runtime that serves, stops or has
+// stopped returns false and no error. An unmount of the repo that runs, or an
+// abandoned mount that has not ended, returns a settlingError, and the next
+// attempt checks again. The mount waits at most mountTimeout, and rt's op
 // context is the parent of every op's context.
 func (s *Service) attachMount(rt *repoRuntime) (bool, error) {
 	s.mu.Lock()
 	cfg, state, failed, abandoned := rt.cfg, rt.mount, rt.mfs, rt.abandoned
-	settled := state == mountServing || state == mountUnmounted
-	settling := rt.stopping || s.unmounting[cfg.ID] != nil || settled || rt.ctx.Err() != nil
+	settled := rt.stopping || state == mountServing || state == mountUnmounted || rt.ctx.Err() != nil
+	unmounting := s.unmounting[cfg.ID] != nil
 	s.mu.Unlock()
-	if settling {
+	if settled {
 		return false, nil
+	}
+	if unmounting {
+		return false, fmt.Errorf("mount %s: %w", cfg.Name, errUnmountInProgress)
 	}
 	switch state {
 	case mountFailed:
-		op, started := s.startUnmount(cfg, s.unmountDead(cfg, failed), func(err error) { s.releaseMount(rt, failed, err, mountNone) })
+		op, started := s.startUnmount(cfg, s.unmountHeld(cfg, failed), func(err error) { s.releaseMount(rt, failed, err, mountNone) })
 		if !started {
-			return false, nil
+			return false, fmt.Errorf("mount %s: %w", cfg.Name, errUnmountInProgress)
 		}
 		if err := s.waitUnmount(op); err != nil {
 			return false, fmt.Errorf("unmount %s after its connection failed: %w", cfg.Name, err)
 		}
 	case mountAbandoned:
-		if !mountEnded(abandoned) {
-			return false, nil
+		if err := s.releaseAbandonedMount(cfg, abandoned); err != nil {
+			return false, err
 		}
-		// A late mount the library failed to unmount stays in place, and
-		// the leftover check below unmounts it.
 		s.mu.Lock()
 		if rt.abandoned == abandoned {
 			rt.abandoned, rt.mount = nil, mountNone
@@ -288,7 +300,7 @@ func (s *Service) attachMount(rt *repoRuntime) (bool, error) {
 	}
 	ctx, cancel := context.WithTimeout(rt.ctx, cmp.Or(s.mountTimeout, mountTimeout))
 	defer cancel()
-	mfs, err := s.mount(ctx, rt.ctx, cfg, rt.engine, rt.gate, s.logger)
+	mfs, err := s.mount(ctx, rt.opCtx, cfg, rt.engine, rt.gate, s.logger)
 	if err != nil {
 		if a, ok := errors.AsType[fusefs.AbandonedMount](err); ok {
 			s.mu.Lock()
@@ -324,11 +336,53 @@ func (s *Service) attachMount(rt *repoRuntime) (bool, error) {
 	return true, nil
 }
 
-// mountEnded reports whether an abandoned mount has ended, without waiting.
-func mountEnded(abandoned fusefs.AbandonedMount) bool {
+// settlingError is a mount precondition that is still settling: an unmount
+// of the repo that runs, or an abandoned mount that has not ended. The next
+// sync checks it again, with no backoff.
+type settlingError struct{ msg string }
+
+func (e *settlingError) Error() string { return e.msg }
+
+var (
+	// errUnmountInProgress is the error of a mount or a stop while an
+	// earlier unmount of the repo has not returned.
+	errUnmountInProgress = &settlingError{"an earlier unmount of the repo has not returned"}
+	// errAbandonedMountRunning is the error of a mount while an abandoned
+	// mount of the repo has not ended.
+	errAbandonedMountRunning = &settlingError{"an abandoned mount of the repo has not ended"}
+)
+
+// releaseAbandonedMount returns nil once abandoned, a mount whose wait timed
+// out, has ended and left nothing at cfg's mount point. A late mount whose
+// cleanup failed stays at the mount point whatever source the mount table
+// names, so it unmounts the mount point by path.
+func (s *Service) releaseAbandonedMount(cfg model.RepoConfig, abandoned fusefs.AbandonedMount) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	return !errors.Is(abandoned.Wait(ctx), context.Canceled)
+	err := abandoned.Wait(ctx)
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("mount %s: %w", cfg.Name, errAbandonedMountRunning)
+	}
+	if err == nil {
+		return nil
+	}
+	if _, held := s.mountPointEntry(cfg.MountPath); !held {
+		return nil
+	}
+	s.logger.Warn("unmounting the abandoned mount the library could not", "repo", cfg.Name, "error", auth.RedactLogString(err.Error(), cfg.RemoteURL))
+	return s.unmountMountPoint(cfg)
+}
+
+// unmountMountPoint unmounts whatever cfg's mount point holds, by path.
+func (s *Service) unmountMountPoint(cfg model.RepoConfig) error {
+	op, started := s.startUnmount(cfg, func(context.Context) error { return s.unmountPath(cfg.MountPath) }, nil)
+	if !started {
+		return fmt.Errorf("mount %s: %w", cfg.Name, errUnmountInProgress)
+	}
+	if err := s.waitUnmount(op); err != nil {
+		return fmt.Errorf("unmount %s: %w", cfg.MountPath, err)
+	}
+	return nil
 }
 
 // releaseMount marks mfs, rt's mount, as gone once its unmount succeeded,
@@ -339,22 +393,26 @@ func (s *Service) releaseMount(rt *repoRuntime, mfs fusefs.MountedFS, err error,
 	}
 }
 
-// releaseLeftoverMount unmounts the mount that cfg's mount point holds when
-// the mount table names it for cfg's repo, as a daemon process that stopped
-// without unmounting leaves it. It leaves any other mount alone.
+// releaseLeftoverMount unmounts the FUSE mount at cfg's mount point when the
+// daemon process before this one ran cfg's repo, because that mount is the
+// one it left. It leaves any other mount alone, such as one of a daemon on
+// another state root.
 func (s *Service) releaseLeftoverMount(cfg model.RepoConfig) error {
-	source, held := s.mountPointSource(cfg.MountPath)
-	if !held || source != fusefs.FSName(cfg.Name) {
+	s.mu.Lock()
+	leftover := s.leftovers[cfg.ID]
+	s.mu.Unlock()
+	if !leftover {
 		return nil
 	}
-	s.logger.Warn("unmounting a mount an earlier daemon left", "repo", cfg.Name, "mount_path", cfg.MountPath)
-	op, started := s.startUnmount(cfg, func(context.Context) error { return s.unmountPath(cfg.MountPath) }, nil)
-	if !started {
-		return fmt.Errorf("unmount %s: %w", cfg.Name, errUnmountInProgress)
+	if entry, held := s.mountPointEntry(cfg.MountPath); held && isFUSEType(entry.fstype) {
+		s.logger.Warn("unmounting a mount an earlier daemon left", "repo", cfg.Name, "mount_path", cfg.MountPath)
+		if err := s.unmountMountPoint(cfg); err != nil {
+			return fmt.Errorf("unmount the mount an earlier daemon left: %w", err)
+		}
 	}
-	if err := s.waitUnmount(op); err != nil {
-		return fmt.Errorf("unmount the mount an earlier daemon left at %s: %w", cfg.MountPath, err)
-	}
+	s.mu.Lock()
+	delete(s.leftovers, cfg.ID)
+	s.mu.Unlock()
 	return nil
 }
 
@@ -380,7 +438,7 @@ func (s *Service) joinMount(rt *repoRuntime, mfs fusefs.MountedFS) {
 		// runtime's context, which ends before the stop's drain.
 		connErr := mfs.Join(context.Background())
 		if connErr == nil {
-			if _, held := s.mountPointSource(mountPath); held {
+			if _, held := s.mountPointEntry(mountPath); held {
 				connErr = errConnectionEndedMounted
 			}
 		}
@@ -414,7 +472,7 @@ func (s *Service) joinMount(rt *repoRuntime, mfs fusefs.MountedFS) {
 		if failed {
 			// The sync loop waits for no unmount it did not start, so an
 			// unmount(2) that hangs on the dead mount stalls only this repo.
-			s.startUnmount(cfg, s.unmountDead(cfg, mfs), func(err error) { s.releaseMount(rt, mfs, err, mountNone) })
+			s.startUnmount(cfg, s.unmountHeld(cfg, mfs), func(err error) { s.releaseMount(rt, mfs, err, mountNone) })
 		}
 		if exited {
 			s.recordRuntimeState(rt)
@@ -429,10 +487,6 @@ type unmountOp struct {
 	done chan struct{}
 	err  error
 }
-
-// errUnmountInProgress is the error of a stop while an earlier unmount of the
-// repo has not returned.
-var errUnmountInProgress = errors.New("an earlier unmount of the repo has not returned")
 
 // startUnmount runs unmount for cfg's repo on its own goroutine, unless an
 // unmount of the repo still runs, and reports whether it started one. A
@@ -478,16 +532,17 @@ func (s *Service) waitUnmount(op *unmountOp) error {
 	}
 }
 
-// unmountDead unmounts mfs, a mount whose connection ended. A failed unmount
-// counts only while the mount table still lists the mount point, or cannot
-// tell, so a mount that is already gone does not block the next mount.
-func (s *Service) unmountDead(cfg model.RepoConfig, mfs fusefs.MountedFS) func(context.Context) error {
+// unmountHeld unmounts mfs. A failed unmount counts only while the mount
+// table still lists the mount point, or cannot tell, so a mount that is
+// already gone, such as one unmounted from outside, neither blocks the next
+// mount nor keeps a stop from finishing.
+func (s *Service) unmountHeld(cfg model.RepoConfig, mfs fusefs.MountedFS) func(context.Context) error {
 	return func(ctx context.Context) error {
 		err := mfs.Unmount(ctx)
 		if err == nil {
 			return nil
 		}
-		if _, held := s.mountPointSource(cfg.MountPath); !held {
+		if _, held := s.mountPointEntry(cfg.MountPath); !held {
 			return nil
 		}
 		return err
@@ -575,11 +630,7 @@ func (s *Service) stopRuntime(rt *repoRuntime) error {
 	}
 	switch {
 	case mfs != nil && (state == mountServing || state == mountFailed):
-		unmount := mfs.Unmount
-		if state == mountFailed {
-			unmount = s.unmountDead(cfg, mfs)
-		}
-		op, started := s.startUnmount(cfg, unmount, func(err error) { s.releaseMount(rt, mfs, err, mountUnmounted) })
+		op, started := s.startUnmount(cfg, s.unmountHeld(cfg, mfs), func(err error) { s.releaseMount(rt, mfs, err, mountUnmounted) })
 		if !started {
 			return keepServing(fmt.Errorf("unmount %s: %w", cfg.Name, errUnmountInProgress))
 		}
@@ -587,11 +638,7 @@ func (s *Service) stopRuntime(rt *repoRuntime) error {
 			return keepServing(fmt.Errorf("unmount %s: %w", cfg.Name, err))
 		}
 	case state == mountAbandoned:
-		if !mountEnded(abandoned) {
-			return keepServing(fmt.Errorf("unmount %s: its abandoned mount has not ended", cfg.Name))
-		}
-		// A late mount the library failed to unmount stays in place.
-		if err := s.releaseLeftoverMount(cfg); err != nil {
+		if err := s.releaseAbandonedMount(cfg, abandoned); err != nil {
 			return keepServing(err)
 		}
 	}
@@ -613,6 +660,9 @@ func (s *Service) stopRuntime(rt *repoRuntime) error {
 	s.mu.Unlock()
 	if rt.cancel != nil {
 		rt.cancel()
+	}
+	if rt.cancelOps != nil {
+		rt.cancelOps()
 	}
 	if rt.gate != nil {
 		rt.gate.MarkFailed(context.Canceled)

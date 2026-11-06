@@ -47,7 +47,8 @@ func (s *Service) retryFailure(cfg model.RepoConfig, r *retrier, err error) time
 const (
 	mountRetryMin = 30 * time.Second
 	mountRetryMax = 5 * time.Minute
-	// fetchRetryMax caps the refresh backoff unless the refresh interval is longer.
+	// fetchRetryMax caps the refresh backoff. A refresh interval longer than
+	// fetchRetryMax is the cap instead.
 	fetchRetryMax = 10 * time.Minute
 )
 

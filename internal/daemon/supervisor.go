@@ -13,10 +13,19 @@ import (
 const registrySyncInterval = 3 * time.Second
 
 func (s *Service) Start(ctx context.Context) error {
-	// A record a stopped daemon left behind describes nothing this daemon serves.
-	if err := s.registry.ClearRuntime(ctx); err != nil {
+	// A record a stopped daemon left behind describes nothing this daemon
+	// serves, but names the repos whose mounts that daemon may have left.
+	previous, err := s.registry.ClearRuntime(ctx)
+	if err != nil {
 		return err
 	}
+	s.mu.Lock()
+	for _, rec := range previous {
+		if rec.State != "" && rec.State != repoStateUnmounted {
+			s.leftovers[rec.RepoID] = true
+		}
+	}
+	s.mu.Unlock()
 	// The socket only wakes the sync loop early, so the daemon runs without it.
 	control, err := s.listenControl()
 	if err != nil {
