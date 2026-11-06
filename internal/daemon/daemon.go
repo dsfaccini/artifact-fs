@@ -263,7 +263,10 @@ func (s *Service) Close() error {
 		// The next daemon on the root finds no mount of this one's to
 		// unmount. The record keeps the last refresh, which status shows
 		// while no daemon runs.
-		s.recordRuntime(cfg.ID, func(rec *model.RepoRuntimeRecord) { rec.State = repoStateUnmounted })
+		s.recordRuntime(cfg.ID, func(rec *model.RepoRuntimeRecord) {
+			rec.State = repoStateUnmounted
+			clearFailure(rec, phaseUnmount)
+		})
 	}
 	if len(errs) == 0 {
 		s.prepareWorkers.Wait()

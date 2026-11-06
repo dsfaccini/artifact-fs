@@ -408,6 +408,84 @@ func TestCleanStopKeepsTheLastRefreshInStatus(t *testing.T) {
 	}
 }
 
+// busyOnceMount fails its first unmount, as a busy mount does, and unmounts
+// at the next.
+type busyOnceMount struct {
+	mu    sync.Mutex
+	fails int
+	exit  chan struct{}
+}
+
+func (m *busyOnceMount) Backend() string          { return "fake" }
+func (m *busyOnceMount) InvalidateChanged() error { return nil }
+
+func (m *busyOnceMount) Join(ctx context.Context) error {
+	select {
+	case <-m.exit:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *busyOnceMount) Unmount(context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.fails > 0 {
+		m.fails--
+		return errors.New("busy")
+	}
+	select {
+	case <-m.exit:
+	default:
+		close(m.exit)
+	}
+	return nil
+}
+
+// A clean shutdown whose unmount succeeds clears the failure of an earlier
+// stop of the repo, so status with no daemon shows no unmount failure.
+func TestCleanStopClearsAnEarlierUnmountFailure(t *testing.T) {
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mfs := &busyOnceMount{fails: 1, exit: make(chan struct{})}
+	svc.mountPointEntry = func(string) (mountEntry, bool) {
+		select {
+		case <-mfs.exit:
+			return mountEntry{}, false
+		default:
+			return ownMountEntry("repo"), true
+		}
+	}
+	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+		return mfs, nil
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.registry.RequestMount(ctx, cfg.ID, false, "stop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	requireFailure(t, ctl, phaseUnmount, "busy")
+	if err := svc.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	st, err := ctl.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LastErrorPhase == phaseUnmount {
+		t.Fatalf("status with no daemon shows the unmount failure the shutdown's unmount resolved: %s", st.LastError)
+	}
+}
+
 // A stop reads the runtime's config under s.mu, because preparation replaces
 // rt.cfg from its own goroutine while the sync loop stops the runtime. The
 // race detector reports the unlocked read.
