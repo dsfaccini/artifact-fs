@@ -52,7 +52,7 @@ This fork depends on `github.com/dsfaccini/fuse`, a fork of `jacobsa/fuse` that
 loads macFUSE's FSKit framework at run time, with no cgo. Every macOS build has
 the FSKit backend.
 
-FSKit needs macOS 26 or later and macFUSE 5.3 or later. Enable the `macFUSE`
+FSKit needs macOS 26 or later and macFUSE 5.5 or later. Enable the `macFUSE`
 and `macFUSE (local)` file system extensions under System Settings > General >
 Login Items & Extensions > File System Extensions. FSKit uses this user-space
 file system extension and needs no kernel extension.
@@ -169,7 +169,13 @@ ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the 
 
 Async existing-clone preparation reports remote configuration, fetch, and branch update as separate `configure_remote`, `fetch`, and `update_branch` phases.
 
-Each error the FUSE library reports becomes a `fuse error` record. A reply the kernel refuses, other than with `ENOENT`, logs at `WARN`. A failed FUSE op logs at `DEBUG`, because expected errnos such as `ENOTEMPTY` fail ops too. The daemon logs at `INFO`, so it never emits these lines. The library reports no failed lookup of a missing name, no `GetXattr` or `ListXattr` that fails with `ENOSYS`, `ENODATA` or `ERANGE`, and no request whose opcode the library does not recognize.
+Each error the FUSE library reports becomes a `fuse error` record:
+
+- `ERROR`: a bug the library answers with `EIO`. That is a panic it recovers from an op, logged with its stack; an op that exits through `runtime.Goexit`; or a reply whose byte count falls outside its buffer.
+- `WARN`: a reply the kernel refuses, other than with `ENOENT`. On Linux, also a mount whose `FUSE_POLL` setup failed.
+- `DEBUG`: every other failed op, including a request the library cannot decode, because expected errnos such as `EEXIST` fail ops too.
+
+The daemon logs at `INFO`, so it drops the `DEBUG` records. The library reports no `ENOSYS` or `EINTR` from any op, no `ENOENT` from a lookup, no `ENOTEMPTY` from `rmdir` or `rename`, and no `ENODATA` or `ERANGE` from `GetXattr` or `ListXattr`.
 
 A repo's FUSE connection can end while its mount stays in place: after an error fatal to the connection, such as a failed read from the kernel, or after the connection is aborted. The daemon then logs `fuse connection failed, unmounting`, records the connection's error as the repo's `mount_error` (for an abort, which carries no error, `fuse connection ended while the mount point still holds the mount`), unmounts the repo, and mounts it again. While that unmount fails and the mount table still lists the mount point, or the table, the path or the mount point cannot be read, each mount retry tries the unmount again instead of mounting. The daemon looks the mount point up in the kernel's mount table by its absolute path, with symlinks in the parent and a symlinked final component resolved. On macOS the lookup ignores case.
 

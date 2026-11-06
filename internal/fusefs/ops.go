@@ -128,13 +128,15 @@ func (e *Engine) Do(ctx context.Context, lock sync.Locker, op func(context.Conte
 	b := &Blobs{}
 	opCtx := context.WithoutCancel(ctx)
 	for {
-		if lock != nil {
-			lock.Lock()
-		}
-		err := op(opCtx, b)
-		if lock != nil {
-			lock.Unlock()
-		}
+		err := func() error {
+			if lock != nil {
+				lock.Lock()
+				// The fuse library recovers a panic in op and keeps serving, so
+				// a panic must not leave lock held.
+				defer lock.Unlock()
+			}
+			return op(opCtx, b)
+		}()
 		var missing *notHydratedError
 		if !errors.As(err, &missing) {
 			return err
