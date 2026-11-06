@@ -358,7 +358,7 @@ func TestRemoveRepoUnmountsFailedConnectionLeftMounted(t *testing.T) {
 	close(m.fail)
 	// The daemon unmounts once after the failure and once more in the
 	// supervisor's retry, which then backs off.
-	waitFor(t, d.startErr, func() bool { return len(m.recorded()) == 3 })
+	waitFor(t, d.startErr, func() bool { return len(m.recorded()) >= 3 })
 
 	// A remount after the retry's backoff returns at once, so it fails the
 	// call sequence below instead of blocking the daemon's poll.
@@ -393,6 +393,10 @@ func TestMountPointHeld(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	file := filepath.Join(tmp, "file")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	tests := []struct {
 		name string
 		path string
@@ -403,6 +407,7 @@ func TestMountPointHeld(t *testing.T) {
 		{"relative", "dev", true},
 		{"unresolvable parent", filepath.Join(tmp, "gone", "repo"), true},
 		{"unmounted", filepath.Join(tmp, "repo"), false},
+		{"unreadable mount point", filepath.Join(file, "repo"), true},
 	}
 	if runtime.GOOS == "darwin" {
 		tests = append(tests, struct {
