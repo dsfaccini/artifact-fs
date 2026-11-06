@@ -38,6 +38,7 @@ func TestFormatStatusLineUsesNeverForUnsetFetch(t *testing.T) {
 		"required_commit=none",
 		"acquisition=not_required",
 		"base_commit=abc123",
+		" phase=none ",
 		"remote_refresh=enabled",
 		"prepare_error=none",
 		"hydrated_blobs=3",
@@ -281,18 +282,13 @@ func TestPrepareCLIReportsQueuedPrepare(t *testing.T) {
 	}
 }
 
-func TestMountCommandsRefuseAndPointToAlternative(t *testing.T) {
-	for _, tt := range []struct {
-		command, name string
-		wants         []string
-	}{
-		{"unmount", "repo", []string{"remove-repo --name repo", "stop the daemon"}},
-		// remount of a registered repo mounted FUSE from the CLI process, and
-		// package tests never mount, so it names an unregistered repo.
-		{"remount", "missing", []string{"stop the daemon and start it again"}},
-	} {
-		t.Run(tt.command, func(t *testing.T) {
-			t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+// unmount and remount are requests to the running daemon, so without one
+// they must fail rather than report a change nothing made.
+func TestMountCommandsFailWithoutDaemon(t *testing.T) {
+	for _, command := range []string{"unmount", "remount"} {
+		t.Run(command, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("ARTIFACT_FS_ROOT", root)
 			ctx := context.Background()
 			var stdout, stderr bytes.Buffer
 			if code := Run(ctx, []string{"add-repo", "--name", "repo", "--remote", "https://github.com/example/repo.git", "--async"}, &stdout, &stderr); code != 0 {
@@ -300,18 +296,43 @@ func TestMountCommandsRefuseAndPointToAlternative(t *testing.T) {
 			}
 			stdout.Reset()
 			stderr.Reset()
-			if code := Run(ctx, []string{tt.command, "--name", tt.name}, &stdout, &stderr); code == 0 {
-				t.Fatalf("%s exit = 0, stdout=%q", tt.command, stdout.String())
+			if code := Run(ctx, []string{command, "--name", "repo"}, &stdout, &stderr); code == 0 {
+				t.Fatalf("%s exit = 0, stdout=%q", command, stdout.String())
 			}
 			if stdout.Len() != 0 {
 				t.Fatalf("stdout = %q, want nothing", stdout.String())
 			}
-			for _, want := range tt.wants {
-				if !strings.Contains(stderr.String(), want) {
-					t.Fatalf("stderr = %q, want substring %q", stderr.String(), want)
-				}
+			if !strings.Contains(stderr.String(), daemon.ErrNoDaemon.Error()) {
+				t.Fatalf("stderr = %q, want %q", stderr.String(), daemon.ErrNoDaemon)
+			}
+			reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := reg.GetRepo(ctx, "repo")
+			if closeErr := reg.Close(); err != nil || closeErr != nil {
+				t.Fatalf("read registry: %v, close: %v", err, closeErr)
+			}
+			if !cfg.Enabled || cfg.MountRequest != "" {
+				t.Fatalf("registry after %s without a daemon = enabled %t, request %q; want it unchanged", command, cfg.Enabled, cfg.MountRequest)
 			}
 		})
+	}
+}
+
+// urfave/cli prints a usage error itself unless OnUsageError handles it, and
+// Run prints the returned error again.
+func TestUsageErrorPrintsOnce(t *testing.T) {
+	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	if code := Run(context.Background(), []string{"status", "--nam", "repo"}, &stdout, &stderr); code == 0 {
+		t.Fatalf("status with an unknown flag exit = 0, stdout=%q", stdout.String())
+	}
+	if got := strings.Count(stderr.String(), "flag provided but not defined"); got != 1 {
+		t.Fatalf("stderr = %q, want the usage error once", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Incorrect Usage") || !strings.Contains(stdout.String(), "--name") {
+		t.Fatalf("stdout = %q, want the usage error and the command's help", stdout.String())
 	}
 }
 
@@ -323,12 +344,12 @@ func TestStatusCLIPrintsDaemonMountError(t *testing.T) {
 	if code := Run(ctx, []string{"add-repo", "--name", "repo", "--remote", "https://github.com/example/repo.git", "--async"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("add-repo exit = %d, stderr=%q", code, stderr.String())
 	}
-	// The daemon persists mount errors in the registry that status reads.
+	// The daemon records mount errors in the registry that status reads.
 	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = reg.UpdateMountError(ctx, "repo", "fskit: extension requires approval")
+	err = reg.PutRuntime(ctx, model.RepoRuntimeRecord{RepoID: "repo", LastError: "fskit: extension requires approval", LastErrorPhase: "mount"})
 	if closeErr := reg.Close(); err != nil || closeErr != nil {
 		t.Fatalf("record mount error: %v, close: %v", err, closeErr)
 	}
@@ -346,7 +367,7 @@ func TestFSMonitorHookCLIAnswersGitToken(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("ARTIFACT_FS_ROOT", root)
 	ctx := context.Background()
-	svc, err := daemon.New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc, err := daemon.NewController(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

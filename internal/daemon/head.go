@@ -52,6 +52,7 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 			rt.state.CurrentHEADRef = ref
 		}
 		s.mu.Unlock()
+		s.recordRuntimeState(rt, phaseHEADReconcile)
 		return nil
 	}
 	if stateErr != nil || storedOID != oid || storedRef != ref || gen == 0 {
@@ -88,6 +89,7 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 		setHeadState(&rt.state, oid, ref, gen)
 	}
 	s.mu.Unlock()
+	s.recordRuntimeState(rt, phaseHEADReconcile)
 	if err := s.pruneGenerations(ctx, rt, rt.snapshot, min(prevGen, gen-1)); err != nil {
 		s.logger.Warn("snapshot generation cleanup failed", "repo", cfg.Name, "error", err)
 	}
@@ -102,10 +104,12 @@ func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, co
 	if err := rt.resolver.SwitchGeneration(ctx, gen, commitTime); err != nil {
 		return err
 	}
-	s.mu.Lock()
 	if prev != 0 && prev != gen {
+		rt.retiredMu.Lock()
 		rt.retired = append(rt.retired, retiredGeneration{gen: prev, at: time.Now()})
+		rt.retiredMu.Unlock()
 	}
+	s.mu.Lock()
 	mfs := rt.mfs
 	s.mu.Unlock()
 	if mfs != nil {
@@ -120,11 +124,11 @@ func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, co
 // that rt, when not nil, retired within the retention window. An inode whose
 // attributes the kernel received before a switch keeps reading the generation
 // they came from until it asks again.
-func (s *Service) pruneGenerations(ctx context.Context, rt *repoRuntime, snap *snapshot.Store, keepFrom int64) error {
+func (s *core) pruneGenerations(ctx context.Context, rt *repoRuntime, snap *snapshot.Store, keepFrom int64) error {
 	if rt != nil {
 		retention := cmp.Or(s.generationRetention, defaultGenerationRetention)
 		now := time.Now()
-		s.mu.Lock()
+		rt.retiredMu.Lock()
 		retired := rt.retired[:0]
 		for _, r := range rt.retired {
 			if now.Sub(r.at) < retention {
@@ -133,7 +137,7 @@ func (s *Service) pruneGenerations(ctx context.Context, rt *repoRuntime, snap *s
 			}
 		}
 		rt.retired = retired
-		s.mu.Unlock()
+		rt.retiredMu.Unlock()
 	}
 	return snap.PruneGenerations(ctx, keepFrom)
 }
@@ -166,13 +170,19 @@ func (s *Service) headReconcileLoop(rt *repoRuntime) {
 		}
 
 		for {
-			if err := s.reconcileHEAD(rt.ctx, rt); err == nil {
+			err := s.reconcileHEAD(rt.ctx, rt)
+			if err == nil {
 				backoff = minBackoff
 				break
 			}
 			if rt.ctx.Err() != nil {
 				return
 			}
+			// A HEAD change can also start the retry early.
+			s.mu.Lock()
+			cfg := rt.cfg
+			s.mu.Unlock()
+			s.recordFailure(cfg, phaseHEADReconcile, err, time.Now().Add(backoff))
 
 			timer := time.NewTimer(backoff)
 			select {

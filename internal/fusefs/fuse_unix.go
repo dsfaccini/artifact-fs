@@ -266,11 +266,13 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 }
 
 // invalidateChanged implements MountedFS.InvalidateChanged. Every inode the
-// kernel holds gets the check for a name that vanished or changed type. Only
-// an inode whose identity the kernel received from the base snapshot gets the
-// identity comparison: an overlay entry changes only through the mount, which
-// keeps the kernel's view of it current. A failure skips only what it
-// concerns, and the first one is returned.
+// kernel holds gets the check for a name that vanished or changed type. An
+// inode whose identity the kernel received from the base snapshot gets the
+// identity comparison. One the kernel last saw from the overlay is invalidated
+// when it now resolves to a base blob, whose bytes can differ from what was
+// written. An overlay entry itself changes only through the mount, which keeps
+// the kernel's view of it current. A failure skips only what it concerns, and
+// the first one is returned.
 func (fs *ArtifactFuse) invalidateChanged() error {
 	type known struct {
 		id       fuseops.InodeID
@@ -320,7 +322,7 @@ func (fs *ArtifactFuse) invalidateChanged() error {
 		switch {
 		case !exists || current.Type != k.reported.Type:
 			entries = append(entries, k.entry)
-		case k.base && current != k.reported:
+		case k.base && current != k.reported, !k.base && current.Blob != "":
 			changed = append(changed, k.id)
 		}
 	}
@@ -388,10 +390,12 @@ func (fs *ArtifactFuse) inodeGeneration(id fuseops.InodeID) int64 {
 	return 0
 }
 
-func (fs *ArtifactFuse) setInodeGeneration(id fuseops.InodeID, gen int64) {
+// markWritten records a write through id. Reads then serve the overlay, and
+// the kernel's cached pages hold the written bytes, not any base blob.
+func (fs *ArtifactFuse) markWritten(id fuseops.InodeID) {
 	fs.mu.Lock()
 	if ref := fs.inodes[id]; ref != nil {
-		ref.Gen = gen
+		ref.Gen, ref.PageBlob = 0, ""
 	}
 	fs.mu.Unlock()
 }
@@ -1132,7 +1136,7 @@ func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) 
 		if n != len(op.Data) {
 			return syscall.EIO
 		}
-		fs.setInodeGeneration(op.Inode, 0)
+		fs.markWritten(op.Inode)
 		fs.closeCachedFilesForPath(path)
 		// A write recreates a path that vanished while the handle was open.
 		// No reply tells the kernel the name exists again.

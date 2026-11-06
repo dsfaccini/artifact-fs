@@ -85,7 +85,7 @@ func newSharedE2ERepo(t *testing.T) *sharedE2ERepo {
 	// The shared daemon can outlive the 5-minute refresh interval. A
 	// background fetch would then move remote-tracking refs while a test or a
 	// restore runs.
-	if err := repo.svc.SetRefresh(context.Background(), repoName, 24*time.Hour, false); err != nil {
+	if err := repo.ctl.SetRefresh(context.Background(), repoName, 24*time.Hour, false); err != nil {
 		t.Fatal(err)
 	}
 	s := &sharedE2ERepo{repo: repo, gitDir: filepath.Join(repo.root, "repos", repoName, "git")}
@@ -93,7 +93,7 @@ func newSharedE2ERepo(t *testing.T) *sharedE2ERepo {
 	if s.head, err = gitOutput(repo.mountPath, "rev-parse", "HEAD"); err != nil {
 		t.Fatal(err)
 	}
-	st, err := repo.svc.Status(context.Background(), repoName)
+	st, err := repo.ctl.Status(context.Background(), repoName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func (s *sharedE2ERepo) restore() error {
 	if err := s.discardOverlay(); err != nil {
 		return err
 	}
-	st, err := s.repo.svc.Status(context.Background(), repoName)
+	st, err := s.repo.ctl.Status(context.Background(), repoName)
 	if err != nil {
 		return err
 	}
@@ -258,12 +258,12 @@ func (s *sharedE2ERepo) settle() (model.RepoRuntimeState, error) {
 		if err := s.waitForDaemonHEAD(s.head); err != nil {
 			return model.RepoRuntimeState{}, err
 		}
-		before, err := s.repo.svc.Status(context.Background(), repoName)
+		before, err := s.repo.ctl.Status(context.Background(), repoName)
 		if err != nil {
 			return model.RepoRuntimeState{}, err
 		}
 		time.Sleep(kernelCacheExpiry)
-		after, err := s.repo.svc.Status(context.Background(), repoName)
+		after, err := s.repo.ctl.Status(context.Background(), repoName)
 		if err != nil {
 			return model.RepoRuntimeState{}, err
 		}
@@ -310,7 +310,7 @@ func (s *sharedE2ERepo) discardOverlay() error {
 // that the test undid: the daemon publishes a snapshot generation for each HEAD
 // it moves to.
 func (s *sharedE2ERepo) verifyUnchanged() error {
-	st, err := s.repo.svc.Status(context.Background(), repoName)
+	st, err := s.repo.ctl.Status(context.Background(), repoName)
 	if err != nil {
 		return err
 	}
@@ -327,7 +327,7 @@ func (s *sharedE2ERepo) verify() error {
 	} else if len(entries) != 0 {
 		return fmt.Errorf("overlay entries = %v, want none", entries)
 	}
-	st, err := s.repo.svc.Status(context.Background(), repoName)
+	st, err := s.repo.ctl.Status(context.Background(), repoName)
 	if err != nil {
 		return err
 	}
@@ -376,7 +376,7 @@ func (s *sharedE2ERepo) verify() error {
 
 func (s *sharedE2ERepo) waitForDaemonHEAD(oid string) error {
 	return pollCondition(15*time.Second, "daemon HEAD on "+s.headRef+" at "+oid, func() (bool, string) {
-		st, err := s.repo.svc.Status(context.Background(), repoName)
+		st, err := s.repo.ctl.Status(context.Background(), repoName)
 		if err != nil {
 			return false, err.Error()
 		}

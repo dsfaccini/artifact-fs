@@ -22,8 +22,8 @@ go build -o artifact-fs ./cmd/artifact-fs
 - **Prefer HTTPS remotes.** For private repos, use Git credential helpers or SSH auth. Do not embed tokens or passwords in the `--remote` URL because `--remote` is a CLI arg and can show up in process listings.
 - **`add-repo` does not mount.** It registers a blobless clone and exits. `daemon` mounts all registered repos and stays running.
 - **The mounted tree starts from committed Git state.** Remote commits, trees, and refs are the base view. Local edits live in an overlay and appear as dirty state until committed.
-- **One daemon can mount many repos.** Register each repo separately, then start one `daemon --root <mount-root>`.
-- **Unmount a stale mount with the OS's tool.** On macOS run `diskutil unmount <path>`, because `umount` fails on an FSKit mount unless the terminal app has the Network Volumes permission. On Linux run `fusermount3 -u <path>`, because `umount` needs root.
+- **One daemon can mount many repos.** Register each repo separately, then start one `daemon --root <mount-root>`. A second daemon on the same `ARTIFACT_FS_ROOT` exits with an error.
+- **Unmount a stale mount with the OS's tool.** A stale mount is one no running daemon serves, so `unmount` cannot reach it. On macOS run `diskutil unmount <path>`, because `umount` fails on an FSKit mount unless the terminal app has the Network Volumes permission. On Linux run `fusermount3 -u <path>`, because `umount` needs root.
 
 ## Quick Reference
 
@@ -33,9 +33,10 @@ go build -o artifact-fs ./cmd/artifact-fs
 | Mount all registered repos | `./artifact-fs daemon --root <mount-root>` |
 | Check mount and overlay state | `./artifact-fs status --name <name>` |
 | List registered repos | `./artifact-fs list-repos` |
+| Unmount a repo until remount | `./artifact-fs unmount --name <name>`; waits for the running daemon and exits non-zero if it failed or no daemon runs |
+| Mount a repo again | `./artifact-fs remount --name <name>` |
 | Shrink a repo's blob cache | `./artifact-fs evict-cache --name <name> --max-bytes <bytes>`; evicts least recently accessed blobs, never automatic |
 | Unmount and remove a repo | `./artifact-fs remove-repo --name <name>`; the running daemon unmounts it at its next registry poll |
-| Remount all repos | Stop the daemon and start it again. `unmount` and `remount` cannot reach a running daemon and exit non-zero |
 
 ## Quick Start: One Repo
 

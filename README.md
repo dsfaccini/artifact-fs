@@ -134,24 +134,61 @@ Check the state of a mounted repo with `status`:
 
 ```bash
 ./artifact-fs status --name workers-sdk
-# repo=workers-sdk state=mounted head=d4c61587... ref=main source_ref=refs/heads/main required_commit=none acquisition=not_required base_commit=d4c61587... remote_refresh=enabled ahead=0 behind=0 diverged=false last_fetch=2026-03-27T12:00:00Z result=ok prepare_error=none mount_error=none hydrated_blobs=42 hydrated_bytes=131072 overlay_dirty=false
+# repo=workers-sdk state=mounted head=d4c61587... ref=main source_ref=refs/heads/main required_commit=none acquisition=not_required base_commit=d4c61587... served_commit=d4c61587... served_generation=3 published_commit=d4c61587... published_generation=3 phase=serve remote_refresh=enabled ahead=0 behind=0 diverged=false last_fetch=2026-03-27T12:00:00Z result=ok prepare_error=none mount_error=none last_error=none last_error_phase=none last_error_at=none next_retry=none attempts=0 hydrated_blobs=42 hydrated_bytes=131072 overlay_dirty=false
 ```
 
 | Field | Meaning |
 |-------|---------|
-| `state` | `mounted`, `unmounted`, `preparing`, or `failed` |
+| `state` | `mounted`, `degraded` (the FUSE mount is down or the last remote refresh failed), `unmounted`, `preparing`, or `failed`. Without a running daemon, `preparing` or `failed` while preparation is pending or has failed, and `unmounted` otherwise |
 | `head` / `ref` | Backward-compatible aliases for the current base commit and Git HEAD ref |
 | `source_ref` | Canonical remote ref selected during acquisition |
 | `required_commit` | Required source commit, or `none` |
 | `acquisition` | Historical acquisition evidence: `not_required`, `pending`, or `verified` |
-| `base_commit` | Commit backing the currently published filesystem generation |
+| `base_commit` | The served commit while the daemon serves the repo, otherwise the published one |
+| `served_commit` / `served_generation` | Commit and snapshot generation the daemon's mount serves; `none`/`0` when no daemon serves the repo |
+| `published_commit` / `published_generation` | Commit and generation the snapshot store last published. After a failed overlay transition they run ahead of the served ones until the daemon's retry succeeds |
+| `phase` | The step the daemon's runtime for the repo is in: `prepare` (async preparation), `mount` (including retries of a FUSE mount that failed), `serve` (a mount is served) or `unmount`; `none` when no daemon runs or before it records one |
 | `remote_refresh` | Whether daemon and manual remote refreshes are enabled |
-| `ahead` / `behind` / `diverged` | Currently zero/false in one-shot CLI status output |
+| `ahead` / `behind` / `diverged` | Divergence from the remote at the daemon's last successful refresh |
 | `prepare_error` | Last redacted preparation error, if any |
-| `mount_error` | Last redacted FUSE mount or connection error, if any; a successful mount clears it |
+| `mount_error` | `last_error` when any step of mounting the repo failed last (phase `mount`: from cloning or fetching its source and building its snapshot to the FUSE mount itself, including unmounting a dead mount before a retry) or its FUSE connection failed or exited (phase `serve`); a mount that serves clears it |
+| `last_error` / `last_error_phase` / `last_error_at` | Last redacted failure the daemon retries, the phase that failed (`mount`, `serve`, `unmount`, `head_reconcile`, `fetch` or `registry_sync`) and when. `serve` is a FUSE connection that failed or exited. A success of that phase clears it |
+| `next_retry` / `attempts` | When the daemon retries the failed phase, and how many times in a row it failed; `next_retry` is `none` when no daemon runs |
 | `hydrated_blobs` / `hydrated_bytes` | Blob count and bytes in the repo's blob cache, read from counters kept with the cache (see [Evicting the blob cache](#evicting-the-blob-cache)) |
 | `overlay_dirty` | `true` if the overlay contains created or modified files; delete-only overlays are not counted |
-| `last_fetch` / `result` | `FETCH_HEAD` modification time and `ok` when present; otherwise `never` |
+| `last_fetch` / `result` | Time and result (`ok` or `failed`) of the daemon's last remote refresh, or of a later `fetch` command; otherwise `never` |
+
+`status` reads what the daemon records in the registry, so it reports the same
+state from any process. Only one daemon runs per state root: it holds a lock on
+`config/daemon.lock`, and a second `daemon` on that root exits with an error.
+
+When you upgrade, stop the running daemon before you start the new one. A
+daemon from a build without the daemon lock takes no lock, so a new daemon
+would start beside it on the same state root.
+
+## Unmounting and remounting a repo
+
+`unmount` asks the running daemon to unmount a repo and keep it unmounted, also
+across daemon restarts, until `remount`. `remount` asks it to mount the repo
+again, unmounting it first if it is mounted. Both wait until the daemon reports
+the outcome. They exit non-zero when the daemon failed, when no daemon runs on
+the state root, when a later `unmount` or `remount` replaced the request, or
+after two minutes without an outcome. The daemon retries a failed unmount or
+mount; `status` shows the retry.
+
+A request stays in the registry until the daemon carries it out, also after the
+command timed out or the daemon stopped. A later `unmount` or `remount` replaces
+it.
+
+```bash
+./artifact-fs unmount --name workers-sdk
+./artifact-fs remount --name workers-sdk
+```
+
+The commands wake the daemon through the owner-only socket
+`config/daemon.sock`, which carries no data. When the state root's path is too
+long for a Unix socket (104 bytes on macOS, 108 on Linux), the daemon opens no
+socket and acts at its next registry poll, within 3 seconds.
 
 Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The first read of a file in a directory also queues up to 256 of that directory's files for background hydration, ranking code and manifests (`package.json`, `go.mod`, `README.md`) ahead of binary files. Listing or walking directories queues nothing. A blobless clone knows a file's size only once its blob is local, so the first `stat` of a file hydrates that one file. A worker takes up to 256 queued blobs, all reads or all prefetches, and fetches the missing ones with one `git fetch` from the promisor remote, so a blobless clone pays one fetch per batch, not one per blob. Queued reads go ahead of queued prefetches, and a blob a prefetch has already downloaded is copied into the cache before more prefetches download. With more than one worker, one worker takes only reads and those copies, so a read never waits for an unrelated prefetch download, though it can wait for one copy of a blob already on disk. With a single worker, a read can wait for a running prefetch download. A read of a file whose own prefetch is downloading waits for that download.
 
@@ -418,7 +455,7 @@ it at a later HEAD change.
 | Backend | After a HEAD change |
 |---------|---------------------|
 | Linux | The mount invalidates three things at once: the attributes and cached pages of each inode the kernel holds whose type, permission bits or blob changed; the entry of each name that vanished or changed type; and each negative entry whose name now exists. The mount caches a missing name as a negative entry for 1 s. A name made through the mount replaces its negative entry, and a write that recreates a vanished file invalidates it. The mount negotiates `FUSE_AUTO_INVAL_DATA` without writeback caching, so the kernel drops a file's cached pages when its size or mtime changes. The kernel keeps a base file's pages across opens only while its opens serve the same blob. For up to 1 s, a reader can still see attributes the mount does not invalidate, such as the old mtime of a file whose blob did not change, or of a directory. A lookup or getattr that races the switch can leave old names and sizes for up to 1 s, and old pages within one open. |
-| macFUSE kernel extension | The mount sends the same invalidations as on Linux. The extension mounts with `novncache`, so it caches no names and the mount caches no negative entries. It drops a file's cached attributes and pages on each `InvalidateInode`. A changed size only resizes its page cache: a smaller size drops the pages past the new end. An open does not drop the pages, and `KeepPageCache` has no effect. So a lookup or getattr that races the switch can leave the old blob's pages beyond one open, until the next invalidation of that inode or a smaller size. For up to 1 s, a reader can still see the old mtime of a file whose blob did not change, and of a directory. macFUSE 5's extension is closed source, so this row follows the open-source [osxfuse extension](https://github.com/osxfuse/kext/blob/534773bd3135f04b7f6fb801faa2f8991daf4a6b/osxfuse/fuse_vnops.c#L2356-L2390). |
+| macFUSE kernel extension | The mount sends the same invalidations as on Linux. The extension mounts with `novncache`, so it caches no names and the mount caches no negative entries. It drops a file's cached attributes and pages on each `InvalidateInode`, and a getattr that reports a size other than the one it holds drops all the file's cached pages. A lookup leaves a held file's size alone. An open does not drop the pages, and `KeepPageCache` has no effect. So a lookup or getattr that races the switch can leave the old blob's pages beyond one open, until the next invalidation of that inode or a getattr that reports a different size. For up to 1 s, a reader can still see the old mtime of a file whose blob did not change, and of a directory. macFUSE 5's extension is closed source, so this row follows the open-source [osxfuse extension](https://github.com/osxfuse/kext/tree/534773bd3135f04b7f6fb801faa2f8991daf4a6b). |
 | FSKit | FSKit takes no invalidations, so the mount sends none and caches no negative entries. FSKit keeps what it cached until it asks again, which the mount cannot hasten. FSKit keeps its own attribute cache, and artifact-fs knows no bound for it. Until then, a reader can see the old commit's names, sizes and modes, and an inode reads the old generation while the daemon keeps it. After that, the inode reads the current content. The fuse library answers EIO to a read inside the size it last reported that the current content does not fill. A read that FSKit sends before a reply reporting a smaller size reaches it can still get a short reply without EIO. |
 
 ### Subsystems

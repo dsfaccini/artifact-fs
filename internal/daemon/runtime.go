@@ -40,7 +40,9 @@ type repoRuntime struct {
 	// failedMount is a mount whose connection failed and that still holds the mount point.
 	failedMount fusefs.MountedFS
 	// retired holds the generations the resolver stopped serving, with when.
-	retired []retiredGeneration
+	// retiredMu guards it, and is taken alone.
+	retiredMu sync.Mutex
+	retired   []retiredGeneration
 }
 
 type retiredGeneration struct {

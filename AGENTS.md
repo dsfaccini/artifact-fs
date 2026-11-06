@@ -16,7 +16,7 @@ Repository-specific guidance for `artifact-fs`.
 ## Architecture
 
 - `cmd/artifact-fs` is the only binary entrypoint.
-- `internal/cli` wires commands onto `daemon.Service`.
+- `internal/cli` runs the `daemon` command on `daemon.Service`, and every other command on `daemon.Controller`. Only `daemon.Service` mounts.
 - `internal/daemon` owns repo lifecycle: registry sync, snapshot publish, overlay reconcile, FUSE mount, watcher, refresh loop.
 - `internal/fusefs` is the merged view and writable filesystem layer.
 - `internal/gitstore` is the performance-sensitive git wrapper; most easy-to-break invariants live there.
@@ -28,6 +28,10 @@ Repository-specific guidance for `artifact-fs`.
 - `add-repo` is one-shot by default: register repo, clone blobless, build the initial snapshot, then exit. It does not mount FUSE or start background goroutines.
 - `add-repo --async` only registers prepare state. The daemon mounts a gated placeholder, prepares clone/fetch and snapshot in the background, then opens the gate and starts watcher/refresh.
 - `daemon` is long-running: it mounts registered repos and starts watcher, refresh, and hydrator workers.
+- The daemon holds a flock on `<root>/config/daemon.lock`. A second daemon on one state root fails. CLI commands probe that lock to learn whether a daemon runs.
+- The registry carries every request from the CLI to the daemon. The control socket only wakes the daemon.
+- Only the daemon writes `repo_runtime`. It writes the record at every transition and every retried failure. `status` reads that record and the stores, never daemon memory.
+- `unmount` and `remount` write an intent to `enabled` and `mount_request`, then nudge `<root>/config/daemon.sock`. They wait until `repo_runtime` echoes the request.
 - `git.CloneBlobless` already populates the git index with `read-tree HEAD`; be careful about extra index resets because they can discard staged state.
 
 ## Code conventions
@@ -45,7 +49,7 @@ Repository-specific guidance for `artifact-fs`.
 - Wrap an operation error's cause with `%w`, and let `toErrno` map it for the kernel. Do not return `syscall.EIO` for a failure that carries an errno.
 - Switch a runtime's generation only through `Service.switchGeneration`. It sends the kernel the invalidations the switch needs through `MountedFS.InvalidateChanged`.
 - Never wait on a kernel invalidation inside an op or while holding a lock an op takes. The kernel can hold a directory lock while it waits for that op's reply, and the invalidation waits for the same lock.
-- Record every entry reply with `allocEntry` and every attribute reply with `setReported`. `InvalidateChanged` compares what the kernel received with the merged view, and `allocEntry` drops the name's negative entry record.
+- Record every entry reply with `allocEntry` and every attribute reply with `setReported`. `InvalidateChanged` compares what the kernel received with the merged view, and `allocEntry` drops the name's negative entry record. The exception is `GetInodeAttributes` for the root and the synthesized `.git` file: `InvalidateChanged` skips both.
 - Prune snapshot generations only through `Service.pruneGenerations`. An inode reads the generation of its last reported attributes, so a retired generation stays readable for `defaultGenerationRetention`.
 
 ## Writing tests

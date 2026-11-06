@@ -2,8 +2,8 @@ package daemon
 
 import (
 	"context"
-	"errors"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -77,54 +77,122 @@ const (
 	logRepoConfigChanged         = "repo config changed, remounting"
 )
 
-type Service struct {
-	root                 string
-	mountRoot            string
-	mount                mountFunc
-	hydrationConcurrency int
+// core is what the CLI controller and the daemon share: the state root, the
+// registry, the git store and the preparation pipeline.
+type core struct {
+	root      string
+	mountRoot string
 	// prepareContext bounds one preparation attempt; nil means defaultPrepareTimeout.
 	prepareContext func(context.Context) (context.Context, context.CancelFunc)
-	// headReconcileBackoff is the first retry delay after a failed HEAD
-	// reconcile; zero means headReconcileMinBackoff.
-	headReconcileBackoff time.Duration
+	logger         *slog.Logger
+	registry       *registry.Store
+	git            *gitstore.Store
 	// generationRetention is how long a retired generation stays readable;
 	// zero means defaultGenerationRetention.
 	generationRetention time.Duration
-	logger              *slog.Logger
-	registry            *registry.Store
-	git                 *gitstore.Store
-	mu                  sync.Mutex
-	running             map[model.RepoID]*repoRuntime
-	preparing           map[model.RepoID]int64
-	prepareAttempts     map[model.RepoID]int64
-	prepareSeq          int64
-	mountFailures       map[model.RepoID]*mountFailure
-	prepareWorkers      sync.WaitGroup
-	closing             bool
 }
 
+// Controller carries out one CLI command. It never mounts. It reaches the
+// daemon only through the registry, repo_runtime and the control socket.
+type Controller struct {
+	*core
+	// requestTimeout bounds the wait of Unmount and Remount; zero means
+	// mountRequestTimeout.
+	requestTimeout time.Duration
+}
+
+// Service is the daemon: it holds the daemon lock and mounts and serves every
+// registered repo.
+type Service struct {
+	*core
+	mount                mountFunc
+	hydrationConcurrency int
+	// Test hooks, nil in production. runtimeStarted runs between starting a
+	// runtime and recording it. mountReleased runs in a join goroutine after
+	// it released a FUSE mount whose server exited cleanly, before it records
+	// the exit. joinFinished runs as a join goroutine ends.
+	runtimeStarted, mountReleased, joinFinished func()
+	// headReconcileBackoff is the first retry delay after a failed HEAD
+	// reconcile; zero means headReconcileMinBackoff.
+	headReconcileBackoff time.Duration
+	mu                   sync.Mutex
+	running              map[model.RepoID]*repoRuntime
+	preparing            map[model.RepoID]int64
+	prepareAttempts      map[model.RepoID]int64
+	prepareSeq           int64
+	mountFailures        map[model.RepoID]*mountFailure
+	prepareWorkers       sync.WaitGroup
+	closing              bool
+	// lock is the daemon lock on root, held until Close.
+	lock *os.File
+	// wake carries control socket nudges to the sync loop.
+	wake chan struct{}
+	// syncInterval is how often Start polls the registry; zero means
+	// registrySyncInterval.
+	syncInterval time.Duration
+	// records holds what recordRuntime last wrote for each repo. recordMu
+	// serializes the writes, and is taken before mu.
+	recordMu sync.Mutex
+	records  map[model.RepoID]*model.RepoRuntimeRecord
+}
+
+// New returns the daemon for root. It takes the daemon lock, so a second
+// daemon on root fails here.
 func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error) {
 	root, err := ensureStateRoot(root)
 	if err != nil {
 		return nil, err
 	}
-	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
+	lock, err := acquireDaemonLock(root)
 	if err != nil {
 		return nil, err
 	}
-	svc := &Service{
-		root:            root,
+	c, err := newCore(ctx, root, logger)
+	if err != nil {
+		lock.Close()
+		return nil, err
+	}
+	return &Service{
+		core:            c,
 		mount:           defaultMount,
-		logger:          logger,
-		registry:        reg,
-		git:             gitstore.New(logger),
 		running:         map[model.RepoID]*repoRuntime{},
 		preparing:       map[model.RepoID]int64{},
 		prepareAttempts: map[model.RepoID]int64{},
 		mountFailures:   map[model.RepoID]*mountFailure{},
+		lock:            lock,
+		wake:            make(chan struct{}, 1),
+		records:         map[model.RepoID]*model.RepoRuntimeRecord{},
+	}, nil
+}
+
+// NewController returns the controller for root. It takes no daemon lock, so
+// it runs beside the daemon.
+func NewController(ctx context.Context, root string, logger *slog.Logger) (*Controller, error) {
+	root, err := ensureStateRoot(root)
+	if err != nil {
+		return nil, err
 	}
-	svc.git.SetBatchPoolSize(DefaultHydrationConcurrency)
-	return svc, nil
+	c, err := newCore(ctx, root, logger)
+	if err != nil {
+		return nil, err
+	}
+	return &Controller{core: c}, nil
+}
+
+func newCore(ctx context.Context, root string, logger *slog.Logger) (*core, error) {
+	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
+	if err != nil {
+		return nil, err
+	}
+	c := &core{root: root, logger: logger, registry: reg, git: gitstore.New(logger)}
+	c.git.SetBatchPoolSize(DefaultHydrationConcurrency)
+	return c, nil
+}
+
+// Close releases the controller's registry and git processes.
+func (c *Controller) Close() error {
+	c.git.Close()
+	return c.registry.Close()
 }
 
 func (s *Service) SetMountRoot(root string) {
@@ -147,6 +215,10 @@ func (s *Service) hydrationWorkers() int {
 	return DefaultHydrationConcurrency
 }
 
+// Close unmounts every repo and releases the registry, the git processes and
+// the daemon lock, also when an unmount fails. It returns the first error. A
+// runtime that failed to unmount keeps its workers, so Close does not wait
+// for its preparation.
 func (s *Service) Close() error {
 	s.mu.Lock()
 	s.closing = true
@@ -161,15 +233,23 @@ func (s *Service) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	if len(errs) > 0 {
-		return errors.Join(errs...)
+	if len(errs) == 0 {
+		s.prepareWorkers.Wait()
 	}
-	s.prepareWorkers.Wait()
 	s.git.Close()
-	return s.registry.Close()
+	if err := s.registry.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := s.lock.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return errs[0]
+	}
+	return nil
 }
 
-func (s *Service) fillPaths(cfg *model.RepoConfig) {
+func (s *core) fillPaths(cfg *model.RepoConfig) {
 	if cfg.MountRoot == "" {
 		if s.mountRoot != "" {
 			cfg.MountRoot = s.mountRoot

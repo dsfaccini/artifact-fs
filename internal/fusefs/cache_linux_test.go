@@ -2,6 +2,8 @@ package fusefs
 
 import (
 	"os"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,5 +120,45 @@ func TestOpenKeepsPageCacheOnlyForTheBlobItLastServed(t *testing.T) {
 	}
 	if keeps() {
 		t.Fatal("open of the overlay file kept the page cache")
+	}
+}
+
+// A write through a handle fills the kernel's pages with the written bytes.
+// After a commit of them and a switch back to the blob the handle's open
+// served, at the same size and with no reply in between, the next open must
+// not keep those pages.
+func TestOpenAfterAWriteDropsThePageCache(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-a", 0o100644))
+	inode := f.lookup(fuseops.RootInodeID, "file.txt")
+	if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: inode, Handle: f.open(inode).Handle, Data: []byte("xxxxxx")}); err != nil {
+		t.Fatal(err)
+	}
+	f.switchTo(baseFile("file.txt", blobOID("xxxxxx"), 0o100644))
+	f.switchTo(baseFile("file.txt", "blob-a", 0o100644))
+	if f.open(inode).KeepPageCache {
+		t.Fatal("open after the write kept pages that hold the written bytes, not blob-a")
+	}
+}
+
+// A negative entry whose name cannot be resolved skips only its own
+// invalidation, like a held inode's. The pass still invalidates every changed
+// inode and returns the first error, which here is the held inode's.
+func TestInvalidateChangedContinuesPastNegativeEntryResolveErrors(t *testing.T) {
+	f := newCacheFixture(t, baseFile("edited.txt", "edited-1", 0o100644), baseFile("broken.txt", "broken", 0o100644))
+	var root fuseops.InodeID = fuseops.RootInodeID
+	edited := f.lookup(root, "edited.txt")
+	f.lookup(root, "broken.txt")
+	if child := f.lookup(root, "missing.txt"); child != 0 {
+		t.Fatalf("lookup of missing.txt = inode %d", child)
+	}
+	f.switchTo(baseFile("edited.txt", "edited-2", 0o100644), baseFile("broken.txt", "broken", 0o100644))
+	f.resolver.Overlay = failingLookupOf{OverlayStore: f.resolver.Overlay, paths: []string{"broken.txt", "missing.txt"}}
+
+	err := f.mount.InvalidateChanged()
+	if err == nil || !strings.Contains(err.Error(), "broken.txt") {
+		t.Fatalf("InvalidateChanged = %v, want the first error, on broken.txt", err)
+	}
+	if inodes, _ := f.notifier.recorded(); !slices.Equal(inodes, []fuseops.InodeID{edited}) {
+		t.Fatalf("invalidated inodes = %v, want edited.txt (%d) despite the errors", inodes, edited)
 	}
 }

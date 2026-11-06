@@ -7,10 +7,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
+
+// fetchResultFailed is the fetch result of a failed refresh, whose error the
+// runtime record holds.
+const fetchResultFailed = "failed"
 
 type aheadBehind struct {
 	ahead    int
@@ -50,7 +53,7 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 			err := s.git.Fetch(ctx, cfg)
 			if err != nil {
 				s.mu.Lock()
-				markFetchFailure(&rt.state, auth.RedactString(err.Error()))
+				markFetchFailure(&rt.state, fetchResultFailed)
 				s.mu.Unlock()
 				cancel()
 				// Exponential backoff on failure, capped at maxBackoff
@@ -61,6 +64,8 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 					backoff *= 2
 				}
 				ticker.Reset(backoff)
+				s.recordFailure(cfg, phaseFetch, err, time.Now().Add(backoff))
+				s.recordRuntimeState(rt)
 				continue
 			}
 			state, abErr := s.fetchState(ctx, cfg)
@@ -74,6 +79,7 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 				applyAheadBehind(&rt.state, state)
 			}
 			s.mu.Unlock()
+			s.recordRuntimeState(rt, phaseFetch)
 		}
 	}
 }

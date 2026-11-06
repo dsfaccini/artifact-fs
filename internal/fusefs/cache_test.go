@@ -321,14 +321,14 @@ func TestInvalidateChangedDropsVanishedNameLastReportedFromOverlay(t *testing.T)
 	}
 }
 
-// failingLookupOf fails the overlay lookup of one path.
+// failingLookupOf fails the overlay lookup of each of paths.
 type failingLookupOf struct {
 	model.OverlayStore
-	path string
+	paths []string
 }
 
 func (o failingLookupOf) Lookup(ctx context.Context, path string) (model.OverlayEntry, bool, error) {
-	if path == o.path {
+	if slices.Contains(o.paths, path) {
 		return model.OverlayEntry{}, false, errors.New("injected lookup failure")
 	}
 	return o.OverlayStore.Lookup(ctx, path)
@@ -342,7 +342,7 @@ func TestInvalidateChangedContinuesPastAResolveError(t *testing.T) {
 	edited := f.lookup(root, "edited.txt")
 	f.lookup(root, "broken.txt")
 	f.switchTo(baseFile("edited.txt", "edited-2", 0o100644), baseFile("broken.txt", "broken", 0o100644))
-	f.resolver.Overlay = failingLookupOf{OverlayStore: f.resolver.Overlay, path: "broken.txt"}
+	f.resolver.Overlay = failingLookupOf{OverlayStore: f.resolver.Overlay, paths: []string{"broken.txt"}}
 
 	err := f.mount.InvalidateChanged()
 	if err == nil {
@@ -384,5 +384,33 @@ func TestLateReplyKeepsTheNewerGeneration(t *testing.T) {
 	}
 	if got := string(bytes.Join(read.Data, nil)); got != "new" || uint64(len(got)) != getattr.Attributes.Size {
 		t.Fatalf("read after the kernel took the %d-byte size of the newer reply = %q, want %q", getattr.Attributes.Size, got, "new")
+	}
+}
+
+// A write fills the kernel's pages with the written bytes. A commit of them
+// makes reconcile drop the overlay entry, and a later switch brings back the
+// blob the file held before the write, at the same size. The kernel last saw
+// the file from the overlay, so the pass must still drop those pages.
+func TestInvalidateChangedDropsWrittenPagesWhenABaseBlobReturns(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-a", 0o100644))
+	inode := f.lookup(fuseops.RootInodeID, "file.txt")
+	if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: inode, Handle: f.open(inode).Handle, Data: []byte("xxxxxx")}); err != nil {
+		t.Fatal(err)
+	}
+	f.switchTo(baseFile("file.txt", blobOID("xxxxxx"), 0o100644))
+	if _, ok, err := f.resolver.Overlay.Lookup(f.ctx, "file.txt"); err != nil || ok {
+		t.Fatalf("overlay holds file.txt after its content was committed: %t, %v", ok, err)
+	}
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := f.notifier.recorded()
+
+	f.switchTo(baseFile("file.txt", "blob-a", 0o100644))
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if after, _ := f.notifier.recorded(); !slices.Equal(after[len(before):], []fuseops.InodeID{inode}) {
+		t.Fatalf("inodes the switch back to blob-a invalidated = %v, want file.txt (%d)", after[len(before):], inode)
 	}
 }
