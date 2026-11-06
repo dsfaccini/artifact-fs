@@ -228,8 +228,9 @@ func TestStartUnmountsAMountTheEarlierDaemonLeft(t *testing.T) {
 			svc.unmountPath = table.unmountPath
 			svc.mount = table.mount
 			done := startService(t, svc)
+			// Until Start clears it, status shows the seeded record.
 			want := tt.wantCalls(cfg.MountPath)
-			waitFor(t, done, func() bool { return len(table.recorded()) >= len(want) })
+			waitFor(t, done, func() bool { return slices.Contains(table.recorded(), want[len(want)-1]) })
 			if tt.unmountErr != nil {
 				waitFor(t, done, func() bool {
 					st, err := ctl.Status(ctx, "repo")
@@ -273,21 +274,137 @@ func TestCleanStopLeavesNoLeftoverClaim(t *testing.T) {
 	if err := first.Close(); err != nil {
 		t.Fatalf("clean Close = %v", err)
 	}
+	// A mount appears at the mount point before the next daemon starts.
+	if got := nextDaemonCalls(t, first.root, cfg.MountPath); !slices.Equal(got, []string{"mount"}) {
+		t.Fatalf("calls = %q; the daemon unmounted a mount the cleanly stopped daemon did not leave", got)
+	}
+}
 
-	next, err := New(ctx, first.root, discardLogger())
+// nextDaemonCalls starts a daemon on root while a daemon's mount of the repo
+// is at mountPath, and returns its unmounts and mounts until it mounts the
+// repo.
+func nextDaemonCalls(t *testing.T, root, mountPath string) []string {
+	t.Helper()
+	next, err := New(context.Background(), root, discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = next.Close() })
-	// A mount appears at the mount point before the next daemon starts.
-	table := &recordingMountTable{path: cfg.MountPath, entry: ownMountEntry("repo"), held: true}
+	table := &recordingMountTable{path: mountPath, entry: ownMountEntry("repo"), held: true}
 	next.mountPointEntry = table.mountPointEntry
 	next.unmountPath = table.unmountPath
 	next.mount = table.mount
-	nextDone := startService(t, next)
-	waitFor(t, nextDone, func() bool { return slices.Contains(table.recorded(), "mount") })
-	if got := table.recorded(); !slices.Equal(got, []string{"mount"}) {
-		t.Fatalf("calls = %q; the daemon unmounted a mount the cleanly stopped daemon did not leave", got)
+	done := startService(t, next)
+	waitFor(t, done, func() bool { return slices.Contains(table.recorded(), "mount") })
+	return table.recorded()
+}
+
+// A daemon that runs a repo's runtime but never released the leftover at its
+// mount point still claims it at a clean stop. The mount table cannot be read
+// at the first check, which keeps the claim, and the runtime's unmount of the
+// leftover then fails, so the runtime runs with nothing mounted and its stop
+// unmounts nothing.
+func TestCloseKeepsAClaimItsRuntimeDidNotRelease(t *testing.T) {
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.registry.PutRuntime(ctx, model.RepoRuntimeRecord{RepoID: cfg.ID, State: repoStateMounted, Phase: phaseServe}); err != nil {
+		t.Fatal(err)
+	}
+	table := &recordingMountTable{path: cfg.MountPath, entry: ownMountEntry("repo"), held: true, unreadable: 1, unmountErr: errors.New("busy")}
+	svc.mountPointEntry = table.mountPointEntry
+	svc.unmountPath = table.unmountPath
+	svc.mount = table.mount
+	startCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- svc.Start(startCtx) }()
+	waitFor(t, done, func() bool {
+		st, err := ctl.Status(ctx, "repo")
+		return err == nil && st.LastErrorPhase == phaseMount
+	})
+	svc.mu.Lock()
+	_, running := svc.running[cfg.ID]
+	svc.mu.Unlock()
+	if !running {
+		t.Fatal("no runtime runs; the leftover unmount failed before the runtime started")
+	}
+	cancel()
+	<-done
+	if err := svc.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	if got, want := nextDaemonCalls(t, svc.root, cfg.MountPath), []string{"unmount " + cfg.MountPath, "mount"}; !slices.Equal(got, want) {
+		t.Fatalf("calls = %q, want %q; the next daemon lost the claim on the earlier daemon's mount", got, want)
+	}
+}
+
+// A Close whose unmount failed leaves the mount behind, so the next daemon
+// claims it.
+func TestFailedCloseKeepsTheLeftoverClaim(t *testing.T) {
+	first, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	cfg, err := first.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy := &exitingMount{exit: make(chan struct{}), err: errors.New("busy")}
+	t.Cleanup(func() { close(busy.exit) })
+	first.mountPointEntry = func(string) (mountEntry, bool) { return ownMountEntry("repo"), true }
+	first.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+		return busy, nil
+	}
+	startCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- first.Start(startCtx) }()
+	waitFor(t, done, func() bool {
+		st, err := ctl.Status(ctx, "repo")
+		return err == nil && st.State == repoStateMounted
+	})
+	cancel()
+	<-done
+	if err := first.Close(); err == nil {
+		t.Fatal("Close succeeded, want the unmount failure")
+	}
+	if got, want := nextDaemonCalls(t, first.root, cfg.MountPath), []string{"unmount " + cfg.MountPath, "mount"}; !slices.Equal(got, want) {
+		t.Fatalf("calls = %q, want %q; the next daemon left the mount a failed Close left behind", got, want)
+	}
+}
+
+// status shows the last refresh of a daemon that stopped cleanly.
+func TestCleanStopKeepsTheLastRefreshInStatus(t *testing.T) {
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ctl.SetRefresh(ctx, "repo", 20*time.Millisecond, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(cfg.RemoteURL); err != nil {
+		t.Fatal(err)
+	}
+	startCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- svc.Start(startCtx) }()
+	waitFor(t, done, func() bool {
+		st, err := ctl.Status(ctx, "repo")
+		return err == nil && st.LastFetchResult == string(fetchFailed)
+	})
+	cancel()
+	<-done
+	if err := svc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := ctl.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LastFetchResult != string(fetchFailed) {
+		t.Fatalf("status with no daemon: result=%s, want %s, the stopped daemon's last refresh", st.LastFetchResult, fetchFailed)
 	}
 }
 
