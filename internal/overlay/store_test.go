@@ -2120,9 +2120,21 @@ func TestReadOnlyModeFileAcceptsWrites(t *testing.T) {
 			t.Fatalf("write %s: %v", step, err)
 		}
 	}
+	ownerWritable := func(step string) {
+		t.Helper()
+		e, _ := s.Get("ro.txt")
+		st, err := os.Stat(e.BackingPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := st.Mode().Perm(); perm&0o600 != 0o600 {
+			t.Fatalf("backing file %s has mode %o; want owner read and write", step, perm)
+		}
+	}
 	if _, err := s.CreateFile(ctx, "ro.txt", 0o444); err != nil {
 		t.Fatal(err)
 	}
+	ownerWritable("after the create")
 	write("after the create", 0, "one")
 	if err := s.Mkdir(ctx, "d", 0o755); err != nil {
 		t.Fatal(err)
@@ -2131,6 +2143,7 @@ func TestReadOnlyModeFileAcceptsWrites(t *testing.T) {
 	if err := s.SetMode(ctx, "ro.txt", 0o444); err != nil {
 		t.Fatal(err)
 	}
+	ownerWritable("after a chmod")
 	write("after a chmod", 6, "six")
 	e, _ := s.Get("ro.txt")
 	if err := s.FlushFile(ctx, "ro.txt"); err != nil {

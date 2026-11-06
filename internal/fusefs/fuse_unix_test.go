@@ -1601,6 +1601,96 @@ func TestCreateThenCloseClearsPending(t *testing.T) {
 	}
 }
 
+// A new O_WRONLY open of a file chmodded to 0444, and a truncate without a
+// handle, fail with EACCES. Only descriptors opened before the chmod write.
+func TestReadOnlyFileRefusesNewWriter(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	ov, err := overlaystore.New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ov.Close() })
+	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{}}, Overlay: ov}
+	resolver.SetGeneration(1)
+	fs := NewArtifactFuse(cfg, &Engine{Repo: cfg, Resolver: resolver, Overlay: ov})
+	create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "f.txt", Mode: 0o644}
+	if err := fs.CreateFile(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.WriteFile(ctx, &fuseops.WriteFileOp{Inode: create.Entry.Child, Handle: create.Handle, Data: []byte("abc")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.FlushFile(ctx, &fuseops.FlushFileOp{Inode: create.Entry.Child, Handle: create.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	ro := os.FileMode(0o444)
+	if err := fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Mode: &ro}); err != nil {
+		t.Fatal(err)
+	}
+	for _, open := range []*fuseops.OpenFileOp{
+		{Inode: create.Entry.Child, OpenFlags: syscall.O_WRONLY},
+		{Inode: create.Entry.Child, OpenFlags: syscall.O_RDWR},
+	} {
+		if got := kernelErrno(fs.OpenFile(ctx, open)); got != syscall.EACCES {
+			t.Errorf("open with flags %v = %v, want EACCES", open.OpenFlags, got)
+		}
+	}
+	zero := uint64(0)
+	if got := kernelErrno(fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Size: &zero})); got != syscall.EACCES {
+		t.Errorf("truncate without a handle = %v, want EACCES", got)
+	}
+	reader := &fuseops.OpenFileOp{Inode: create.Entry.Child, OpenFlags: syscall.O_RDONLY}
+	if err := fs.OpenFile(ctx, reader); err != nil {
+		t.Errorf("read-only open of a 0444 file = %v", err)
+	}
+	e, _ := ov.Get("f.txt")
+	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "abc" {
+		t.Fatalf("content = %q, %v; want abc kept", data, err)
+	}
+}
+
+// A new open of a file chmodded to 0000 fails with EACCES.
+func TestNoAccessFileRefusesReader(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	ov, err := overlaystore.New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ov.Close() })
+	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{}}, Overlay: ov}
+	resolver.SetGeneration(1)
+	fs := NewArtifactFuse(cfg, &Engine{Repo: cfg, Resolver: resolver, Overlay: ov})
+	create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "secret.txt", Mode: 0o644}
+	if err := fs.CreateFile(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.WriteFile(ctx, &fuseops.WriteFileOp{Inode: create.Entry.Child, Handle: create.Handle, Data: []byte("abc")}); err != nil {
+		t.Fatal(err)
+	}
+	_ = fs.FlushFile(ctx, &fuseops.FlushFileOp{Inode: create.Entry.Child, Handle: create.Handle})
+	_ = fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle})
+	none := os.FileMode(0)
+	if err := fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Mode: &none}); err != nil {
+		t.Fatal(err)
+	}
+	for _, open := range []*fuseops.OpenFileOp{
+		{Inode: create.Entry.Child, OpenFlags: syscall.O_RDONLY},
+		{Inode: create.Entry.Child, OpenFlags: syscall.O_WRONLY},
+		{Inode: create.Entry.Child, OpenFlags: syscall.O_RDWR},
+	} {
+		if got := kernelErrno(fs.OpenFile(ctx, open)); got != syscall.EACCES {
+			t.Errorf("open with flags %v = %v, want EACCES", open.OpenFlags, got)
+		}
+	}
+}
+
 // committedOverlay reads path's committed size and the pending row count
 // straight from the database, past the store's in-memory values.
 func committedOverlay(t *testing.T, dbPath, path string) (size int64, pending int) {

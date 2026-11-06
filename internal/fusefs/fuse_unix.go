@@ -617,7 +617,13 @@ func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetI
 		if changesContent {
 			fs.closeCachedFilesForPath(ref.Path)
 		}
-		attrs, err := fs.engine.SetAttributes(ctx, b, ref.Path, size, mode, op.Mtime)
+		// A size change without a handle is truncate(2), which needs write
+		// permission; ftruncate(2) uses a handle whose open was checked.
+		var sizeAccess uint32
+		if op.Handle == nil {
+			sizeAccess = ownerWrite
+		}
+		attrs, err := fs.engine.SetAttributes(ctx, b, ref.Path, size, sizeAccess, mode, op.Mtime)
 		if changesContent {
 			fs.closeCachedFilesForPath(ref.Path)
 		}
@@ -814,8 +820,15 @@ func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) er
 		}
 		fh := &FileHandle{inode: ref, path: ref.Path}
 		if ref.Path != ".git" {
+			// The access mode picks the owner permission bits the handle needs.
 			// An open for writing only reads nothing, so it prefetches nothing.
-			f, gen, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen, !op.OpenFlags.IsWriteOnly())
+			access := ownerRead | ownerWrite
+			if op.OpenFlags.IsReadOnly() {
+				access = ownerRead
+			} else if op.OpenFlags.IsWriteOnly() {
+				access = ownerWrite
+			}
+			f, gen, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen, access)
 			if err != nil {
 				return err
 			}
