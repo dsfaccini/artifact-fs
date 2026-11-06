@@ -172,7 +172,7 @@ Async existing-clone preparation reports remote configuration, fetch, and branch
 Each error the FUSE library reports becomes a `fuse error` record:
 
 - `ERROR`: a bug the library answers with `EIO`. That is a panic it recovers from an op, logged with its stack; an op that exits through `runtime.Goexit`; or a reply whose byte count falls outside its buffer.
-- `WARN`: a reply the kernel refuses, other than with `ENOENT`. On Linux, also a mount whose `FUSE_POLL` setup failed.
+- `WARN`: a reply the kernel refuses, other than with `ENOENT`. On FSKit, a read whose reply is shorter than the size last reported for the file, which the library answers with `EIO`. On Linux, a mount whose `FUSE_POLL` setup failed.
 - `DEBUG`: every other failed op, including a request the library cannot decode, because expected errnos such as `EEXIST` fail ops too.
 
 The daemon logs at `INFO`, so it drops the `DEBUG` records. The library reports no `ENOSYS` or `EINTR` from any op, no `ENOENT` from a lookup, no `ENOTEMPTY` from `rmdir` or `rename`, and no `ENODATA` or `ERANGE` from `GetXattr` or `ListXattr`.

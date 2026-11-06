@@ -109,6 +109,13 @@ func TestMountRepoLogsFuseErrorsRedacted(t *testing.T) {
 			},
 			{
 				log: func() {
+					cfg.ErrorLogger.Printf("Op 0x%08x %T] -> %s: %q", 7, &fuseops.ReadFileOp{}, "Error", fmt.Errorf("read of inode %d at offset %d returned %d bytes, want %d for size %d: %w", 5, 0, 3, 10, 10, syscall.EIO))
+				},
+				wantLevel: "WARN",
+				wantText:  "returned 3 bytes, want 10",
+			},
+			{
+				log: func() {
 					cfg.ErrorLogger.Print("writeMessage: no such device [16 0 0 0 254 255 255 255 2 0 0 0 0 0 0 0]")
 				},
 				wantLevel: "WARN",

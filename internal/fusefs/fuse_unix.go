@@ -1133,7 +1133,8 @@ var fuseMount = fuse.Mount
 
 // fuseErrorLog writes each line the fuse library logs to logger, with the
 // repo's remote redacted. A bug the library answered with EIO goes out as an
-// error. Any other op error, which the library logs for expected errnos such
+// error. A short FSKit read the library answered with EIO goes out as a
+// warning. Any other op error, which the library logs for expected errnos such
 // as EEXIST too, goes out at Debug. Anything else, such as a failed reply,
 // goes out as a warning.
 type fuseErrorLog struct {
@@ -1147,12 +1148,19 @@ type fuseErrorLog struct {
 // it never matches the panic form.
 var fuseBugLine = regexp.MustCompile(`^Op 0x[0-9a-f]+ \S+\] -> \w+: (panic: |"fuseutil: the method exited without returning: |"\S+\.BytesRead is -?\d+, outside its \d+-byte buffer: )`)
 
+// fuseShortReadLine matches the op error line the fuse library writes when, on
+// FSKit, a read's reply is shorter than the size last reported for the file,
+// which it answers with EIO.
+var fuseShortReadLine = regexp.MustCompile(`^Op 0x[0-9a-f]+ \*fuseops\.ReadFileOp\] -> Error: "read of inode \d+ at offset \d+ returned \d+ bytes, want \d+ for size \d+: `)
+
 func (l fuseErrorLog) Write(p []byte) (int, error) {
 	msg := strings.TrimSuffix(string(p), "\n")
 	level := slog.LevelWarn
 	switch {
 	case fuseBugLine.MatchString(msg):
 		level = slog.LevelError
+	case fuseShortReadLine.MatchString(msg):
+		level = slog.LevelWarn
 	case strings.HasPrefix(msg, "Op "):
 		level = slog.LevelDebug
 	}
