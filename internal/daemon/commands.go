@@ -269,8 +269,8 @@ func (s *Controller) Prepare(ctx context.Context, name string) error {
 }
 
 // mountRequestTimeout bounds how long Unmount and Remount wait for the
-// daemon. Unmounting can take a minute: macFUSE retries a busy unmount for
-// 20 s, and the daemon then drains the FUSE server for up to 30 s.
+// daemon. Unmounting can take a minute: the daemon retries a busy unmount for
+// unmountTimeout, then drains the FUSE server for up to drainTimeout.
 const mountRequestTimeout = 2 * time.Minute
 
 // ErrNoDaemon is the error of a request that needs the running daemon.

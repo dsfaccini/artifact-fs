@@ -40,7 +40,7 @@ func TestE2EAsyncPreparedGitDirBlocksUntilReady(t *testing.T) {
 		if err != nil {
 			return false, err.Error()
 		}
-		if st.State == model.PrepareStatePreparing {
+		if st.State == string(model.PrepareStatePreparing) {
 			return true, ""
 		}
 		return false, "state=" + st.State
@@ -99,7 +99,7 @@ func TestE2EAsyncPreparedGitDirFailureThenRetry(t *testing.T) {
 		if err != nil {
 			return false, err.Error()
 		}
-		if st.State == model.PrepareStateFailed && st.PrepareError != "" {
+		if st.State == string(model.PrepareStateFailed) && st.PrepareError != "" {
 			return true, ""
 		}
 		return false, "state=" + st.State + " prepare_error=" + st.PrepareError

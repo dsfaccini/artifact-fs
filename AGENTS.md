@@ -32,6 +32,11 @@ Repository-specific guidance for `artifact-fs`.
 - The registry carries every request from the CLI to the daemon. The control socket only wakes the daemon.
 - Only the daemon writes `repo_runtime`. It writes the record at every transition and every retried failure. `status` reads that record and the stores, never daemon memory.
 - `unmount` and `remount` write an intent to `enabled` and `mount_request`, then nudge `<root>/config/daemon.sock`. They wait until `repo_runtime` echoes the request.
+- One sync loop serves every repo. Bound every per-repo step it runs, so one repo cannot stall the others. A mount waits at most `mountTimeout` through `fuse.MountContext`.
+- Unmount a repo only through `startUnmount`. It runs one unmount per repo on its own goroutine, because `unmount(2)` can hang on a dead FSKit volume. Wait only for an unmount you started, and at most `unmountTimeout`.
+- Build a runtime only with `startRuntime`. Mount it only with `attachMount`, which checks every mount precondition. A dead mount whose unmount failed blocks a new mount while the mount table lists its mount point.
+- Mount with the runtime's context as the op context. A stop unmounts first, then cancels that context, which cancels the ops in flight, then closes the runtime's stores and its `git cat-file --batch` processes.
+- Back off a retried mount, HEAD reconcile or remote refresh with `retrier`. `status` shows each failure with its next attempt.
 - `git.CloneBlobless` already populates the git index with `read-tree HEAD`; be careful about extra index resets because they can discard staged state.
 
 ## Code conventions
