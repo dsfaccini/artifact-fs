@@ -37,6 +37,8 @@ type repoRuntime struct {
 	headMu      sync.Mutex
 	workers     sync.WaitGroup
 	mounts      sync.WaitGroup
+	// failedMount is a mount whose connection failed and that still holds the mount point.
+	failedMount fusefs.MountedFS
 }
 
 func (s *Service) startRuntime(rt *repoRuntime) {
@@ -114,6 +116,9 @@ func (s *Service) unmount(id model.RepoID) error {
 
 func (s *Service) stopRuntime(rt *repoRuntime) error {
 	rt.mounts.Wait()
+	if err := s.unmountFailedMount(rt); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	mfs := rt.mfs
 	detached := rt.detached
