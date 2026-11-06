@@ -103,7 +103,7 @@ func TestStatusReportsAFailureBeforeTheFUSEMount(t *testing.T) {
 
 func TestStatusRedactsAFailedFUSEMount(t *testing.T) {
 	svc, ctl := newSyncedDaemon(t)
-	svc.mount = func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
 		return nil, errors.New("mount " + credentialRemote + " refused")
 	}
 	if err := svc.syncRepos(context.Background()); err != nil {
@@ -132,12 +132,12 @@ func (m *exitingMount) Join(ctx context.Context) error {
 	}
 }
 
-func (m *exitingMount) Unmount() error { return m.err }
+func (m *exitingMount) Unmount(context.Context) error { return m.err }
 
 func TestStatusReportsAnExitedFUSEServer(t *testing.T) {
 	svc, ctl := newSyncedDaemon(t)
 	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("connection to " + credentialRemote + " lost")}
-	svc.mount = func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
 	if err := svc.syncRepos(context.Background()); err != nil {
@@ -175,7 +175,7 @@ func TestUnmountReportsTheDaemonsFailure(t *testing.T) {
 	svc, ctl := newSyncedDaemon(t)
 	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("unmount " + credentialRemote + ": busy")}
 	t.Cleanup(func() { close(mfs.exit) })
-	svc.mount = func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
 	done := startService(t, svc)
@@ -232,8 +232,8 @@ func TestStatusReportsAFailedRefresh(t *testing.T) {
 		st, err := ctl.Status(ctx, "repo")
 		return err == nil && st.LastErrorPhase == phaseFetch
 	})
-	if st := requireFailure(t, ctl, phaseFetch, "fetch"); st.LastFetchResult != fetchResultFailed {
-		t.Fatalf("fetch result = %q, want %q", st.LastFetchResult, fetchResultFailed)
+	if st := requireFailure(t, ctl, phaseFetch, "fetch"); st.LastFetchResult != string(fetchFailed) {
+		t.Fatalf("fetch result = %q, want %q", st.LastFetchResult, fetchFailed)
 	}
 }
 
@@ -243,7 +243,7 @@ func TestCloseReleasesTheDaemonLockAfterAFailedUnmount(t *testing.T) {
 	svc, _ := newSyncedDaemon(t)
 	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("busy")}
 	t.Cleanup(func() { close(mfs.exit) })
-	svc.mount = func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
 	if err := svc.syncRepos(context.Background()); err != nil {
@@ -272,11 +272,11 @@ func TestRemountClearsAConnectionFailure(t *testing.T) {
 	svc.syncInterval = time.Hour
 	first := &exitingMount{exit: make(chan struct{}), err: errors.New("connection lost")}
 	var mounts atomic.Int32
-	svc.mount = func(cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(ctx, opCtx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
 		if mounts.Add(1) == 1 {
 			return first, nil
 		}
-		return fakeMount(cfg, engine, gate, logger)
+		return fakeMount(ctx, opCtx, cfg, engine, gate, logger)
 	}
 	done := startService(t, svc)
 	ctx := context.Background()
@@ -322,7 +322,7 @@ func TestStatusReportsAFailedPlaceholderMountOnRePrepare(t *testing.T) {
 		t.Fatal(err)
 	}
 	// An active runtime whose registry entry asks for another preparation.
-	rt := &repoRuntime{cfg: cfg, gate: fusefs.NewReadyGate(true), active: true, state: model.RepoRuntimeState{RepoID: cfg.ID, State: repoStateMounted}}
+	rt := &repoRuntime{cfg: cfg, gate: fusefs.NewReadyGate(true), active: true, mount: mountServing, mfs: &fakeMountedFS{unmounted: make(chan struct{})}}
 	svc.mu.Lock()
 	svc.running[cfg.ID] = rt
 	svc.mu.Unlock()
@@ -346,7 +346,7 @@ func TestStatusKeepsAConnectionFailureAtStart(t *testing.T) {
 	ctx := context.Background()
 	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("connection lost")}
 	close(mfs.exit)
-	svc.mount = func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
 	// The daemon records the started runtime only after the connection failed.
@@ -413,11 +413,11 @@ func TestRetryClearsAConnectionFailure(t *testing.T) {
 	ctx := context.Background()
 	first := &exitingMount{exit: make(chan struct{}), err: errors.New("connection lost")}
 	var mounts atomic.Int32
-	svc.mount = func(cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(ctx, opCtx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
 		if mounts.Add(1) == 1 {
 			return first, nil
 		}
-		return fakeMount(cfg, engine, gate, logger)
+		return fakeMount(ctx, opCtx, cfg, engine, gate, logger)
 	}
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
@@ -431,7 +431,7 @@ func TestRetryClearsAConnectionFailure(t *testing.T) {
 		svc.mu.Lock()
 		defer svc.mu.Unlock()
 		rec := svc.records["repo"]
-		return rt.mfs == nil && rt.failedMount == nil && rec != nil && rec.State == repoStateDegraded
+		return rt.mount == mountNone && rec != nil && rec.State == repoStateDegraded
 	})
 	requireFailure(t, ctl, phaseServe, "connection lost")
 	if err := svc.syncRepos(ctx); err != nil {
@@ -451,7 +451,7 @@ func TestRetryClearsAConnectionFailure(t *testing.T) {
 func TestStatusReportsACleanFUSEExit(t *testing.T) {
 	svc, ctl := newSyncedDaemon(t)
 	mfs := &exitingMount{exit: make(chan struct{})}
-	svc.mount = func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
 	if err := svc.syncRepos(context.Background()); err != nil {
@@ -476,11 +476,11 @@ func TestRetryInACleanExitWindowClearsTheExit(t *testing.T) {
 	ctx := context.Background()
 	first := &exitingMount{exit: make(chan struct{})}
 	var mounts atomic.Int32
-	svc.mount = func(cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(ctx, opCtx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
 		if mounts.Add(1) == 1 {
 			return first, nil
 		}
-		return fakeMount(cfg, engine, gate, logger)
+		return fakeMount(ctx, opCtx, cfg, engine, gate, logger)
 	}
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)

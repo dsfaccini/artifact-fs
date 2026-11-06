@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/meta"
@@ -37,11 +36,11 @@ func persistedStatus(ctx context.Context, cfg model.RepoConfig, rec model.RepoRu
 	st := model.RepoRuntimeState{RepoID: cfg.ID, State: repoStateUnmounted, LastFetchResult: "never", PrepareError: cfg.PrepareError}
 	switch {
 	case cfg.PrepareState == model.PrepareStateSyncPreparing:
-		st.State = model.PrepareStatePreparing
+		st.State = string(model.PrepareStatePreparing)
 	case live && rec.State != "":
 		st.State = rec.State
 	case isPendingOrFailedPrepareState(cfg.PrepareState):
-		st.State = cfg.PrepareState
+		st.State = string(cfg.PrepareState)
 	}
 	// The last failure stays visible after the daemon stops, but nothing
 	// retries it.
@@ -110,42 +109,6 @@ func applySourceStatus(st *model.RepoRuntimeState, cfg model.RepoConfig) {
 	default:
 		st.Acquisition = "pending"
 	}
-}
-
-func newRuntimeState(repoID model.RepoID, headOID string, headRef string, gen int64) model.RepoRuntimeState {
-	return model.RepoRuntimeState{
-		RepoID:             repoID,
-		CurrentHEADOID:     headOID,
-		CurrentHEADRef:     headRef,
-		SnapshotGeneration: gen,
-		LastFetchResult:    "never",
-		State:              repoStateMounted,
-	}
-}
-
-func setHeadState(st *model.RepoRuntimeState, oid string, ref string, gen int64) {
-	st.CurrentHEADOID = oid
-	st.CurrentHEADRef = ref
-	st.SnapshotGeneration = gen
-}
-
-func applyAheadBehind(st *model.RepoRuntimeState, state aheadBehind) {
-	st.AheadCount = state.ahead
-	st.BehindCount = state.behind
-	st.Diverged = state.diverged
-}
-
-func markFetchResult(st *model.RepoRuntimeState, at time.Time, result string, mounted bool) {
-	st.LastFetchResult = result
-	st.LastFetchAt = at
-	if st.State == repoStateDegraded && result == "ok" && mounted {
-		st.State = repoStateMounted
-	}
-}
-
-func markFetchFailure(st *model.RepoRuntimeState, result string) {
-	st.State = repoStateDegraded
-	st.LastFetchResult = result
 }
 
 // applyHydrationStats reads the cache counters that the hydrator and

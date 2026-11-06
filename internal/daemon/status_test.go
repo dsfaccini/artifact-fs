@@ -224,15 +224,15 @@ exec "$AFS_REAL_GIT" "$@"
 func TestRequiredCommitIgnoresHEADWatcher(t *testing.T) {
 	const requiredCommit = "0123456789012345678901234567890123456789"
 	runtime := &repoRuntime{
-		cfg:   model.RepoConfig{ID: "verified", RequiredCommit: requiredCommit, GitDir: filepath.Join(t.TempDir(), "missing")},
-		state: model.RepoRuntimeState{CurrentHEADOID: requiredCommit, SnapshotGeneration: 1},
+		cfg:  model.RepoConfig{ID: "verified", RequiredCommit: requiredCommit, GitDir: filepath.Join(t.TempDir(), "missing")},
+		head: servedHead{oid: requiredCommit, gen: 1},
 	}
 	service := &Service{running: map[model.RepoID]*repoRuntime{"verified": runtime}}
 	if err := service.reconcileHEAD(context.Background(), runtime); err != nil {
 		t.Fatal(err)
 	}
-	if runtime.state.CurrentHEADOID != requiredCommit || runtime.state.SnapshotGeneration != 1 {
-		t.Fatalf("fixed base changed: %+v", runtime.state)
+	if runtime.head.oid != requiredCommit || runtime.head.gen != 1 {
+		t.Fatalf("fixed base changed: %+v", runtime.head)
 	}
 }
 
@@ -332,7 +332,7 @@ func TestStatusReportsMountErrorUntilRetryMounts(t *testing.T) {
 	defer svc.Close()
 	svc.SetMountRoot(filepath.Join(tmp, "mnt"))
 	mountErr := errors.New("fskit: file system extension requires approval")
-	svc.mount = func(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
 		return nil, mountErr
 	}
 	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", Enabled: true}); err != nil {
@@ -408,15 +408,15 @@ func (m *blockingMountedFS) Join(ctx context.Context) error {
 
 func (m *blockingMountedFS) Backend() string { return "fake" }
 
-func (m *blockingMountedFS) Unmount() error { return m.unmountErr }
+func (m *blockingMountedFS) Unmount(context.Context) error { return m.unmountErr }
 
 func TestJoinRuntimeMountIsNotCanceledWithWorkers(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		runtimeCtx, cancel := context.WithCancel(context.Background())
 		mfs := &blockingMountedFS{started: make(chan context.Context, 1), release: make(chan struct{})}
-		rt := &repoRuntime{ctx: runtimeCtx, mfs: mfs, stopping: true}
-		svc := &Service{}
-		svc.joinRuntimeMount(rt)
+		rt := &repoRuntime{ctx: runtimeCtx, mfs: mfs, mount: mountServing, stopping: true}
+		svc := &Service{mountPointSource: func(string) (string, bool) { return "", false }}
+		svc.joinMount(rt, mfs)
 		joinCtx := <-mfs.started
 		cancel()
 		synctest.Wait()
@@ -434,9 +434,10 @@ func TestStopRuntimeKeepsWorkersAliveWhenUnmountFails(t *testing.T) {
 		ctx:    runtimeCtx,
 		cancel: cancel,
 		mfs:    &blockingMountedFS{unmountErr: errors.New("busy")},
+		mount:  mountServing,
 		cfg:    model.RepoConfig{Name: "repo"},
 	}
-	if err := (&Service{}).stopRuntime(rt); err == nil {
+	if err := (&Service{unmounting: map[model.RepoID]*unmountOp{}}).stopRuntime(rt); err == nil {
 		t.Fatal("expected unmount failure")
 	}
 	if err := runtimeCtx.Err(); err != nil {

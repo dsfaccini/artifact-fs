@@ -22,8 +22,11 @@ func TestMain(m *testing.M) {
 		fmt.Print("artifact-fs:package-test\x00/\x00")
 		os.Exit(0)
 	}
-	defaultMount = func(cfg model.RepoConfig, _ *fusefs.Engine, _ *fusefs.ReadyGate, _ *slog.Logger) (fusefs.MountedFS, error) {
+	defaultMount = func(_, _ context.Context, cfg model.RepoConfig, _ *fusefs.Engine, _ *fusefs.ReadyGate, _ *slog.Logger) (fusefs.MountedFS, error) {
 		panic(fmt.Sprintf("daemon unit test tried to mount %q; set Service.mount to fakeMount", cfg.MountPath))
+	}
+	defaultUnmountPath = func(path string) error {
+		panic(fmt.Sprintf("daemon unit test tried to unmount %q; set Service.unmountPath", path))
 	}
 	gittest.IsolateConfig()
 	m.Run()
@@ -36,7 +39,7 @@ func TestGitIgnoresMachineConfig(t *testing.T) { gittest.RequireConfigIsolated(t
 func (s *Service) ctl() *Controller { return &Controller{core: s.core} }
 
 // fakeMount stands in for a successful mount.
-func fakeMount(model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+func fakeMount(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
 	return &fakeMountedFS{unmounted: make(chan struct{})}, nil
 }
 
@@ -57,7 +60,7 @@ func (m *fakeMountedFS) Join(ctx context.Context) error {
 	}
 }
 
-func (m *fakeMountedFS) Unmount() error {
+func (m *fakeMountedFS) Unmount(context.Context) error {
 	m.unmountOnce.Do(func() { close(m.unmounted) })
 	return nil
 }

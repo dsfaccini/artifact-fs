@@ -32,7 +32,9 @@ type fetchBlobResult struct {
 
 const maxReadBlobBytes int64 = 1<<31 - 1
 
-func (s *Store) invalidateBatchPool(gitDir string) {
+// CloseBatchPool stops the git cat-file --batch processes that read gitDir's
+// objects, and fails the reads waiting for one. A later read starts new ones.
+func (s *Store) CloseBatchPool(gitDir string) {
 	s.mu.Lock()
 	pool := s.pools[gitDir]
 	delete(s.pools, gitDir)

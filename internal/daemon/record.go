@@ -23,22 +23,6 @@ const (
 	phaseFetch         = "fetch"
 )
 
-// runtimePhase is the phase of a runtime in state. A runtime with no FUSE
-// mount serves nothing while the daemon retries the mount.
-func runtimePhase(state string, mounted bool) string {
-	if !mounted {
-		return phaseMount
-	}
-	switch state {
-	case model.PrepareStatePreparing, model.PrepareStateFailed:
-		return phasePrepare
-	case repoStateUnmounted:
-		return phaseUnmount
-	default:
-		return phaseServe
-	}
-}
-
 // recordPhase records that the daemon entered phase for cfg.
 func (s *Service) recordPhase(cfg model.RepoConfig, phase string) {
 	s.recordRuntime(cfg.ID, func(rec *model.RepoRuntimeRecord) { rec.Phase = phase })
@@ -87,17 +71,16 @@ func (s *Service) recordRuntimeState(rt *repoRuntime, cleared ...string) {
 		if s.running[id] != rt {
 			return
 		}
-		st := rt.state
-		rec.State = st.State
-		rec.Phase = runtimePhase(st.State, rt.mfs != nil)
-		rec.ServedGeneration = st.SnapshotGeneration
-		rec.ServedCommit = st.CurrentHEADOID
-		rec.ServedRef = st.CurrentHEADRef
-		rec.LastFetchAt = st.LastFetchAt
-		rec.LastFetchResult = st.LastFetchResult
-		rec.AheadCount = st.AheadCount
-		rec.BehindCount = st.BehindCount
-		rec.Diverged = st.Diverged
+		rec.State = rt.reportedState()
+		rec.Phase = rt.phase()
+		rec.ServedGeneration = rt.head.gen
+		rec.ServedCommit = rt.head.oid
+		rec.ServedRef = rt.head.ref
+		rec.LastFetchAt = rt.fetch.at
+		rec.LastFetchResult = string(rt.fetch.state)
+		rec.AheadCount = rt.fetch.ahead
+		rec.BehindCount = rt.fetch.behind
+		rec.Diverged = rt.fetch.diverged
 		rec.MountRequest = rt.cfg.MountRequest
 		for _, phase := range cleared {
 			clearFailure(rec, phase)

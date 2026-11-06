@@ -48,7 +48,7 @@ type RepoConfig struct {
 	PreparedGitDir        bool
 	AdoptGitDir           bool
 	FetchRef              string
-	PrepareState          string
+	PrepareState          PrepareState
 	PrepareError          string
 	RequiredCommit        string
 	HistoryDepth          int
@@ -129,11 +129,18 @@ type RepoRuntimeState struct {
 	Attempts            int
 }
 
+// PrepareState is where a repo's preparation stands. The empty state is a
+// repo add-repo prepared, which the daemon mounts without preparing it, or,
+// with PrepareError set, whose preparation failed.
+type PrepareState string
+
 const (
-	PrepareStatePreparing     = "preparing"
-	PrepareStateSyncPreparing = "sync-preparing"
-	PrepareStateReady         = "ready"
-	PrepareStateFailed        = "failed"
+	// PrepareStatePreparing is an async repo whose preparation the daemon runs.
+	PrepareStatePreparing PrepareState = "preparing"
+	// PrepareStateSyncPreparing is a repo the CLI prepares; the daemon waits.
+	PrepareStateSyncPreparing PrepareState = "sync-preparing"
+	PrepareStateReady         PrepareState = "ready"
+	PrepareStateFailed        PrepareState = "failed"
 )
 
 // BaseNode represents a tracked entry from the git tree. Inode IDs are assigned

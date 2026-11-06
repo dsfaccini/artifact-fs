@@ -28,10 +28,9 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 		return err
 	}
 	s.mu.Lock()
-	prevOID := rt.state.CurrentHEADOID
-	prevRef := rt.state.CurrentHEADRef
-	prevGen := rt.state.SnapshotGeneration
+	prev := rt.head
 	s.mu.Unlock()
+	prevOID, prevRef, prevGen := prev.oid, prev.ref, prev.gen
 	storedOID, storedRef, gen, stateErr := rt.snapshot.ReadState(ctx)
 	// A failed overlay transition can leave the published snapshot ahead of the active generation.
 	if oid == prevOID && stateErr == nil && storedOID == oid && gen == prevGen {
@@ -47,7 +46,7 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 		}
 		s.mu.Lock()
 		if s.running[cfg.ID] == rt && !rt.stopping {
-			rt.state.CurrentHEADRef = ref
+			rt.head.ref = ref
 		}
 		s.mu.Unlock()
 		s.recordRuntimeState(rt, phaseHEADReconcile)
@@ -84,7 +83,7 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 
 	s.mu.Lock()
 	if s.running[cfg.ID] == rt {
-		setHeadState(&rt.state, oid, ref, gen)
+		rt.head = servedHead{oid: oid, ref: ref, gen: gen}
 	}
 	s.mu.Unlock()
 	s.recordRuntimeState(rt, phaseHEADReconcile)
@@ -112,8 +111,7 @@ func (s *Service) signalHEADReconcile(rt *repoRuntime) {
 }
 
 func (s *Service) headReconcileLoop(rt *repoRuntime) {
-	minBackoff := cmp.Or(s.headReconcileBackoff, headReconcileMinBackoff)
-	backoff := minBackoff
+	retry := newRetrier(phaseHEADReconcile, cmp.Or(s.headReconcileBackoff, headReconcileMinBackoff), headReconcileMaxBackoff)
 	for {
 		select {
 		case <-rt.ctx.Done():
@@ -124,19 +122,17 @@ func (s *Service) headReconcileLoop(rt *repoRuntime) {
 		for {
 			err := s.reconcileHEAD(rt.ctx, rt)
 			if err == nil {
-				backoff = minBackoff
+				retry.succeed()
 				break
 			}
 			if rt.ctx.Err() != nil {
 				return
 			}
-			// A HEAD change can also start the retry early.
 			s.mu.Lock()
 			cfg := rt.cfg
 			s.mu.Unlock()
-			s.recordFailure(cfg, phaseHEADReconcile, err, time.Now().Add(backoff))
-
-			timer := time.NewTimer(backoff)
+			// A HEAD change can also start the retry early.
+			timer := time.NewTimer(s.retryFailure(cfg, retry, err))
 			select {
 			case <-rt.ctx.Done():
 				timer.Stop()
@@ -145,7 +141,6 @@ func (s *Service) headReconcileLoop(rt *repoRuntime) {
 				timer.Stop()
 			case <-timer.C:
 			}
-			backoff = min(backoff*2, headReconcileMaxBackoff)
 		}
 	}
 }

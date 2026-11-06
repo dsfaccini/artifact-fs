@@ -180,7 +180,7 @@ func (s *Store) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
 	acquired_at_ns=excluded.acquired_at_ns,
 	config_version=excluded.config_version,
 	updated_at_ns=excluded.updated_at_ns
-	`, string(cfg.ID), cfg.Name, cfg.MountRoot, cfg.MountPath, cfg.RemoteURL, cfg.RemoteURLRedacted, cfg.Branch, int64(cfg.RefreshInterval.Seconds()), int64(cfg.RefreshInterval), cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath, cfg.OverlayDBPath, boolToInt(cfg.Enabled), boolToInt(cfg.PreparedGitDir), boolToInt(cfg.AdoptGitDir), cfg.FetchRef, cfg.PrepareState, cfg.PrepareError, cfg.RequiredCommit, cfg.HistoryDepth, boolToInt(cfg.RemoteRefreshDisabled), cfg.AcquiredRef, cfg.AcquiredCommit, acquiredAtNS, cfg.ConfigVersion, now, now)
+	`, string(cfg.ID), cfg.Name, cfg.MountRoot, cfg.MountPath, cfg.RemoteURL, cfg.RemoteURLRedacted, cfg.Branch, int64(cfg.RefreshInterval.Seconds()), int64(cfg.RefreshInterval), cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath, cfg.OverlayDBPath, boolToInt(cfg.Enabled), boolToInt(cfg.PreparedGitDir), boolToInt(cfg.AdoptGitDir), cfg.FetchRef, string(cfg.PrepareState), cfg.PrepareError, cfg.RequiredCommit, cfg.HistoryDepth, boolToInt(cfg.RemoteRefreshDisabled), cfg.AcquiredRef, cfg.AcquiredCommit, acquiredAtNS, cfg.ConfigVersion, now, now)
 	return err
 }
 
@@ -206,12 +206,12 @@ func (s *Store) UpdateRefresh(ctx context.Context, repoID model.RepoID, interval
 	return nil
 }
 
-func (s *Store) UpdatePrepareState(ctx context.Context, repoID model.RepoID, state string, prepareErr string) error {
+func (s *Store) UpdatePrepareState(ctx context.Context, repoID model.RepoID, state model.PrepareState, prepareErr string) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE repos
 		SET prepare_state=?, prepare_error=?, updated_at_ns=?
 		WHERE repo_id=?
-	`, state, prepareErr, time.Now().UnixNano(), string(repoID))
+	`, string(state), prepareErr, time.Now().UnixNano(), string(repoID))
 	return err
 }
 
@@ -290,12 +290,12 @@ func fromUnixNano(ns int64) time.Time {
 	return time.Unix(0, ns)
 }
 
-func (s *Store) BeginPrepare(ctx context.Context, cfg model.RepoConfig, state string, configVersion string) error {
+func (s *Store) BeginPrepare(ctx context.Context, cfg model.RepoConfig, state model.PrepareState, configVersion string) error {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE repos
 		SET prepare_state=?, prepare_error='', config_version=?, updated_at_ns=?
 		WHERE repo_id=? AND config_version=?
-	`, state, configVersion, time.Now().UnixNano(), string(cfg.ID), cfg.ConfigVersion)
+	`, string(state), configVersion, time.Now().UnixNano(), string(cfg.ID), cfg.ConfigVersion)
 	if err != nil {
 		return err
 	}
@@ -309,7 +309,7 @@ func (s *Store) BeginPrepare(ctx context.Context, cfg model.RepoConfig, state st
 	return nil
 }
 
-func (s *Store) UpdatePrepareStateForConfig(ctx context.Context, cfg model.RepoConfig, state string, prepareErr string) error {
+func (s *Store) UpdatePrepareStateForConfig(ctx context.Context, cfg model.RepoConfig, state model.PrepareState, prepareErr string) error {
 	res, err := s.db.ExecContext(ctx, `
 	UPDATE repos
 	SET prepare_state=?, prepare_error=?, updated_at_ns=?
@@ -329,7 +329,7 @@ func (s *Store) UpdatePrepareStateForConfig(ctx context.Context, cfg model.RepoC
 	  AND history_depth=?
 	  AND refresh_disabled=?
 	  AND config_version=?
-	`, state, prepareErr, time.Now().UnixNano(), string(cfg.ID), cfg.Branch, cfg.RemoteURL, boolToInt(cfg.PreparedGitDir), boolToInt(cfg.AdoptGitDir), cfg.FetchRef, cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath, cfg.OverlayDBPath, cfg.MountPath, cfg.RequiredCommit, cfg.HistoryDepth, boolToInt(cfg.RemoteRefreshDisabled), cfg.ConfigVersion)
+	`, string(state), prepareErr, time.Now().UnixNano(), string(cfg.ID), cfg.Branch, cfg.RemoteURL, boolToInt(cfg.PreparedGitDir), boolToInt(cfg.AdoptGitDir), cfg.FetchRef, cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath, cfg.OverlayDBPath, cfg.MountPath, cfg.RequiredCommit, cfg.HistoryDepth, boolToInt(cfg.RemoteRefreshDisabled), cfg.ConfigVersion)
 	if err != nil {
 		return err
 	}
