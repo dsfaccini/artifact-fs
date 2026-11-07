@@ -716,8 +716,9 @@ func (fs *ArtifactFuse) markWritten(id fuseops.InodeID, path string) {
 // setReported records attrs as what the kernel last received for id. When
 // id is unmapped and attrs show its path back, setReported first decides id as
 // the switch pass does: it maps id back to the path, or retires id and
-// returns ESTALE. Recording a changed identity on an unmapped inode would let
-// the pass map the path back to it.
+// returns ESTALE when the path changed or another inode holds it. Recording a
+// changed identity on an unmapped inode would let the pass map the path back
+// to it.
 func (fs *ArtifactFuse) setReported(id fuseops.InodeID, attrs Attrs) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -726,7 +727,7 @@ func (fs *ArtifactFuse) setReported(id fuseops.InodeID, attrs Attrs) error {
 		return nil
 	}
 	if fs.unmapped[ref.Path] == id {
-		if !ref.returnsAs(attrs.identity()) {
+		if _, mapped := fs.pathToInode[ref.Path]; mapped || !ref.returnsAs(attrs.identity()) {
 			fs.retireLocked(id)
 			return syscall.ESTALE
 		}

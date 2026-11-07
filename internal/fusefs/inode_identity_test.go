@@ -595,7 +595,8 @@ func TestMkDirOverHeldDirectoryPathGetsNewNumber(t *testing.T) {
 // An open of an unmapped inode can race an op that retires it, such as a
 // getattr that finds its path back changed. The open must not hand out a
 // handle on the retired inode, whose earlier handles the retirement already
-// detached.
+// detached. The open runs twice, because Engine.Do hydrates the blob and
+// runs it again, so the getattr runs inside the second run.
 func TestOpenRacingARetirementGetsNoHandle(t *testing.T) {
 	f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
 	held := f.lookup(fuseops.RootInodeID, "file.txt")
@@ -607,7 +608,9 @@ func TestOpenRacingARetirementGetsNoHandle(t *testing.T) {
 	ov := hookOverlay(f)
 	var getattrErr error
 	ov.beforeLookup = func() {
-		getattrErr = f.fs.GetInodeAttributes(f.ctx, &fuseops.GetInodeAttributesOp{Inode: held})
+		ov.beforeLookup = func() {
+			getattrErr = f.fs.GetInodeAttributes(f.ctx, &fuseops.GetInodeAttributesOp{Inode: held})
+		}
 	}
 	open := &fuseops.OpenFileOp{Inode: held}
 	err := f.fs.OpenFile(f.ctx, open)
@@ -1442,4 +1445,53 @@ func lookUpAlongside(f *cacheFixture, via string) error {
 	plus.Handle = open.Handle
 	plus.Dst = make([]byte, 64*1024)
 	return f.fs.ReadDirPlus(f.ctx, plus)
+}
+
+// An ftruncate through a held inode whose path came back as another file,
+// before the switch pass, must not reach that file. It returns ESTALE, and
+// the new HEAD's file keeps its content.
+func TestSetattrThroughHeldInodeLeavesReturnedPathAlone(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	open := f.open(held)
+	f.switchTo()
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	f.switchTo(baseFile("file.txt", "blob-BBBB", 0o100644))
+	size := uint64(2)
+	err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: held, Handle: &open.Handle, Size: &size})
+	if got := readWholeFile(t, f.fs, f.lookup(fuseops.RootInodeID, "file.txt")); got != "blob-BBBB" {
+		t.Fatalf("an ftruncate through inode %d reached the new HEAD's file.txt, which holds %q", held, got)
+	}
+	if got := kernelErrno(err); got != syscall.ESTALE {
+		t.Fatalf("ftruncate through inode %d = errno %v, want ESTALE", held, got)
+	}
+}
+
+// A directory renamed through the mount onto the vanished path of a held
+// directory takes the path. The held directory is retired: an opendir of it
+// returns ESTALE instead of listing the moved directory, and a getattr does
+// not map the path back to it.
+func TestRenameOntoHeldDirectoryPathRetiresIt(t *testing.T) {
+	moved := []model.BaseNode{baseDir("e", "e1"), baseFile("e/other.txt", "other", 0o100644)}
+	f := newCacheFixture(t, append([]model.BaseNode{baseDir("d", "d1"), baseFile("d/keep.txt", "keep", 0o100644)}, moved...)...)
+	held := f.lookup(fuseops.RootInodeID, "d")
+	e := f.lookup(fuseops.RootInodeID, "e")
+	f.switchTo(moved...)
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "e", NewParent: fuseops.RootInodeID, NewName: "d"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := kernelErrno(f.fs.OpenDir(f.ctx, &fuseops.OpenDirOp{Inode: held})); got != syscall.ESTALE {
+		t.Fatalf("opendir of the held directory %d = errno %v, want ESTALE", held, got)
+	}
+	if got := kernelErrno(f.fs.GetInodeAttributes(f.ctx, &fuseops.GetInodeAttributesOp{Inode: held})); got != syscall.ESTALE {
+		t.Fatalf("getattr of the held directory %d = errno %v, want ESTALE", held, got)
+	}
+	if got := f.lookup(fuseops.RootInodeID, "d"); got != e {
+		t.Fatalf("d looks up as inode %d, want %d, the directory renamed there", got, e)
+	}
 }
