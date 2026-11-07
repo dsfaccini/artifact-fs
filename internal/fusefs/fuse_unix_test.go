@@ -1538,7 +1538,7 @@ func (f *fakeLookupHydrator) ReadBlob(_ context.Context, _ model.RepoPaths, _ mo
 func TestReleasingAReaderLeavesAnotherHandlesWritesCoalescing(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	cfg := model.RepoPaths{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
 	ov, err := overlaystore.New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -1579,7 +1579,7 @@ func TestReleasingAReaderLeavesAnotherHandlesWritesCoalescing(t *testing.T) {
 func TestCreateThenCloseClearsPending(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	cfg := model.RepoPaths{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
 	ov, err := overlaystore.New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -1610,7 +1610,7 @@ func newChmoddedFile(t *testing.T, fskit bool, mode os.FileMode) (fuseutil.FileS
 	t.Helper()
 	ctx := context.Background()
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	cfg := model.RepoPaths{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
 	ov, err := overlaystore.New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -1827,7 +1827,7 @@ func (o *lookupCountingOverlay) Lookup(ctx context.Context, path string) (model.
 func TestKernelMountTruncateSkipsThePermissionLookup(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	cfg := model.RepoPaths{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
 	store, err := overlaystore.New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)

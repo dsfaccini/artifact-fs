@@ -307,7 +307,7 @@ type failingWriteOverlay struct {
 	backingPath string
 }
 
-func (o *failingWriteOverlay) EnsureCopyOnWriteFrom(_ context.Context, _ model.RepoConfig, path string, base model.BaseNode, _ *os.File) (model.OverlayEntry, error) {
+func (o *failingWriteOverlay) EnsureCopyOnWriteFrom(_ context.Context, _ model.RepoPaths, path string, base model.BaseNode, _ *os.File) (model.OverlayEntry, error) {
 	e := model.OverlayEntry{Path: model.CleanPath(path), Kind: model.OverlayKindModify, BackingPath: o.backingPath, Mode: base.Mode, SourceOID: base.ObjectOID}
 	o.entries[e.Path] = e
 	return e, nil
@@ -337,8 +337,8 @@ func TestFailedWriteThatPromotedClosesCachedBase(t *testing.T) {
 	}
 	overlay := &failingWriteOverlay{fakeOverlay: &fakeOverlay{entries: map[string]model.OverlayEntry{}}, backingPath: filepath.Join(tmp, "overlay")}
 	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": {Path: "file.txt", Type: "file", ObjectOID: "blob", Mode: 0o644}}}, overlay.fakeOverlay)
-	engine := &Engine{Repo: model.RepoConfig{ID: "repo"}, Resolver: resolver, Overlay: overlay, Hydrator: &fakeBatchHydrator{path: baseCache}}
-	fs := NewArtifactFuse(model.RepoConfig{ID: "repo"}, engine)
+	engine := &Engine{Repo: model.RepoPaths{ID: "repo"}, Resolver: resolver, Overlay: overlay, Hydrator: &fakeBatchHydrator{path: baseCache}}
+	fs := NewArtifactFuse(model.RepoPaths{ID: "repo"}, engine)
 	fh := &FileHandle{path: "file.txt"}
 	fs.fileHandles[1] = fh
 	defer fh.closeCachedFile()
