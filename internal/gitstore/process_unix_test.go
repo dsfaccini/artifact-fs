@@ -39,21 +39,46 @@ func init() {
 }
 
 func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
+	const sshRemote = "ssh://git@example.invalid/repo.git"
+	// elsewhere is a repo config that clones or acquires from sshRemote next
+	// to cfg's git dir.
+	elsewhere := func(cfg model.RepoConfig, branch string) model.RepoConfig {
+		return model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: filepath.Join(filepath.Dir(cfg.GitDir), "other.git")}, RepoSpec: model.RepoSpec{RemoteURL: sshRemote, Branch: branch}}
+	}
 	for _, tt := range []struct {
 		name   string
 		filter string
+		// sshEnv names the SSH command in GIT_SSH_COMMAND, for a command that
+		// runs before a repo config exists to hold core.sshCommand.
+		sshEnv bool
 		read   func(ctx context.Context, store *Store, cfg model.RepoConfig, commit, blob string) error
 	}{
-		{"blob", "blob:none", func(ctx context.Context, store *Store, cfg model.RepoConfig, _, blob string) error {
+		{"blob", "blob:none", false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, blob string) error {
 			_, err := store.BlobToCache(ctx, cfg.RepoPaths, blob, filepath.Join(filepath.Dir(cfg.GitDir), "cache", blob))
 			return err
 		}},
-		{"tree", "tree:0", func(ctx context.Context, store *Store, cfg model.RepoConfig, commit, _ string) error {
+		{"tree", "tree:0", false, func(ctx context.Context, store *Store, cfg model.RepoConfig, commit, _ string) error {
 			_, err := store.BuildTreeIndex(ctx, cfg, commit)
 			return err
 		}},
-		{"batch blob fetch", "blob:none", func(ctx context.Context, store *Store, cfg model.RepoConfig, _, blob string) error {
+		{"batch blob fetch", "blob:none", false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, blob string) error {
 			return store.FetchMissingBlobs(ctx, cfg.RepoPaths, []string{blob})
+		}},
+		{"refresh fetch", "blob:none", false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
+			return store.FetchNonInteractive(ctx, cfg)
+		}},
+		{"prepare fetch", "blob:none", false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
+			return store.FetchRefWithCredentials(ctx, cfg, "refs/heads/main")
+		}},
+		{"clone", "blob:none", true, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
+			return store.CloneBlobless(ctx, elsewhere(cfg, "refs/heads/main"))
+		}},
+		{"clone of an exact ref", "blob:none", true, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
+			return store.CloneBlobless(ctx, elsewhere(cfg, "refs/tags/v1"))
+		}},
+		{"verified source fetch", "blob:none", true, func(ctx context.Context, store *Store, cfg model.RepoConfig, commit, _ string) error {
+			_, err := store.PrepareSource(ctx, elsewhere(cfg, ""), model.SourceRequirement{Ref: "refs/heads/main", RequiredCommit: commit})
+			return err
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -64,8 +89,11 @@ func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", "ssh://git@example.invalid/repo.git")
+			run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", sshRemote)
 			run(t, "git", "--git-dir", gitDir, "config", "core.sshCommand", shellQuote(exe))
+			if tt.sshEnv {
+				t.Setenv("GIT_SSH_COMMAND", shellQuote(exe))
+			}
 			report := filepath.Join(tmp, "ssh-session")
 			t.Setenv(sshSessionReportEnv, report)
 
@@ -75,11 +103,11 @@ func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
 			err = tt.read(ctx, store, model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: gitDir}}, commit, blob)
 			store.Close()
 			if err == nil {
-				t.Fatal("read a missing object through an SSH command that fails")
+				t.Fatal("reached a remote through an SSH command that fails")
 			}
 			data, err := os.ReadFile(report)
 			if err != nil {
-				t.Fatalf("the lazy fetch did not run core.sshCommand: %v", err)
+				t.Fatalf("git did not run the SSH command: %v", err)
 			}
 			testSID, err := unix.Getsid(0)
 			if err != nil {

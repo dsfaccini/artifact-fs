@@ -67,7 +67,7 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 				args = append(args, fmt.Sprintf("--depth=%d", cfg.HistoryDepth))
 			}
 			args = append(args, "--no-checkout", "--single-branch", "--no-tags", "--branch", branch, "--", safeURL, target)
-			_, err = runGitWithEnv(ctx, "", env, args...)
+			_, err = runNetworkGit(ctx, "", env, args...)
 		} else {
 			err = cloneExactRef(ctx, target, safeURL, env, sourceRef, cfg.HistoryDepth)
 		}
@@ -175,7 +175,7 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 			args = append(args, fmt.Sprintf("--depth=%d", requirement.Depth))
 		}
 		args = append(args, "origin", refspec)
-		if _, err := runGitWithEnv(ctx, candidateGitDir, env, args...); err != nil {
+		if _, err := runNetworkGit(ctx, candidateGitDir, env, args...); err != nil {
 			return err
 		}
 		observed, err := runGit(ctx, candidateGitDir, "rev-parse", "--verify", verifiedSourceTrackingRef+"^{commit}")
@@ -224,7 +224,7 @@ func configureArtifactWorktree(ctx context.Context, gitDir string) error {
 }
 
 func cloneExactRef(ctx context.Context, target string, safeURL string, env []string, ref string, depth int) error {
-	advertisement, err := runGitWithEnv(ctx, "", env, "ls-remote", "--", safeURL, ref)
+	advertisement, err := runNetworkGit(ctx, "", env, "ls-remote", "--", safeURL, ref)
 	if err != nil {
 		return err
 	}
@@ -264,7 +264,7 @@ func cloneExactRef(ctx context.Context, target string, safeURL string, env []str
 		fetchArgs = append(fetchArgs, fmt.Sprintf("--depth=%d", depth))
 	}
 	fetchArgs = append(fetchArgs, "origin", refspec)
-	if _, err := runGitWithEnv(ctx, gitDir, env, fetchArgs...); err != nil {
+	if _, err := runNetworkGit(ctx, gitDir, env, fetchArgs...); err != nil {
 		return err
 	}
 	commit, err := runGit(ctx, gitDir, "rev-parse", "--verify", fetchedFullRefRemoteTrackingRef+"^{commit}")
@@ -341,9 +341,8 @@ func installGitDir(candidate string, destination string) error {
 }
 
 // FetchNonInteractive fetches origin for the daemon's refresh and the fetch
-// command. It runs as a lazy fetch does, so a remote that needs a prompt
-// makes it fail. The fetch command could not prompt anyway: git runs in a
-// process group of its own, which the terminal stops when it reads a prompt.
+// command. Like every Git command that contacts a remote, it runs through
+// runNetworkGit, so a remote that needs a prompt makes it fail.
 func (s *Store) FetchNonInteractive(ctx context.Context, repo model.RepoConfig) error {
 	args := []string{"fetch", "--no-tags"}
 	if depth := fetchDepth(ctx, repo, model.BranchName(repo.FetchRef)); depth > 0 {
@@ -353,7 +352,7 @@ func (s *Store) FetchNonInteractive(ctx context.Context, repo model.RepoConfig) 
 	remotesForLogging, cancelLookup := s.startRemotesForLogging(ctx, repo)
 	defer cancelLookup()
 	return s.retryGitOperationForRemoteLookup(ctx, GitOperationFetch, repo.Name, remotesForLogging, func() error {
-		_, err := runLazyFetchGit(ctx, repo.GitDir, args...)
+		_, err := runNetworkGit(ctx, repo.GitDir, nil, args...)
 		return err
 	})
 }
@@ -403,7 +402,7 @@ func (s *Store) fetchRef(ctx context.Context, repo model.RepoConfig, ref string,
 	remotesForLogging, cancelLookup := s.startRemotesForLogging(ctx, repo)
 	defer cancelLookup()
 	return s.retryGitOperationForRemoteLookup(ctx, GitOperationFetch, repo.Name, remotesForLogging, func() error {
-		_, err := runGitWithEnv(ctx, repo.GitDir, env, args...)
+		_, err := runNetworkGit(ctx, repo.GitDir, env, args...)
 		return err
 	})
 }

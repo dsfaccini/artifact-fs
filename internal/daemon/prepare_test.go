@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 )
@@ -483,6 +484,41 @@ func TestPreparedGitDirWithDepthPreparesAgainAfterAFetch(t *testing.T) {
 	}
 	// Registering the repo again prepares it again.
 	preparePreparedGitDir(t, svc, work, gitDir)
+}
+
+// add-repo without --async clones or fetches in the CLI, where git runs in a
+// background process group. A prompt there stops git until the prepare
+// timeout, so a remote that asks for credentials must fail add-repo instead.
+// Git falls back to SSH_ASKPASS, which IsolatePrompts records, for the prompt
+// it would show on the terminal.
+func TestSyncAddRepoDoesNotPrompt(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		svc  func(t *testing.T) *Service
+	}{
+		{"fresh clone", func(t *testing.T) *Service {
+			svc, err := New(context.Background(), filepath.Join(t.TempDir(), "artifact-fs"), discardLogger())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = svc.Close() })
+			return svc
+		}},
+		{"existing clone", func(t *testing.T) *Service {
+			svc, _ := newSyncedDaemon(t)
+			return svc
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			askpassRuns := gittest.IsolatePrompts(t)
+			svc := tt.svc(t)
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: gittest.UnauthorizedRemote(t), Branch: "main"}, Enabled: true}
+			if err := svc.ctl().AddRepo(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "terminal prompts disabled") {
+				t.Fatalf("add-repo from a remote that refuses every request = %v, want the non-interactive failure", err)
+			}
+			gittest.RequireNoPrompt(t, askpassRuns)
+		})
+	}
 }
 
 // prepare cancels the async preparation it supersedes, so the next
