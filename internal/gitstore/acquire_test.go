@@ -254,6 +254,53 @@ func TestPrepareFetchedBranchKeepsARefUpdateThatLanded(t *testing.T) {
 	}
 }
 
+// A forward read-tree that wrote the index before a cancel stopped it is
+// undone, so the index matches HEAD again, staged paths included.
+func TestPrepareFetchedBranchUndoesAReadTreeThatLanded(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		remoteRef string
+		fetchRef  string
+		staged    bool
+	}{
+		{"branch", "refs/remotes/origin/main", "main", false},
+		{"branch with a staged file", "refs/remotes/origin/main", "main", true},
+		{"detached HEAD", fetchedFullRefRemoteTrackingRef, "refs/pull/10/head", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			gitDir, baseOID, _ := fetchedAheadRepo(t, tmp, tt.remoteRef)
+			wantStaged := ""
+			if tt.staged {
+				repo := filepath.Dir(gitDir)
+				if err := os.WriteFile(filepath.Join(repo, "staged.txt"), []byte("staged\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				run(t, "git", "-C", repo, "add", "staged.txt")
+				wantStaged = "staged.txt\n"
+			}
+			// The read-tree writes the index, then hangs until the cancel
+			// stops it.
+			landed := filepath.Join(tmp, "landed")
+			realGit := wrapGit(t, tmp, "#!/bin/sh\nif [ \"$1\" = read-tree ] && [ ! -e \"$AFS_LANDED\" ]; then\n  \"$AFS_REAL_GIT\" \"$@\" || exit\n  : > \"$AFS_LANDED\"\n  sleep 60\n  exit 0\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n")
+			t.Setenv("AFS_LANDED", landed)
+
+			ctx, cancel := gittest.ExpireOnFile(context.Background(), landed)
+			defer cancel()
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}}
+			if err := New(nil).PrepareFetchedBranch(ctx, cfg, tt.fetchRef); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("PrepareFetchedBranch error = %v, want deadline exceeded", err)
+			}
+			if head := strings.TrimSpace(runOutput(t, realGit, "--git-dir", gitDir, "rev-parse", "HEAD")); head != baseOID {
+				t.Fatalf("HEAD = %s, want %s", head, baseOID)
+			}
+			if staged := runOutput(t, realGit, "--git-dir", gitDir, "diff-index", "--cached", "--name-only", "HEAD"); staged != wantStaged {
+				t.Fatalf("the index differs from HEAD in %q, want %q", staged, wantStaged)
+			}
+		})
+	}
+}
+
 func TestFetchRefNonInteractiveAndPrepareFetchedBranch(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()

@@ -471,7 +471,7 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 	}
 	if target.branch == "" {
 		if err := readTreeTransition(ctx, repo.GitDir, oldOID, oid); err != nil {
-			return err
+			return s.rollbackLandedReadTree(ctx, repo.GitDir, oldOID, oid, err)
 		}
 		oldHeadOID, err := refOIDOrZero(ctx, repo.GitDir, "HEAD")
 		if err != nil {
@@ -497,7 +497,7 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 		return err
 	}
 	if err := readTreeTransition(ctx, repo.GitDir, oldOID, oid); err != nil {
-		return err
+		return s.rollbackLandedReadTree(ctx, repo.GitDir, oldOID, oid, err)
 	}
 	if _, err := runGit(ctx, repo.GitDir, "update-ref", refName, oid, oldBranchOID); err != nil {
 		return s.rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
@@ -563,6 +563,40 @@ func (s *Store) rollbackIndexTransition(ctx context.Context, gitDir string, from
 	return restoreIndex(ctx, gitDir, fromOID, toOID, cause)
 }
 
+// rollbackLandedReadTree restores the index from newOID back to oldOID when
+// a read-tree that reported failure moved it after all, as when a cancel
+// arrives after git wrote the index. The read-tree moved the index when every
+// path that differs between the two commits stands at newOID in the index;
+// a staged path it kept differs between neither.
+func (s *Store) rollbackLandedReadTree(ctx context.Context, gitDir string, oldOID string, newOID string, cause error) error {
+	if oldOID == newOID {
+		return cause
+	}
+	ctx, cancel := s.rollbackContext(ctx)
+	defer cancel()
+	changed, err := runGit(ctx, gitDir, "diff-tree", "-r", "-z", "--name-only", oldOID, newOID)
+	if err != nil {
+		return errors.Join(cause, fmt.Errorf("check index after read-tree failure: %w", err))
+	}
+	if changed == "" {
+		return cause
+	}
+	notNew, err := runGit(ctx, gitDir, "diff-index", "--cached", "-z", "--name-only", newOID)
+	if err != nil {
+		return errors.Join(cause, fmt.Errorf("check index after read-tree failure: %w", err))
+	}
+	stale := map[string]bool{}
+	for path := range strings.SplitSeq(notNew, "\x00") {
+		stale[path] = true
+	}
+	for path := range strings.SplitSeq(changed, "\x00") {
+		if path != "" && stale[path] {
+			return cause
+		}
+	}
+	return restoreIndex(ctx, gitDir, newOID, oldOID, cause)
+}
+
 func headAt(ctx context.Context, gitDir string, oid string) bool {
 	head, err := runGit(ctx, gitDir, "rev-parse", "--verify", "HEAD^{commit}")
 	return err == nil && strings.TrimSpace(head) == oid
@@ -570,7 +604,7 @@ func headAt(ctx context.Context, gitDir string, oid string) bool {
 
 func restoreIndex(ctx context.Context, gitDir string, fromOID string, toOID string, cause error) error {
 	if err := readTreeTransition(ctx, gitDir, fromOID, toOID); err != nil {
-		return errors.Join(cause, fmt.Errorf("restore index after ref update failure: %w", err))
+		return errors.Join(cause, fmt.Errorf("restore index after failed update: %w", err))
 	}
 	return cause
 }
