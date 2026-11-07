@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -80,13 +79,12 @@ const (
 // core is what the CLI controller and the daemon share: the state root, the
 // registry, the git store and the preparation pipeline.
 type core struct {
-	root      string
-	mountRoot string
+	root string
 	// prepareContext bounds one preparation attempt; nil means defaultPrepareTimeout.
 	prepareContext func(context.Context) (context.Context, context.CancelFunc)
 	logger         *slog.Logger
-	registry       *registry.Store
-	git            *gitstore.Store
+	registry       model.Registry
+	git            model.GitStore
 	// generationRetention is how long a retired generation stays readable;
 	// zero means defaultGenerationRetention.
 	generationRetention time.Duration
@@ -118,16 +116,19 @@ type Service struct {
 	// Test hooks, nil in production. runtimeStarted runs between starting a
 	// runtime and recording it. mountReleased runs in a join goroutine after
 	// it released a FUSE mount whose server exited cleanly, before it records
-	// the exit. joinFinished runs as a join goroutine ends.
-	runtimeStarted, mountReleased, joinFinished func()
+	// the exit. joinFinished runs as a join goroutine ends. readyRecorded runs
+	// after an async preparation persisted ready, before it activates the
+	// runtime.
+	runtimeStarted, mountReleased, joinFinished, readyRecorded func()
 	// headReconcileBackoff is the first retry delay after a failed HEAD
 	// reconcile; zero means headReconcileMinBackoff.
 	headReconcileBackoff time.Duration
 	mu                   sync.Mutex
 	running              map[model.RepoID]*repoRuntime
-	preparing            map[model.RepoID]int64
-	prepareAttempts      map[model.RepoID]int64
-	prepareSeq           int64
+	// preparing holds each repo's async preparation worker.
+	preparing       map[model.RepoID]prepareWorker
+	prepareAttempts map[model.RepoID]int64
+	prepareSeq      int64
 	// leftovers holds the repos the daemon process before this one ran and
 	// whose mounts it may have left. Before the daemon mounts such a repo,
 	// it unmounts the mount at its mount point when ownsLeftover matches it.
@@ -173,7 +174,7 @@ func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error
 		unmountPath:     defaultUnmountPath,
 		mountPointEntry: mountPointEntry,
 		running:         map[model.RepoID]*repoRuntime{},
-		preparing:       map[model.RepoID]int64{},
+		preparing:       map[model.RepoID]prepareWorker{},
 		prepareAttempts: map[model.RepoID]int64{},
 		leftovers:       map[model.RepoID]bool{},
 		mountRetries:    map[model.RepoID]*mountRetry{},
@@ -212,12 +213,6 @@ func newCore(ctx context.Context, root string, logger *slog.Logger) (*core, erro
 func (c *Controller) Close() error {
 	c.git.Close()
 	return c.registry.Close()
-}
-
-func (s *Service) SetMountRoot(root string) {
-	if strings.TrimSpace(root) != "" {
-		s.mountRoot = root
-	}
 }
 
 func (s *Service) SetHydrationConcurrency(n int) {
@@ -286,11 +281,7 @@ func (s *Service) Close() error {
 
 func (s *core) fillPaths(cfg *model.RepoConfig) {
 	if cfg.MountRoot == "" {
-		if s.mountRoot != "" {
-			cfg.MountRoot = s.mountRoot
-		} else {
-			cfg.MountRoot = filepath.Join(s.root, "mnt")
-		}
+		cfg.MountRoot = filepath.Join(s.root, "mnt")
 	}
 	if cfg.MountPath == "" {
 		cfg.MountPath = filepath.Join(cfg.MountRoot, cfg.Name)

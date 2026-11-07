@@ -193,7 +193,6 @@ func newAsyncPreparedE2ERepo(t *testing.T, preparedGitDir string, fetchRef strin
 		cancel()
 		t.Fatal(err)
 	}
-	svc.SetMountRoot(mountDir)
 	ctl := newE2EController(t, root)
 
 	cfg := model.RepoConfig{

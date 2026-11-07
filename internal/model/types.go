@@ -56,7 +56,13 @@ type RepoConfig struct {
 	AcquiredRef           string
 	AcquiredCommit        string
 	AcquiredAt            time.Time
-	ConfigVersion         string
+	// ConfigVersion identifies the registered config. A new registration
+	// changes it, and only a new registration does, so it is the one token
+	// that tells whether a config is still current.
+	ConfigVersion string
+	// PrepareRequest identifies the latest preparation the CLI asked for, by
+	// add-repo or prepare.
+	PrepareRequest string
 	// MountRequest identifies the latest unmount or remount the CLI asked for.
 	MountRequest string
 }
@@ -242,40 +248,68 @@ func ValidateRepoName(name string) error {
 	return nil
 }
 
+// The interfaces below list the methods production code calls through them.
+// Each implementation asserts its interface with a var _ declaration.
+
+// Registry is the repo registry: the stored configs, their prepare and mount
+// requests, and the runtime records the daemon writes.
 type Registry interface {
 	AddRepo(ctx context.Context, cfg RepoConfig) error
 	RemoveRepo(ctx context.Context, name string) error
 	GetRepo(ctx context.Context, name string) (RepoConfig, error)
 	ListRepos(ctx context.Context) ([]RepoConfig, error)
+	UpdateRefresh(ctx context.Context, repoID RepoID, interval time.Duration, disabled bool) error
+	BeginPrepare(ctx context.Context, cfg RepoConfig, state PrepareState, request string) error
+	UpdatePrepareStateForRequest(ctx context.Context, cfg RepoConfig, state PrepareState, prepareErr string) error
+	RecordAcquisition(ctx context.Context, cfg RepoConfig, source PreparedSource) error
+	RequestMount(ctx context.Context, repoID RepoID, enabled bool, request string) error
+	PutRuntime(ctx context.Context, rec RepoRuntimeRecord) error
+	GetRuntime(ctx context.Context, repoID RepoID) (RepoRuntimeRecord, bool, error)
+	DeleteRuntime(ctx context.Context, repoID RepoID) error
+	ClearRuntime(ctx context.Context) ([]RepoRuntimeRecord, error)
+	Close() error
 }
 
+// GitStore runs git for the daemon's preparations and refreshes, and fetches
+// and reads blobs for the hydrator.
 type GitStore interface {
 	CloneBlobless(ctx context.Context, cfg RepoConfig) error
 	CloneBloblessNonInteractive(ctx context.Context, cfg RepoConfig) error
 	PrepareSource(ctx context.Context, cfg RepoConfig, requirement SourceRequirement) (PreparedSource, error)
+	ValidateAmbientRemote(repo RepoConfig) error
+	ConfigureRemoteNonInteractive(ctx context.Context, repo RepoConfig) error
+	ConfigureRemoteWithCredentials(ctx context.Context, repo RepoConfig) error
 	Fetch(ctx context.Context, repo RepoConfig) error
 	FetchRefNonInteractive(ctx context.Context, repo RepoConfig, ref string) error
-	ResolveHEAD(ctx context.Context, repo RepoConfig) (oid string, ref string, err error)
-	BuildTreeIndex(ctx context.Context, repo RepoConfig, headOID string) ([]BaseNode, error)
-	BlobToCache(ctx context.Context, repo RepoConfig, objectOID string, dstPath string) (size int64, err error)
-	ReadBlob(ctx context.Context, repo RepoConfig, objectOID string, maxBytes int64) ([]byte, error)
-	ComputeAheadBehind(ctx context.Context, repo RepoConfig) (ahead int, behind int, diverged bool, err error)
-	CommitTimestamp(ctx context.Context, repo RepoConfig, oid string) (int64, error)
-	ReadTreeHEAD(ctx context.Context, repo RepoConfig) error
+	FetchRefWithCredentials(ctx context.Context, repo RepoConfig, ref string) error
 	PrepareFetchedBranch(ctx context.Context, repo RepoConfig, ref string) error
 	ValidatePreparedGitDir(ctx context.Context, repo RepoConfig) error
 	ConfigureAdoptedWorktree(ctx context.Context, repo RepoConfig) error
+	WarnAdoptedOriginCredentials(ctx context.Context, repo RepoConfig)
+	RemoveAdoptedFSMonitorHook(ctx context.Context, repo RepoConfig) error
+	EnsureIndexInitialized(ctx context.Context, repo RepoConfig) error
+	ConfigureStatusOptimization(ctx context.Context, repo RepoConfig, stateRoot string) error
+	ConfigureFSMonitorHook(ctx context.Context, repo RepoConfig, stateRoot string) error
+	BootstrapCleanIndexForFSMonitor(ctx context.Context, repo RepoConfig, snapshotOID string, validate func() (bool, error)) (bool, error)
+	ResolveHEAD(ctx context.Context, repo RepoConfig) (oid string, ref string, err error)
+	CommitTimestamp(ctx context.Context, repo RepoConfig, oid string) (int64, error)
+	ComputeAheadBehind(ctx context.Context, repo RepoConfig) (ahead int, behind int, diverged bool, err error)
+	BuildTreeIndex(ctx context.Context, repo RepoConfig, headOID string) ([]BaseNode, error)
+	BlobToCache(ctx context.Context, repo RepoConfig, objectOID string, dstPath string) (size int64, err error)
+	FetchMissingBlobs(ctx context.Context, repo RepoConfig, objectOIDs []string) error
+	ReadBlob(ctx context.Context, repo RepoConfig, objectOID string, maxBytes int64) ([]byte, error)
+	VerifyBlob(ctx context.Context, repo RepoConfig, objectOID string, cachePath string) (ok bool, err error)
+	SetBatchPoolSize(n int)
+	CloseBatchPool(gitDir string)
+	Close()
 }
 
 type SnapshotStore interface {
-	PublishGeneration(ctx context.Context, headOID string, ref string, nodes []BaseNode) (generation int64, err error)
-	GetNode(generation int64, path string) (BaseNode, bool)
 	LookupNode(ctx context.Context, generation int64, path string) (BaseNode, bool, error)
 	ListChildren(generation int64, parentPath string) ([]BaseNode, error)
 }
 
 type OverlayStore interface {
-	Get(path string) (OverlayEntry, bool)
 	Lookup(ctx context.Context, path string) (OverlayEntry, bool, error)
 	EnsureCopyOnWrite(ctx context.Context, repo RepoConfig, path string, base BaseNode) (OverlayEntry, error)
 	EnsureCopyOnWriteFrom(ctx context.Context, repo RepoConfig, path string, base BaseNode, src *os.File) (OverlayEntry, error)
@@ -292,17 +326,13 @@ type OverlayStore interface {
 	Mkdir(ctx context.Context, path string, mode uint32) error
 	SetMode(ctx context.Context, path string, mode uint32) error
 	SetMtime(ctx context.Context, path string, t time.Time) error
-	Reconcile(ctx context.Context, baseLookup func(path string) (BaseNode, bool)) error
 	ReconcileChecked(ctx context.Context, baseLookup func(path string) (BaseNode, bool, error), lock sync.Locker, switchBase func()) error
-	DirtyCount(ctx context.Context) (int64, error)
 	ListByPrefix(ctx context.Context, prefix string) ([]OverlayEntry, error)
 }
 
 type Hydrator interface {
-	Enqueue(task HydrationTask)
 	EnqueueBatch(tasks []HydrationTask)
 	EnsureHydrated(ctx context.Context, repo RepoConfig, node BaseNode) (cachePath string, size int64, err error)
 	OpenHydrated(ctx context.Context, repo RepoConfig, node BaseNode) (*os.File, int64, error)
 	ReadBlob(ctx context.Context, repo RepoConfig, node BaseNode, maxBytes int64) ([]byte, error)
-	QueueDepth(repoID RepoID) int
 }

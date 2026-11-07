@@ -306,12 +306,12 @@ func TestEnqueueDedupesAndUpgradesPriority(t *testing.T) {
 
 	h.Enqueue(low)
 	h.Enqueue(low)
-	if got := h.QueueDepth("repo"); got != 1 {
-		t.Fatalf("QueueDepth after duplicate enqueue = %d, want 1", got)
+	if got := queueDepth(h, "repo"); got != 1 {
+		t.Fatalf("queue depth after duplicate enqueue = %d, want 1", got)
 	}
 	h.EnqueueBatch([]model.HydrationTask{low, high})
-	if got := h.QueueDepth("repo"); got != 1 {
-		t.Fatalf("QueueDepth after priority upgrade = %d, want 1", got)
+	if got := queueDepth(h, "repo"); got != 1 {
+		t.Fatalf("queue depth after priority upgrade = %d, want 1", got)
 	}
 	h.mu.Lock()
 	got := h.pq[0].task
@@ -454,7 +454,7 @@ func TestExplicitReadsDoNotShareBatchWithPrefetch(t *testing.T) {
 			errs <- err
 		}()
 	}
-	for h.QueueDepth(cfg.ID) < len(prefetch)+len(reads) {
+	for queueDepth(h, cfg.ID) < len(prefetch)+len(reads) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	h.Start(1, cfg)
@@ -723,7 +723,7 @@ func TestReadOfAQueuedFallbackDownloadWakesTheReservedWorker(t *testing.T) {
 				}
 				h.EnqueueBatch(prefetchTasksFor(cfg.ID, PriorityLikelyText, append(oids, "queued")...))
 				synctest.Wait()
-				if got := h.QueueDepth(cfg.ID); got != 1 {
+				if got := queueDepth(h, cfg.ID); got != 1 {
 					t.Fatalf("queue depth = %d, want 1: only the last blob waits for its download", got)
 				}
 
@@ -1344,7 +1344,7 @@ func TestStopWaitsForWorkerAndRejectsLaterWork(t *testing.T) {
 			t.Fatalf("EnsureHydrated after Stop err = %v, want ErrStopped", err)
 		}
 		h.Enqueue(model.HydrationTask{RepoID: cfg.ID, ObjectOID: "other"})
-		if depth := h.QueueDepth(cfg.ID); depth != 0 {
+		if depth := queueDepth(h, cfg.ID); depth != 0 {
 			t.Fatalf("queue depth after Stop = %d, want 0", depth)
 		}
 	})
@@ -1541,7 +1541,10 @@ func waitForHydratorIdle(t *testing.T, h *Service, repoID model.RepoID) {
 	}
 }
 
+// fakeBlobFetcher fakes the git store methods the hydrator calls. A call to any
+// other method panics on the nil embedded model.GitStore.
 type fakeBlobFetcher struct {
+	model.GitStore
 	mu            sync.Mutex
 	calls         int
 	readBlobCalls int
@@ -1752,4 +1755,17 @@ func cacheFile(t testing.TB, dir, oid string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// queueDepth counts the tasks of repoID waiting in h's queue.
+func queueDepth(h *Service, repoID model.RepoID) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	c := 0
+	for _, item := range h.pq {
+		if item.task.RepoID == repoID {
+			c++
+		}
+	}
+	return c
 }

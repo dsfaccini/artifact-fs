@@ -69,9 +69,7 @@ func (h *gatedHydrator) enter(ctx context.Context) error {
 	}
 }
 
-func (h *gatedHydrator) Enqueue(model.HydrationTask)        {}
 func (h *gatedHydrator) EnqueueBatch([]model.HydrationTask) {}
-func (h *gatedHydrator) QueueDepth(model.RepoID) int        { return 0 }
 
 func (h *gatedHydrator) EnsureHydrated(ctx context.Context, _ model.RepoConfig, node model.BaseNode) (string, int64, error) {
 	if err := h.enter(ctx); err != nil {

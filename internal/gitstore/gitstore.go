@@ -12,6 +12,8 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
+var _ model.GitStore = (*Store)(nil)
+
 type Store struct {
 	logger         *slog.Logger
 	mu             sync.Mutex
@@ -94,7 +96,7 @@ func (s *Store) CommitTimestamp(ctx context.Context, repo model.RepoConfig, oid 
 }
 
 func (s *Store) ComputeAheadBehind(ctx context.Context, repo model.RepoConfig) (ahead int, behind int, diverged bool, err error) {
-	branch := branchName(repo.Branch)
+	branch := model.BranchName(repo.Branch)
 	if branch == "" {
 		return 0, 0, false, nil
 	}

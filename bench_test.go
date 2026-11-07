@@ -172,7 +172,9 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 	// Getattr for all root children (simulates what FUSE does after readdir)
 	start = time.Now()
 	for _, c := range rootChildren {
-		snap.GetNode(gen, c.Path)
+		if _, _, err := snap.LookupNode(ctx, gen, c.Path); err != nil {
+			t.Fatal(err)
+		}
 	}
 	rootGetattrDur := time.Since(start)
 	results = append(results, timing{"getattr root children (snapshot)", rootGetattrDur,

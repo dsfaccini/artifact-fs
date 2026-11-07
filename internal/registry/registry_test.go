@@ -44,7 +44,7 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 	if err := store.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdatePrepareState(ctx, cfg.ID, model.PrepareStateFailed, "clone failed"); err != nil {
+	if err := store.UpdatePrepareStateForRequest(ctx, cfg, model.PrepareStateFailed, "clone failed"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -85,7 +85,9 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 	}
 }
 
-func TestPrepareStateUpdateRejectsOlderConfigVersion(t *testing.T) {
+// A preparation's outcome lands only while its config and its prepare request
+// are both still the registry's.
+func TestPrepareStateUpdateRejectsOlderConfigOrRequest(t *testing.T) {
 	ctx := context.Background()
 	store, err := New(ctx, filepath.Join(t.TempDir(), "repos.sqlite"))
 	if err != nil {
@@ -93,29 +95,42 @@ func TestPrepareStateUpdateRejectsOlderConfigVersion(t *testing.T) {
 	}
 	defer store.Close()
 
-	cfg := model.RepoConfig{ID: "repo", Name: "repo", Branch: "main", ConfigVersion: "version-1"}
+	cfg := model.RepoConfig{ID: "repo", Name: "repo", Branch: "refs/heads/main", ConfigVersion: "version-1", PrepareRequest: "request-1"}
 	if err := store.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
-	stale := cfg
+	staleConfig := cfg
 	cfg.ConfigVersion = "version-2"
 	cfg.PrepareState = model.PrepareStatePreparing
 	if err := store.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdatePrepareStateForConfig(ctx, stale, "", "old failure"); err != ErrRepoChanged {
-		t.Fatalf("stale update error = %v, want ErrRepoChanged", err)
+	if err := store.UpdatePrepareStateForRequest(ctx, staleConfig, "", "old failure"); err != ErrRepoChanged {
+		t.Fatalf("stale config update error = %v, want ErrRepoChanged", err)
+	}
+	staleRequest := cfg
+	if err := store.BeginPrepare(ctx, cfg, model.PrepareStatePreparing, "request-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdatePrepareStateForRequest(ctx, staleRequest, model.PrepareStateFailed, "old failure"); err != ErrRepoChanged {
+		t.Fatalf("stale request update error = %v, want ErrRepoChanged", err)
 	}
 	got, err := store.GetRepo(ctx, cfg.Name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ConfigVersion != "version-2" || got.PrepareState != model.PrepareStatePreparing || got.PrepareError != "" {
-		t.Fatalf("new config changed: version/state/error = %q/%q/%q", got.ConfigVersion, got.PrepareState, got.PrepareError)
+	if got.ConfigVersion != "version-2" || got.PrepareRequest != "request-2" || got.PrepareState != model.PrepareStatePreparing || got.PrepareError != "" {
+		t.Fatalf("new config changed: version/request/state/error = %q/%q/%q/%q", got.ConfigVersion, got.PrepareRequest, got.PrepareState, got.PrepareError)
+	}
+	cfg.PrepareRequest = "request-2"
+	if err := store.UpdatePrepareStateForRequest(ctx, cfg, model.PrepareStateReady, ""); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestBeginPrepareChangesVersionWithCompareAndSwap(t *testing.T) {
+// A prepare request applies only to the config it was made for, and leaves
+// that config's version as it is.
+func TestBeginPrepareRecordsRequestWithCompareAndSwap(t *testing.T) {
 	ctx := context.Background()
 	store, err := New(ctx, filepath.Join(t.TempDir(), "repos.sqlite"))
 	if err != nil {
@@ -123,21 +138,23 @@ func TestBeginPrepareChangesVersionWithCompareAndSwap(t *testing.T) {
 	}
 	defer store.Close()
 
-	cfg := model.RepoConfig{ID: "repo", Name: "repo", Branch: "main", ConfigVersion: "version-1"}
+	cfg := model.RepoConfig{ID: "repo", Name: "repo", Branch: "refs/heads/main", ConfigVersion: "version-1", PrepareRequest: "request-1"}
 	if err := store.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.BeginPrepare(ctx, cfg, model.PrepareStateSyncPreparing, "version-2"); err != nil {
+	if err := store.BeginPrepare(ctx, cfg, model.PrepareStateSyncPreparing, "request-2"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.BeginPrepare(ctx, cfg, model.PrepareStateSyncPreparing, "version-3"); err != ErrRepoChanged {
+	stale := cfg
+	stale.ConfigVersion = "version-0"
+	if err := store.BeginPrepare(ctx, stale, model.PrepareStateSyncPreparing, "request-3"); err != ErrRepoChanged {
 		t.Fatalf("stale begin error = %v, want ErrRepoChanged", err)
 	}
 	got, err := store.GetRepo(ctx, cfg.Name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ConfigVersion != "version-2" || got.PrepareState != model.PrepareStateSyncPreparing || got.PrepareError != "" {
+	if got.ConfigVersion != "version-1" || got.PrepareRequest != "request-2" || got.PrepareState != model.PrepareStateSyncPreparing || got.PrepareError != "" {
 		t.Fatalf("prepared config = %+v", got)
 	}
 }

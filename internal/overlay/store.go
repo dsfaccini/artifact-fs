@@ -110,6 +110,8 @@ var changeLogTriggers = []string{
 
 var changeLogTriggerNames = []string{"overlay_entries_insert_change", "overlay_entries_update_change", "overlay_entries_delete_change"}
 
+var _ model.OverlayStore = (*Store)(nil)
+
 type Store struct {
 	db       *sql.DB
 	repo     model.RepoConfig
@@ -200,13 +202,8 @@ func (s *Store) Close() error {
 }
 
 // overlayCols is the column list for overlay_entries queries. Keep in sync with
-// the Scan call in queryEntries and the single-row scan in Get.
+// the Scan call in queryEntries and the single-row scan in Lookup.
 const overlayCols = `path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path`
-
-func (s *Store) Get(path string) (model.OverlayEntry, bool) {
-	e, ok, _ := s.Lookup(context.Background(), path)
-	return e, ok
-}
 
 func (s *Store) Lookup(ctx context.Context, path string) (model.OverlayEntry, bool, error) {
 	path = model.CleanPath(path)
@@ -697,7 +694,7 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string, sourceTrack
 	writeSourceWhiteout := true
 	if e.Kind == model.OverlayKindRename && e.TargetPath != "" {
 		newTargetPath = e.TargetPath
-		// Reconcile drops a whiteout that names another path, so only an
+		// ReconcileChecked drops a whiteout that names another path, so only an
 		// untracked intermediate path of a rename chain may name the original.
 		if !sourceTracked {
 			whiteoutTargetPath = e.TargetPath
@@ -1109,28 +1106,17 @@ func (s *Store) SetMode(ctx context.Context, path string, mode uint32) error {
 	return s.upsertEntry(ctx, e)
 }
 
-// Reconcile prunes overlay entries that are stale relative to the new base
-// snapshot. Called after a generation change (commit, branch switch, fetch).
+// ReconcileChecked prunes overlay entries that are stale relative to the new
+// base snapshot. Called after a generation change (commit, branch switch, fetch).
 //
 // Source OID and mode identify the base version an overlay entry was derived
 // from. When either changes, matching overlay content was committed and can be
 // removed; divergent content is kept and rebased onto the new source metadata.
 // Creates, symlinks, deletes, and directories are removed once the new base
 // independently represents their pending operation.
-func (s *Store) Reconcile(ctx context.Context, baseLookup func(path string) (model.BaseNode, bool)) error {
-	if baseLookup == nil {
-		return nil
-	}
-	return s.ReconcileChecked(ctx, func(path string) (model.BaseNode, bool, error) {
-		n, ok := baseLookup(path)
-		return n, ok, nil
-	}, nil, nil)
-}
-
-// ReconcileChecked reconciles as Reconcile does, in two phases, so that
-// readers keep working while it compares the overlay with the new base.
 //
-// The plan phase reads every entry, looks up its base and hashes its content
+// It runs in two phases, so that readers keep working while it compares the
+// overlay with the new base. The plan phase reads every entry, looks up its base and hashes its content
 // with no lock that a reader or an overlay write takes. The apply phase holds
 // lock, which excludes the readers of the overlay and the base. It takes the
 // database write lock, classifies again every entry the change log shows a

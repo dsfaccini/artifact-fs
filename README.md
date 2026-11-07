@@ -112,8 +112,8 @@ MOUNT_ROOT="$HOME/artifact-fs-mnt"
   --ref refs/heads/main \
   --mount-root "$MOUNT_ROOT"
 
-# Start the daemon (mounts via FUSE, blocks until killed)
-./artifact-fs daemon --root "$MOUNT_ROOT" &
+# Start the daemon (mounts each repo where add-repo registered it, blocks until killed)
+./artifact-fs daemon &
 DAEMON_PID=$!
 
 # Use the repo
@@ -209,7 +209,7 @@ When the Git index matches the published snapshot and the overlay is empty, star
 Use `--hydration-concurrency` to control the number of parallel blob-fetch workers (default 4). Each worker maintains a persistent `git cat-file --batch` process that copies fetched blobs into the cache, so higher values trade memory for faster bulk hydration:
 
 ```bash
-./artifact-fs daemon --root /tmp --hydration-concurrency 8
+./artifact-fs daemon --hydration-concurrency 8
 ```
 
 ### Evicting the blob cache
@@ -236,7 +236,7 @@ The cache shards blobs by the first two hex characters of their object ID, `<blo
 
 ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the mode, source, attempt, phase, state, duration, and deadline. Clone and fetch operations retry known transient transport failures up to three total attempts. Preparation has a 30-minute timeout. Caller cancellation stops the active Git command and retry backoff; synchronous preparation records a redacted `prepare canceled` status, while daemon shutdown leaves async preparation queued for restart.
 
-Async existing-clone preparation reports remote configuration, fetch, and branch update as separate `configure_remote`, `fetch`, and `update_branch` phases.
+Existing-clone preparation reports remote configuration, fetch, and branch update as separate `configure_remote`, `fetch`, and `update_branch` phases.
 
 Each error the FUSE library reports becomes a `fuse error` record:
 
@@ -262,7 +262,7 @@ Stopping a repo, for `unmount`, `remove-repo` or a daemon shutdown, unmounts it 
 Successful `add-repo`:
 
 ```json
-{"time":"2026-07-16T12:00:00Z","level":"INFO","msg":"repo preparation started","repo":"workers-sdk","mode":"sync","source":"fresh_clone","attempt":1,"phase":"validate","state":"started","duration_ms":0,"branch":"refs/heads/main","fetch_ref":"main","deadline_set":true,"timeout_ms":1799999}
+{"time":"2026-07-16T12:00:00Z","level":"INFO","msg":"repo preparation started","repo":"workers-sdk","mode":"sync","source":"fresh_clone","attempt":1,"phase":"validate","state":"started","duration_ms":0,"branch":"refs/heads/main","fetch_ref":"refs/heads/main","deadline_set":true,"timeout_ms":1799999}
 {"time":"2026-07-16T12:00:04Z","level":"INFO","msg":"repo preparation completed","repo":"workers-sdk","mode":"sync","source":"fresh_clone","attempt":1,"phase":"complete","state":"completed","duration_ms":4217,"deadline_set":true,"timeout_ms":1799999,"head_oid":"d4c61587...","head_ref":"main","snapshot_generation":1}
 ```
 
@@ -283,7 +283,7 @@ Preparation timeout:
 Diagnostics are bounded and redact credentials and complete remote references. To follow preparation and network activity:
 
 ```bash
-./artifact-fs daemon --root /tmp 2>/tmp/daemon.log &
+./artifact-fs daemon 2>/tmp/daemon.log &
 tail -f /tmp/daemon.log | grep -Ei 'prepar|git operation'
 ```
 
@@ -307,6 +307,8 @@ The daemon mounts a placeholder immediately. Operations inside that repo mount, 
 ./artifact-fs prepare --name workers-sdk
 ```
 
+`prepare` never unmounts the repo. The daemon prepares an async repo again behind its gate, so operations wait as they did during the first preparation. For a repo `add-repo` prepared without `--async`, `prepare` fetches and prepares in the CLI while the daemon keeps serving the previous commit, and `status` reports `preparing` meanwhile. The mount then moves to the prepared commit. When that `prepare` fails, the daemon keeps serving the repo. If the fetch already moved HEAD before a later step failed, the watcher moves the live mount to that HEAD, and a restarted daemon serves the git dir's HEAD. `status` shows the `prepare_error` with the commit the daemon serves. An async repo that is ready and has no `--require-commit` has nothing to prepare. `set-refresh` never prepares a repo again.
+
 Async HTTPS remotes must use ambient credentials, such as a configured Git credential helper or repo-local Git config. Inline credentials in the remote URL are rejected for async repositories.
 
 For workflows that create the gitdir separately, `--prepared-gitdir` makes the async step fetch and prepare an existing gitdir instead of running `git clone`:
@@ -324,6 +326,8 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
   --git-dir /tmp/workers-sdk.git \
   --fetch-ref main
 ```
+
+`--ref` and `--fetch-ref` take a full ref name, a branch name, or `origin/<branch>`, and `add-repo` stores each as a full ref name. `origin/X` names branch `X`, so a branch literally named `origin/X` needs `--ref refs/heads/origin/X`. `--fetch-ref` defaults to `--ref`. Preparation fetches the fetch ref and serves it, also right after a fresh clone of `--ref`.
 
 ## Adopting linked Git worktrees
 
@@ -346,7 +350,7 @@ mv /path/to/mounts/topic/.git /path/to/topic.gitfile
 ARTIFACT_FS_ROOT=/path/to/topic-state artifact-fs add-repo \
   --name topic --adopt-gitdir --git-dir "$topic_gitdir" \
   --mount-root /path/to/mounts --blob-cache-dir /path/to/shared-blobs
-ARTIFACT_FS_ROOT=/path/to/topic-state artifact-fs daemon --root /path/to/mounts
+ARTIFACT_FS_ROOT=/path/to/topic-state artifact-fs daemon
 ```
 
 Adoption disables remote refresh and rejects acquisition options (`--remote`,
@@ -492,7 +496,7 @@ it at a later HEAD change.
 | `hydrator` | Priority queue with deduped waiters; workers fetch queued blobs in batches. With more than one worker, a reserved worker takes only reads and copies of local blobs and blocks on `reservedReady`; the others block on `workReady` |
 | `watcher` | Polls gitdir mtimes (HEAD, index, refs) at 500ms intervals |
 | `registry` | SQLite-backed repo config persistence |
-| `model` | Shared types and canonical interfaces (`GitStore`, `SnapshotStore`, `OverlayStore`, `Hydrator`) |
+| `model` | Shared types and canonical interfaces (`Registry`, `GitStore`, `SnapshotStore`, `OverlayStore`, `Hydrator`) |
 
 ## Supported git operations
 

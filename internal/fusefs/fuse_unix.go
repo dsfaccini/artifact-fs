@@ -1483,10 +1483,6 @@ func (m *mountedFSWrapper) InvalidateChanged() error {
 	return m.fs.invalidateChanged()
 }
 
-func MountRepo(ctx, opCtx context.Context, repo model.RepoConfig, engine *Engine, logger *slog.Logger) (MountedFS, error) {
-	return MountRepoWithGate(ctx, opCtx, repo, engine, nil, logger)
-}
-
 // fuseMount is fuse.MountContext. Package tests replace it so they cannot mount.
 var fuseMount = fuse.MountContext
 

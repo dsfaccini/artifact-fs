@@ -85,7 +85,6 @@ func (s *Controller) FSMonitorHook(ctx context.Context, name string, since strin
 	if err != nil {
 		return err
 	}
-	s.fillPaths(&cfg)
 	prefix := fmt.Sprintf("artifact-fs:%s:%s:", cfg.ID, cfg.ConfigVersion)
 	rest, trusted := strings.CutPrefix(since, prefix)
 	sinceInstance, seqText, ok := strings.Cut(rest, ":")

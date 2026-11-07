@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -1087,15 +1088,14 @@ func TestFirstFileReadPrefetchesItsDirectoryAndListingPrefetchesNothing(t *testi
 	t.Cleanup(func() { _ = ov.Close() })
 	h := hydrator.New(git)
 	t.Cleanup(h.Stop)
+	queue := &enqueueCounter{Hydrator: h}
 	resolver := &Resolver{Snapshot: snap, Overlay: ov}
 	resolver.SetGeneration(gen)
-	fs := NewArtifactFuse(repo, &Engine{Resolver: resolver, Repo: repo, Overlay: ov, Hydrator: h})
+	fs := NewArtifactFuse(repo, &Engine{Resolver: resolver, Repo: repo, Overlay: ov, Hydrator: queue})
 	packs := packCount(t, repo.GitDir)
 
-	// The hydrator has not started, so anything a listing queued would still
-	// be queued.
 	walkListing(t, fs, fuseops.RootInodeID, ".")
-	if got := h.QueueDepth(repo.ID); got != 0 {
+	if got := queue.queued.Load(); got != 0 {
 		t.Fatalf("a listing-only walk queued %d blobs for hydration", got)
 	}
 
@@ -1504,8 +1504,6 @@ type fakeLookupHydrator struct {
 	data          []byte
 }
 
-func (f *fakeLookupHydrator) Enqueue(model.HydrationTask) {}
-
 func (f *fakeLookupHydrator) EnqueueBatch([]model.HydrationTask) {}
 
 func (f *fakeLookupHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfig, _ model.BaseNode) (string, int64, error) {
@@ -1532,8 +1530,6 @@ func (f *fakeLookupHydrator) ReadBlob(_ context.Context, _ model.RepoConfig, _ m
 	}
 	return f.data, nil
 }
-
-func (f *fakeLookupHydrator) QueueDepth(model.RepoID) int { return 0 }
 
 func TestReleasingAReaderLeavesAnotherHandlesWritesCoalescing(t *testing.T) {
 	ctx := context.Background()
@@ -1660,7 +1656,7 @@ func TestReadOnlyFileRefusesNewWriter(t *testing.T) {
 	if err := fs.OpenFile(ctx, &fuseops.OpenFileOp{Inode: inode, OpenFlags: syscall.O_RDONLY}); err != nil {
 		t.Errorf("read-only open of a 0444 file = %v", err)
 	}
-	e, _ := ov.Get("f.txt")
+	e := overlayEntry(t, ov, "f.txt")
 	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "abc" {
 		t.Fatalf("content = %q, %v; want abc kept", data, err)
 	}
@@ -1686,7 +1682,7 @@ func TestHandleOpenedForWriteBeforeChmodKeepsWriting(t *testing.T) {
 	if err := fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: inode, Handle: &open.Handle, Size: &two}); err != nil {
 		t.Fatalf("ftruncate through the earlier handle = %v", err)
 	}
-	e, _ := ov.Get("f.txt")
+	e := overlayEntry(t, ov, "f.txt")
 	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "ab" {
 		t.Fatalf("content = %q, %v; want ab", data, err)
 	}
@@ -1708,7 +1704,7 @@ func TestCreateHandleTruncatesReadOnlyFile(t *testing.T) {
 	if err := fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Handle: &create.Handle, Size: &one}); err != nil {
 		t.Fatalf("ftruncate through the create handle = %v", err)
 	}
-	e, _ := ov.Get("ro.txt")
+	e := overlayEntry(t, ov, "ro.txt")
 	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "a" {
 		t.Fatalf("content = %q, %v; want a", data, err)
 	}
@@ -1749,7 +1745,7 @@ func TestCreatorsOpenAfterCreateWritesReadOnlyFile(t *testing.T) {
 	if err := fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: open.Handle}); err != nil {
 		t.Fatal(err)
 	}
-	e, _ := ov.Get("ro.txt")
+	e := overlayEntry(t, ov, "ro.txt")
 	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "abc" {
 		t.Fatalf("content = %q, %v; want abc", data, err)
 	}
@@ -1805,7 +1801,7 @@ func TestReadOnlyHandleCannotTruncateReadOnlyFile(t *testing.T) {
 	if got := kernelErrno(fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: inode, Handle: &open.Handle, Size: &zero})); got != syscall.EACCES {
 		t.Errorf("ftruncate through a read-only handle = %v, want EACCES", got)
 	}
-	e, _ := ov.Get("f.txt")
+	e := overlayEntry(t, ov, "f.txt")
 	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "abc" {
 		t.Fatalf("content = %q, %v; want abc kept", data, err)
 	}
@@ -1888,9 +1884,19 @@ func TestKernelMountAdapterSkipsPermissionCheck(t *testing.T) {
 	if err := fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: inode, Size: &zero}); err != nil {
 		t.Errorf("truncate without a handle = %v, want success", err)
 	}
-	if e, _ := ov.Get("f.txt"); e.SizeBytes != 0 {
+	if e := overlayEntry(t, ov, "f.txt"); e.SizeBytes != 0 {
 		t.Fatalf("size after the truncate = %d, want 0", e.SizeBytes)
 	}
+}
+
+// overlayEntry returns path's overlay entry, and fails the test without one.
+func overlayEntry(t *testing.T, ov *overlaystore.Store, path string) model.OverlayEntry {
+	t.Helper()
+	e, ok, err := ov.Lookup(context.Background(), path)
+	if err != nil || !ok {
+		t.Fatalf("overlay entry %s = %v, %t", path, err, ok)
+	}
+	return e
 }
 
 // committedOverlay reads path's committed size and the pending row count
@@ -1976,4 +1982,16 @@ func TestCreateFileKeepsExistingEntry(t *testing.T) {
 	if err := f.fs.LookUpInode(ctx, attrs); err != nil || attrs.Entry.Attributes.Size != uint64(base.SizeBytes) {
 		t.Fatalf("base file after CreateFile = size %d, %v; want size %d", attrs.Entry.Attributes.Size, err, base.SizeBytes)
 	}
+}
+
+// enqueueCounter passes every call to its hydrator and counts the blobs queued
+// through it.
+type enqueueCounter struct {
+	model.Hydrator
+	queued atomic.Int64
+}
+
+func (c *enqueueCounter) EnqueueBatch(tasks []model.HydrationTask) {
+	c.queued.Add(int64(len(tasks)))
+	c.Hydrator.EnqueueBatch(tasks)
 }

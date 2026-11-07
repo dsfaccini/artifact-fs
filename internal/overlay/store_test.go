@@ -57,7 +57,7 @@ func TestCreateAndGet(t *testing.T) {
 		t.Fatalf("unexpected entry: %+v", e)
 	}
 
-	got, ok := s.Get("hello.txt")
+	got, ok := lookupEntry(t, s, "hello.txt")
 	if !ok {
 		t.Fatal("expected to find hello.txt")
 	}
@@ -93,10 +93,10 @@ func TestCreateSymlinkReconcilesAfterCommit(t *testing.T) {
 			ObjectOID: testBlobOID([]byte(target)),
 		}, true
 	}
-	if err := s.Reconcile(ctx, baseLookup); err != nil {
+	if err := reconcile(ctx, s, baseLookup); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := s.Get("docs/readme-link"); ok {
+	if _, ok := lookupEntry(t, s, "docs/readme-link"); ok {
 		t.Fatal("committed symlink should be removed from overlay")
 	}
 }
@@ -116,7 +116,7 @@ func TestSetModePreservesUncommittedModeAndReconcilesCommittedMode(t *testing.T)
 	if err := s.SetMode(ctx, base.Path, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	entry, ok := s.Get(base.Path)
+	entry, ok := lookupEntry(t, s, base.Path)
 	if !ok {
 		t.Fatal("expected mode-only overlay entry")
 	}
@@ -131,21 +131,21 @@ func TestSetModePreservesUncommittedModeAndReconcilesCommittedMode(t *testing.T)
 		t.Fatalf("backing mode = %#o, want 0755", st.Mode().Perm())
 	}
 
-	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+	if err := reconcile(ctx, s, func(path string) (model.BaseNode, bool) {
 		return model.BaseNode{Path: path, Type: "file", Mode: 0o100644, ObjectOID: baseOID}, true
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := s.Get(base.Path); !ok {
+	if _, ok := lookupEntry(t, s, base.Path); !ok {
 		t.Fatal("uncommitted executable-bit change should remain in overlay")
 	}
 
-	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+	if err := reconcile(ctx, s, func(path string) (model.BaseNode, bool) {
 		return model.BaseNode{Path: path, Type: "file", Mode: 0o100755, ObjectOID: baseOID}, true
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := s.Get(base.Path); ok {
+	if _, ok := lookupEntry(t, s, base.Path); ok {
 		t.Fatal("committed executable-bit change should be removed from overlay")
 	}
 }
@@ -174,12 +174,12 @@ func TestReconcilePreservesUnstagedModeAfterContentCommit(t *testing.T) {
 	}
 
 	committedOID := testBlobOID(committed)
-	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+	if err := reconcile(ctx, s, func(path string) (model.BaseNode, bool) {
 		return model.BaseNode{Path: path, Type: "file", Mode: 0o100644, ObjectOID: committedOID}, true
 	}); err != nil {
 		t.Fatal(err)
 	}
-	entry, ok := s.Get(base.Path)
+	entry, ok := lookupEntry(t, s, base.Path)
 	if !ok {
 		t.Fatal("unstaged executable-bit change should remain after committing content")
 	}
@@ -214,7 +214,7 @@ func TestReconcileDoesNotDeleteConcurrentModeChange(t *testing.T) {
 	}
 	t.Cleanup(func() { concurrent.Close() })
 	lookups := 0
-	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+	if err := reconcile(ctx, s, func(path string) (model.BaseNode, bool) {
 		lookups++
 		if lookups == 1 {
 			if err := concurrent.SetMode(ctx, path, 0o755); err != nil {
@@ -225,7 +225,7 @@ func TestReconcileDoesNotDeleteConcurrentModeChange(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	entry, ok := s.Get(base.Path)
+	entry, ok := lookupEntry(t, s, base.Path)
 	if !ok {
 		t.Fatal("concurrent executable-bit change was deleted")
 	}
@@ -253,14 +253,14 @@ func TestRenameBaseSymlinkReconcilesAfterCommit(t *testing.T) {
 	if err := s.Rename(ctx, base.Path, "link", true); err != nil {
 		t.Fatal(err)
 	}
-	if source, ok := s.Get(base.Path); !ok || !source.IsDeleted() {
+	if source, ok := lookupEntry(t, s, base.Path); !ok || !source.IsDeleted() {
 		t.Fatalf("source entry = %+v, ok=%v, want whiteout", source, ok)
 	}
-	if destination, ok := s.Get("link"); !ok || destination.Kind != model.OverlayKindSymlink || destination.TargetPath != target || destination.SourceOID != "" {
+	if destination, ok := lookupEntry(t, s, "link"); !ok || destination.Kind != model.OverlayKindSymlink || destination.TargetPath != target || destination.SourceOID != "" {
 		t.Fatalf("destination entry = %+v, ok=%v", destination, ok)
 	}
 
-	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+	if err := reconcile(ctx, s, func(path string) (model.BaseNode, bool) {
 		if path == base.Path {
 			return base, true
 		}
@@ -268,14 +268,14 @@ func TestRenameBaseSymlinkReconcilesAfterCommit(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if source, ok := s.Get(base.Path); !ok || !source.IsDeleted() {
+	if source, ok := lookupEntry(t, s, base.Path); !ok || !source.IsDeleted() {
 		t.Fatalf("uncommitted rename source after reconcile = %+v, ok=%v", source, ok)
 	}
-	if destination, ok := s.Get("link"); !ok || destination.Kind != model.OverlayKindSymlink {
+	if destination, ok := lookupEntry(t, s, "link"); !ok || destination.Kind != model.OverlayKindSymlink {
 		t.Fatalf("uncommitted rename destination after reconcile = %+v, ok=%v", destination, ok)
 	}
 
-	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+	if err := reconcile(ctx, s, func(path string) (model.BaseNode, bool) {
 		if path == "link" {
 			return model.BaseNode{Path: path, Type: "symlink", Mode: 0o120000, ObjectOID: oid}, true
 		}
@@ -283,10 +283,10 @@ func TestRenameBaseSymlinkReconcilesAfterCommit(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := s.Get(base.Path); ok {
+	if _, ok := lookupEntry(t, s, base.Path); ok {
 		t.Fatal("committed symlink rename source should be removed from overlay")
 	}
-	if _, ok := s.Get("link"); ok {
+	if _, ok := lookupEntry(t, s, "link"); ok {
 		t.Fatal("committed symlink rename destination should be removed from overlay")
 	}
 }
@@ -296,7 +296,7 @@ func TestWriteAndRead(t *testing.T) {
 	ctx := context.Background()
 
 	s.CreateFile(ctx, "f.txt", 0o644)
-	created, _ := s.Get("f.txt")
+	created, _ := lookupEntry(t, s, "f.txt")
 	n, err := s.WriteFile(ctx, "f.txt", 0, []byte("hello"))
 	if err != nil {
 		t.Fatal(err)
@@ -305,7 +305,7 @@ func TestWriteAndRead(t *testing.T) {
 		t.Fatalf("wrote %d, want 5", n)
 	}
 
-	e, _ := s.Get("f.txt")
+	e, _ := lookupEntry(t, s, "f.txt")
 	data, err := os.ReadFile(e.BackingPath)
 	if err != nil {
 		t.Fatal(err)
@@ -329,10 +329,10 @@ func TestRemoveCreatesWhiteout(t *testing.T) {
 	if err := s.Remove(ctx, "del.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := s.Get("del.txt"); !ok || !e.IsDeleted() {
+	if e, ok := lookupEntry(t, s, "del.txt"); !ok || !e.IsDeleted() {
 		t.Fatal("expected whiteout")
 	}
-	if _, ok := s.Get("del.txt"); !ok {
+	if _, ok := lookupEntry(t, s, "del.txt"); !ok {
 		t.Fatal("expected entry (delete kind)")
 	}
 }
@@ -353,7 +353,7 @@ func TestRenameDBFirst(t *testing.T) {
 	if err := s.SetMtime(ctx, "old.txt", target); err != nil {
 		t.Fatal(err)
 	}
-	before, ok := s.Get("old.txt")
+	before, ok := lookupEntry(t, s, "old.txt")
 	if !ok {
 		t.Fatal("expected old entry")
 	}
@@ -363,7 +363,7 @@ func TestRenameDBFirst(t *testing.T) {
 	}
 
 	// Old path should have a whiteout
-	if e, ok := s.Get("old.txt"); !ok || !e.IsDeleted() {
+	if e, ok := lookupEntry(t, s, "old.txt"); !ok || !e.IsDeleted() {
 		t.Fatal("expected whiteout at old path")
 	} else {
 		if e.MtimeUnixNs == target.UnixNano() || e.CtimeUnixNs == target.UnixNano() {
@@ -371,7 +371,7 @@ func TestRenameDBFirst(t *testing.T) {
 		}
 	}
 	// New path should exist
-	got, ok := s.Get("new.txt")
+	got, ok := lookupEntry(t, s, "new.txt")
 	if !ok || got.Kind != model.OverlayKindRename {
 		t.Fatalf("expected rename entry, got %+v ok=%v", got, ok)
 	}
@@ -407,7 +407,7 @@ func TestRenameSamePathNoop(t *testing.T) {
 	if err := s.Rename(ctx, "same.txt", "same.txt", false); err != nil {
 		t.Fatal(err)
 	}
-	got, ok := s.Get("same.txt")
+	got, ok := lookupEntry(t, s, "same.txt")
 	if !ok {
 		t.Fatal("expected entry")
 	}
@@ -434,8 +434,8 @@ func TestRenameThenRecreateSourceUsesDistinctBacking(t *testing.T) {
 	if _, err := s.WriteFile(ctx, "a.txt", 0, []byte("new")); err != nil {
 		t.Fatal(err)
 	}
-	a, _ := s.Get("a.txt")
-	b, _ := s.Get("b.txt")
+	a, _ := lookupEntry(t, s, "a.txt")
+	b, _ := lookupEntry(t, s, "b.txt")
 	if a.BackingPath == b.BackingPath {
 		t.Fatalf("recreated source and renamed destination share backing %q", a.BackingPath)
 	}
@@ -471,22 +471,22 @@ func TestRenameCreateRemainsCreateAcrossReconcile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	before, ok := s.Get("kept.txt")
+	before, ok := lookupEntry(t, s, "kept.txt")
 	if !ok {
 		t.Fatal("expected renamed create entry")
 	}
 	if before.Kind != model.OverlayKindCreate {
 		t.Fatalf("kind = %q, want create", before.Kind)
 	}
-	if _, ok := s.Get("tmp.txt"); ok {
+	if _, ok := lookupEntry(t, s, "tmp.txt"); ok {
 		t.Fatal("untracked create rename should not leave a source whiteout")
 	}
 
 	baseLookup := func(string) (model.BaseNode, bool) { return model.BaseNode{}, false }
-	if err := s.Reconcile(ctx, baseLookup); err != nil {
+	if err := reconcile(ctx, s, baseLookup); err != nil {
 		t.Fatal(err)
 	}
-	after, ok := s.Get("kept.txt")
+	after, ok := lookupEntry(t, s, "kept.txt")
 	if !ok || after.IsDeleted() {
 		t.Fatalf("reconcile should keep renamed create, got %+v ok=%v", after, ok)
 	}
@@ -502,7 +502,7 @@ func TestRenamePreservesDirectoryKindAndRepairsMode(t *testing.T) {
 	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET mode=? WHERE path=?`, 0o40000, "src"); err != nil {
 		t.Fatal(err)
 	}
-	src, _ := s.Get("src")
+	src, _ := lookupEntry(t, s, "src")
 	if err := os.Chmod(src.BackingPath, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -510,7 +510,7 @@ func TestRenamePreservesDirectoryKindAndRepairsMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, ok := s.Get("dst")
+	got, ok := lookupEntry(t, s, "dst")
 	if !ok {
 		t.Fatal("expected renamed entry")
 	}
@@ -554,16 +554,16 @@ func TestRenameMovesNonEmptyOverlayDirectory(t *testing.T) {
 	}
 
 	for _, path := range []string{"src", "src/a.txt", "src/nested", "src/nested/b.txt"} {
-		if _, ok := s.Get(path); ok {
+		if _, ok := lookupEntry(t, s, path); ok {
 			t.Fatalf("source entry %q still exists", path)
 		}
 	}
 	for _, path := range []string{"dst", "dst/a.txt", "dst/nested", "dst/nested/b.txt"} {
-		if e, ok := s.Get(path); !ok || e.IsDeleted() {
+		if e, ok := lookupEntry(t, s, path); !ok || e.IsDeleted() {
 			t.Fatalf("destination entry %q = %+v, ok=%v", path, e, ok)
 		}
 	}
-	moved, _ := s.Get("dst/nested/b.txt")
+	moved, _ := lookupEntry(t, s, "dst/nested/b.txt")
 	if data, err := os.ReadFile(moved.BackingPath); err != nil {
 		t.Fatal(err)
 	} else if string(data) != "nested" {
@@ -605,20 +605,20 @@ func TestRenameTreeWhiteoutsEveryTrackedSourcePath(t *testing.T) {
 	}
 
 	for _, path := range basePaths {
-		if e, ok := s.Get(path); !ok || !e.IsDeleted() {
+		if e, ok := lookupEntry(t, s, path); !ok || !e.IsDeleted() {
 			t.Fatalf("tracked source %q = %+v, ok=%v; want whiteout", path, e, ok)
 		}
 	}
-	if e, ok := s.Get("dst/a.txt"); !ok || e.Kind != model.OverlayKindRename || e.TargetPath != "src/a.txt" {
+	if e, ok := lookupEntry(t, s, "dst/a.txt"); !ok || e.Kind != model.OverlayKindRename || e.TargetPath != "src/a.txt" {
 		t.Fatalf("moved tracked file = %+v, ok=%v", e, ok)
 	}
-	if e, ok := s.Get("dst/nested/new.txt"); !ok || e.Kind != model.OverlayKindCreate {
+	if e, ok := lookupEntry(t, s, "dst/nested/new.txt"); !ok || e.Kind != model.OverlayKindCreate {
 		t.Fatalf("moved untracked file = %+v, ok=%v", e, ok)
 	}
-	if e, ok := s.Get("dst/link"); !ok || e.Kind != model.OverlayKindSymlink || e.SourceOID != "" || e.TargetPath != "../target" {
+	if e, ok := lookupEntry(t, s, "dst/link"); !ok || e.Kind != model.OverlayKindSymlink || e.SourceOID != "" || e.TargetPath != "../target" {
 		t.Fatalf("moved tracked symlink = %+v, ok=%v", e, ok)
 	}
-	if _, ok := s.Get("dst/deleted.txt"); ok {
+	if _, ok := lookupEntry(t, s, "dst/deleted.txt"); ok {
 		t.Fatal("deleted tracked child should not be recreated at destination")
 	}
 }
@@ -636,7 +636,7 @@ func TestRenameTreeReplacesEmptyOverlayDestination(t *testing.T) {
 	if err := s.Mkdir(ctx, "dst", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	replaced, _ := s.Get("dst")
+	replaced, _ := lookupEntry(t, s, "dst")
 
 	if err := s.RenameTree(ctx, "src", "dst", nil, nil); err != nil {
 		t.Fatal(err)
@@ -645,7 +645,7 @@ func TestRenameTreeReplacesEmptyOverlayDestination(t *testing.T) {
 	if _, err := os.Stat(replaced.BackingPath); !os.IsNotExist(err) {
 		t.Fatalf("replaced destination backing still exists: %v", err)
 	}
-	if e, ok := s.Get("dst/a.txt"); !ok || e.IsDeleted() {
+	if e, ok := lookupEntry(t, s, "dst/a.txt"); !ok || e.IsDeleted() {
 		t.Fatalf("moved child = %+v, ok=%v", e, ok)
 	}
 }
@@ -676,7 +676,7 @@ func TestRenameTreeRejectsNonEmptyOverlayDestinationWithoutMutation(t *testing.T
 	}
 
 	for _, path := range []string{"src", "src/source.txt", "dst", "dst/concurrent.txt"} {
-		if e, ok := s.Get(path); !ok || e.IsDeleted() {
+		if e, ok := lookupEntry(t, s, path); !ok || e.IsDeleted() {
 			t.Fatalf("entry %q = %+v, ok=%v; want preserved", path, e, ok)
 		}
 	}
@@ -685,7 +685,7 @@ func TestRenameTreeRejectsNonEmptyOverlayDestinationWithoutMutation(t *testing.T
 	} else if string(data) != "preserve me" {
 		t.Fatalf("destination child content = %q", data)
 	}
-	if _, ok := s.Get("dst/source.txt"); ok {
+	if _, ok := lookupEntry(t, s, "dst/source.txt"); ok {
 		t.Fatal("source child appeared at rejected destination")
 	}
 }
@@ -710,10 +710,10 @@ func TestRenameTreeAllowsDeletedDestinationDescendants(t *testing.T) {
 	if err := s.RenameTree(ctx, "src", "dst", nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := s.Get("dst/source.txt"); !ok || e.IsDeleted() {
+	if e, ok := lookupEntry(t, s, "dst/source.txt"); !ok || e.IsDeleted() {
 		t.Fatalf("moved child = %+v, ok=%v", e, ok)
 	}
-	if _, ok := s.Get("dst/deleted.txt"); ok {
+	if _, ok := lookupEntry(t, s, "dst/deleted.txt"); ok {
 		t.Fatal("destination tombstone survived replacement")
 	}
 }
@@ -752,14 +752,14 @@ func TestRenameTreeKeepsReplacedBaseDescendantsHidden(t *testing.T) {
 	}
 
 	for _, path := range []string{"dst/gone.txt", "dst/overlap/stale.txt"} {
-		if e, ok := s.Get(path); !ok || !e.IsDeleted() {
+		if e, ok := lookupEntry(t, s, path); !ok || !e.IsDeleted() {
 			t.Fatalf("replaced base path %q = %+v, ok=%v; want tombstone", path, e, ok)
 		}
 	}
-	if e, ok := s.Get("dst/overlap"); !ok || e.Kind != model.OverlayKindMkdir {
+	if e, ok := lookupEntry(t, s, "dst/overlap"); !ok || e.Kind != model.OverlayKindMkdir {
 		t.Fatalf("incoming overlapping directory = %+v, ok=%v", e, ok)
 	}
-	if e, ok := s.Get("dst/source.txt"); !ok || e.IsDeleted() {
+	if e, ok := lookupEntry(t, s, "dst/source.txt"); !ok || e.IsDeleted() {
 		t.Fatalf("incoming source file = %+v, ok=%v", e, ok)
 	}
 }
@@ -812,19 +812,19 @@ func TestRenameTreePersistsAcrossReopen(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
 	for _, path := range []string{"src", "src/tracked.txt"} {
-		if entry, ok := reopened.Get(path); !ok || !entry.IsDeleted() {
+		if entry, ok := lookupEntry(t, reopened, path); !ok || !entry.IsDeleted() {
 			t.Fatalf("reopened source whiteout %q = %+v, ok=%v", path, entry, ok)
 		}
 	}
 	for _, path := range []string{"dst", "dst/tracked.txt", "dst/nested", "dst/nested/local.txt"} {
-		if entry, ok := reopened.Get(path); !ok || entry.IsDeleted() {
+		if entry, ok := lookupEntry(t, reopened, path); !ok || entry.IsDeleted() {
 			t.Fatalf("reopened destination entry %q = %+v, ok=%v", path, entry, ok)
 		}
 	}
-	if entry, ok := reopened.Get("dst/old.txt"); !ok || !entry.IsDeleted() {
+	if entry, ok := lookupEntry(t, reopened, "dst/old.txt"); !ok || !entry.IsDeleted() {
 		t.Fatalf("reopened replaced descendant tombstone = %+v, ok=%v", entry, ok)
 	}
-	local, _ := reopened.Get("dst/nested/local.txt")
+	local, _ := lookupEntry(t, reopened, "dst/nested/local.txt")
 	if data, err := os.ReadFile(local.BackingPath); err != nil {
 		t.Fatal(err)
 	} else if string(data) != "local" {
@@ -860,20 +860,20 @@ func TestRenameTreeReconcilesAcrossBaseChange(t *testing.T) {
 			return model.BaseNode{}, false
 		}
 	}
-	if err := s.Reconcile(ctx, baseLookup); err != nil {
+	if err := reconcile(ctx, s, baseLookup); err != nil {
 		t.Fatal(err)
 	}
-	if entry, ok := s.Get("dst"); ok {
+	if entry, ok := lookupEntry(t, s, "dst"); ok {
 		t.Fatalf("destination directory represented by new base should reconcile, got %+v", entry)
 	}
-	if entry, ok := s.Get("dst/tracked.txt"); !ok ||
+	if entry, ok := lookupEntry(t, s, "dst/tracked.txt"); !ok ||
 		entry.Kind != model.OverlayKindRename ||
 		entry.TargetPath != "src/tracked.txt" ||
 		entry.SourceOID != "new" ||
 		entry.SourceMode != 0o100755 {
 		t.Fatalf("reconciled tree rename entry = %+v, ok=%v", entry, ok)
 	}
-	if entry, ok := s.Get("src/tracked.txt"); !ok || !entry.IsDeleted() {
+	if entry, ok := lookupEntry(t, s, "src/tracked.txt"); !ok || !entry.IsDeleted() {
 		t.Fatalf("reconciled source whiteout = %+v, ok=%v", entry, ok)
 	}
 }
@@ -897,14 +897,14 @@ func TestRenameOverlayDirectoryIgnoresDeletedDescendants(t *testing.T) {
 	if err := s.Rename(ctx, "a_b", "dst", false); err != nil {
 		t.Fatal(err)
 	}
-	got, ok := s.Get("dst")
+	got, ok := lookupEntry(t, s, "dst")
 	if !ok || got.Kind != model.OverlayKindMkdir {
 		t.Fatalf("expected renamed directory, got %+v ok=%v", got, ok)
 	}
-	if e, ok := s.Get("a_b/a.txt"); ok {
+	if e, ok := lookupEntry(t, s, "a_b/a.txt"); ok {
 		t.Fatalf("deleted descendant tombstone should be removed after directory rename, got %+v", e)
 	}
-	if e, ok := s.Get("axb/secret.txt"); !ok || !e.IsDeleted() {
+	if e, ok := lookupEntry(t, s, "axb/secret.txt"); !ok || !e.IsDeleted() {
 		t.Fatalf("unrelated wildcard-like tombstone should remain, got %+v ok=%v", e, ok)
 	}
 }
@@ -927,7 +927,7 @@ func TestRenameOverlayDirectoryCleansUTF8DeletedDescendants(t *testing.T) {
 	if err := s.Rename(ctx, dir, "dst", false); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := s.Get(child); ok {
+	if e, ok := lookupEntry(t, s, child); ok {
 		t.Fatalf("UTF-8 deleted descendant tombstone should be removed after directory rename, got %+v", e)
 	}
 }
@@ -948,10 +948,10 @@ func TestRenameOverlayDirectoryDoesNotDependOnDestinationBackingPath(t *testing.
 	if err := s.Rename(ctx, "src", "dst", false); err != nil {
 		t.Fatalf("Rename: %v", err)
 	}
-	if _, ok := s.Get("src/a.txt"); ok {
+	if _, ok := lookupEntry(t, s, "src/a.txt"); ok {
 		t.Fatal("deleted descendant tombstone should be removed")
 	}
-	if e, ok := s.Get("dst"); !ok || e.Kind != model.OverlayKindMkdir {
+	if e, ok := lookupEntry(t, s, "dst"); !ok || e.Kind != model.OverlayKindMkdir {
 		t.Fatalf("destination entry = %+v, ok=%v", e, ok)
 	}
 }
@@ -972,7 +972,7 @@ func TestRenameChainPreservesOriginalSourceForReconcile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	before, ok := s.Get("c.txt")
+	before, ok := lookupEntry(t, s, "c.txt")
 	if !ok {
 		t.Fatal("expected final rename entry")
 	}
@@ -986,11 +986,11 @@ func TestRenameChainPreservesOriginalSourceForReconcile(t *testing.T) {
 		}
 		return model.BaseNode{}, false
 	}
-	if err := s.Reconcile(ctx, baseLookup); err != nil {
+	if err := reconcile(ctx, s, baseLookup); err != nil {
 		t.Fatal(err)
 	}
 
-	after, ok := s.Get("c.txt")
+	after, ok := lookupEntry(t, s, "c.txt")
 	if !ok || after.IsDeleted() {
 		t.Fatalf("reconcile should keep chained rename, got %+v ok=%v", after, ok)
 	}
@@ -1011,7 +1011,7 @@ func TestReconcilePreservesDivergentRenameAcrossBaseChange(t *testing.T) {
 	if err := s.Rename(ctx, "a.txt", "b.txt", true); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := s.Get("a.txt"); !ok || !e.IsDeleted() {
+	if e, ok := lookupEntry(t, s, "a.txt"); !ok || !e.IsDeleted() {
 		t.Fatalf("expected source whiteout before reconcile, got %+v ok=%v", e, ok)
 	}
 
@@ -1021,13 +1021,13 @@ func TestReconcilePreservesDivergentRenameAcrossBaseChange(t *testing.T) {
 		}
 		return model.BaseNode{}, false
 	}
-	if err := s.Reconcile(ctx, baseLookup); err != nil {
+	if err := reconcile(ctx, s, baseLookup); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := s.Get("b.txt"); !ok || e.Kind != model.OverlayKindRename || e.SourceOID != "bbb" {
+	if e, ok := lookupEntry(t, s, "b.txt"); !ok || e.Kind != model.OverlayKindRename || e.SourceOID != "bbb" {
 		t.Fatalf("divergent rename should be preserved against new base, got %+v ok=%v", e, ok)
 	}
-	if e, ok := s.Get("a.txt"); !ok || !e.IsDeleted() {
+	if e, ok := lookupEntry(t, s, "a.txt"); !ok || !e.IsDeleted() {
 		t.Fatalf("source whiteout should remain with divergent rename, got %+v ok=%v", e, ok)
 	}
 }
@@ -1053,13 +1053,13 @@ func TestReconcileKeepsRenameWhenIdenticalSourceStillExists(t *testing.T) {
 		}
 		return model.BaseNode{}, false
 	}
-	if err := s.Reconcile(ctx, lookup); err != nil {
+	if err := reconcile(ctx, s, lookup); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := s.Get("b.txt"); !ok || e.Kind != model.OverlayKindRename {
+	if e, ok := lookupEntry(t, s, "b.txt"); !ok || e.Kind != model.OverlayKindRename {
 		t.Fatalf("rename should remain pending, got %+v ok=%v", e, ok)
 	}
-	if e, ok := s.Get("a.txt"); !ok || !e.IsDeleted() {
+	if e, ok := lookupEntry(t, s, "a.txt"); !ok || !e.IsDeleted() {
 		t.Fatalf("source whiteout should remain pending, got %+v ok=%v", e, ok)
 	}
 }
@@ -1079,7 +1079,7 @@ func TestReconcilePreservesDivergentChainedRenameAndRemovesIntermediateWhiteout(
 	if err := s.Rename(ctx, "b.txt", "c.txt", false); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := s.Get("b.txt"); !ok || !e.IsDeleted() {
+	if e, ok := lookupEntry(t, s, "b.txt"); !ok || !e.IsDeleted() {
 		t.Fatalf("expected intermediate whiteout before reconcile, got %+v ok=%v", e, ok)
 	}
 
@@ -1093,16 +1093,16 @@ func TestReconcilePreservesDivergentChainedRenameAndRemovesIntermediateWhiteout(
 			return model.BaseNode{}, false
 		}
 	}
-	if err := s.Reconcile(ctx, baseLookup); err != nil {
+	if err := reconcile(ctx, s, baseLookup); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := s.Get("a.txt"); !ok || !e.IsDeleted() {
+	if e, ok := lookupEntry(t, s, "a.txt"); !ok || !e.IsDeleted() {
 		t.Fatalf("source whiteout should remain, got %+v ok=%v", e, ok)
 	}
-	if e, ok := s.Get("b.txt"); ok {
+	if e, ok := lookupEntry(t, s, "b.txt"); ok {
 		t.Fatalf("intermediate whiteout should be removed, got %+v", e)
 	}
-	if e, ok := s.Get("c.txt"); !ok || e.Kind != model.OverlayKindRename || e.SourceOID != "bbb" {
+	if e, ok := lookupEntry(t, s, "c.txt"); !ok || e.Kind != model.OverlayKindRename || e.SourceOID != "bbb" {
 		t.Fatalf("final rename should remain rebased, got %+v ok=%v", e, ok)
 	}
 }
@@ -1130,7 +1130,7 @@ func TestEnsureCopyOnWritePreservesSize(t *testing.T) {
 		t.Fatalf("size = %d, want %d", e.SizeBytes, len("payload"))
 	}
 
-	got, ok := s.Get("tracked.txt")
+	got, ok := lookupEntry(t, s, "tracked.txt")
 	if !ok {
 		t.Fatal("expected tracked.txt entry")
 	}
@@ -1146,7 +1146,7 @@ func TestMkdir(t *testing.T) {
 	if err := s.Mkdir(ctx, "subdir", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	e, ok := s.Get("subdir")
+	e, ok := lookupEntry(t, s, "subdir")
 	if !ok || e.Kind != model.OverlayKindMkdir {
 		t.Fatalf("expected mkdir entry, got %+v", e)
 	}
@@ -1159,7 +1159,7 @@ func TestMkdirNormalizesGitTreeMode(t *testing.T) {
 	if err := s.Mkdir(ctx, "src", 0o40000); err != nil {
 		t.Fatal(err)
 	}
-	e, ok := s.Get("src")
+	e, ok := lookupEntry(t, s, "src")
 	if !ok {
 		t.Fatal("expected entry")
 	}
@@ -1175,7 +1175,7 @@ func TestMkdirPreservesExplicitZeroMode(t *testing.T) {
 	if err := s.Mkdir(ctx, "private", 0); err != nil {
 		t.Fatal(err)
 	}
-	e, ok := s.Get("private")
+	e, ok := lookupEntry(t, s, "private")
 	if !ok {
 		t.Fatal("expected entry")
 	}
@@ -1194,7 +1194,7 @@ func TestSetMtimeRepairsGitTreeDirectoryMode(t *testing.T) {
 	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET mode=? WHERE path=?`, 0o40000, "src"); err != nil {
 		t.Fatal(err)
 	}
-	src, _ := s.Get("src")
+	src, _ := lookupEntry(t, s, "src")
 	if err := os.Chmod(src.BackingPath, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -1203,7 +1203,7 @@ func TestSetMtimeRepairsGitTreeDirectoryMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e, ok := s.Get("src")
+	e, ok := lookupEntry(t, s, "src")
 	if !ok {
 		t.Fatal("expected entry")
 	}
@@ -1225,7 +1225,7 @@ func TestRenameRepairsDirectoryModeBeforeCommitting(t *testing.T) {
 	if err := s.Mkdir(ctx, "src", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	src, _ := s.Get("src")
+	src, _ := lookupEntry(t, s, "src")
 	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET mode=? WHERE path=?`, 0o40000, "src"); err != nil {
 		t.Fatal(err)
 	}
@@ -1235,10 +1235,10 @@ func TestRenameRepairsDirectoryModeBeforeCommitting(t *testing.T) {
 	if err := s.Rename(ctx, "src", "dst", false); err == nil {
 		t.Fatal("expected backing mode repair failure")
 	}
-	if _, ok := s.Get("src"); !ok {
+	if _, ok := lookupEntry(t, s, "src"); !ok {
 		t.Fatal("source entry was removed despite rename failure")
 	}
-	if _, ok := s.Get("dst"); ok {
+	if _, ok := lookupEntry(t, s, "dst"); ok {
 		t.Fatal("destination entry was committed despite rename failure")
 	}
 }
@@ -1261,7 +1261,7 @@ func TestTruncateUpdatesSizeAndTimes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e, ok := s.Get("trunc.txt")
+	e, ok := lookupEntry(t, s, "trunc.txt")
 	if !ok {
 		t.Fatal("expected entry")
 	}
@@ -1400,18 +1400,18 @@ func TestReconcileAfterCommit(t *testing.T) {
 			return model.BaseNode{}, false
 		}
 	}
-	if err := s.Reconcile(ctx, baseLookup); err != nil {
+	if err := reconcile(ctx, s, baseLookup); err != nil {
 		t.Fatal(err)
 	}
 
 	// All three entries should be removed.
-	if _, ok := s.Get("foo.txt"); ok {
+	if _, ok := lookupEntry(t, s, "foo.txt"); ok {
 		t.Fatal("foo.txt should be removed (base OID changed)")
 	}
-	if _, ok := s.Get("new.txt"); ok {
+	if _, ok := lookupEntry(t, s, "new.txt"); ok {
 		t.Fatal("new.txt should be removed (now in base)")
 	}
-	if _, ok := s.Get("gone.txt"); ok {
+	if _, ok := lookupEntry(t, s, "gone.txt"); ok {
 		t.Fatal("gone.txt whiteout should be removed (not in base)")
 	}
 }
@@ -1450,33 +1450,19 @@ func TestReconcileKeepsValidEntries(t *testing.T) {
 			return model.BaseNode{}, false
 		}
 	}
-	if err := s.Reconcile(ctx, baseLookup); err != nil {
+	if err := reconcile(ctx, s, baseLookup); err != nil {
 		t.Fatal(err)
 	}
 
 	// All three entries should be kept.
-	if _, ok := s.Get("foo.txt"); !ok {
+	if _, ok := lookupEntry(t, s, "foo.txt"); !ok {
 		t.Fatal("foo.txt should be kept (base OID unchanged)")
 	}
-	if _, ok := s.Get("local-only.txt"); !ok {
+	if _, ok := lookupEntry(t, s, "local-only.txt"); !ok {
 		t.Fatal("local-only.txt should be kept (not in base)")
 	}
-	if e, ok := s.Get("hidden.txt"); !ok || !e.IsDeleted() {
+	if e, ok := lookupEntry(t, s, "hidden.txt"); !ok || !e.IsDeleted() {
 		t.Fatal("hidden.txt whiteout should be kept (still in base)")
-	}
-}
-
-func TestReconcileNilLookup(t *testing.T) {
-	s, _ := testStore(t)
-	ctx := context.Background()
-	s.CreateFile(ctx, "a.txt", 0o644)
-
-	// nil baseLookup should be a no-op.
-	if err := s.Reconcile(ctx, nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := s.Get("a.txt"); !ok {
-		t.Fatal("entry should survive nil reconcile")
 	}
 }
 
@@ -1489,7 +1475,7 @@ func TestSetMtime(t *testing.T) {
 	if err := s.SetMtime(ctx, "m.txt", target); err != nil {
 		t.Fatal(err)
 	}
-	e, ok := s.Get("m.txt")
+	e, ok := lookupEntry(t, s, "m.txt")
 	if !ok {
 		t.Fatal("expected entry")
 	}
@@ -1582,7 +1568,7 @@ func TestReconcileLogsOnlyDeleteMarkersOverBasePaths(t *testing.T) {
 		}
 	}
 	before := changesSince(t, cfg, 0).Seq
-	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+	if err := reconcile(ctx, s, func(path string) (model.BaseNode, bool) {
 		switch path {
 		case "a.txt":
 			return model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "bbb"}, true
@@ -1593,7 +1579,7 @@ func TestReconcileLogsOnlyDeleteMarkersOverBasePaths(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := s.Get("gone/0.txt"); ok {
+	if _, ok := lookupEntry(t, s, "gone/0.txt"); ok {
 		t.Fatal("delete marker for a path the base lacks survived reconcile")
 	}
 	// Dropping the gone/ markers and rebasing c.txt leave the merged view as
@@ -1684,7 +1670,7 @@ func TestReconcileClassifiesWritesThatLandDuringItsLookups(t *testing.T) {
 	before := changesSince(t, cfg, 0).Seq
 	var logged []string
 	var once sync.Once
-	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+	if err := reconcile(ctx, s, func(path string) (model.BaseNode, bool) {
 		once.Do(func() {
 			if _, err := s.WriteFile(ctx, "committed.txt", int64(len("committed")), []byte(" and more")); err != nil {
 				t.Error(err)
@@ -1711,18 +1697,18 @@ func TestReconcileClassifiesWritesThatLandDuringItsLookups(t *testing.T) {
 		t.Fatalf("the tree rename logged dst/sub/c.txt, so the test proves nothing about unlogged paths: %q", logged)
 	}
 
-	if e, ok := s.Get("committed.txt"); !ok || e.Kind != model.OverlayKindModify || e.SourceOID != base["committed.txt"].ObjectOID {
+	if e, ok := lookupEntry(t, s, "committed.txt"); !ok || e.Kind != model.OverlayKindModify || e.SourceOID != base["committed.txt"].ObjectOID {
 		t.Errorf("committed.txt after reconcile = %+v, %t; want a modify of the new base", e, ok)
 	} else if got, err := os.ReadFile(e.BackingPath); err != nil || string(got) != "committed and more" {
 		t.Errorf("committed.txt content = %q, %v; want the write that landed during reconcile", got, err)
 	}
-	if e, ok := s.Get("new.txt"); !ok || e.Kind != model.OverlayKindModify || e.SourceOID != base["new.txt"].ObjectOID {
+	if e, ok := lookupEntry(t, s, "new.txt"); !ok || e.Kind != model.OverlayKindModify || e.SourceOID != base["new.txt"].ObjectOID {
 		t.Errorf("new.txt after reconcile = %+v, %t; want a modify of the new base", e, ok)
 	}
-	if e, ok := s.Get("dst/sub/c.txt"); ok {
+	if e, ok := lookupEntry(t, s, "dst/sub/c.txt"); ok {
 		t.Errorf("dst/sub/c.txt after reconcile = %+v; want it gone, as the new base matches it", e)
 	}
-	if e, ok := s.Get("dst/sub/b.txt"); !ok || e.Kind != model.OverlayKindCreate {
+	if e, ok := lookupEntry(t, s, "dst/sub/b.txt"); !ok || e.Kind != model.OverlayKindCreate {
 		t.Errorf("dst/sub/b.txt after reconcile = %+v, %t; want the create kept", e, ok)
 	}
 	if got := changesSince(t, cfg, before).Paths; !slices.Equal(got, logged) {
@@ -1758,9 +1744,9 @@ func TestReconcileGuardKeepsAnotherStoresUnloggedRebase(t *testing.T) {
 	t.Cleanup(func() { other.Close() })
 	theirs := baseFile("x.txt", "theirs")
 	var once sync.Once
-	if err := s.Reconcile(ctx, func(string) (model.BaseNode, bool) {
+	if err := reconcile(ctx, s, func(string) (model.BaseNode, bool) {
 		once.Do(func() {
-			if err := other.Reconcile(ctx, func(string) (model.BaseNode, bool) { return theirs, true }); err != nil {
+			if err := reconcile(ctx, other, func(string) (model.BaseNode, bool) { return theirs, true }); err != nil {
 				t.Error(err)
 			}
 		})
@@ -1768,7 +1754,7 @@ func TestReconcileGuardKeepsAnotherStoresUnloggedRebase(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := s.Get("x.txt"); !ok || e.SourceOID != theirs.ObjectOID {
+	if e, ok := lookupEntry(t, s, "x.txt"); !ok || e.SourceOID != theirs.ObjectOID {
 		t.Fatalf("x.txt = %+v, %t; want the other reconcile's rebase kept", e, ok)
 	}
 }
@@ -1781,7 +1767,7 @@ func TestReconcileClassifiesAnEntryWhoseBackingFileVanishedDuringItsLookups(t *t
 	createWithContent(t, s, "x.txt", "mine")
 	before := changesSince(t, cfg, 0).Seq
 	var once sync.Once
-	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+	if err := reconcile(ctx, s, func(path string) (model.BaseNode, bool) {
 		once.Do(func() {
 			if err := s.Remove(ctx, "x.txt"); err != nil {
 				t.Error(err)
@@ -1791,7 +1777,7 @@ func TestReconcileClassifiesAnEntryWhoseBackingFileVanishedDuringItsLookups(t *t
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := s.Get("x.txt"); !ok || e.Kind != model.OverlayKindDelete {
+	if e, ok := lookupEntry(t, s, "x.txt"); !ok || e.Kind != model.OverlayKindDelete {
 		t.Fatalf("x.txt = %+v, %t; want the delete marker", e, ok)
 	}
 	if got := changesSince(t, cfg, before).Paths; !slices.Equal(got, []string{"x.txt"}) {
@@ -1813,9 +1799,9 @@ func TestReconcileUpdateGuardKeepsAnotherStoresUnloggedRebase(t *testing.T) {
 	t.Cleanup(func() { other.Close() })
 	theirs := baseFile("x.txt", "theirs")
 	var once sync.Once
-	if err := s.Reconcile(ctx, func(string) (model.BaseNode, bool) {
+	if err := reconcile(ctx, s, func(string) (model.BaseNode, bool) {
 		once.Do(func() {
-			if err := other.Reconcile(ctx, func(string) (model.BaseNode, bool) { return theirs, true }); err != nil {
+			if err := reconcile(ctx, other, func(string) (model.BaseNode, bool) { return theirs, true }); err != nil {
 				t.Error(err)
 			}
 		})
@@ -1823,7 +1809,7 @@ func TestReconcileUpdateGuardKeepsAnotherStoresUnloggedRebase(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := s.Get("x.txt"); !ok || e.SourceOID != theirs.ObjectOID {
+	if e, ok := lookupEntry(t, s, "x.txt"); !ok || e.SourceOID != theirs.ObjectOID {
 		t.Fatalf("x.txt = %+v, %t; want the other reconcile's rebase kept", e, ok)
 	}
 }
@@ -1834,15 +1820,15 @@ func TestReconcileFailsOnABackingFileMissingWithNoWrite(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
 	createWithContent(t, s, "x.txt", "mine")
-	before, _ := s.Get("x.txt")
+	before, _ := lookupEntry(t, s, "x.txt")
 	if err := os.Remove(before.BackingPath); err != nil {
 		t.Fatal(err)
 	}
-	err := s.Reconcile(ctx, func(string) (model.BaseNode, bool) { return baseFile("x.txt", "theirs"), true })
+	err := reconcile(ctx, s, func(string) (model.BaseNode, bool) { return baseFile("x.txt", "theirs"), true })
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Reconcile = %v, want the missing backing file's ErrNotExist", err)
 	}
-	if after, ok := s.Get("x.txt"); !ok || after != before {
+	if after, ok := lookupEntry(t, s, "x.txt"); !ok || after != before {
 		t.Fatalf("x.txt after the failed reconcile = %+v, %t; want it unchanged: %+v", after, ok, before)
 	}
 }
@@ -1851,11 +1837,11 @@ func TestLookupShowsUnflushedWriteSize(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
 	createWithContent(t, s, "f.txt", "one")
-	before, _ := s.Get("f.txt")
+	before, _ := lookupEntry(t, s, "f.txt")
 	if _, err := s.WriteFile(ctx, "f.txt", 3, []byte("two")); err != nil {
 		t.Fatal(err)
 	}
-	e, ok := s.Get("f.txt")
+	e, ok := lookupEntry(t, s, "f.txt")
 	if !ok || e.SizeBytes != 6 || e.MtimeUnixNs <= before.MtimeUnixNs {
 		t.Fatalf("f.txt = %+v, %t; want size 6 and an mtime after %d", e, ok, before.MtimeUnixNs)
 	}
@@ -1872,7 +1858,7 @@ func TestSyncFileCommitsUnflushedWrites(t *testing.T) {
 	if err := s.SyncFile(ctx, "f.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if e, _ := s.Get("f.txt"); e.SizeBytes != 6 {
+	if e, _ := lookupEntry(t, s, "f.txt"); e.SizeBytes != 6 {
 		t.Fatalf("live f.txt after SyncFile = %d, want 6", e.SizeBytes)
 	} else if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "onetwo" {
 		t.Fatalf("backing file = %q, %v; want onetwo", data, err)
@@ -1938,7 +1924,7 @@ func TestNewCommitsWritesAProcessLeftUncommitted(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { restarted.Close() })
-	if e, ok := restarted.Get("f.txt"); !ok || e.SizeBytes != 6 {
+	if e, ok := lookupEntry(t, restarted, "f.txt"); !ok || e.SizeBytes != 6 {
 		t.Fatalf("f.txt after restart = %+v, %t; want size 6", e, ok)
 	}
 	if got := changesSince(t, cfg, changesSince(t, cfg, 0).Seq).Paths; len(got) != 0 {
@@ -2046,7 +2032,7 @@ func TestListByPrefixShowsUnflushedWriteSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, data := range []string{"two", "six"} {
-		e, _ := s.Get("d/f.txt")
+		e, _ := lookupEntry(t, s, "d/f.txt")
 		if _, err := s.WriteFile(ctx, "d/f.txt", e.SizeBytes, []byte(data)); err != nil {
 			t.Fatal(err)
 		}
@@ -2123,7 +2109,7 @@ func TestReadOnlyModeFileAcceptsWrites(t *testing.T) {
 	}
 	ownerWritable := func(step string) {
 		t.Helper()
-		e, _ := s.Get("ro.txt")
+		e, _ := lookupEntry(t, s, "ro.txt")
 		st, err := os.Stat(e.BackingPath)
 		if err != nil {
 			t.Fatal(err)
@@ -2146,7 +2132,7 @@ func TestReadOnlyModeFileAcceptsWrites(t *testing.T) {
 	}
 	ownerWritable("after a chmod")
 	write("after a chmod", 6, "six")
-	e, _ := s.Get("ro.txt")
+	e, _ := lookupEntry(t, s, "ro.txt")
 	if err := s.FlushFile(ctx, "ro.txt"); err != nil {
 		t.Fatal(err)
 	}
@@ -2161,7 +2147,7 @@ func TestReadOnlyModeFileAcceptsWrites(t *testing.T) {
 	if err := s.Truncate(ctx, "ro.txt", 6); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
-	e, _ = s.Get("ro.txt")
+	e, _ = lookupEntry(t, s, "ro.txt")
 	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "onetwo" || e.Mode&0o777 != 0o444 {
 		t.Fatalf("ro.txt = %q, %v, mode %o; want onetwo and mode 444", data, err, e.Mode&0o777)
 	}
@@ -2175,4 +2161,23 @@ func cachedBlobPath(t *testing.T, cfg model.RepoConfig, oid string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// lookupEntry looks path up in s and fails t on a database error.
+func lookupEntry(t *testing.T, s *Store, path string) (model.OverlayEntry, bool) {
+	t.Helper()
+	e, ok, err := s.Lookup(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e, ok
+}
+
+// reconcile reconciles s with the base lookup reads, with no readers to
+// exclude.
+func reconcile(ctx context.Context, s *Store, lookup func(string) (model.BaseNode, bool)) error {
+	return s.ReconcileChecked(ctx, func(path string) (model.BaseNode, bool, error) {
+		n, ok := lookup(path)
+		return n, ok, nil
+	}, nil, nil)
 }

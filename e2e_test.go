@@ -163,7 +163,6 @@ func TestE2E(t *testing.T) {
 			t.Errorf("close daemon: %v", err)
 		}
 	}()
-	svc.SetMountRoot(mountDir)
 	ctl := newE2EController(t, root)
 
 	cfg := model.RepoConfig{
@@ -1126,7 +1125,6 @@ func TestE2EVerifiedSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstSvc.SetMountRoot(mountDir)
 	ctl := newE2EController(t, root)
 	if err := ctl.AddRepo(firstCtx, cfg); err != nil {
 		firstCancel()
@@ -1239,7 +1237,6 @@ func TestE2EVerifiedSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondSvc.SetMountRoot(mountDir)
 	secondErrCh := startE2EDaemon(secondCtx, secondSvc)
 	if err := waitForMount(ctl, mountPath, 60*time.Second); err != nil {
 		secondCancel()

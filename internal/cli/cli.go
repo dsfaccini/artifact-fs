@@ -36,7 +36,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			Name:  "daemon",
 			Usage: "start the artifact-fs daemon",
 			Flags: []ucli.Flag{
-				&ucli.StringFlag{Name: "root", Value: filepath.Join(root, "mnt"), Usage: "mount root directory"},
+				&ucli.StringFlag{Name: "root", Value: filepath.Join(root, "mnt"), Usage: "accepted for compatibility; changes no registered repo, which mounts where add-repo --mount-root put it"},
 				&ucli.IntFlag{Name: "hydration-concurrency", Value: daemon.DefaultHydrationConcurrency, Usage: "number of concurrent blob hydration workers"},
 			},
 			Action: func(_ context.Context, c *ucli.Command) error {
@@ -46,7 +46,6 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					return err
 				}
 				defer svc.Close()
-				svc.SetMountRoot(c.String("root"))
 				svc.SetHydrationConcurrency(c.Int("hydration-concurrency"))
 				err = svc.Start(ctx)
 				if err == context.Canceled {
@@ -62,7 +61,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				&ucli.StringFlag{Name: "name", Usage: "repo name (required)"},
 				&ucli.StringFlag{Name: "remote", Usage: "remote URL (required)"},
 				&ucli.StringFlag{Name: "branch", Usage: "deprecated alias for --ref refs/heads/<branch>"},
-				&ucli.StringFlag{Name: "ref", Value: "refs/heads/main", Usage: "canonical source ref"},
+				&ucli.StringFlag{Name: "ref", Value: "refs/heads/main", Usage: "source ref: a full ref name, a branch name, or origin/<branch>"},
 				&ucli.StringFlag{Name: "require-commit", Usage: "require the source ref to resolve to this exact commit"},
 				&ucli.IntFlag{Name: "depth", Usage: "history depth to transfer; 0 transfers complete history"},
 				&ucli.StringFlag{Name: "refresh", Value: "30s", Usage: "remote refresh interval or never"},
@@ -72,7 +71,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				&ucli.BoolFlag{Name: "prepared-gitdir", Usage: "use an existing git dir for async preparation"},
 				&ucli.StringFlag{Name: "git-dir", Usage: "explicit git dir path"},
 				&ucli.StringFlag{Name: "blob-cache-dir", Usage: "directory for hydrated blobs; may be shared between repositories"},
-				&ucli.StringFlag{Name: "fetch-ref", Usage: "ref to fetch during async preparation"},
+				&ucli.StringFlag{Name: "fetch-ref", Usage: "ref to fetch and serve; defaults to --ref"},
 			},
 			Action: withController(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Controller) error {
 				name := strings.TrimSpace(c.String("name"))
@@ -173,7 +172,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			fmt.Fprintf(w, "fetched %s\n", name)
 			return nil
 		}),
-		nameCommand("prepare", "retry async repository preparation", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Controller, name string, w io.Writer) error {
+		nameCommand("prepare", "prepare a repository again without unmounting it", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Controller, name string, w io.Writer) error {
 			if err := svc.Prepare(c, name); err != nil {
 				return err
 			}

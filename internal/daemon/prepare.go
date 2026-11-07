@@ -10,7 +10,6 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
-	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/registry"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
@@ -39,198 +38,309 @@ func preparationFailurePhase(err error) string {
 	return preparePhaseUnknown
 }
 
-func (s *core) configVersionIsCurrent(ctx context.Context, cfg model.RepoConfig) (bool, error) {
+// errPrepareSuperseded is the error of a preparation whose config or prepare
+// request is no longer the registry's.
+var errPrepareSuperseded = fmt.Errorf("prepare superseded by a newer repo config or prepare request: %w", registry.ErrRepoChanged)
+
+// prepareIsCurrent reports whether cfg's config and prepare request are still
+// the registry's.
+func (s *core) prepareIsCurrent(ctx context.Context, cfg model.RepoConfig) (bool, error) {
 	latest, err := s.registry.GetRepo(ctx, cfg.Name)
 	if err != nil {
 		return false, err
 	}
-	return latest.ConfigVersion == cfg.ConfigVersion, nil
+	return latest.ConfigVersion == cfg.ConfigVersion && latest.PrepareRequest == cfg.PrepareRequest, nil
 }
 
-func samePrepareConfig(a model.RepoConfig, b model.RepoConfig) bool {
-	return a.Branch == b.Branch &&
-		a.RemoteURL == b.RemoteURL &&
-		a.RequiredCommit == b.RequiredCommit &&
-		a.HistoryDepth == b.HistoryDepth &&
-		a.RemoteRefreshDisabled == b.RemoteRefreshDisabled &&
-		a.PreparedGitDir == b.PreparedGitDir &&
-		a.AdoptGitDir == b.AdoptGitDir &&
-		a.FetchRef == b.FetchRef &&
-		a.GitDir == b.GitDir &&
-		a.MetaDBPath == b.MetaDBPath &&
-		a.OverlayDir == b.OverlayDir &&
-		a.OverlayDBPath == b.OverlayDBPath &&
-		a.BlobCacheDir == b.BlobCacheDir &&
-		a.MountPath == b.MountPath &&
-		a.ConfigVersion == b.ConfigVersion
+// withCurrentPrepare runs fn under cfg's repo config lock while cfg's config
+// and prepare request are still the registry's, and returns
+// errPrepareSuperseded otherwise.
+func (s *core) withCurrentPrepare(ctx context.Context, cfg model.RepoConfig, fn func() error) error {
+	return s.withRepoConfigLock(ctx, cfg.Name, func() error {
+		current, err := s.prepareIsCurrent(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		if !current {
+			return errPrepareSuperseded
+		}
+		return fn()
+	})
 }
 
-func normalizeSourceConfig(cfg *model.RepoConfig) error {
-	if err := gitstore.ValidateRemoteNotOption(cfg.RemoteURL); err != nil {
-		return err
+// preparation is what differs between the runs of the one prepare pipeline:
+// add-repo and prepare on a sync repo, the daemon's async preparation, and
+// the daemon's check of a prepared repo before it mounts it.
+type preparation struct {
+	// mode is the mode field of the preparation logs. An empty mode logs
+	// nothing.
+	mode    string
+	attempt int64
+	// ambient makes git use only ambient credentials and never prompt, and
+	// rejects a remote URL with inline credentials. Otherwise a credential
+	// helper hands git the remote URL's inline credentials.
+	ambient bool
+	// fetch makes an existing clone fetch FetchRef and move its branch to it.
+	// Otherwise the pipeline takes the clone's HEAD as it is.
+	fetch bool
+	// mountPoint creates cfg's mount point first.
+	mountPoint bool
+	// snapshot returns the snapshot store the pipeline publishes in, and
+	// whether the pipeline owns it. nil opens cfg's store.
+	snapshot func(context.Context, model.RepoConfig) (*snapshot.Store, bool, error)
+	// complete persists the result, or starts or activates the runtime that
+	// serves it. It runs under the repo's prepare lock.
+	complete func(context.Context, *prepared) error
+	// fail records a failed preparation and returns the error the caller gets.
+	// nil records nothing.
+	fail func(context.Context, model.RepoConfig, error) error
+}
+
+// prepared is what the pipeline hands complete.
+type prepared struct {
+	cfg    model.RepoConfig
+	source model.PreparedSource
+	snap   *snapshot.Store
+	// gen is the generation that holds source's commit, and prevGen the one
+	// the store held before the pipeline published.
+	gen, prevGen int64
+	// kept means complete took snap over, so the pipeline must not close it.
+	kept bool
+}
+
+// prepare runs the one prepare pipeline on cfg under its repo's prepare lock:
+// it checks that cfg's config and prepare request are current, acquires
+// cfg's source, publishes the snapshot of the source's commit, records the
+// acquisition, then completes as p says. prepareContext bounds it.
+func (s *core) prepare(ctx context.Context, cfg model.RepoConfig, p preparation) (retErr error) {
+	prepareCtx, cancel := s.withPrepareTimeout(ctx)
+	defer cancel()
+	source := prepareSourceOf(cfg)
+	var res prepared
+	if p.mode != "" {
+		logEnd := s.logPreparation(prepareCtx, cfg, p, &source)
+		defer func() { logEnd(res, retErr) }()
 	}
-	if cfg.AdoptGitDir {
-		if strings.TrimSpace(cfg.GitDir) == "" {
-			return errors.New("--adopt-gitdir requires --git-dir")
+	err := s.withRepoPrepareLock(prepareCtx, cfg.Name, func() error {
+		current, err := s.prepareIsCurrent(prepareCtx, cfg)
+		if err != nil {
+			return withPreparationPhase(preparePhaseValidate, err)
 		}
-		if cfg.PreparedGitDir || cfg.RemoteURL != "" || cfg.RequiredCommit != "" || cfg.HistoryDepth != 0 || cfg.FetchRef != "" || (cfg.Branch != "" && cfg.Branch != "HEAD") {
-			return errors.New("--adopt-gitdir cannot fetch, select a source ref, or prepare a remote git dir")
+		if !current {
+			return withPreparationPhase(preparePhaseValidate, errPrepareSuperseded)
 		}
-		cfg.Branch = "HEAD"
-		cfg.RemoteRefreshDisabled = true
+		if p.mountPoint {
+			if err := os.MkdirAll(cfg.MountPath, 0o755); err != nil {
+				return withPreparationPhase(preparePhaseInitializeStorage, err)
+			}
+		}
+		res.cfg = cfg
+		res.source, source, err = s.acquireSource(prepareCtx, cfg, p)
+		if err != nil {
+			return err
+		}
+		owned := true
+		if p.snapshot != nil {
+			res.snap, owned, err = p.snapshot(prepareCtx, cfg)
+		} else {
+			res.snap, err = snapshot.New(prepareCtx, cfg.MetaDBPath)
+		}
+		if err != nil {
+			return withPreparationPhase(preparePhaseOpenSnapshot, err)
+		}
+		if owned {
+			defer func() {
+				if !res.kept {
+					res.snap.Close()
+				}
+			}()
+		}
+		if err := s.publishPrepared(prepareCtx, &res); err != nil {
+			return err
+		}
+		if err := s.recordAcquisition(prepareCtx, cfg, res.source); err != nil {
+			return withPreparationPhase(preparePhasePersistReady, err)
+		}
+		return p.complete(prepareCtx, &res)
+	})
+	if err == nil {
 		return nil
 	}
-	cfg.Branch = strings.TrimSpace(cfg.Branch)
-	if cfg.Branch == "" {
-		cfg.Branch = "refs/heads/main"
-	} else if !strings.HasPrefix(cfg.Branch, "refs/") {
-		cfg.Branch = "refs/heads/" + cfg.Branch
+	if ctxErr := prepareCtx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+		err = errors.Join(err, ctxErr)
 	}
-	cfg.RequiredCommit = strings.ToLower(strings.TrimSpace(cfg.RequiredCommit))
-	if cfg.HistoryDepth < 0 {
-		return errors.New("--depth must not be negative")
+	if p.fail != nil {
+		return p.fail(ctx, cfg, err)
 	}
-	if cfg.RequiredCommit == "" {
-		return nil
-	}
-	if len(cfg.RequiredCommit) != 40 && len(cfg.RequiredCommit) != 64 {
-		return errors.New("--require-commit must be a full 40- or 64-character commit OID")
-	}
-	for _, character := range cfg.RequiredCommit {
-		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
-			return errors.New("--require-commit must be hexadecimal")
-		}
-	}
-	return nil
+	return err
 }
 
-func (s *core) prepareConfigStillCurrent(ctx context.Context, cfg model.RepoConfig) bool {
-	latest, err := s.registry.GetRepo(ctx, cfg.Name)
-	if err != nil {
-		s.logger.Error("repo prepare state refresh failed", "repo", cfg.Name, "error", err)
-		return false
+// prepareSourceOf is the source field of cfg's preparation logs.
+func prepareSourceOf(cfg model.RepoConfig) string {
+	switch {
+	case cfg.RequiredCommit != "":
+		return prepareSourceVerified
+	case cfg.PreparedGitDir:
+		return prepareSourcePreparedGitDir
 	}
-	s.fillPaths(&latest)
-	if strings.TrimSpace(latest.FetchRef) == "" {
-		latest.FetchRef = defaultFetchRef(latest.Branch)
+	if _, err := os.Stat(cfg.GitDir); err == nil {
+		return prepareSourceExistingClone
 	}
-	return samePrepareConfig(cfg, latest)
+	return prepareSourceFreshClone
 }
 
-// prepareRepo clones the git repo and builds the initial snapshot. It does NOT
-// start a FUSE mount or any background goroutines, so it's safe to call from
-// short-lived CLI commands like add-repo.
-func (s *core) prepareRepo(ctx context.Context, cfg model.RepoConfig) (retErr error) {
+// logPreparation logs the start of cfg's preparation, and returns what logs
+// its end. source is the source field, which acquisition can still change.
+func (s *core) logPreparation(ctx context.Context, cfg model.RepoConfig, p preparation, source *string) func(prepared, error) {
 	started := time.Now()
-	safeRepo := auth.RedactLogString(cfg.Name)
-	safeBranch := auth.RedactLogString(cfg.Branch)
-	safeFetchRef := auth.RedactLogString(cfg.FetchRef)
-	source := prepareSourceFreshClone
-	existingClone := false
-	if cfg.RequiredCommit != "" {
-		source = prepareSourceVerified
-	} else if _, err := os.Stat(cfg.GitDir); err == nil {
-		source = prepareSourceExistingClone
-		existingClone = true
-	}
 	deadlineSet := false
 	timeoutMS := int64(0)
 	if deadline, ok := ctx.Deadline(); ok {
 		deadlineSet = true
 		timeoutMS = max(time.Until(deadline).Milliseconds(), 0)
 	}
-	logger := s.logger.With("repo", safeRepo, "mode", prepareModeSync, "attempt", 1)
-	logger.InfoContext(ctx, logRepoPreparationStarted, "source", source, "phase", preparePhaseValidate, "state", prepareLogStateStarted, "duration_ms", 0, "branch", safeBranch, "fetch_ref", safeFetchRef, "deadline_set", deadlineSet, "timeout_ms", timeoutMS)
-
-	var headOID, headRef string
-	var gen int64
-	defer func() {
+	logger := s.logger.With("repo", auth.RedactLogString(cfg.Name), "mode", p.mode, "attempt", p.attempt)
+	logger.InfoContext(ctx, logRepoPreparationStarted, "source", *source, "phase", preparePhaseValidate, "state", prepareLogStateStarted, "duration_ms", 0, "branch", auth.RedactLogString(cfg.Branch), "fetch_ref", auth.RedactLogString(cfg.FetchRef), "deadline_set", deadlineSet, "timeout_ms", timeoutMS)
+	return func(res prepared, err error) {
 		durationMS := time.Since(started).Milliseconds()
-		if retErr == nil {
-			logger.InfoContext(ctx, logRepoPreparationCompleted, "source", source, "phase", preparePhaseComplete, "state", prepareLogStateCompleted, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "head_oid", auth.RedactLogString(headOID), "head_ref", auth.RedactLogString(headRef), "snapshot_generation", gen)
+		if err == nil {
+			logger.InfoContext(ctx, logRepoPreparationCompleted, "source", *source, "phase", preparePhaseComplete, "state", prepareLogStateCompleted, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "head_oid", auth.RedactLogString(res.source.Commit), "head_ref", auth.RedactLogString(res.source.Ref), "snapshot_generation", res.gen)
 			return
 		}
-		phase := preparationFailurePhase(retErr)
-		timedOut := errors.Is(retErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)
-		canceled := errors.Is(retErr, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
+		timedOut := errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)
+		canceled := errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
 		state := prepareLogStateFailed
 		if canceled && !timedOut {
 			state = prepareLogStateCanceled
 		}
-		args := []any{"source", source, "phase", phase, "state", state, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "timed_out", timedOut, "canceled", canceled, "error", auth.RedactLogString(retErr.Error(), cfg.RemoteURL)}
+		args := []any{"source", *source, "phase", preparationFailurePhase(err), "state", state, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "timed_out", timedOut, "canceled", canceled, "error", auth.RedactLogString(err.Error(), cfg.RemoteURL)}
 		if canceled && !timedOut {
 			logger.InfoContext(ctx, logRepoPreparationCanceled, args...)
 			return
 		}
 		logger.ErrorContext(ctx, logRepoPreparationFailed, args...)
-	}()
-	return s.withRepoPrepareLock(ctx, cfg.Name, func() error {
-		current, err := s.configVersionIsCurrent(ctx, cfg)
-		if err != nil {
-			return withPreparationPhase(preparePhaseValidate, err)
-		}
-		if !current {
-			return withPreparationPhase(preparePhaseValidate, fmt.Errorf("prepare superseded by newer repo config: %w", registry.ErrRepoChanged))
-		}
-		existingClone = false
-		if _, err := os.Stat(cfg.GitDir); err == nil {
-			existingClone = true
-			source = prepareSourceExistingClone
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return withPreparationPhase(preparePhaseValidate, err)
-		} else if cfg.RequiredCommit == "" {
-			source = prepareSourceFreshClone
-		}
-		if existingClone && strings.TrimSpace(cfg.RemoteURL) != "" {
-			if err := s.git.ConfigureRemoteWithCredentials(ctx, cfg); err != nil {
-				return withPreparationPhase(preparePhaseConfigureRemote, err)
-			}
-			if err := s.git.FetchRefWithCredentials(ctx, cfg, cfg.FetchRef); err != nil {
-				return withPreparationPhase(preparePhaseFetch, err)
-			}
-			if err := s.git.PrepareFetchedBranch(ctx, cfg, cfg.FetchRef); err != nil {
-				return withPreparationPhase(preparePhaseUpdateBranch, err)
-			}
-		}
-
-		snap, resolvedOID, resolvedRef, generation, err := s.ensurePreparedRepo(ctx, cfg, false)
-		if err != nil {
-			return err
-		}
-		headOID, headRef, gen = resolvedOID, resolvedRef, generation
-		defer snap.Close()
-		return nil
-	})
+	}
 }
 
-func (s *core) prepareSource(ctx context.Context, cfg model.RepoConfig) (model.PreparedSource, error) {
-	if cfg.AdoptGitDir {
+// acquireSource brings cfg's git dir to the commit the snapshot must hold
+// and returns it, with the source field of the preparation logs.
+func (s *core) acquireSource(ctx context.Context, cfg model.RepoConfig, p preparation) (model.PreparedSource, string, error) {
+	source := prepareSourceOf(cfg)
+	switch {
+	case cfg.AdoptGitDir:
 		if err := s.git.ConfigureAdoptedWorktree(ctx, cfg); err != nil {
-			return model.PreparedSource{}, err
+			return model.PreparedSource{}, source, withPreparationPhase(preparePhaseClone, err)
 		}
-		// prepareSource runs once per prepare and once per mount.
+		// Adoption runs once per prepare and once per mount.
 		s.git.WarnAdoptedOriginCredentials(ctx, cfg)
-		headOID, headRef, err := s.git.ResolveHEAD(ctx, cfg)
-		if err != nil {
-			return model.PreparedSource{}, err
-		}
-		return model.PreparedSource{Ref: headRef, Commit: headOID}, nil
-	}
-	if cfg.RequiredCommit != "" {
-		return s.git.PrepareSource(ctx, cfg, model.SourceRequirement{
+	case cfg.RequiredCommit != "":
+		prepared, err := s.git.PrepareSource(ctx, cfg, model.SourceRequirement{
 			Ref:            cfg.Branch,
 			RequiredCommit: cfg.RequiredCommit,
 			Depth:          cfg.HistoryDepth,
 		})
-	}
-	if err := s.git.CloneBlobless(ctx, cfg); err != nil {
-		return model.PreparedSource{}, err
+		return prepared, source, withPreparationPhase(preparePhaseClone, err)
+	case cfg.PreparedGitDir && p.fetch:
+		if err := s.git.ValidatePreparedGitDir(ctx, cfg); err != nil {
+			return model.PreparedSource{}, source, withPreparationPhase(preparePhaseValidate, err)
+		}
+		if err := s.git.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
+			return model.PreparedSource{}, source, withPreparationPhase(preparePhaseFetch, err)
+		}
+		if err := s.git.PrepareFetchedBranch(ctx, cfg, cfg.FetchRef); err != nil {
+			return model.PreparedSource{}, source, withPreparationPhase(preparePhaseUpdateBranch, err)
+		}
+	default:
+		_, statErr := os.Stat(cfg.GitDir)
+		switch {
+		case statErr == nil:
+			if p.fetch {
+				if err := s.refreshClone(ctx, cfg, p); err != nil {
+					return model.PreparedSource{}, source, err
+				}
+			}
+		case !errors.Is(statErr, os.ErrNotExist) || cfg.PreparedGitDir:
+			return model.PreparedSource{}, source, withPreparationPhase(preparePhaseValidate, statErr)
+		default:
+			source = prepareSourceFreshClone
+			if err := s.cloneSource(ctx, cfg, p); err != nil {
+				return model.PreparedSource{}, source, err
+			}
+		}
 	}
 	headOID, headRef, err := s.git.ResolveHEAD(ctx, cfg)
 	if err != nil {
-		return model.PreparedSource{}, err
+		return model.PreparedSource{}, source, withPreparationPhase(preparePhaseResolveHEAD, err)
 	}
-	return model.PreparedSource{Ref: headRef, Commit: headOID}, nil
+	return model.PreparedSource{Ref: headRef, Commit: headOID}, source, nil
+}
+
+// cloneSource clones cfg's branch blobless, then moves it to FetchRef when
+// FetchRef names another ref.
+func (s *core) cloneSource(ctx context.Context, cfg model.RepoConfig, p preparation) error {
+	if p.ambient {
+		if err := s.git.ValidateAmbientRemote(cfg); err != nil {
+			return withPreparationPhase(preparePhaseValidate, err)
+		}
+		if err := s.git.CloneBloblessNonInteractive(ctx, cfg); err != nil {
+			return withPreparationPhase(preparePhaseClone, err)
+		}
+	} else if err := s.git.CloneBlobless(ctx, cfg); err != nil {
+		return withPreparationPhase(preparePhaseClone, err)
+	}
+	if cfg.FetchRef == cfg.Branch {
+		return nil
+	}
+	return s.refreshClone(ctx, cfg, p)
+}
+
+// refreshClone points an existing clone's origin at cfg's remote, fetches
+// FetchRef and moves the clone's branch to it. A clone registered without a
+// remote URL, because add-repo dropped its inline credentials, keeps its
+// origin and is not refreshed.
+func (s *core) refreshClone(ctx context.Context, cfg model.RepoConfig, p preparation) error {
+	if p.ambient {
+		if err := s.git.ValidateAmbientRemote(cfg); err != nil {
+			return withPreparationPhase(preparePhaseValidate, err)
+		}
+		if err := s.git.ConfigureRemoteNonInteractive(ctx, cfg); err != nil {
+			return withPreparationPhase(preparePhaseConfigureRemote, err)
+		}
+		if err := s.git.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
+			return withPreparationPhase(preparePhaseFetch, err)
+		}
+	} else {
+		if strings.TrimSpace(cfg.RemoteURL) == "" {
+			return nil
+		}
+		if err := s.git.ConfigureRemoteWithCredentials(ctx, cfg); err != nil {
+			return withPreparationPhase(preparePhaseConfigureRemote, err)
+		}
+		if err := s.git.FetchRefWithCredentials(ctx, cfg, cfg.FetchRef); err != nil {
+			return withPreparationPhase(preparePhaseFetch, err)
+		}
+	}
+	return withPreparationPhase(preparePhaseUpdateBranch, s.git.PrepareFetchedBranch(ctx, cfg, cfg.FetchRef))
+}
+
+// publishPrepared publishes the snapshot of res's source in res.snap unless
+// the store already holds it, while res's config and request are current.
+func (s *core) publishPrepared(ctx context.Context, res *prepared) error {
+	phase := preparePhaseBuildTree
+	err := s.withCurrentPrepare(ctx, res.cfg, func() error {
+		storedOID, storedRef, storedGen, readErr := res.snap.ReadState(ctx)
+		res.gen, res.prevGen = storedGen, storedGen
+		if readErr == nil && storedGen != 0 && storedOID == res.source.Commit && storedRef == res.source.Ref {
+			return nil
+		}
+		gen, publishPhase, err := s.publishSnapshot(ctx, res.cfg, res.snap, res.source.Commit, res.source.Ref)
+		if publishPhase == snapshotPhasePublish {
+			phase = preparePhasePublishSnapshot
+		}
+		res.gen = gen
+		return err
+	})
+	return withPreparationPhase(phase, err)
 }
 
 func (s *core) recordAcquisition(ctx context.Context, cfg model.RepoConfig, source model.PreparedSource) error {
@@ -240,60 +350,115 @@ func (s *core) recordAcquisition(ctx context.Context, cfg model.RepoConfig, sour
 	return s.registry.RecordAcquisition(ctx, cfg, source)
 }
 
-// ensurePreparedRepo makes sure the repo is cloned and has an initial snapshot.
-// The returned snapshot store remains open for callers that need to continue
-// into runtime startup.
-func (s *core) ensurePreparedRepo(ctx context.Context, cfg model.RepoConfig, pruneOldGenerations bool) (*snapshot.Store, string, string, int64, error) {
-	if err := os.MkdirAll(cfg.MountPath, 0o755); err != nil {
-		return nil, "", "", 0, withPreparationPhase(preparePhaseInitializeStorage, err)
-	}
-	source, err := s.prepareSource(ctx, cfg)
-	if err != nil {
-		return nil, "", "", 0, withPreparationPhase(preparePhaseClone, err)
-	}
-	headOID, headRef := source.Commit, source.Ref
-	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
-	if err != nil {
-		return nil, "", "", 0, withPreparationPhase(preparePhaseOpenSnapshot, err)
-	}
-	gen := int64(0)
-	failurePhase := preparePhaseValidate
-	err = s.withRepoConfigLock(ctx, cfg.Name, func() error {
-		current, err := s.configVersionIsCurrent(ctx, cfg)
-		if err != nil {
-			return err
-		}
-		if !current {
-			return registry.ErrRepoChanged
-		}
-		storedOID, storedRef, storedGen, readErr := snap.ReadState(ctx)
-		gen = storedGen
-		if readErr != nil || gen == 0 || storedOID != headOID || storedRef != headRef {
-			failurePhase = preparePhaseBuildTree
-			var publishPhase string
-			gen, publishPhase, err = s.publishSnapshot(ctx, cfg, snap, headOID, headRef)
-			if publishPhase == snapshotPhasePublish {
-				failurePhase = preparePhasePublishSnapshot
-			}
-			if err != nil {
-				return err
-			}
-		}
-		if pruneOldGenerations {
-			failurePhase = preparePhaseCleanupSnapshot
-			return s.pruneGenerations(ctx, nil, snap, gen)
-		}
-		return nil
+// prepareSync prepares cfg in the CLI, with cfg's inline credentials, and
+// persists the outcome for the daemon, which mounts the repo once it
+// succeeded.
+func (s *core) prepareSync(ctx context.Context, cfg model.RepoConfig) error {
+	return s.prepare(ctx, cfg, preparation{
+		mode:       prepareModeSync,
+		attempt:    1,
+		fetch:      true,
+		mountPoint: true,
+		complete: func(ctx context.Context, res *prepared) error {
+			stateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prepareStateWriteTimeout)
+			defer cancel()
+			return withPreparationPhase(preparePhasePersistReady, s.registry.UpdatePrepareStateForRequest(stateCtx, res.cfg, "", ""))
+		},
+		fail: s.persistSyncFailure,
 	})
-	if err != nil {
-		snap.Close()
-		return nil, "", "", 0, withPreparationPhase(failurePhase, err)
+}
+
+// persistSyncFailure records a failed sync preparation as the empty prepare
+// state with its error, unless a newer config or request superseded it.
+func (s *core) persistSyncFailure(ctx context.Context, cfg model.RepoConfig, prepareErr error) error {
+	if errors.Is(prepareErr, registry.ErrRepoChanged) {
+		return prepareErr
 	}
-	if err := s.recordAcquisition(ctx, cfg, source); err != nil {
-		snap.Close()
-		return nil, "", "", 0, withPreparationPhase(preparePhasePersistReady, err)
+	stateErr := prepareErr
+	if errors.Is(prepareErr, context.DeadlineExceeded) {
+		stateErr = errors.New("prepare timed out")
+	} else if errors.Is(prepareErr, context.Canceled) {
+		stateErr = errors.New("prepare canceled")
 	}
-	return snap, headOID, headRef, gen, nil
+	stateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prepareStateWriteTimeout)
+	defer cancel()
+	if err := s.registry.UpdatePrepareStateForRequest(stateCtx, cfg, "", auth.RedactLogString(stateErr.Error(), cfg.RemoteURL)); err != nil {
+		if errors.Is(err, registry.ErrRepoChanged) {
+			return prepareErr
+		}
+		s.logger.ErrorContext(stateCtx, logRepoPrepareStatusWriteErr, "repo", auth.RedactLogString(cfg.Name), "mode", prepareModeSync, "phase", preparationFailurePhase(prepareErr), "target_state", "", "error", auth.RedactLogString(err.Error()))
+		return errors.Join(prepareErr, fmt.Errorf("persist failed prepare state: %w", err))
+	}
+	return prepareErr
+}
+
+// prepareAsync prepares cfg in the daemon with ambient credentials, then
+// persists it ready and activates the runtime that waits behind its gate.
+func (s *Service) prepareAsync(ctx context.Context, cfg model.RepoConfig, attempt int64) error {
+	return s.prepare(ctx, cfg, preparation{
+		mode:     prepareModeAsync,
+		attempt:  attempt,
+		ambient:  true,
+		fetch:    true,
+		snapshot: s.snapshotForPrepare,
+		complete: s.activatePrepared,
+		fail:     s.persistAsyncFailure,
+	})
+}
+
+// activatePrepared persists res ready, then switches the runtime that waits
+// for it to res's generation and opens its gate.
+func (s *Service) activatePrepared(ctx context.Context, res *prepared) error {
+	cfg := res.cfg
+	if err := s.setPrepareStateBeforeReadyGate(ctx, cfg); err != nil {
+		return withPreparationPhase(preparePhasePersistReady, err)
+	}
+	runHook(s.readyRecorded)
+	if err := s.completePreparedRuntime(ctx, cfg, res.source.Commit, res.source.Ref, res.gen); err != nil {
+		return withPreparationPhase(preparePhaseActivateRuntime, err)
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	err := s.withCurrentPrepare(cleanupCtx, cfg, func() error {
+		s.mu.Lock()
+		rt := s.running[cfg.ID]
+		s.mu.Unlock()
+		return s.pruneGenerations(cleanupCtx, rt, res.snap, min(res.prevGen, res.gen-1))
+	})
+	if err != nil && !errors.Is(err, registry.ErrRepoChanged) {
+		s.logger.Warn("snapshot generation cleanup failed", "repo", cfg.Name, "error", err)
+	}
+	s.configureStatusOptimization(ctx, cfg)
+	return nil
+}
+
+// persistAsyncFailure records a failed async preparation as failed and fails
+// its runtime's gate. A canceled preparation stays queued for the next
+// daemon, and a superseded one records nothing.
+func (s *Service) persistAsyncFailure(ctx context.Context, cfg model.RepoConfig, prepareErr error) error {
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(prepareErr, context.Canceled) || errors.Is(prepareErr, registry.ErrRepoChanged) {
+		return prepareErr
+	}
+	stateErr := prepareErr
+	if errors.Is(prepareErr, context.DeadlineExceeded) {
+		stateErr = errors.New("prepare timed out")
+	}
+	stateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prepareStateWriteTimeout)
+	defer cancel()
+	if err := s.setPrepareState(stateCtx, cfg, model.PrepareStateFailed, stateErr); err != nil {
+		if errors.Is(err, registry.ErrRepoChanged) {
+			return prepareErr
+		}
+		s.logger.ErrorContext(stateCtx, logRepoPrepareStatusWriteErr, "repo", auth.RedactLogString(cfg.Name), "mode", prepareModeAsync, "phase", preparationFailurePhase(prepareErr), "target_state", model.PrepareStateFailed, "error", auth.RedactLogString(err.Error()))
+		return errors.Join(prepareErr, fmt.Errorf("persist failed prepare state: %w", err))
+	}
+	return prepareErr
+}
+
+// prepareWorker is a running async preparation. cancel ends it.
+type prepareWorker struct {
+	token  int64
+	cancel context.CancelFunc
 }
 
 func (s *Service) startPrepareWorker(ctx context.Context, cfg model.RepoConfig) {
@@ -317,7 +482,8 @@ func (s *Service) startPrepareWorker(ctx context.Context, cfg model.RepoConfig) 
 		workerCtx = rt.ctx
 		rt.workers.Add(1)
 	}
-	s.preparing[cfg.ID] = token
+	workerCtx, cancel := context.WithCancel(workerCtx)
+	s.preparing[cfg.ID] = prepareWorker{token: token, cancel: cancel}
 	s.prepareWorkers.Add(1)
 	s.mu.Unlock()
 
@@ -326,23 +492,28 @@ func (s *Service) startPrepareWorker(ctx context.Context, cfg model.RepoConfig) 
 		if trackedRuntime {
 			defer rt.workers.Done()
 		}
+		defer cancel()
 		defer func() {
 			s.mu.Lock()
-			if s.preparing[cfg.ID] == token {
+			if s.preparing[cfg.ID].token == token {
 				delete(s.preparing, cfg.ID)
 			}
 			s.mu.Unlock()
 		}()
-		prepareCtx, cancel := s.withPrepareTimeout(workerCtx)
-		defer cancel()
-		_ = s.runPrepareAttempt(prepareCtx, cfg, attempt)
+		_ = s.prepareAsync(workerCtx, cfg, attempt)
 	}()
 }
 
+// supersedePrepare cancels id's running async preparation, which releases
+// the repo's prepare lock for the preparation that replaces it.
 func (s *Service) supersedePrepare(id model.RepoID) {
 	s.mu.Lock()
+	worker, ok := s.preparing[id]
 	delete(s.preparing, id)
 	s.mu.Unlock()
+	if ok && worker.cancel != nil {
+		worker.cancel()
+	}
 }
 
 func (s *core) withPrepareTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -352,6 +523,9 @@ func (s *core) withPrepareTimeout(ctx context.Context) (context.Context, context
 	return context.WithTimeout(ctx, defaultPrepareTimeout)
 }
 
+// resetRunningPrepareState makes cfg's runtime wait for cfg's preparation:
+// its gate holds FUSE ops again and it reports preparing. The runtime stays
+// mounted. It reports false when the runtime has no gate.
 func (s *Service) resetRunningPrepareState(cfg model.RepoConfig) bool {
 	s.mu.Lock()
 	rt, ok := s.running[cfg.ID]
@@ -360,283 +534,19 @@ func (s *Service) resetRunningPrepareState(cfg model.RepoConfig) bool {
 		return false
 	}
 	rt.gate.Reset()
-	rt.cfg = cfg
+	rt.cfg.PrepareRequest = cfg.PrepareRequest
+	rt.cfg.PrepareState = cfg.PrepareState
+	rt.cfg.PrepareError = cfg.PrepareError
 	rt.prepare = model.PrepareStatePreparing
 	s.mu.Unlock()
 	s.recordRuntimeState(rt)
 	return true
 }
 
-func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
-	return s.runPrepareAttempt(ctx, cfg, 1)
-}
-
-func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, attempt int64) (retErr error) {
-	s.fillPaths(&cfg)
-	if !cfg.AdoptGitDir && strings.TrimSpace(cfg.FetchRef) == "" {
-		cfg.FetchRef = defaultFetchRef(cfg.Branch)
-	}
-	started := time.Now()
-	safeRepo := auth.RedactLogString(cfg.Name)
-	safeBranch := auth.RedactLogString(cfg.Branch)
-	safeFetchRef := auth.RedactLogString(cfg.FetchRef)
-	phase := preparePhaseValidate
-	source := prepareSourceFreshClone
-	if cfg.RequiredCommit != "" {
-		source = prepareSourceVerified
-	} else if cfg.PreparedGitDir {
-		source = prepareSourcePreparedGitDir
-	} else if _, err := os.Stat(cfg.GitDir); err == nil {
-		source = prepareSourceExistingClone
-	}
-	deadlineSet := false
-	timeoutMS := int64(0)
-	if deadline, ok := ctx.Deadline(); ok {
-		deadlineSet = true
-		timeoutMS = max(time.Until(deadline).Milliseconds(), 0)
-	}
-	logger := s.logger.With("repo", safeRepo, "mode", prepareModeAsync, "attempt", attempt)
-	logger.InfoContext(ctx, logRepoPreparationStarted, "source", source, "phase", preparePhaseValidate, "state", prepareLogStateStarted, "duration_ms", 0, "branch", safeBranch, "fetch_ref", safeFetchRef, "deadline_set", deadlineSet, "timeout_ms", timeoutMS)
-
-	var headOID, headRef string
-	var gen int64
-	defer func() {
-		durationMS := time.Since(started).Milliseconds()
-		if retErr == nil {
-			logger.InfoContext(ctx, logRepoPreparationCompleted, "source", source, "phase", preparePhaseComplete, "state", prepareLogStateCompleted, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "head_oid", auth.RedactLogString(headOID), "head_ref", auth.RedactLogString(headRef), "snapshot_generation", gen)
-			return
-		}
-		timedOut := errors.Is(retErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)
-		canceled := errors.Is(retErr, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
-		state := prepareLogStateFailed
-		if canceled && !timedOut {
-			state = prepareLogStateCanceled
-		}
-		args := []any{"source", source, "phase", phase, "state", state, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "timed_out", timedOut, "canceled", canceled, "error", auth.RedactLogString(retErr.Error(), cfg.RemoteURL)}
-		if canceled && !timedOut {
-			logger.InfoContext(ctx, logRepoPreparationCanceled, args...)
-			return
-		}
-		logger.ErrorContext(ctx, logRepoPreparationFailed, args...)
-	}()
-
-	fail := func(err error) error {
-		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
-			return err
-		}
-		stateErr := err
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			stateErr = errors.New("prepare timed out")
-		}
-		stateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prepareStateWriteTimeout)
-		defer cancel()
-		if stateWriteErr := s.setPrepareState(stateCtx, cfg, model.PrepareStateFailed, stateErr); stateWriteErr != nil {
-			if errors.Is(stateWriteErr, registry.ErrRepoChanged) {
-				return err
-			}
-			logger.ErrorContext(stateCtx, logRepoPrepareStatusWriteErr, "phase", phase, "target_state", model.PrepareStateFailed, "error", auth.RedactLogString(stateWriteErr.Error()))
-			return errors.Join(err, fmt.Errorf("persist failed prepare state: %w", stateWriteErr))
-		}
-		return err
-	}
-	lockAcquired := false
-	retErr = s.withRepoPrepareLock(ctx, cfg.Name, func() error {
-		lockAcquired = true
-		current, err := s.configVersionIsCurrent(ctx, cfg)
-		if err != nil {
-			return fail(err)
-		}
-		if !current {
-			return fmt.Errorf("prepare superseded by newer repo config: %w", registry.ErrRepoChanged)
-		}
-		var preparedSource model.PreparedSource
-		prepareExistingClone := func() error {
-			phase = preparePhaseValidate
-			if err := s.git.ValidateAmbientRemote(cfg); err != nil {
-				return err
-			}
-			phase = preparePhaseConfigureRemote
-			if err := s.git.ConfigureRemoteNonInteractive(ctx, cfg); err != nil {
-				return err
-			}
-			phase = preparePhaseFetch
-			if err := s.git.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
-				return err
-			}
-			phase = preparePhaseUpdateBranch
-			return s.git.PrepareFetchedBranch(ctx, cfg, cfg.FetchRef)
-		}
-
-		if cfg.RequiredCommit != "" {
-			phase = preparePhaseClone
-			preparedSource, err = s.git.PrepareSource(ctx, cfg, model.SourceRequirement{
-				Ref:            cfg.Branch,
-				RequiredCommit: cfg.RequiredCommit,
-				Depth:          cfg.HistoryDepth,
-			})
-			if err != nil {
-				return fail(err)
-			}
-			headOID, headRef = preparedSource.Commit, preparedSource.Ref
-		} else {
-			if cfg.PreparedGitDir {
-				phase = preparePhaseValidate
-				if err := s.git.ValidatePreparedGitDir(ctx, cfg); err != nil {
-					return fail(err)
-				}
-				phase = preparePhaseFetch
-				if err := s.git.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
-					return fail(err)
-				}
-				phase = preparePhaseUpdateBranch
-				if err := s.git.PrepareFetchedBranch(ctx, cfg, cfg.FetchRef); err != nil {
-					return fail(err)
-				}
-			} else {
-				phase = preparePhaseValidate
-				if strings.TrimSpace(cfg.RemoteURL) == "" {
-					return fail(errors.New("remote URL is required for async clone"))
-				}
-				if _, err := os.Stat(cfg.GitDir); err == nil {
-					if err := prepareExistingClone(); err != nil {
-						return fail(err)
-					}
-				} else if errors.Is(err, os.ErrNotExist) {
-					phase = preparePhaseValidate
-					if err := s.git.ValidateAmbientRemote(cfg); err != nil {
-						return fail(err)
-					}
-					phase = preparePhaseClone
-					if err := s.git.CloneBloblessNonInteractive(ctx, cfg); err != nil {
-						return fail(err)
-					}
-					if !sameBranchRef(cfg.FetchRef, cfg.Branch) {
-						if err := prepareExistingClone(); err != nil {
-							return fail(err)
-						}
-					}
-				} else {
-					return fail(err)
-				}
-			}
-			phase = preparePhaseResolveHEAD
-			headOID, headRef, err = s.git.ResolveHEAD(ctx, cfg)
-			if err != nil {
-				return fail(err)
-			}
-			preparedSource = model.PreparedSource{Ref: headRef, Commit: headOID}
-		}
-		phase = preparePhaseOpenSnapshot
-		snap, closeSnap, err := s.snapshotForPrepare(ctx, cfg)
-		if err != nil {
-			return fail(err)
-		}
-		if closeSnap {
-			defer snap.Close()
-		}
-		prevGen := int64(0)
-		phase = preparePhaseBuildTree
-		var publishPhase string
-		err = s.withRepoConfigLock(ctx, cfg.Name, func() error {
-			current, err := s.configVersionIsCurrent(ctx, cfg)
-			if err != nil {
-				return err
-			}
-			if !current {
-				return registry.ErrRepoChanged
-			}
-			_, _, prevGen, _ = snap.ReadState(ctx)
-			gen, publishPhase, err = s.publishSnapshot(ctx, cfg, snap, headOID, headRef)
-			return err
-		})
-		if err != nil {
-			if errors.Is(err, registry.ErrRepoChanged) {
-				return fmt.Errorf("prepare superseded by newer repo config: %w", err)
-			}
-			if publishPhase == snapshotPhasePublish {
-				phase = preparePhasePublishSnapshot
-			}
-			return fail(err)
-		}
-		if err := s.recordAcquisition(ctx, cfg, preparedSource); err != nil {
-			return fail(err)
-		}
-		phase = preparePhasePersistReady
-		latest, err := s.registry.GetRepo(ctx, cfg.Name)
-		if err != nil {
-			return fail(err)
-		}
-		s.fillPaths(&latest)
-		if strings.TrimSpace(latest.FetchRef) == "" {
-			latest.FetchRef = latest.Branch
-		}
-		if !samePrepareConfig(cfg, latest) {
-			return errors.New("prepare superseded by newer repo config")
-		}
-		if err := s.setPrepareStateBeforeReadyGate(ctx, cfg); err != nil {
-			return fail(err)
-		}
-		phase = preparePhaseActivateRuntime
-		if err := s.completePreparedRuntime(ctx, cfg, headOID, headRef, gen); err != nil {
-			return fail(err)
-		}
-		phase = preparePhaseCleanupSnapshot
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		cleanupErr := s.withRepoConfigLock(cleanupCtx, cfg.Name, func() error {
-			current, err := s.configVersionIsCurrent(cleanupCtx, cfg)
-			if err != nil {
-				return err
-			}
-			if !current {
-				return registry.ErrRepoChanged
-			}
-			s.mu.Lock()
-			rt := s.running[cfg.ID]
-			s.mu.Unlock()
-			return s.pruneGenerations(cleanupCtx, rt, snap, min(prevGen, gen-1))
-		})
-		if cleanupErr != nil && !errors.Is(cleanupErr, registry.ErrRepoChanged) {
-			s.logger.Warn("snapshot generation cleanup failed", "repo", cfg.Name, "error", cleanupErr)
-		}
-		cleanupCancel()
-		s.configureStatusOptimization(ctx, cfg)
-		return nil
-	})
-	if retErr != nil && !lockAcquired {
-		return fail(retErr)
-	}
-	return retErr
-}
-
-func defaultFetchRef(sourceRef string) string {
-	if branch := branchRefName(sourceRef); branch != "" {
-		return branch
-	}
-	return strings.TrimSpace(sourceRef)
-}
-
-func sameBranchRef(fetchRef string, branch string) bool {
-	return canonicalFetchRef(fetchRef) == canonicalFetchRef(branch)
-}
-
-func canonicalFetchRef(ref string) string {
-	if branch := branchRefName(ref); branch != "" {
-		return "refs/heads/" + branch
-	}
-	return strings.TrimSpace(ref)
-}
-
-func branchRefName(ref string) string {
-	ref = strings.TrimSpace(ref)
-	for _, prefix := range []string{"refs/heads/", "refs/remotes/origin/", "origin/"} {
-		if after, ok := strings.CutPrefix(ref, prefix); ok {
-			return after
-		}
-	}
-	if strings.HasPrefix(ref, "refs/") {
-		return ""
-	}
-	return ref
+// samePrepare reports whether a and b hold the same config and prepare
+// request.
+func samePrepare(a, b model.RepoConfig) bool {
+	return a.ConfigVersion == b.ConfigVersion && a.PrepareRequest == b.PrepareRequest
 }
 
 func (s *Service) snapshotForPrepare(ctx context.Context, cfg model.RepoConfig) (*snapshot.Store, bool, error) {
@@ -656,16 +566,13 @@ func (s *Service) snapshotForPrepare(ctx context.Context, cfg model.RepoConfig) 
 func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoConfig, headOID string, headRef string, gen int64) error {
 	s.mu.Lock()
 	rt := s.running[cfg.ID]
-	if rt != nil && !samePrepareConfig(rt.cfg, cfg) {
+	if rt != nil && !samePrepare(rt.cfg, cfg) {
 		s.mu.Unlock()
-		return registry.ErrRepoChanged
+		return errPrepareSuperseded
 	}
 	s.mu.Unlock()
 	if rt == nil {
 		return nil
-	}
-	if !s.prepareConfigStillCurrent(ctx, cfg) {
-		return registry.ErrRepoChanged
 	}
 	if err := s.bootstrapCleanStatusIndex(ctx, cfg, headOID, gen, rt.snapshot, rt.overlay); err != nil {
 		return err
@@ -679,15 +586,11 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	if err := s.switchGeneration(ctx, rt, gen, commitTime); err != nil {
 		return err
 	}
-	if !s.prepareConfigStillCurrent(ctx, cfg) {
-		return registry.ErrRepoChanged
-	}
 	s.mu.Lock()
-	if s.running[cfg.ID] != rt || !samePrepareConfig(rt.cfg, cfg) {
+	if s.running[cfg.ID] != rt || !samePrepare(rt.cfg, cfg) {
 		s.mu.Unlock()
-		return registry.ErrRepoChanged
+		return errPrepareSuperseded
 	}
-	rt.cfg = cfg
 	rt.cfg.PrepareState = model.PrepareStateReady
 	rt.cfg.PrepareError = ""
 	rt.head = servedHead{oid: headOID, ref: headRef, gen: gen}
@@ -712,12 +615,12 @@ func (s *Service) applyPrepareState(ctx context.Context, cfg model.RepoConfig, s
 	if stateErr != nil {
 		msg = auth.RedactLogString(stateErr.Error(), cfg.RemoteURL)
 	}
-	if err := s.registry.UpdatePrepareStateForConfig(ctx, cfg, state, msg); err != nil {
+	if err := s.registry.UpdatePrepareStateForRequest(ctx, cfg, state, msg); err != nil {
 		return err
 	}
 	s.mu.Lock()
 	if rt, ok := s.running[cfg.ID]; ok {
-		if !samePrepareConfig(rt.cfg, cfg) {
+		if !samePrepare(rt.cfg, cfg) {
 			s.mu.Unlock()
 			return nil
 		}
