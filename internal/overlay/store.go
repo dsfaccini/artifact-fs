@@ -1630,6 +1630,22 @@ func (s *Store) ListByPrefix(ctx context.Context, prefix string) ([]model.Overla
 	return s.queryEntries(ctx, listByPrefixQuery, prefix+"/", prefix+"0")
 }
 
+// HasEntryBelow reports whether an entry of any kind lies below path. It
+// reads at most one row of the path index.
+func (s *Store) HasEntryBelow(ctx context.Context, path string) (bool, error) {
+	path = model.CleanPath(path)
+	query, args := `SELECT 1 FROM overlay_entries LIMIT 1`, []any{}
+	if path != "." {
+		query, args = `SELECT 1 FROM overlay_entries WHERE path >= ? AND path < ? LIMIT 1`, []any{path + "/", path + "0"}
+	}
+	var one int
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // queryEntries runs an arbitrary overlay query and scans the results.
 func (s *Store) queryEntries(ctx context.Context, query string, args ...any) ([]model.OverlayEntry, error) {
 	pending := s.pendingValues()

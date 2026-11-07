@@ -683,6 +683,7 @@ func TestMkDirCannotLandInsideRmDir(t *testing.T) {
 // same paths as a merged listing of each directory: over overlay deletes, a
 // renamed base directory and file, implicit directories at the root and below
 // it, a directory replaced by a file and a file replaced by a directory.
+// Engine.Identity, which the switch pass uses for held inodes, must agree.
 func TestMissingPathsMatchesPerDirectoryListings(t *testing.T) {
 	gen1 := []model.BaseNode{
 		baseDir("a", "a1"), baseFile("a/x.txt", "x", 0o100644), baseDir("a/b", "ab1"), baseFile("a/b/y.txt", "y", 0o100644),
@@ -772,5 +773,41 @@ func TestMissingPathsMatchesPerDirectoryListings(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("MissingPaths = %v, merged listings of each parent = %v", got, want)
+	}
+	for _, p := range paths {
+		_, exists, err := f.fs.engine.Identity(p)
+		must(err)
+		if missing := slices.Contains(want, p); exists == missing {
+			t.Errorf("Identity(%q) exists = %t, but the merged listing of its parent says missing = %t", p, exists, missing)
+		}
+	}
+}
+
+// A directory that a HEAD change leaves holding only untracked files becomes
+// implicit, and still exists. It keeps its inode number across the switch,
+// whether the kernel still holds it or has forgotten it.
+func TestImplicitDirectoryKeepsInodeNumberAcrossSwitch(t *testing.T) {
+	for _, held := range []bool{true, false} {
+		t.Run(fmt.Sprint("held=", held), func(t *testing.T) {
+			f := newCacheFixture(t, baseDir("d", "d1"), baseFile("d/file.txt", "blob-A", 0o100644))
+			d := f.lookup(fuseops.RootInodeID, "d")
+			create := &fuseops.CreateFileOp{Parent: d, Name: "new.txt", Mode: 0o644}
+			if err := f.fs.CreateFile(f.ctx, create); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+				t.Fatal(err)
+			}
+			if !held {
+				forget(t, f.fs, d)
+			}
+			f.switchTo()
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if got := f.lookup(fuseops.RootInodeID, "d"); got != d {
+				t.Fatalf("d, implicit after the switch, looks up as inode %d, want %d", got, d)
+			}
+		})
 	}
 }

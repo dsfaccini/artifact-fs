@@ -489,24 +489,37 @@ func (e *Engine) Sync(ctx context.Context, path string) error {
 	return e.Overlay.SyncFile(ctx, path)
 }
 
-// Create makes an empty file at path. A name that exists in the merged view
-// returns fs.ErrExist and stays untouched: the kernel can send CREATE for a
-// name that appeared after its lookup missed, such as after a HEAD change.
-func (e *Engine) Create(ctx context.Context, path string, mode uint32) error {
-	e.Resolver.transition.RLock()
-	defer e.Resolver.transition.RUnlock()
+// requireAbsent returns fs.ErrExist when path exists in the merged view. The
+// kernel can send CREATE, MKDIR or SYMLINK for a name that appeared after its
+// lookup missed, such as after a HEAD change, and the op must leave that entry
+// untouched. The caller holds the transition read lock.
+func (e *Engine) requireAbsent(path string) error {
 	if _, err := e.Resolver.resolvePath(path); err == nil {
 		return fs.ErrExist
 	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// Create makes an empty file at path, unless path exists.
+func (e *Engine) Create(ctx context.Context, path string, mode uint32) error {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
+	if err := e.requireAbsent(path); err != nil {
 		return err
 	}
 	_, err := e.Overlay.CreateFile(ctx, path, mode)
 	return err
 }
 
+// Symlink makes a symlink at path, unless path exists.
 func (e *Engine) Symlink(ctx context.Context, path string, target string) error {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
+	if err := e.requireAbsent(path); err != nil {
+		return err
+	}
 	_, err := e.Overlay.CreateSymlink(ctx, path, target)
 	return err
 }
@@ -823,9 +836,13 @@ func (e *Engine) snapshotTreePaths(ctx context.Context, root string) ([]string, 
 	return out, nil
 }
 
+// Mkdir makes a directory at path, unless path exists.
 func (e *Engine) Mkdir(ctx context.Context, path string, mode uint32) error {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
+	if err := e.requireAbsent(path); err != nil {
+		return err
+	}
 	return e.Overlay.Mkdir(ctx, path, mode)
 }
 
