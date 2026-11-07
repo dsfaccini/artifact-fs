@@ -340,32 +340,38 @@ func installGitDir(candidate string, destination string) error {
 	return nil
 }
 
-// Fetch fetches origin for the fetch command. That command runs in the
-// user's terminal, so Git and SSH may prompt there. The daemon's refresh
-// uses FetchNonInteractive.
-func (s *Store) Fetch(ctx context.Context, repo model.RepoConfig) error {
-	return s.fetch(ctx, repo, runGit)
-}
-
-// FetchNonInteractive fetches origin as Fetch does, but as a lazy fetch runs,
-// so a remote that needs a prompt makes it fail. The daemon refreshes with it
-// in the background.
+// FetchNonInteractive fetches origin for the daemon's refresh and the fetch
+// command. It runs as a lazy fetch does, so a remote that needs a prompt
+// makes it fail. The fetch command could not prompt anyway: git runs in a
+// process group of its own, which the terminal stops when it reads a prompt.
 func (s *Store) FetchNonInteractive(ctx context.Context, repo model.RepoConfig) error {
-	return s.fetch(ctx, repo, runLazyFetchGit)
-}
-
-func (s *Store) fetch(ctx context.Context, repo model.RepoConfig, run func(context.Context, string, ...string) (string, error)) error {
+	args := []string{"fetch", "--no-tags"}
+	if depth := fetchDepth(ctx, repo, model.BranchName(repo.FetchRef)); depth > 0 {
+		args = append(args, fmt.Sprintf("--depth=%d", depth))
+	}
+	args = append(args, "origin")
 	remotesForLogging, cancelLookup := s.startRemotesForLogging(ctx, repo)
 	defer cancelLookup()
 	return s.retryGitOperationForRemoteLookup(ctx, GitOperationFetch, repo.Name, remotesForLogging, func() error {
-		args := []string{"fetch", "--no-tags"}
-		if repo.HistoryDepth > 0 {
-			args = append(args, fmt.Sprintf("--depth=%d", repo.HistoryDepth))
-		}
-		args = append(args, "origin")
-		_, err := run(ctx, repo.GitDir, args...)
+		_, err := runLazyFetchGit(ctx, repo.GitDir, args...)
 		return err
 	})
+}
+
+// fetchDepth returns the --depth of a fetch onto branch: repo's history depth
+// until branch exists locally, then none. A fetch with --depth marks its tip
+// shallow even when the git dir holds the tip's parent, which hides the old
+// tip from the check that a prepared git dir's branch only moves forward. A
+// fetch onto a branch's history transfers only the new commits anyway. A
+// fetch of a ref that is not a branch keeps the depth.
+func fetchDepth(ctx context.Context, repo model.RepoConfig, branch string) int {
+	if repo.HistoryDepth <= 0 || branch == "" {
+		return repo.HistoryDepth
+	}
+	if _, err := runGit(ctx, repo.GitDir, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
+		return 0
+	}
+	return repo.HistoryDepth
 }
 
 func (s *Store) FetchRefNonInteractive(ctx context.Context, repo model.RepoConfig, ref string) error {
@@ -390,8 +396,8 @@ func (s *Store) fetchRef(ctx context.Context, repo model.RepoConfig, ref string,
 		refspec = fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", target.branch, target.branch)
 	}
 	args := []string{"fetch", "--filter=blob:none", "--no-tags"}
-	if repo.HistoryDepth > 0 {
-		args = append(args, fmt.Sprintf("--depth=%d", repo.HistoryDepth))
+	if depth := fetchDepth(ctx, repo, target.branch); depth > 0 {
+		args = append(args, fmt.Sprintf("--depth=%d", depth))
 	}
 	args = append(args, "origin", refspec)
 	remotesForLogging, cancelLookup := s.startRemotesForLogging(ctx, repo)

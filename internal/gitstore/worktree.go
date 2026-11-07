@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -250,11 +251,10 @@ func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfi
 	if err != nil {
 		return err
 	}
-	hookDir := filepath.Join(repo.GitDir, "hooks")
-	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+	hookPath := fsmonitorHookPath(repo.GitDir)
+	if err := os.MkdirAll(filepath.Dir(hookPath), 0o755); err != nil {
 		return err
 	}
-	hookPath := filepath.Join(hookDir, "artifact-fs-fsmonitor")
 	script := fsmonitorHookScript(stateRoot, exe, repo.Name)
 	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
 		return err
@@ -270,22 +270,34 @@ func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfi
 	return nil
 }
 
+func fsmonitorHookPath(gitDir string) string {
+	return filepath.Join(gitDir, "hooks", "artifact-fs-fsmonitor")
+}
+
 // ReleaseAdoptedWorktree hands a worktree back to native Git once remove-repo
 // releases it. It unsets the FSMonitor hook and the filesystem settings that
 // ConfigureAdoptedWorktree pinned for the mount, so the worktree inherits its
-// repository's settings again. A value the worktree's own config held before
-// adoption does not come back, because adoption overwrote it. The core.worktree
-// and core.bare pins stay, because they match the registered worktree.
-// extensions.worktreeConfig stays on because sibling worktrees may now keep
-// their own settings in config.worktree.
+// repository's settings again. It unsets a key only while it holds the value
+// adoption writes, so an adoption that failed before writing it leaves the
+// worktree's own value. A value the worktree's own config held before a
+// successful adoption does not come back, because adoption overwrote it. The
+// core.worktree and core.bare pins stay, because they match the registered
+// worktree. extensions.worktreeConfig stays on because sibling worktrees may
+// now keep their own settings in config.worktree.
 func (s *Store) ReleaseAdoptedWorktree(ctx context.Context, repo model.RepoConfig) error {
 	// --worktree resolves to this file, but fails once the extension is off.
 	worktreeConfig := filepath.Join(repo.GitDir, "config.worktree")
 	if _, err := os.Stat(worktreeConfig); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	for _, key := range []string{"core.fsmonitor", "fsmonitor.allowRemote", "core.filemode", "core.ignorecase", "core.symlinks"} {
-		if _, err := runGit(ctx, repo.GitDir, "config", "--file", worktreeConfig, "--unset-all", key); err != nil {
+	for _, pin := range [][2]string{
+		{"core.fsmonitor", "^" + regexp.QuoteMeta(fsmonitorHookPath(repo.GitDir)) + "$"},
+		{"fsmonitor.allowRemote", "^true$"},
+		{"core.filemode", "^true$"},
+		{"core.ignorecase", "^false$"},
+		{"core.symlinks", "^true$"},
+	} {
+		if _, err := runGit(ctx, repo.GitDir, "config", "--file", worktreeConfig, "--unset-all", pin[0], pin[1]); err != nil {
 			var exitErr *gitCommandError
 			if !errors.As(err, &exitErr) || exitErr.exitCode != 5 {
 				return err

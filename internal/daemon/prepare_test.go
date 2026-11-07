@@ -394,14 +394,95 @@ func TestSyncPreparationFetchRefKeepsHistoryDepth(t *testing.T) {
 	if got := commits(); got != "1" {
 		t.Fatalf("add-repo --depth 1 transferred %s commits of the fetch ref, want 1", got)
 	}
+	// A later fetch adds only the new commits to the history it has.
 	commitFile(t, remote, "AGAIN.md", "again\n")
 	commitFile(t, remote, "LAST.md", "last\n")
 	if err := svc.ctl().Prepare(ctx, "repo"); err != nil {
 		t.Fatal(err)
 	}
-	if got := commits(); got != "1" {
-		t.Fatalf("prepare with --depth 1 left %s commits of the fetch ref, want 1", got)
+	if got := commits(); got != "3" {
+		t.Fatalf("prepare with --depth 1 left %s commits of the fetch ref, want the 2 new ones on the 1 it had", got)
 	}
+}
+
+// newPreparedGitDir returns a work repository pushing to a bare remote, and a
+// git dir that already holds the remote's master branch, as a baked image
+// would.
+func newPreparedGitDir(t *testing.T, tmp string) (work, gitDir string) {
+	t.Helper()
+	bare := filepath.Join(tmp, "origin.git")
+	work = filepath.Join(tmp, "work")
+	gitDir = filepath.Join(tmp, "prepared.git")
+	runCmd(t, "git", "init", "--bare", bare)
+	runCmd(t, "git", "clone", bare, work)
+	runCmd(t, "git", "-C", work, "checkout", "-b", "master")
+	commitFile(t, work, "README.md", "hello\n")
+	runCmd(t, "git", "-C", work, "push", "origin", "master")
+	runCmd(t, "git", "init", "--separate-git-dir", gitDir, "--initial-branch", "master", filepath.Join(tmp, "prepared"))
+	runCmd(t, "git", "--git-dir", gitDir, "remote", "add", "origin", "file://"+bare)
+	runCmd(t, "git", "--git-dir", gitDir, "fetch", "--update-head-ok", "origin", "+refs/heads/master:refs/heads/master")
+	return work, gitDir
+}
+
+// preparePreparedGitDir registers gitDir with --prepared-gitdir --depth 1,
+// prepares it as the daemon does, and fails t unless its master matches
+// work's.
+func preparePreparedGitDir(t *testing.T, svc *Service, work, gitDir string) {
+	t.Helper()
+	ctx := context.Background()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: gitDir}, RepoSpec: model.RepoSpec{Branch: "master", PreparedGitDir: true, FetchRef: "master", HistoryDepth: 1}, Enabled: true}
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.prepareAsync(ctx, got, 1); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	want := strings.TrimSpace(runCmdOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
+	if head := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "rev-parse", "refs/heads/master")); head != want {
+		t.Fatalf("master = %s, want %s", head, want)
+	}
+}
+
+// A fetch with --depth marks its tip shallow even when the git dir holds the
+// tip's parent. The check that a prepared git dir's branch only moves forward
+// then cannot see the old tip below the new one.
+func TestPreparedGitDirWithDepthMovesItsExistingBranch(t *testing.T) {
+	tmp := t.TempDir()
+	work, gitDir := newPreparedGitDir(t, tmp)
+	commitFile(t, work, "MORE.md", "more\n")
+	runCmd(t, "git", "-C", work, "push", "origin", "master")
+	svc, err := New(context.Background(), filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	preparePreparedGitDir(t, svc, work, gitDir)
+}
+
+// A fetch command or refresh fetches the remote-tracking branch a later
+// preparation moves the prepared branch to, so it must not mark it shallow
+// either.
+func TestPreparedGitDirWithDepthPreparesAgainAfterAFetch(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	work, gitDir := newPreparedGitDir(t, tmp)
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	preparePreparedGitDir(t, svc, work, gitDir)
+	commitFile(t, work, "MORE.md", "more\n")
+	runCmd(t, "git", "-C", work, "push", "origin", "master")
+	if err := svc.ctl().FetchNow(ctx, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	// Registering the repo again prepares it again.
+	preparePreparedGitDir(t, svc, work, gitDir)
 }
 
 // prepare cancels the async preparation it supersedes, so the next

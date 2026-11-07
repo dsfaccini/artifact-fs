@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"golang.org/x/sys/unix"
 )
@@ -56,7 +57,7 @@ func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			isolateLazyFetchEnv(t)
+			gittest.IsolatePrompts(t)
 			tmp := t.TempDir()
 			gitDir, commit, blob := partialClone(t, tmp, tt.filter)
 			exe, err := os.Executable()

@@ -355,17 +355,66 @@ func TestRemoveRepoRestoresAdoptedWorktreeFilesystemConfig(t *testing.T) {
 	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "config", "--get", "core.filemode")); got != "true" {
-		t.Fatalf("adopted core.filemode = %q, want true", got)
+	stored, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.git.ConfigureFSMonitorHook(ctx, stored, filepath.Join(dir, "state")); err != nil {
+		t.Fatal(err)
+	}
+	pinned := []string{"core.fsmonitor", "fsmonitor.allowRemote", "core.filemode", "core.ignorecase", "core.symlinks"}
+	worktreeConfig := filepath.Join(gitDir, "config.worktree")
+	for _, key := range pinned {
+		runCmd(t, "git", "config", "--file", worktreeConfig, "--get", key)
 	}
 	if err := svc.ctl().RemoveRepo(ctx, cfg.Name); err != nil {
 		t.Fatal(err)
+	}
+	for _, key := range pinned {
+		if out, err := exec.Command("git", "config", "--file", worktreeConfig, "--get", key).Output(); err == nil {
+			t.Fatalf("%s = %q after remove-repo, want it unset", key, out)
+		}
 	}
 	if err := os.Chmod(filepath.Join(worktree, "README.md"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if got := runCmdOutput(t, "git", "-C", worktree, "status", "--porcelain"); got != "" {
 		t.Fatalf("status after remove-repo and a mode change = %q, want clean as core.filemode=false makes it", got)
+	}
+}
+
+// remove-repo unsets only the values adoption pins, so an adoption that
+// failed before it wrote any leaves the worktree's own config.worktree alone.
+func TestRemoveRepoAfterFailedAdoptionKeepsWorktreeConfig(t *testing.T) {
+	ctx := t.Context()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, worktree, elsewhere := filepath.Join(dir, "source"), filepath.Join(dir, "worktree"), filepath.Join(dir, "elsewhere")
+	runCmd(t, "git", "init", "--initial-branch=main", source)
+	commitFile(t, source, "README.md", "base\n")
+	runCmd(t, "git", "-C", source, "worktree", "add", "-b", "topic", worktree)
+	runCmd(t, "git", "-C", source, "config", "extensions.worktreeConfig", "true")
+	runCmd(t, "git", "-C", worktree, "config", "--worktree", "core.symlinks", "false")
+	gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
+	if err := os.MkdirAll(elsewhere, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := New(ctx, filepath.Join(dir, "state"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: elsewhere}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
+	if err := svc.ctl().AddRepo(ctx, cfg); err == nil || !strings.Contains(err.Error(), "must match the registered worktree path") {
+		t.Fatalf("adoption with a mismatched mount path = %v, want the path mismatch", err)
+	}
+	if err := svc.ctl().RemoveRepo(ctx, cfg.Name); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "config", "--worktree", "--get", "core.symlinks")); got != "false" {
+		t.Fatalf("core.symlinks = %q after remove-repo, want the worktree's own false", got)
 	}
 }
 

@@ -439,7 +439,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "advance main")
 	run(t, "git", "-C", work, "push", "origin", "main")
 	advancedTip := strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
-	if err := New(nil).Fetch(ctx, cfg); err != nil {
+	if err := New(nil).FetchNonInteractive(ctx, cfg); err != nil {
 		t.Fatalf("verified source refresh: %v", err)
 	}
 	count, err = runGit(ctx, gitDir, "rev-list", "--count", "HEAD")
@@ -896,7 +896,7 @@ func TestCloneAndFetchRefSkipTags(t *testing.T) {
 	if err := store.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
 		t.Fatalf("FetchRefNonInteractive: %v", err)
 	}
-	if err := store.Fetch(ctx, cfg); err != nil {
+	if err := store.FetchNonInteractive(ctx, cfg); err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
 
@@ -941,7 +941,7 @@ func TestFetchStartsBeforeRemoteLookupCompletes(t *testing.T) {
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	store.gitRetryDelays = nil
-	err := store.Fetch(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: "/private/configured/repo.git"}})
+	err := store.FetchNonInteractive(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: "/private/configured/repo.git"}})
 	if err == nil {
 		t.Fatal("Fetch error = nil, want transport failure")
 	}

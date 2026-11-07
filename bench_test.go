@@ -326,7 +326,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 	// Phase 10: Refresh -- fetch + re-index + re-publish
 	// -------------------------------------------------------
 	start = time.Now()
-	fetchErr := git.Fetch(ctx, cfg)
+	fetchErr := git.FetchNonInteractive(ctx, cfg)
 	fetchDur := time.Since(start)
 	if fetchErr != nil {
 		results = append(results, timing{"fetch", fetchDur, "error: " + fetchErr.Error()})

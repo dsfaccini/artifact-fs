@@ -303,7 +303,6 @@ type GitStore interface {
 	ValidateAmbientRemote(repo RepoConfig) error
 	ConfigureRemoteNonInteractive(ctx context.Context, repo RepoConfig) error
 	ConfigureRemoteWithCredentials(ctx context.Context, repo RepoConfig) error
-	Fetch(ctx context.Context, repo RepoConfig) error
 	FetchNonInteractive(ctx context.Context, repo RepoConfig) error
 	FetchRefNonInteractive(ctx context.Context, repo RepoConfig, ref string) error
 	FetchRefWithCredentials(ctx context.Context, repo RepoConfig, ref string) error
