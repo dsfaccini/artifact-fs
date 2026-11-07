@@ -96,8 +96,8 @@ func TestInvalidateChangedSendsNothingOnFSKit(t *testing.T) {
 	if inodes, entries := f.notifier.recorded(); len(inodes) != 0 || len(entries) != 0 {
 		t.Fatalf("FSKit mount sent invalidations: inodes %v, entries %v", inodes, entries)
 	}
-	if got := kernelErrno(f.fs.GetInodeAttributes(f.ctx, &fuseops.GetInodeAttributesOp{Inode: held})); got != syscall.ESTALE {
-		t.Fatalf("getattr of inode %d, whose path came back with another blob, = errno %v, want ESTALE", held, got)
+	if got := openErrno(f, held); got != syscall.ESTALE {
+		t.Fatalf("open of inode %d, whose path came back with another blob, = errno %v, want ESTALE", held, got)
 	}
 	if got := f.lookup(fuseops.RootInodeID, "file.txt"); got == forgotten {
 		t.Fatalf("file.txt came back with inode %d, which it had before a switch removed it", got)

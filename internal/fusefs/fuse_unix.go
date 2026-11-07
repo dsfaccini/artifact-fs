@@ -135,6 +135,10 @@ type InodeRef struct {
 	// Blob is the Attrs.Blob last reported for this inode. Type, Mode and Blob
 	// are the identity the kernel holds.
 	Blob string
+	// Size and Mtime are the size and modification time last reported for
+	// this inode. heldAttrs answers with them while the inode's path is away.
+	Size  int64
+	Mtime time.Time
 	// PageBlob is the base blob that the inode's last open served, while the
 	// kernel's cached pages can hold only that blob. It is empty otherwise.
 	PageBlob string
@@ -169,6 +173,7 @@ func (ref *InodeRef) report(attrs Attrs) {
 		ref.PageBlob = ""
 	}
 	ref.Type, ref.Mode, ref.Gen, ref.Blob = attrs.Type, attrs.Mode, attrs.Gen, attrs.Blob
+	ref.Size, ref.Mtime = attrs.Size, attrs.Mtime
 }
 
 func (ref *InodeRef) identity() Identity {
@@ -759,6 +764,44 @@ func (fs *ArtifactFuse) markWritten(id fuseops.InodeID, path string) {
 	fs.mu.Unlock()
 }
 
+// heldAttrs returns the attributes of the content that id's handles read,
+// for an inode whose path is away or that is retired: the size and time of the
+// overlay file or own copy a handle holds, or else the base attributes the
+// kernel last received, which the handles read at InodeRef.Gen. It returns
+// false when id holds neither.
+func (fs *ArtifactFuse) heldAttrs(id fuseops.InodeID) (Attrs, bool) {
+	fs.mu.RLock()
+	ref := fs.inodes[id]
+	if ref == nil || ref.IsRoot {
+		fs.mu.RUnlock()
+		return Attrs{}, false
+	}
+	held := *ref
+	var handles []*FileHandle
+	for _, fh := range fs.fileHandles {
+		if fh.inode.ID == id {
+			handles = append(handles, fh)
+		}
+	}
+	fs.mu.RUnlock()
+	for _, fh := range handles {
+		fh.mu.Lock()
+		var st os.FileInfo
+		var err error
+		if fh.cacheFile != nil && fh.cacheGeneration == -1 {
+			st, err = fh.cacheFile.Stat()
+		}
+		fh.mu.Unlock()
+		if st != nil && err == nil {
+			return Attrs{Type: held.Type, Mode: held.Mode, Size: st.Size(), Mtime: st.ModTime(), Ctime: st.ModTime()}, true
+		}
+	}
+	if held.Gen == 0 {
+		return Attrs{}, false
+	}
+	return Attrs{Type: held.Type, Mode: held.Mode, Size: held.Size, Mtime: held.Mtime, Ctime: held.Mtime, Gen: held.Gen, Blob: held.Blob}, true
+}
+
 // setReported records attrs as what the kernel last received for id. When
 // id is unmapped and attrs show its path back, setReported first decides id as
 // the switch pass does: it maps id back to the path, or retires id and
@@ -1224,11 +1267,21 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 	})
 }
 
+// GetInodeAttributes replies with an inode's attributes. An inode whose path
+// is away, or a retired one, gets the attributes of the content its handles
+// read, from heldAttrs. Linux fetches attributes before a read once they
+// expire, so a read through such a file needs a reply that is not an error.
 func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetInodeAttributesOp) error {
 	return fs.shared(ctx, func(_ context.Context, b *Blobs) error {
 		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 		if err != nil {
-			return err
+			held, ok := fs.heldAttrs(op.Inode)
+			if !ok {
+				return err
+			}
+			op.Attributes = inodeAttrs(held.Mode, uint64(held.Size), held.Type, held.Mtime, held.Ctime)
+			op.AttributesExpiration = attrExpiry(CacheTTL)
+			return nil
 		}
 
 		if ref.IsRoot {
@@ -1251,10 +1304,15 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 		}
 
 		attrs, err := fs.engine.Attrs(b, ref.Path)
-		if err != nil {
-			return err
+		if err == nil {
+			err = fs.setReported(op.Inode, attrs)
 		}
-		if err := fs.setReported(op.Inode, attrs); err != nil {
+		if errors.Is(err, iofs.ErrNotExist) || errors.Is(err, syscall.ESTALE) {
+			if held, ok := fs.heldAttrs(op.Inode); ok {
+				attrs, err = held, nil
+			}
+		}
+		if err != nil {
 			return err
 		}
 		op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
