@@ -334,12 +334,29 @@ func (e *Engine) copyOnWrite(ctx context.Context, path string, base model.BaseNo
 	return err
 }
 
+// Owner permission bits that opening or truncating a file needs.
+const (
+	ownerRead  uint32 = 0o400
+	ownerWrite uint32 = 0o200
+)
+
+// checkOwnerAccess refuses access when mode lacks any of its owner permission
+// bits. The check applies the owner's bits to every caller. A base file's
+// mode from Git, 644 or 755, grants the owner both bits.
+func checkOwnerAccess(mode, access uint32) error {
+	if access&^mode != 0 {
+		return syscall.EACCES
+	}
+	return nil
+}
+
 // OpenFile opens path's content for a new file handle: the overlay file, as
 // generation -1, or else the base blob of generation gen, or of the current
 // generation when gen is 0, with the generation and the blob it opened.
 // forRead says the handle may read, so opening a base file prefetches its
-// directory.
-func (e *Engine) OpenFile(ctx context.Context, b *Blobs, path string, gen int64, forRead bool) (*os.File, int64, string, error) {
+// directory. access holds the owner permission bits to check the entry's mode
+// against, none when the adapter does not check permissions.
+func (e *Engine) OpenFile(ctx context.Context, b *Blobs, path string, gen int64, forRead bool, access uint32) (*os.File, int64, string, error) {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
 	path = model.CleanPath(path)
@@ -348,6 +365,9 @@ func (e *Engine) OpenFile(ctx context.Context, b *Blobs, path string, gen int64,
 	} else if ok {
 		if ov.IsDeleted() {
 			return nil, 0, "", os.ErrNotExist
+		}
+		if err := checkOwnerAccess(ov.Mode, access); err != nil {
+			return nil, 0, "", err
 		}
 		f, err := os.OpenFile(ov.BackingPath, os.O_RDWR, 0)
 		if err != nil {
@@ -454,6 +474,13 @@ func (e *Engine) Write(ctx context.Context, b *Blobs, path string, off int64, da
 		}
 	}
 	return e.Overlay.WriteFile(ctx, path, off, data)
+}
+
+// Flush commits the size and times of path's writes since its last flush.
+func (e *Engine) Flush(ctx context.Context, path string) error {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
+	return e.Overlay.FlushFile(ctx, path)
 }
 
 func (e *Engine) Sync(ctx context.Context, path string) error {
@@ -822,12 +849,22 @@ var errAttrUnsupported = fmt.Errorf("%w: %w", syscall.ENOTSUP, fs.ErrInvalid)
 
 // SetAttributes applies each of size, mode, and mtime that is not nil to path,
 // then returns its attributes. Changing a base file copies it into the
-// overlay first.
-func (e *Engine) SetAttributes(ctx context.Context, b *Blobs, path string, size *int64, mode *uint32, mtime *time.Time) (Attrs, error) {
+// overlay first. sizeAccess holds the owner permission bits to check a size
+// change against, none when the adapter does not check it.
+func (e *Engine) SetAttributes(ctx context.Context, b *Blobs, path string, size *int64, sizeAccess uint32, mode *uint32, mtime *time.Time) (Attrs, error) {
 	if err := func() error {
 		e.Resolver.transition.RLock()
 		defer e.Resolver.transition.RUnlock()
 		if size != nil {
+			if sizeAccess != 0 {
+				if ov, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
+					return err
+				} else if ok && !ov.IsDeleted() {
+					if err := checkOwnerAccess(ov.Mode, sizeAccess); err != nil {
+						return err
+					}
+				}
+			}
 			if err := e.ensureOverlay(ctx, b, path); err != nil {
 				return err
 			}

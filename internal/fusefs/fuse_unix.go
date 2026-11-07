@@ -142,6 +142,12 @@ type InodeRef struct {
 	IsRoot    bool
 	Overlay   bool
 	Stale     bool
+	// CreateOpenPending says a CreateFile made the inode and no OpenFile or
+	// write has reached it since. The next OpenFile skips the permission
+	// check: on an FSKit mount the creator's descriptor can arrive as a
+	// separate open after the create, and a create grants its creator access
+	// whatever the mode.
+	CreateOpenPending bool
 }
 
 // report records attrs as what the kernel last received for ref. Reads then
@@ -181,6 +187,11 @@ type FileHandle struct {
 	cacheGeneration int64
 	invalidateSeq   uint64
 	detached        bool
+	// wrote says the handle created or wrote its file, so its flush commits
+	// the path's pending writes. A reader's close leaves them coalescing.
+	wrote bool
+	// writable says the handle's access mode allows writes.
+	writable bool
 }
 
 // ReaddirEntry holds child metadata, avoiding per-child Getattr or snapshot lookups.
@@ -667,6 +678,35 @@ func (fs *ArtifactFuse) fileHandle(handleID fuseops.HandleID) (*FileHandle, erro
 	return fh, nil
 }
 
+// takeCreateOpenPending reports whether id's CreateOpenPending was set, and
+// clears it.
+func (fs *ArtifactFuse) takeCreateOpenPending(id fuseops.InodeID) bool {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	ref := fs.inodes[id]
+	if ref == nil {
+		return false
+	}
+	pending := ref.CreateOpenPending
+	ref.CreateOpenPending = false
+	return pending
+}
+
+// handleWritable says id names an open handle whose access mode allows
+// writes. A nil id, from truncate(2), names none.
+func (fs *ArtifactFuse) handleWritable(id *fuseops.HandleID) bool {
+	if id == nil {
+		return false
+	}
+	fh, err := fs.fileHandle(*id)
+	if err != nil {
+		return false
+	}
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	return fh.writable
+}
+
 func (fs *ArtifactFuse) closeCachedFilesForPath(path string) {
 	fs.mu.RLock()
 	var handles []*FileHandle
@@ -995,6 +1035,13 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 }
 
 func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp) error {
+	return fs.setInodeAttributes(ctx, op, false)
+}
+
+// setInodeAttributes changes an inode's attributes. checkPermissions checks a
+// size change against the entry's owner write bit, unless it comes through a
+// handle whose access mode allows writes.
+func (fs *ArtifactFuse) setInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp, checkPermissions bool) error {
 	return fs.shared(ctx, func(ctx context.Context, b *Blobs) error {
 		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 		if err != nil {
@@ -1017,7 +1064,11 @@ func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetI
 		if changesContent {
 			fs.closeCachedFilesForPath(ref.Path)
 		}
-		attrs, err := fs.engine.SetAttributes(ctx, b, ref.Path, size, mode, op.Mtime)
+		var sizeAccess uint32
+		if op.Size != nil && checkPermissions && !fs.handleWritable(op.Handle) {
+			sizeAccess = ownerWrite
+		}
+		attrs, err := fs.engine.SetAttributes(ctx, b, ref.Path, size, sizeAccess, mode, op.Mtime)
 		if changesContent {
 			fs.closeCachedFilesForPath(ref.Path)
 		}
@@ -1197,15 +1248,35 @@ func (fs *ArtifactFuse) ReleaseDirHandle(_ context.Context, op *fuseops.ReleaseD
 }
 
 func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) error {
+	return fs.openFile(ctx, op, false)
+}
+
+// openFile opens a handle. checkPermissions checks the open against the
+// entry's owner permission bits: read and write for the access mode, and
+// write for O_TRUNC.
+func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, checkPermissions bool) error {
+	created := fs.takeCreateOpenPending(op.Inode)
 	return fs.shared(ctx, func(ctx context.Context, b *Blobs) error {
 		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 		if err != nil {
 			return err
 		}
-		fh := &FileHandle{inode: ref, path: ref.Path}
+		fh := &FileHandle{inode: ref, path: ref.Path, writable: !op.OpenFlags.IsReadOnly()}
 		if ref.Path != ".git" {
+			var access uint32
+			if checkPermissions && !created {
+				access = ownerRead | ownerWrite
+				if op.OpenFlags.IsReadOnly() {
+					access = ownerRead
+				} else if op.OpenFlags.IsWriteOnly() {
+					access = ownerWrite
+				}
+				if op.OpenFlags&syscall.O_TRUNC != 0 {
+					access |= ownerWrite
+				}
+			}
 			// An open for writing only reads nothing, so it prefetches nothing.
-			f, gen, blob, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen, !op.OpenFlags.IsWriteOnly())
+			f, gen, blob, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen, !op.OpenFlags.IsWriteOnly(), access)
 			if err != nil {
 				return err
 			}
@@ -1282,9 +1353,15 @@ func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) 
 			return err
 		}
 		path := fh.path
+		fh.wrote = true
 		fh.mu.Unlock()
-		fs.closeCachedFilesForPath(path)
+		// The creator has its descriptor once a write arrives.
+		fs.takeCreateOpenPending(op.Inode)
 		n, err := fs.engine.Write(ctx, b, path, op.Offset, op.Data)
+		// A handle that cached the base content before the write promoted the
+		// path, or while another write promoted it, would keep serving the
+		// base. Close those caches before the write returns, failed or not.
+		fs.closeCachedFilesForPath(path)
 		if err != nil {
 			return err
 		}
@@ -1292,7 +1369,6 @@ func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) 
 			return syscall.EIO
 		}
 		fs.markWritten(op.Inode, path)
-		fs.closeCachedFilesForPath(path)
 		// A write recreates a path that vanished while the handle was open.
 		// No reply tells the kernel the name exists again.
 		if e, notifier, ok := fs.takeNegative(path); ok {
@@ -1313,7 +1389,8 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 		}
 		fs.mu.Lock()
 		ref := fs.createEntry(op.Parent, op.Name, childPath, Attrs{Type: "file", Mode: uint32(op.Mode)})
-		fh := &FileHandle{inode: ref, path: childPath}
+		ref.CreateOpenPending = true
+		fh := &FileHandle{inode: ref, path: childPath, wrote: true, writable: !op.OpenFlags.IsReadOnly()}
 		handle := fs.nextHandleID
 		fs.nextHandleID++
 		fs.fileHandles[handle] = fh
@@ -1462,8 +1539,27 @@ func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlink
 	return nil
 }
 
-func (fs *ArtifactFuse) FlushFile(_ context.Context, _ *fuseops.FlushFileOp) error {
-	return nil
+func (fs *ArtifactFuse) FlushFile(ctx context.Context, op *fuseops.FlushFileOp) error {
+	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+		fh, err := fs.fileHandle(op.Handle)
+		if err != nil {
+			return err
+		}
+		return fs.flushHandle(ctx, fh)
+	})
+}
+
+// flushHandle commits the writes made through fh's path when fh wrote. A
+// detached handle writes to a file no entry names, so it has nothing to
+// commit.
+func (fs *ArtifactFuse) flushHandle(ctx context.Context, fh *FileHandle) error {
+	fh.mu.Lock()
+	path, detached, wrote := fh.path, fh.detached, fh.wrote
+	fh.mu.Unlock()
+	if !wrote || detached || path == ".git" {
+		return nil
+	}
+	return fs.engine.Flush(ctx, path)
 }
 
 func (fs *ArtifactFuse) SyncFile(ctx context.Context, op *fuseops.SyncFileOp) error {
@@ -1492,15 +1588,17 @@ func (fs *ArtifactFuse) SyncFile(ctx context.Context, op *fuseops.SyncFileOp) er
 }
 
 func (fs *ArtifactFuse) ReleaseFileHandle(ctx context.Context, op *fuseops.ReleaseFileHandleOp) error {
-	return fs.shared(ctx, func(context.Context, *Blobs) error {
+	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
 		fs.mu.Lock()
 		fh := fs.fileHandles[op.Handle]
 		delete(fs.fileHandles, op.Handle)
 		fs.mu.Unlock()
-		if fh != nil {
-			fh.release()
+		if fh == nil {
+			return nil
 		}
-		return nil
+		err := fs.flushHandle(ctx, fh)
+		fh.release()
+		return err
 	})
 }
 
@@ -1546,6 +1644,25 @@ const FSSubtype = "artifact-fs"
 // it, such as one a daemon process that stopped left behind. It does not
 // retry a busy mount.
 func UnmountPath(dir string) error { return fuse.Unmount(dir) }
+
+// newFileSystemServer is fuseutil.NewFileSystemServer. Package tests replace
+// it to reach the file system each mount attempt serves.
+var newFileSystemServer = fuseutil.NewFileSystemServer
+
+// permissionCheckingFS serves an FSKit mount: artifact-fs checks permissions
+// itself there. It checks each open, and each size change not made through a
+// handle that may write, against the entry's owner permission bits.
+type permissionCheckingFS struct {
+	*ArtifactFuse
+}
+
+func (fs permissionCheckingFS) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) error {
+	return fs.openFile(ctx, op, true)
+}
+
+func (fs permissionCheckingFS) SetInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp) error {
+	return fs.setInodeAttributes(ctx, op, true)
+}
 
 // newNotifier is fuse.NewNotifier. Package tests replace it to tell the
 // Notifiers of two mount attempts apart.
@@ -1674,7 +1791,11 @@ func MountRepoWithGate(ctx, opCtx context.Context, repo model.RepoConfig, engine
 		// Server.
 		notifier := newNotifier()
 		notifiers[fskit] = notifier
-		server := fuse.NewServerWithNotifier(notifier, fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate)))
+		var served fuseutil.FileSystem = fsint
+		if fskit {
+			served = permissionCheckingFS{fsint}
+		}
+		server := fuse.NewServerWithNotifier(notifier, newFileSystemServer(NewGatedFileSystem(served, gate)))
 		return fuseMount(ctx, repo.MountPath, server, &cfg)
 	}
 

@@ -28,7 +28,8 @@ const kernelCacheExpiry = 1500 * time.Millisecond
 // seeded state on one mount, because each mount counts toward the series after
 // which macFUSE's FSKit extension can stop loading (see e2eMountsStarted). A
 // test whose subject is mounting, restarting, or the state of a fresh mount
-// keeps its own mount. On FSKit only the runReadOnly tests run.
+// keeps its own mount, and so does a test that changes the mount and must run
+// on FSKit. On FSKit only the runReadOnly tests run.
 func TestE2ESharedMount(t *testing.T) {
 	shared := newSharedE2ERepo(t)
 	shared.runReadOnly(t, "GitCleanState", testE2EGitCleanState)

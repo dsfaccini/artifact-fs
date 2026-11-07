@@ -85,7 +85,7 @@ Repository-specific guidance for `artifact-fs`.
 - Never mount in a package test. Only the root-package e2e tests mount.
 - Call an `Engine` method that takes a `*Blobs` through `Engine.Do`, as the FUSE adapter does. `internal/fusefs/ops_test.go` has `engineRename` and its siblings.
 - Assert the errno the kernel receives with `kernelErrno`, not by comparing error values.
-- Run a new e2e test as a `TestE2ESharedMount` subtest. Give it its own mount only when its subject is mounting, a daemon restart, or a fresh mount's state. macFUSE's FSKit extension can stop loading after a series of mounts in one session.
+- Run a new e2e test as a `TestE2ESharedMount` subtest. Give it its own mount only when its subject is mounting, a daemon restart, or a fresh mount's state. Give a test its own mount also when it changes the mount and must run on FSKit, where `run` skips it. A test of an FSKit-only check that leaves the mount unchanged uses `runReadOnly` on the shared mount. macFUSE's FSKit extension can stop loading after a series of mounts in one session.
 - Register a shared-mount test that leaves the mount unchanged with `runReadOnly`, and every other one with `run`. When e2e tests mount through FSKit on macOS, `run` skips the test, because the restore that undoes its changes moves HEAD. A `runReadOnly` test that changes the mount fails.
 - Call `skipIfFSKitHEADMove` in a test that moves HEAD on its own mount. After a HEAD move, FSKit can pad a short read with bytes that are not file data ([macfuse#1231](https://github.com/macfuse/macfuse/issues/1231)).
 - Before a test's first mount, call `skipIfOverMountBudget` with the number of mounts the test starts. A run that mounts through FSKit starts at most 8 mounts. `newMountedE2ERepo` checks one mount.

@@ -23,6 +23,9 @@ func OpenDB(path string) (*sql.DB, error) {
 	params := url.Values{}
 	params.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeout.Milliseconds()))
 	params.Add("_pragma", "foreign_keys(ON)")
+	// In WAL mode NORMAL syncs the WAL only at checkpoints. A process crash
+	// loses no commit; an OS crash can lose the commits since the last sync.
+	params.Add("_pragma", "synchronous(NORMAL)")
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: params.Encode()}).String()
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
