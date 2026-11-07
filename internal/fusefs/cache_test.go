@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"os"
@@ -448,6 +449,39 @@ func TestSwitchPassInvalidatesInodeAReplyUpdatedFirst(t *testing.T) {
 			}
 			if inodes, _ := f.notifier.recorded(); len(inodes) != 1 {
 				t.Fatalf("a switch that kept file.txt invalidated it again: inodes %v", inodes)
+			}
+		})
+	}
+}
+
+// A switch that turns a held file into a directory invalidates its entry
+// once. A lookup before the pass already reports the directory, so the pass
+// sees the type change through Prior. Once the pass invalidated the entry, a
+// lookup records nothing older, and a later switch that keeps the directory
+// sends nothing.
+func TestSwitchPassInvalidatesRetypedEntryOnce(t *testing.T) {
+	for _, lookupFirst := range []bool{false, true} {
+		t.Run(fmt.Sprint("lookup before the pass=", lookupFirst), func(t *testing.T) {
+			f := newCacheFixture(t, baseFile("swap", "blob-S", 0o100644))
+			f.lookup(fuseops.RootInodeID, "swap")
+			dir := []model.BaseNode{baseDir("swap", "t1"), baseFile("swap/x.txt", "x", 0o100644)}
+			f.switchTo(dir...)
+			if lookupFirst {
+				f.lookup(fuseops.RootInodeID, "swap")
+			}
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if _, entries := f.notifier.recorded(); !slices.Equal(entries, []kernelEntry{{fuseops.RootInodeID, "swap"}}) {
+				t.Fatalf("the switch that made swap a directory invalidated entries %v, want swap", entries)
+			}
+			f.lookup(fuseops.RootInodeID, "swap")
+			f.switchTo(dir...)
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if inodes, entries := f.notifier.recorded(); len(inodes) != 0 || len(entries) != 1 {
+				t.Fatalf("a switch that kept the directory swap sent invalidations: inodes %v, entries %v", inodes, entries)
 			}
 		})
 	}

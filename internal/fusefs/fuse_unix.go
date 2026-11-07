@@ -141,8 +141,9 @@ type InodeRef struct {
 	// lookup's attributes for an inode it holds, so the pass checks Prior too.
 	// Its Type is empty when no reply replaced an identity.
 	Prior Identity
-	// Invalidated says the switch pass invalidated the inode and no reply has
-	// reached the kernel since, so the kernel holds nothing of an older identity.
+	// Invalidated says the switch pass invalidated the inode or its entry and no
+	// reply has reached the kernel since, so the kernel holds nothing of an older
+	// identity.
 	Invalidated bool
 	// WrittenAt is the writeSeq of the last write through this inode.
 	WrittenAt uint64
@@ -481,8 +482,9 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	var entries []kernelEntry
 	var changed []fuseops.InodeID
 	var vanished []pathMapping
-	// priors holds the Prior of each inode checked against a Prior.
-	priors := map[fuseops.InodeID]Identity{}
+	// dropped holds each inode whose entry or attributes the pass invalidates:
+	// the kernel then holds nothing of an identity older than the next reply.
+	var dropped []fuseops.InodeID
 	for _, k := range inodes {
 		current, exists, err := fs.engine.Identity(k.path)
 		if err != nil {
@@ -492,21 +494,20 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		// A Prior is an identity the kernel can still cache: a reply between
 		// the switch and this pass replaced it.
 		hidden := k.prior.Type != ""
-		if hidden {
-			priors[k.id] = k.prior
-		}
 		switch {
 		case !exists || current.Type != k.reported.Type || hidden && current.Type != k.prior.Type:
 			// The name of an unmapped inode already left the kernel, through
 			// the op or the pass that unmapped it.
 			if k.mapped {
 				entries = append(entries, k.entry)
+				dropped = append(dropped, k.id)
 			}
 			if k.mapped && !exists {
 				vanished = append(vanished, k.pathMapping)
 			}
 		case hidden, k.base && current != k.reported, !k.base && current.Blob != "":
 			changed = append(changed, k.id)
+			dropped = append(dropped, k.id)
 		}
 	}
 	paths := make([]string, len(existenceOnly))
@@ -525,12 +526,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		}
 	}
 	fs.mu.Lock()
-	for id, prior := range priors {
-		if ref := fs.inodes[id]; ref != nil && ref.Prior == prior {
-			ref.Prior = Identity{}
-		}
-	}
-	for _, id := range changed {
+	for _, id := range dropped {
 		if ref := fs.inodes[id]; ref != nil {
 			ref.Invalidated, ref.Prior = true, Identity{}
 		}
