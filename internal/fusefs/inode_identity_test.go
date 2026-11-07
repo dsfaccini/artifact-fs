@@ -570,6 +570,52 @@ func TestWriteDuringSwitchPassKeepsHeldNumber(t *testing.T) {
 	}
 }
 
+// A rename overlaps the switch pass, so the pass checks file.txt again while
+// it holds handleOps. A write through the held inode recreates file.txt after
+// the re-check's overlay read and before its unmap, and must keep its number.
+func TestWriteDuringSwitchPassRecheckKeepsHeldNumber(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644), baseFile("other.txt", "o", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	open := f.open(held)
+	forget(t, f.fs, f.lookup(fuseops.RootInodeID, "other.txt"))
+	if err := f.fs.MkDir(f.ctx, &fuseops.MkDirOp{Parent: fuseops.RootInodeID, Name: "a", Mode: os.ModeDir | 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	f.switchTo(baseFile("other.txt", "o", 0o100644))
+	ov := hookOverlay(f)
+	wrote := false
+	write := func() {
+		if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("new")}); err != nil {
+			t.Error(err)
+			return
+		}
+		wrote = true
+	}
+	lists := 0
+	ov.beforeList = func() {
+		if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "a", NewParent: fuseops.RootInodeID, NewName: "b"}); err != nil {
+			t.Error(err)
+		}
+		// The pass's own overlay read, then the re-check's.
+		ov.afterList = func() {
+			lists++
+			ov.afterList = func() {
+				lists++
+				write()
+			}
+		}
+	}
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if !wrote || lists != 2 {
+		t.Fatalf("the write did not run inside the re-check: wrote %v after %d overlay reads, want 2", wrote, lists)
+	}
+	if got := f.lookup(fuseops.RootInodeID, "file.txt"); got != held {
+		t.Fatalf("file.txt, recreated by a write through inode %d during the re-check, looks up as inode %d", held, got)
+	}
+}
+
 // A create can land after the switch pass read the mappings and the overlay.
 // The pass then finds the path missing, and must leave the created path's
 // mapping alone.

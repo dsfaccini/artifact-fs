@@ -110,9 +110,9 @@ type ArtifactFuse struct {
 	// A rename commits the overlay before it moves the mappings, so a switch
 	// pass that a rename overlapped checks its vanished paths again.
 	renameSeq uint64
-	// writeSeq counts writes through the mount. A write through an open file
-	// recreates its path, so the switch pass leaves mapped the path of an
-	// inode written since the pass read the table.
+	// writeSeq counts successful writes through file handles that are not
+	// detached. Such a write recreates its path, so the switch pass leaves
+	// mapped the path of an inode written since the pass read the table.
 	writeSeq uint64
 
 	// notifier is nil when nothing should reach the kernel. fs.mu guards it:
