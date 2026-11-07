@@ -13,6 +13,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/registry"
 )
@@ -26,66 +27,20 @@ func (s *Controller) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
 }
 
 func (s *Controller) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, opts AddRepoOptions) error {
-	if err := model.ValidateRepoName(cfg.Name); err != nil {
+	if err := s.normalizeRepoConfig(&cfg, opts); err != nil {
 		return err
-	}
-	if cfg.AdoptGitDir && opts.Async {
-		return errors.New("--adopt-gitdir cannot be combined with --async")
-	}
-	if err := normalizeSourceConfig(&cfg); err != nil {
-		return err
-	}
-	if cfg.ID == "" {
-		cfg.ID = model.RepoID(cfg.Name)
-	}
-	cfg.RemoteURLRedacted = auth.RedactRemoteURL(cfg.RemoteURL)
-	if cfg.RefreshInterval <= 0 {
-		cfg.RefreshInterval = 30 * time.Second
-	}
-	explicitGitDir := strings.TrimSpace(cfg.GitDir) != ""
-	s.fillPaths(&cfg)
-	if cfg.AdoptGitDir {
-		var err error
-		cfg.GitDir, err = filepath.Abs(cfg.GitDir)
-		if err != nil {
-			return err
-		}
-		cfg.MountPath, err = filepath.Abs(cfg.MountPath)
-		if err != nil {
-			return err
-		}
-	}
-	if !cfg.AdoptGitDir && strings.TrimSpace(cfg.FetchRef) == "" {
-		cfg.FetchRef = defaultFetchRef(cfg.Branch)
 	}
 	cfg.ConfigVersion = rand.Text()
+	cfg.PrepareRequest = rand.Text()
 	cloneURL := cfg.RemoteURL
-	if cfg.PreparedGitDir && !opts.Async {
-		return fmt.Errorf("--prepared-gitdir requires --async")
-	}
-	if cfg.PreparedGitDir && cfg.RequiredCommit != "" {
-		return fmt.Errorf("--prepared-gitdir is not supported with --require-commit")
-	}
 	if opts.Async {
-		if strings.TrimSpace(cfg.RemoteURL) == "" && !cfg.PreparedGitDir {
-			return fmt.Errorf("--remote is required unless --prepared-gitdir is set")
-		}
-		if cfg.PreparedGitDir && !explicitGitDir {
-			return fmt.Errorf("--git-dir is required with --prepared-gitdir")
-		}
-		if auth.HasInlineCredentials(cfg.RemoteURL) {
-			return fmt.Errorf("async repositories must use ambient credentials; remove credentials from --remote")
-		}
 		cfg.PrepareState = model.PrepareStatePreparing
-		cfg.PrepareError = ""
 	} else {
 		cfg.PrepareState = model.PrepareStateSyncPreparing
-		cfg.PrepareError = ""
 		if auth.HasInlineCredentials(cfg.RemoteURL) {
 			cfg.RemoteURL = ""
 		}
 	}
-	registeredCfg := cfg
 	if err := s.withRepoConfigLock(ctx, cfg.Name, func() error {
 		return s.registry.AddRepo(ctx, cfg)
 	}); err != nil {
@@ -97,44 +52,91 @@ func (s *Controller) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfi
 	// Clone and build snapshot so the repo is ready to mount, but don't start
 	// the FUSE server -- that's the daemon's job.
 	cfg.RemoteURL = cloneURL
-	prepareCtx, cancel := s.withPrepareTimeout(ctx)
-	err := s.prepareRepo(prepareCtx, cfg)
-	prepareContextErr := prepareCtx.Err()
-	cancel()
-	if err == nil {
-		return s.persistSyncPrepareSuccess(ctx, registeredCfg)
-	}
-	if prepareContextErr != nil && !errors.Is(err, prepareContextErr) {
-		err = errors.Join(err, prepareContextErr)
-	}
-	return s.persistSyncPrepareFailure(ctx, cfg, registeredCfg, err)
+	return s.prepareSync(ctx, cfg)
 }
 
-func (s *Controller) persistSyncPrepareFailure(ctx context.Context, cfg model.RepoConfig, registeredCfg model.RepoConfig, prepareErr error) error {
-	stateErr := prepareErr
-	if errors.Is(prepareErr, context.DeadlineExceeded) {
-		stateErr = errors.New("prepare timed out")
-	} else if errors.Is(prepareErr, context.Canceled) {
-		stateErr = errors.New("prepare canceled")
-	}
-	stateCtx, stateCancel := context.WithTimeout(context.WithoutCancel(ctx), prepareStateWriteTimeout)
-	defer stateCancel()
-	if stateWriteErr := s.registry.UpdatePrepareStateForConfig(stateCtx, registeredCfg, "", auth.RedactLogString(stateErr.Error(), cfg.RemoteURL)); stateWriteErr != nil {
-		if errors.Is(stateWriteErr, registry.ErrRepoChanged) {
-			return prepareErr
-		}
-		s.logger.ErrorContext(stateCtx, logRepoPrepareStatusWriteErr, "repo", auth.RedactLogString(cfg.Name), "mode", prepareModeSync, "phase", preparationFailurePhase(prepareErr), "target_state", "", "error", auth.RedactLogString(stateWriteErr.Error()))
-		return errors.Join(prepareErr, fmt.Errorf("persist failed prepare state: %w", stateWriteErr))
-	}
-	return prepareErr
-}
-
-func (s *Controller) persistSyncPrepareSuccess(ctx context.Context, cfg model.RepoConfig) error {
-	stateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prepareStateWriteTimeout)
-	defer cancel()
-	if err := s.registry.UpdatePrepareStateForConfig(stateCtx, cfg, "", ""); err != nil {
-		s.logger.ErrorContext(stateCtx, logRepoPrepareStatusWriteErr, "repo", auth.RedactLogString(cfg.Name), "mode", prepareModeSync, "phase", preparePhaseComplete, "target_state", "", "error", auth.RedactLogString(err.Error()))
+// normalizeRepoConfig validates cfg and fills in what add-repo leaves to
+// defaults, once, before the registry stores it: full refs, the fetch ref,
+// and absolute paths. Every reader trusts the stored config.
+func (s *core) normalizeRepoConfig(cfg *model.RepoConfig, opts AddRepoOptions) error {
+	if err := model.ValidateRepoName(cfg.Name); err != nil {
 		return err
+	}
+	if err := gitstore.ValidateRemoteNotOption(cfg.RemoteURL); err != nil {
+		return err
+	}
+	if cfg.AdoptGitDir {
+		if opts.Async {
+			return errors.New("--adopt-gitdir cannot be combined with --async")
+		}
+		if strings.TrimSpace(cfg.GitDir) == "" {
+			return errors.New("--adopt-gitdir requires --git-dir")
+		}
+		if cfg.PreparedGitDir || cfg.RemoteURL != "" || cfg.RequiredCommit != "" || cfg.HistoryDepth != 0 || cfg.FetchRef != "" || (cfg.Branch != "" && cfg.Branch != "HEAD") {
+			return errors.New("--adopt-gitdir cannot fetch, select a source ref, or prepare a remote git dir")
+		}
+		cfg.Branch = "HEAD"
+		cfg.RemoteRefreshDisabled = true
+	} else if err := normalizeSource(cfg, opts); err != nil {
+		return err
+	}
+	if cfg.ID == "" {
+		cfg.ID = model.RepoID(cfg.Name)
+	}
+	cfg.RemoteURLRedacted = auth.RedactRemoteURL(cfg.RemoteURL)
+	if cfg.RefreshInterval <= 0 {
+		cfg.RefreshInterval = 30 * time.Second
+	}
+	s.fillPaths(cfg)
+	for _, path := range []*string{&cfg.MountRoot, &cfg.MountPath, &cfg.GitDir, &cfg.OverlayDir, &cfg.BlobCacheDir, &cfg.MetaDBPath, &cfg.OverlayDBPath} {
+		abs, err := filepath.Abs(*path)
+		if err != nil {
+			return err
+		}
+		*path = abs
+	}
+	cfg.PrepareError = ""
+	return nil
+}
+
+// normalizeSource validates the source of a repo add-repo clones or fetches,
+// and stores its refs in full: the source ref defaults to refs/heads/main,
+// and the fetch ref to the source ref.
+func normalizeSource(cfg *model.RepoConfig, opts AddRepoOptions) error {
+	explicitGitDir := strings.TrimSpace(cfg.GitDir) != ""
+	if cfg.PreparedGitDir && !opts.Async {
+		return errors.New("--prepared-gitdir requires --async")
+	}
+	if cfg.PreparedGitDir && cfg.RequiredCommit != "" {
+		return errors.New("--prepared-gitdir is not supported with --require-commit")
+	}
+	if opts.Async {
+		if strings.TrimSpace(cfg.RemoteURL) == "" && !cfg.PreparedGitDir {
+			return errors.New("--remote is required unless --prepared-gitdir is set")
+		}
+		if cfg.PreparedGitDir && !explicitGitDir {
+			return errors.New("--git-dir is required with --prepared-gitdir")
+		}
+		if auth.HasInlineCredentials(cfg.RemoteURL) {
+			return errors.New("async repositories must use ambient credentials; remove credentials from --remote")
+		}
+	}
+	cfg.Branch = model.CanonicalRef(cmp.Or(strings.TrimSpace(cfg.Branch), "refs/heads/main"))
+	cfg.FetchRef = model.CanonicalRef(cmp.Or(strings.TrimSpace(cfg.FetchRef), cfg.Branch))
+	if cfg.HistoryDepth < 0 {
+		return errors.New("--depth must not be negative")
+	}
+	cfg.RequiredCommit = strings.ToLower(strings.TrimSpace(cfg.RequiredCommit))
+	if cfg.RequiredCommit == "" {
+		return nil
+	}
+	if len(cfg.RequiredCommit) != 40 && len(cfg.RequiredCommit) != 64 {
+		return errors.New("--require-commit must be a full 40- or 64-character commit OID")
+	}
+	for _, character := range cfg.RequiredCommit {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return errors.New("--require-commit must be hexadecimal")
+		}
 	}
 	return nil
 }
@@ -230,6 +232,10 @@ func (s *Controller) FetchNow(ctx context.Context, name string) error {
 	return s.git.Fetch(ctx, cfg)
 }
 
+// Prepare asks for a new preparation of name. A sync repo prepares in the
+// CLI; the daemon prepares an async one. Either way the daemon keeps serving
+// the repo's mount, and only an async repo's gate holds FUSE ops meanwhile. An
+// async repo that is ready and follows its ref has nothing to prepare.
 func (s *Controller) Prepare(ctx context.Context, name string) error {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
@@ -239,33 +245,20 @@ func (s *Controller) Prepare(ctx context.Context, name string) error {
 	if async && cfg.PrepareState == model.PrepareStateReady && cfg.RequiredCommit == "" {
 		return nil
 	}
-	nextVersion := rand.Text()
-	nextState := model.PrepareStateSyncPreparing
+	request := rand.Text()
+	state := model.PrepareStateSyncPreparing
 	if async {
-		nextState = model.PrepareStatePreparing
+		state = model.PrepareStatePreparing
 	}
-	if err := s.registry.BeginPrepare(ctx, cfg, nextState, nextVersion); err != nil {
+	if err := s.registry.BeginPrepare(ctx, cfg, state, request); err != nil {
 		return err
 	}
-	cfg.ConfigVersion = nextVersion
-	cfg.PrepareState = nextState
-	cfg.PrepareError = ""
-	if !async {
-		prepareCtx, cancel := s.withPrepareTimeout(ctx)
-		err := s.prepareRepo(prepareCtx, cfg)
-		prepareContextErr := prepareCtx.Err()
-		cancel()
-		if err != nil {
-			if prepareContextErr != nil && !errors.Is(err, prepareContextErr) {
-				err = errors.Join(err, prepareContextErr)
-			}
-			return s.persistSyncPrepareFailure(ctx, cfg, cfg, err)
-		}
-		return s.persistSyncPrepareSuccess(ctx, cfg)
+	if async {
+		// The daemon prepares the repo again at its next registry sync.
+		return nil
 	}
-	// The new config version makes the daemon prepare the repo again at its
-	// next registry sync.
-	return nil
+	cfg.PrepareRequest, cfg.PrepareState, cfg.PrepareError = request, state, ""
+	return s.prepareSync(ctx, cfg)
 }
 
 // mountRequestTimeout bounds how long Unmount and Remount wait for the
@@ -364,6 +357,5 @@ func (s *Controller) EvictCache(ctx context.Context, name string, maxBytes int64
 	if err != nil {
 		return blobcache.EvictResult{}, err
 	}
-	s.fillPaths(&cfg)
 	return blobcache.Evict(ctx, cfg.BlobCacheDir, maxBytes)
 }

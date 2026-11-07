@@ -51,8 +51,8 @@ func TestAddRepoAsyncRegistersWithoutClone(t *testing.T) {
 	if got.PrepareState != model.PrepareStatePreparing {
 		t.Fatalf("PrepareState = %q, want preparing", got.PrepareState)
 	}
-	if got.FetchRef != "master" {
-		t.Fatalf("FetchRef = %q, want master", got.FetchRef)
+	if got.FetchRef != "refs/heads/master" {
+		t.Fatalf("FetchRef = %q, want refs/heads/master", got.FetchRef)
 	}
 	if got.GitDir != filepath.Join(svc.root, "repos", "repo", "git") {
 		t.Fatalf("GitDir = %q", got.GitDir)
@@ -216,7 +216,7 @@ func TestSupersededPrepareDoesNotMutateExistingClone(t *testing.T) {
 	}()
 	waitFor(t, prepareErr, func() bool {
 		current, err := svc.registry.GetRepo(ctx, cfg.Name)
-		return err == nil && current.PrepareState == model.PrepareStateSyncPreparing && current.ConfigVersion != cfg.ConfigVersion
+		return err == nil && current.PrepareState == model.PrepareStateSyncPreparing && current.PrepareRequest != cfg.PrepareRequest
 	})
 	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{
 		Name:      cfg.Name,
@@ -392,24 +392,6 @@ func TestAddRepoPreparedGitDirValidation(t *testing.T) {
 	}
 }
 
-func TestSameBranchRefPreservesNonBranchNamespaces(t *testing.T) {
-	for _, test := range []struct {
-		fetchRef  string
-		sourceRef string
-		want      bool
-	}{
-		{fetchRef: "main", sourceRef: "refs/heads/main", want: true},
-		{fetchRef: "origin/main", sourceRef: "refs/heads/main", want: true},
-		{fetchRef: "refs/tags/release", sourceRef: "refs/tags/release", want: true},
-		{fetchRef: "refs/tags/release", sourceRef: "refs/tags/other", want: false},
-		{fetchRef: "refs/pull/1/head", sourceRef: "refs/pull/2/head", want: false},
-	} {
-		if got := sameBranchRef(test.fetchRef, test.sourceRef); got != test.want {
-			t.Fatalf("sameBranchRef(%q, %q) = %t, want %t", test.fetchRef, test.sourceRef, got, test.want)
-		}
-	}
-}
-
 func TestSyncReposSkipsResetWhilePrepareWorkerInFlight(t *testing.T) {
 	ctx := context.Background()
 	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -447,7 +429,7 @@ func TestSyncReposSkipsResetWhilePrepareWorkerInFlight(t *testing.T) {
 	}
 	svc.mu.Lock()
 	svc.running[cfg.ID] = rt
-	svc.preparing[cfg.ID] = 1
+	svc.preparing[cfg.ID] = prepareWorker{token: 1}
 	svc.mu.Unlock()
 
 	if err := svc.syncRepos(ctx); err != nil {
@@ -461,7 +443,7 @@ func TestSyncReposSkipsResetWhilePrepareWorkerInFlight(t *testing.T) {
 	}
 }
 
-func TestRestartRunningPrepareSkipsStalePreparingSnapshot(t *testing.T) {
+func TestDrivePrepareSkipsStalePreparingSnapshot(t *testing.T) {
 	ctx := context.Background()
 	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -506,7 +488,7 @@ func TestRestartRunningPrepareSkipsStalePreparingSnapshot(t *testing.T) {
 	svc.running[latest.ID] = rt
 	svc.mu.Unlock()
 
-	svc.restartRunningPrepareIfCurrent(ctx, stale, rt, false)
+	svc.drivePrepare(ctx, stale, rt, false)
 	if got := rt.reportedState(); got != repoStateMounted {
 		t.Fatalf("runtime state = %q, want mounted", got)
 	}
@@ -1108,7 +1090,7 @@ func TestRunPreparePreparedGitDirPublishesSnapshotAndMarksReady(t *testing.T) {
 		!strings.Contains(logOutput, `"source":"`+prepareSourcePreparedGitDir+`"`) ||
 		!strings.Contains(logOutput, `"phase":"`+preparePhaseComplete+`"`) ||
 		!strings.Contains(logOutput, `"state":"`+prepareLogStateCompleted+`"`) ||
-		!strings.Contains(logOutput, `"deadline_set":false`) ||
+		!strings.Contains(logOutput, `"deadline_set":true`) ||
 		!strings.Contains(logOutput, `"snapshot_generation":`) {
 		t.Fatalf("async completion lifecycle log incomplete: %s", logOutput)
 	}
@@ -1154,7 +1136,7 @@ func TestSyncPrepareRetainsPreviousGenerationForDaemonHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := svc.prepareRepo(ctx, got); err != nil {
+	if err := svc.prepareSync(ctx, got); err != nil {
 		t.Fatal(err)
 	}
 	snap, err = snapshot.New(ctx, got.MetaDBPath)

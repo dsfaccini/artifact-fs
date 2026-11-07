@@ -96,7 +96,7 @@ func (s *Service) syncRepos(ctx context.Context) error {
 		if running {
 			s.retryMount(rt)
 			s.updateRuntimeRefresh(rt, repo.RefreshInterval, repo.RemoteRefreshDisabled)
-			s.restartRunningPrepareIfCurrent(ctx, repo, rt, alreadyPreparing)
+			s.drivePrepare(ctx, repo, rt, alreadyPreparing)
 			continue
 		}
 		if repo.PrepareState == model.PrepareStateSyncPreparing {
@@ -194,16 +194,14 @@ func (s *Service) stopRepo(repo model.RepoConfig, stopped string, logMsg string)
 	return true
 }
 
-func (s *Service) restartRunningPrepareIfCurrent(ctx context.Context, repo model.RepoConfig, rt *repoRuntime, alreadyPreparing bool) {
-	if repo.PrepareState != model.PrepareStatePreparing || rt == nil {
-		return
-	}
-	latest, err := s.registry.GetRepo(ctx, repo.Name)
-	if err != nil {
-		s.logger.Error("repo prepare state refresh failed", "repo", repo.Name, "error", err)
-		return
-	}
-	if latest.PrepareState != model.PrepareStatePreparing {
+// drivePrepare carries out an async repo's latest prepare request on rt, the
+// runtime that serves the repo's current config, and never unmounts rt. The
+// repo prepares again behind rt's gate, which holds FUSE ops meanwhile, unless
+// a worker already prepares that request or rt already finished it: repo can
+// be older than rt. The CLI prepares a sync repo, and rt's watcher moves the
+// mount to the HEAD that preparation leaves.
+func (s *Service) drivePrepare(ctx context.Context, repo model.RepoConfig, rt *repoRuntime, alreadyPreparing bool) {
+	if repo.PrepareState != model.PrepareStatePreparing {
 		return
 	}
 	s.mu.Lock()
@@ -211,30 +209,14 @@ func (s *Service) restartRunningPrepareIfCurrent(ctx context.Context, repo model
 		s.mu.Unlock()
 		return
 	}
-	runtimeCfg := rt.cfg
-	active := rt.active
+	request, finished := rt.cfg.PrepareRequest, rt.prepare != model.PrepareStatePreparing
 	s.mu.Unlock()
-	configMatches := samePrepareConfig(runtimeCfg, latest)
-	if alreadyPreparing && configMatches {
+	if request == repo.PrepareRequest && (alreadyPreparing || finished) {
 		return
 	}
-	if active || !configMatches {
-		if !s.stopRepo(latest, runtimeCfg.MountRequest, "repo prepare remount unmount failed") {
-			return
-		}
-		if err := s.mountAsyncRepo(ctx, latest); err != nil {
-			s.logger.Error("repo async remount failed", "repo", latest.Name, "error", auth.RedactLogString(err.Error(), latest.RemoteURL))
-			s.recordMountFailure(latest, repoStateUnmounted, err, time.Now().Add(registrySyncInterval))
-			return
-		}
-		s.supersedePrepare(latest.ID)
-		s.startPrepareWorker(ctx, latest)
+	if !s.resetRunningPrepareState(repo) {
 		return
 	}
-	if alreadyPreparing {
-		return
-	}
-	if s.resetRunningPrepareState(latest) {
-		s.startPrepareWorker(ctx, latest)
-	}
+	s.supersedePrepare(repo.ID)
+	s.startPrepareWorker(ctx, repo)
 }

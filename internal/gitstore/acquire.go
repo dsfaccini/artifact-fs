@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -60,13 +61,7 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 			return fmt.Errorf("mktemp clone dir: %w", err)
 		}
 		sourceRef := strings.TrimSpace(cfg.Branch)
-		branch := sourceRef
-		if after, ok := strings.CutPrefix(sourceRef, "refs/heads/"); ok {
-			branch = after
-		} else if strings.HasPrefix(sourceRef, "refs/") {
-			branch = ""
-		}
-		if branch != "" {
+		if branch := model.BranchName(sourceRef); branch != "" {
 			args := []string{"clone", "--filter=blob:none"}
 			if cfg.HistoryDepth > 0 {
 				args = append(args, fmt.Sprintf("--depth=%d", cfg.HistoryDepth))
@@ -372,7 +367,7 @@ func (s *Store) FetchRefWithCredentials(ctx context.Context, repo model.RepoConf
 }
 
 func (s *Store) fetchRef(ctx context.Context, repo model.RepoConfig, ref string, env []string) error {
-	target, err := fetchRefTarget(repo, ref)
+	target, err := fetchRefTarget(ref)
 	if err != nil {
 		return err
 	}
@@ -474,7 +469,7 @@ func (s *Store) ValidateAmbientRemote(repo model.RepoConfig) error {
 }
 
 func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig, ref string) error {
-	target, err := fetchRefTarget(repo, ref)
+	target, err := fetchRefTarget(ref)
 	if err != nil {
 		return err
 	}
@@ -539,7 +534,18 @@ func refOIDOrZero(ctx context.Context, gitDir string, refName string) (string, e
 	return zeroOIDForGitDir(ctx, gitDir)
 }
 
+// rollbackTimeout bounds a rollback, which runs after its caller's context
+// ended too: a canceled preparation must still restore the index and refs it
+// changed.
+const rollbackTimeout = 30 * time.Second
+
+func rollbackContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+}
+
 func rollbackIndexTransition(ctx context.Context, gitDir string, fromOID string, toOID string, cause error) error {
+	ctx, cancel := rollbackContext(ctx)
+	defer cancel()
 	if err := readTreeTransition(ctx, gitDir, fromOID, toOID); err != nil {
 		return errors.Join(cause, fmt.Errorf("restore index after ref update failure: %w", err))
 	}
@@ -547,6 +553,8 @@ func rollbackIndexTransition(ctx context.Context, gitDir string, fromOID string,
 }
 
 func restoreRef(ctx context.Context, gitDir string, refName string, oldOID string, newOID string) error {
+	ctx, cancel := rollbackContext(ctx)
+	defer cancel()
 	if _, err := runGit(ctx, gitDir, "update-ref", refName, oldOID, newOID); err != nil {
 		return fmt.Errorf("restore ref after HEAD update failure: %w", err)
 	}
@@ -624,15 +632,12 @@ func (s *Store) ValidatePreparedGitDir(ctx context.Context, repo model.RepoConfi
 	return nil
 }
 
-func fetchRefTarget(repo model.RepoConfig, ref string) (fetchRefInfo, error) {
+func fetchRefTarget(ref string) (fetchRefInfo, error) {
 	ref = strings.TrimSpace(ref)
-	if ref == "" {
-		ref = strings.TrimSpace(repo.Branch)
-	}
 	if ref == "" {
 		return fetchRefInfo{}, errors.New("fetch ref is required")
 	}
-	if branch := branchName(ref); branch != "" {
+	if branch := model.BranchName(ref); branch != "" {
 		return fetchRefInfo{
 			sourceRef: "refs/heads/" + branch,
 			remoteRef: "refs/remotes/origin/" + branch,
@@ -643,21 +648,4 @@ func fetchRefTarget(repo model.RepoConfig, ref string) (fetchRefInfo, error) {
 		return fetchRefInfo{sourceRef: ref, remoteRef: fetchedFullRefRemoteTrackingRef}, nil
 	}
 	return fetchRefInfo{}, errors.New("fetch ref is required")
-}
-
-func branchName(ref string) string {
-	ref = strings.TrimSpace(ref)
-	if after, ok := strings.CutPrefix(ref, "refs/heads/"); ok {
-		return after
-	}
-	if after, ok := strings.CutPrefix(ref, "refs/remotes/origin/"); ok {
-		return after
-	}
-	if after, ok := strings.CutPrefix(ref, "origin/"); ok {
-		return after
-	}
-	if strings.HasPrefix(ref, "refs/") {
-		return ""
-	}
-	return ref
 }

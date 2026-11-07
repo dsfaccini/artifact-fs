@@ -56,7 +56,13 @@ type RepoConfig struct {
 	AcquiredRef           string
 	AcquiredCommit        string
 	AcquiredAt            time.Time
-	ConfigVersion         string
+	// ConfigVersion identifies the registered config. A new registration
+	// changes it, and only a new registration does, so it is the one token
+	// that tells whether a config is still current.
+	ConfigVersion string
+	// PrepareRequest identifies the latest preparation the CLI asked for, by
+	// add-repo or prepare.
+	PrepareRequest string
 	// MountRequest identifies the latest unmount or remount the CLI asked for.
 	MountRequest string
 }

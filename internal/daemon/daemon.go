@@ -118,16 +118,19 @@ type Service struct {
 	// Test hooks, nil in production. runtimeStarted runs between starting a
 	// runtime and recording it. mountReleased runs in a join goroutine after
 	// it released a FUSE mount whose server exited cleanly, before it records
-	// the exit. joinFinished runs as a join goroutine ends.
-	runtimeStarted, mountReleased, joinFinished func()
+	// the exit. joinFinished runs as a join goroutine ends. readyRecorded runs
+	// after an async preparation persisted ready, before it activates the
+	// runtime.
+	runtimeStarted, mountReleased, joinFinished, readyRecorded func()
 	// headReconcileBackoff is the first retry delay after a failed HEAD
 	// reconcile; zero means headReconcileMinBackoff.
 	headReconcileBackoff time.Duration
 	mu                   sync.Mutex
 	running              map[model.RepoID]*repoRuntime
-	preparing            map[model.RepoID]int64
-	prepareAttempts      map[model.RepoID]int64
-	prepareSeq           int64
+	// preparing holds each repo's async preparation worker.
+	preparing       map[model.RepoID]prepareWorker
+	prepareAttempts map[model.RepoID]int64
+	prepareSeq      int64
 	// leftovers holds the repos the daemon process before this one ran and
 	// whose mounts it may have left. Before the daemon mounts such a repo,
 	// it unmounts the mount at its mount point when ownsLeftover matches it.
@@ -173,7 +176,7 @@ func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error
 		unmountPath:     defaultUnmountPath,
 		mountPointEntry: mountPointEntry,
 		running:         map[model.RepoID]*repoRuntime{},
-		preparing:       map[model.RepoID]int64{},
+		preparing:       map[model.RepoID]prepareWorker{},
 		prepareAttempts: map[model.RepoID]int64{},
 		leftovers:       map[model.RepoID]bool{},
 		mountRetries:    map[model.RepoID]*mountRetry{},

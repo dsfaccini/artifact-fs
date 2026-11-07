@@ -24,9 +24,13 @@ Repository-specific guidance for `artifact-fs`.
 
 ## Runtime contracts
 
-- `ARTIFACT_FS_ROOT` is the state root. `artifact-fs daemon --root` is the mount root. They are different things.
+- `ARTIFACT_FS_ROOT` is the state root. Each repo mounts at the path its registration stores: `add-repo --mount-root`, default `<state root>/mnt`, plus the repo name. `artifact-fs daemon --root` changes no registered repo's mount path.
 - `add-repo` is one-shot by default: register repo, clone blobless, build the initial snapshot, then exit. It does not mount FUSE or start background goroutines.
 - `add-repo --async` only registers prepare state. The daemon mounts a gated placeholder, prepares clone/fetch and snapshot in the background, then opens the gate and starts watcher/refresh.
+- `config_version` identifies a registered config, and only a new registration changes it. Use it as the only token that a config is still current.
+- `prepare_request` identifies the latest prepare request, from `add-repo` or `prepare`. Write a preparation's outcome only while its `config_version` and its `prepare_request` are both current.
+- A prepare request never unmounts a repo. The daemon prepares an async repo again behind its runtime's gate. The CLI prepares a sync repo while the daemon keeps serving it.
+- Refresh settings are not part of a repo's prepare identity. `set-refresh` changes neither token.
 - `daemon` is long-running: it mounts registered repos and starts watcher, refresh, and hydrator workers.
 - The daemon holds a flock on `<root>/config/daemon.lock`. A second daemon on one state root fails. CLI commands probe that lock to learn whether a daemon runs.
 - The registry carries every request from the CLI to the daemon. The control socket only wakes the daemon.
@@ -43,6 +47,9 @@ Repository-specific guidance for `artifact-fs`.
 ## Code conventions
 
 - `Readdir()` stays thin; merged directory logic belongs in `ReaddirTyped()`.
+- Run every preparation through `core.prepare`. Express a new caller's differences as a `preparation`, not as another pipeline.
+- Normalize a repo config only in `normalizeRepoConfig`, before the registry stores it. Readers trust the stored config: never re-default or re-resolve a field after reading it.
+- Parse a ref only with `model.BranchName` and `model.CanonicalRef`.
 - The watcher polls `HEAD` plus the current HEAD ref path. If you change it, preserve branch-switch and packed-ref behavior covered by `internal/watcher/watcher_test.go`.
 - The overlay stores deletes as SQLite entries with `kind='delete'`; there is no on-disk whiteout file layer.
 - SQLite is `modernc.org/sqlite` in WAL mode via `internal/meta`.

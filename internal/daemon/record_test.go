@@ -307,42 +307,6 @@ func TestRemountClearsAConnectionFailure(t *testing.T) {
 	}
 }
 
-// A preparation that restarts a running repo records the failure to mount
-// its placeholder.
-func TestStatusReportsAFailedPlaceholderMountOnRePrepare(t *testing.T) {
-	ctx := context.Background()
-	svc, err := New(ctx, t.TempDir(), discardLogger())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = svc.Close() })
-	ctl := svc.ctl()
-	if err := ctl.AddRepoWithOptions(ctx, model.RepoConfig{Name: "repo", ID: "repo", RemoteURL: "https://github.com/example/repo.git", Branch: "master", Enabled: true}, AddRepoOptions{Async: true}); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := svc.registry.GetRepo(ctx, "repo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// An active runtime whose registry entry asks for another preparation.
-	rt := &repoRuntime{cfg: cfg, gate: fusefs.NewReadyGate(true), active: true, mount: mountServing, mfs: &fakeMountedFS{unmounted: make(chan struct{})}}
-	svc.mu.Lock()
-	svc.running[cfg.ID] = rt
-	svc.mu.Unlock()
-	// A snapshot store a newer build migrated fails the placeholder mount.
-	metatest.Exec(t, cfg.MetaDBPath, `PRAGMA user_version = 99`)
-	if err := svc.syncRepos(ctx); err != nil {
-		t.Fatal(err)
-	}
-	st, err := ctl.Status(ctx, "repo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st.State != repoStateUnmounted || st.LastErrorPhase != phaseMount || !strings.Contains(st.LastError, "upgrade artifact-fs") || st.NextRetryAt.IsZero() {
-		t.Fatalf("status after a failed placeholder mount = %+v, want unmounted with the mount failure", st)
-	}
-}
-
 // A connection that fails as its runtime starts keeps its failure in status.
 func TestStatusKeepsAConnectionFailureAtStart(t *testing.T) {
 	svc, ctl := newSyncedDaemon(t)
@@ -391,7 +355,9 @@ func TestAsyncMountClearsAnEarlierMountFailure(t *testing.T) {
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
-	requireFailure(t, ctl, phaseMount, "upgrade artifact-fs")
+	if st := requireFailure(t, ctl, phaseMount, "upgrade artifact-fs"); st.State != repoStateUnmounted {
+		t.Fatalf("state after a failed placeholder mount = %q, want %s", st.State, repoStateUnmounted)
+	}
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		if err := os.Remove(cfg.MetaDBPath + suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
 			t.Fatal(err)
