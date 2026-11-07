@@ -32,7 +32,9 @@ type fetchBlobResult struct {
 
 const maxReadBlobBytes int64 = 1<<31 - 1
 
-func (s *Store) invalidateBatchPool(gitDir string) {
+// CloseBatchPool stops the git cat-file --batch processes that read gitDir's
+// objects, and fails the reads waiting for one. A later read starts new ones.
+func (s *Store) CloseBatchPool(gitDir string) {
 	s.mu.Lock()
 	pool := s.pools[gitDir]
 	delete(s.pools, gitDir)
@@ -42,9 +44,11 @@ func (s *Store) invalidateBatchPool(gitDir string) {
 	}
 }
 
-// BlobToCache fetches a git object and writes it to dstPath in a binary-safe manner.
-// Uses a persistent cat-file --batch process to amortize process spawn and
-// remote connection costs across multiple blob fetches.
+// BlobToCache fetches a git object and writes it into dstPath in place, in a
+// binary-safe manner. Pass a path no reader opens, such as one
+// blobcache.Stage reserved. A failed write removes dstPath. Uses a persistent
+// cat-file --batch process to amortize process spawn and remote connection
+// costs across multiple blob fetches.
 func (s *Store) BlobToCache(ctx context.Context, repo model.RepoConfig, objectOID string, dstPath string) (size int64, err error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -557,8 +561,8 @@ func (b *batchCatFile) shutdown(kill bool) {
 }
 
 // fetchToFile writes oid to the batch process stdin, reads the response header
-// and streams the blob content directly to dstPath. Binary-safe (no string
-// conversion of blob content).
+// and streams the blob content into dstPath in place. Binary-safe (no string
+// conversion of blob content). A failed write removes dstPath.
 func (b *batchCatFile) fetchToFile(oid string, dstPath string) (int64, error) {
 	if b.cmd == nil || b.stdin == nil {
 		return 0, errors.New("batch cat-file process not running")
@@ -574,15 +578,14 @@ func (b *batchCatFile) fetchToFile(oid string, dstPath string) (int64, error) {
 		return 0, err
 	}
 
-	// Stream blob content to a temp file, then atomic rename. The blob cache is
-	// reconstructible from git, so we prefer throughput over per-object fsync.
-	f, err := os.CreateTemp(filepath.Dir(dstPath), ".artifact-fs-blob-*")
+	// The blob cache is reconstructible from git, so we prefer throughput over
+	// per-object fsync.
+	f, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		// Drain the blob content so the protocol stays in sync.
 		_, _ = io.CopyN(io.Discard, b.stdout, size+1) // +1 for trailing LF
 		return 0, err
 	}
-	tmp := f.Name()
 	written, copyErr := io.CopyN(f, b.stdout, size)
 	// Read the trailing LF that git appends after the content. If this fails
 	// the batch protocol is desynchronized and the caller must discard the
@@ -597,20 +600,15 @@ func (b *batchCatFile) fetchToFile(oid string, dstPath string) (int64, error) {
 	closeErr := f.Close()
 
 	if copyErr != nil || written != size {
-		os.Remove(tmp)
+		os.Remove(dstPath)
 		if copyErr != nil {
 			return 0, fmt.Errorf("batch read content: %w", copyErr)
 		}
 		return 0, fmt.Errorf("short read: got %d, want %d", written, size)
 	}
 	if closeErr != nil {
-		os.Remove(tmp)
-		return 0, fmt.Errorf("close temp blob file: %w", closeErr)
-	}
-
-	if err := os.Rename(tmp, dstPath); err != nil {
-		os.Remove(tmp)
-		return 0, err
+		os.Remove(dstPath)
+		return 0, fmt.Errorf("close blob file: %w", closeErr)
 	}
 	return size, nil
 }

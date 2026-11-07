@@ -18,6 +18,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
+	"github.com/cloudflare/artifact-fs/internal/registry"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 	"github.com/dsfaccini/fuse/fuseops"
 )
@@ -48,9 +49,10 @@ type delayedUnmountFailure struct {
 }
 
 func (m *delayedUnmountFailure) Backend() string            { return "fake" }
+func (m *delayedUnmountFailure) InvalidateChanged() error   { return nil }
 func (m *delayedUnmountFailure) Join(context.Context) error { return nil }
 
-func (m *delayedUnmountFailure) Unmount() error {
+func (m *delayedUnmountFailure) Unmount(context.Context) error {
 	close(m.started)
 	<-m.release
 	return errors.New("busy")
@@ -101,6 +103,7 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 		GitDir:        filepath.Join(workDir, ".git"),
 		OverlayDir:    filepath.Join(root, "overlay"),
 		OverlayDBPath: filepath.Join(root, "overlay", "meta.sqlite"),
+		MetaDBPath:    filepath.Join(root, "snapshot.sqlite"),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	logs := &lockedBuffer{}
@@ -111,7 +114,7 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 		cancel()
 		t.Fatal(err)
 	}
-	snap, err := snapshot.New(ctx, filepath.Join(root, "snapshot.sqlite"))
+	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
 	if err != nil {
 		cancel()
 		t.Fatal(err)
@@ -138,12 +141,21 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 		overlay:     ov,
 		resolver:    resolver,
 		headChanges: make(chan struct{}, 1),
-		state:       newRuntimeState(cfg.ID, oldOID, "main", oldGen),
+		head:        servedHead{oid: oldOID, ref: "main", gen: oldGen},
+		fetch:       fetchStatus{state: fetchNever},
+		mount:       mountNone,
 	}
+	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
 	svc := &Service{
-		logger:               logger,
-		git:                  git,
+		core:                 &core{root: root, logger: logger, git: git, registry: reg},
 		running:              map[model.RepoID]*repoRuntime{cfg.ID: rt},
+		unmounting:           map[model.RepoID]*unmountOp{},
+		mountPointEntry:      heldMountPoint,
+		records:              map[model.RepoID]*model.RepoRuntimeRecord{},
 		headReconcileBackoff: backoff,
 	}
 	f := &headReconcileFixture{
@@ -195,9 +207,9 @@ func (f *headReconcileFixture) waitForHead(oid, ref string, generation int64) {
 	waitFor(f.t, nil, func() bool {
 		f.svc.mu.Lock()
 		defer f.svc.mu.Unlock()
-		return f.rt.state.CurrentHEADOID == oid &&
-			f.rt.state.CurrentHEADRef == ref &&
-			f.rt.state.SnapshotGeneration == generation &&
+		return f.rt.head.oid == oid &&
+			f.rt.head.ref == ref &&
+			f.rt.head.gen == generation &&
 			f.rt.resolver.Generation() == generation
 	})
 }
@@ -294,6 +306,37 @@ func TestHeadReconcileRetriesTransientOverlayFailureWithoutRepublishing(t *testi
 	}
 }
 
+// After a failed overlay transition the snapshot store holds the new
+// generation while the mount still serves the old one.
+func TestStatusReportsPublishedAndServedGenerationsAfterOverlayFailure(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	if err := f.svc.registry.AddRepo(f.ctx, f.rt.cfg); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := acquireDaemonLock(f.svc.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	// The daemon records a runtime once it mounts.
+	f.svc.recordRuntimeState(f.rt, "")
+	f.updateMain(f.nextOID)
+	if err := f.rt.overlay.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.signal()
+	var st model.RepoRuntimeState
+	waitFor(t, nil, func() bool {
+		st, err = f.svc.ctl().Status(f.ctx, f.rt.cfg.Name)
+		return err == nil && st.LastErrorPhase == phaseHEADReconcile
+	})
+	if st.PublishedHEADOID != f.nextOID || st.PublishedGeneration != f.oldGen+1 ||
+		st.ServedHEADOID != f.oldOID || st.ServedGeneration != f.oldGen ||
+		st.CurrentHEADOID != f.oldOID || st.NextRetryAt.IsZero() || st.Attempts == 0 {
+		t.Fatalf("status after a failed overlay transition = %+v, want %s/%d published and %s/%d served with a retry", st, f.nextOID, f.oldGen+1, f.oldOID, f.oldGen)
+	}
+}
+
 func TestHeadReconcileRestoresPersistedStateWhenHEADReturnsAfterOverlayFailure(t *testing.T) {
 	f := newHeadReconcileFixture(t)
 	f.updateMain(f.nextOID)
@@ -325,7 +368,7 @@ func TestHeadReconcileRestoresPersistedStateWhenHEADReturnsAfterOverlayFailure(t
 
 	cfg := f.rt.cfg
 	cfg.MetaDBPath = filepath.Join(filepath.Dir(cfg.OverlayDir), "snapshot.sqlite")
-	status := f.svc.readPersistedStatus(f.ctx, cfg)
+	status := persistedStatus(f.ctx, cfg, model.RepoRuntimeRecord{}, false)
 	if status.CurrentHEADOID != f.oldOID || status.CurrentHEADRef != "main" || status.SnapshotGeneration != f.oldGen+2 {
 		t.Fatalf("persisted status after rollback = %+v", status)
 	}
@@ -343,7 +386,7 @@ func TestHeadReconcilePersistsSameOIDRefBeforeUpdatingRuntime(t *testing.T) {
 	f.signal()
 	f.waitForLog("snapshot publish failed")
 	f.svc.mu.Lock()
-	gotRef := f.rt.state.CurrentHEADRef
+	gotRef := f.rt.head.ref
 	f.svc.mu.Unlock()
 	if gotRef != "main" {
 		t.Fatalf("runtime ref advanced before persistence: got %q", gotRef)
@@ -425,7 +468,7 @@ func TestHeadReconcileResumesAfterUnmountFailure(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	f.svc.mu.Lock()
-	f.rt.mfs = mfs
+	f.rt.mfs, f.rt.mount = mfs, mountServing
 	f.svc.mu.Unlock()
 
 	errCh := make(chan error, 1)
@@ -503,5 +546,83 @@ func TestHeadReconcileServesReadsMatchingReportedSize(t *testing.T) {
 	}
 	if got := read(inode, open(inode)); got != "next\n" || uint64(len(got)) != reported {
 		t.Errorf("read through handle opened after getattr = %q, want the new content getattr sized at %d bytes", got, reported)
+	}
+}
+
+// invalidatingMount records the generation the resolver serves each time the
+// daemon asks the mount to invalidate the kernel's caches.
+type invalidatingMount struct {
+	*fakeMountedFS
+	resolver *fusefs.Resolver
+	gens     chan int64
+}
+
+func (m *invalidatingMount) InvalidateChanged() error {
+	m.gens <- m.resolver.Generation()
+	return nil
+}
+
+func TestHeadReconcileInvalidatesKernelCacheAfterSwitch(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	mount := &invalidatingMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, resolver: f.rt.resolver, gens: make(chan int64, 1)}
+	f.svc.mu.Lock()
+	f.rt.mfs, f.rt.mount = mount, mountServing
+	f.svc.mu.Unlock()
+
+	f.updateMain(f.nextOID)
+	f.signal()
+	if gen := <-mount.gens; gen != f.oldGen+1 {
+		t.Fatalf("mount invalidated while the resolver served generation %d, want the new generation %d", gen, f.oldGen+1)
+	}
+}
+
+// An inode whose attributes came from a generation keeps reading it after two
+// switches inside the retention window. Once the window lapses, the next
+// switch prunes it.
+func TestHeadReconcileKeepsRetiredGenerationReadable(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		retention time.Duration
+		want      string
+	}{
+		{name: "within retention", retention: time.Hour, want: "old\n"},
+		{name: "after retention", retention: time.Nanosecond, want: "last\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newHeadReconcileFixture(t)
+			f.svc.generationRetention = tt.retention
+			repo := f.rt.cfg
+			repo.BlobCacheDir = t.TempDir()
+			h := hydrator.New(f.svc.git)
+			h.Start(1, repo)
+			t.Cleanup(h.Stop)
+			fs := fusefs.NewArtifactFuse(repo, &fusefs.Engine{Resolver: f.rt.resolver, Repo: repo, Overlay: f.rt.overlay, Hydrator: h})
+			lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "README.md"}
+			if err := fs.LookUpInode(f.ctx, lookup); err != nil {
+				t.Fatalf("LookUpInode: %v", err)
+			}
+
+			f.updateMain(f.nextOID)
+			f.signal()
+			f.waitForHead(f.nextOID, "main", f.oldGen+1)
+			f.updateMain(f.lastOID)
+			f.signal()
+			f.waitForHead(f.lastOID, "main", f.oldGen+2)
+
+			open := &fuseops.OpenFileOp{Inode: lookup.Entry.Child}
+			if err := fs.OpenFile(f.ctx, open); err != nil {
+				t.Fatalf("OpenFile: %v", err)
+			}
+			t.Cleanup(func() {
+				_ = fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: open.Handle})
+			})
+			read := &fuseops.ReadFileOp{Inode: lookup.Entry.Child, Handle: open.Handle, Size: 64}
+			if err := fs.ReadFile(f.ctx, read); err != nil {
+				t.Fatalf("ReadFile: %v", err)
+			}
+			if got := string(bytes.Join(read.Data, nil)); got != tt.want {
+				t.Fatalf("read through the inode looked up before both switches = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

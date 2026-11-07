@@ -14,6 +14,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
@@ -657,8 +658,8 @@ func TestCreateAndReadOverlaySymlink(t *testing.T) {
 func TestMoveInodePathPreservesSourceIdentityAndStalesReplacement(t *testing.T) {
 	fs := NewArtifactFuse(model.RepoConfig{}, nil)
 	fs.mu.Lock()
-	source := fs.allocInode("source.txt", "file", 0o100644, 1)
-	replaced := fs.allocInode("destination.txt", "file", 0o100644, 1)
+	source := fs.allocInode("source.txt", Attrs{Type: "file", Mode: 0o100644, Gen: 1})
+	replaced := fs.allocInode("destination.txt", Attrs{Type: "file", Mode: 0o100644, Gen: 1})
 	fs.mu.Unlock()
 
 	fs.moveInodePath("source.txt", "destination.txt")
@@ -688,11 +689,11 @@ func TestMoveInodePathPreservesSourceIdentityAndStalesReplacement(t *testing.T) 
 func TestMoveInodePathRewritesDirectoryDescendants(t *testing.T) {
 	fs := NewArtifactFuse(model.RepoConfig{}, nil)
 	fs.mu.Lock()
-	source := fs.allocInode("source", "dir", 0o755, 1)
-	child := fs.allocInode("source/nested/file.txt", "file", 0o100644, 1)
-	sibling := fs.allocInode("source-other/file.txt", "file", 0o100644, 1)
-	replaced := fs.allocInode("destination", "dir", 0o755, 1)
-	replacedChild := fs.allocInode("destination/nested/file.txt", "file", 0o100644, 1)
+	source := fs.allocInode("source", Attrs{Type: "dir", Mode: 0o755, Gen: 1})
+	child := fs.allocInode("source/nested/file.txt", Attrs{Type: "file", Mode: 0o100644, Gen: 1})
+	sibling := fs.allocInode("source-other/file.txt", Attrs{Type: "file", Mode: 0o100644, Gen: 1})
+	replaced := fs.allocInode("destination", Attrs{Type: "dir", Mode: 0o755, Gen: 1})
+	replacedChild := fs.allocInode("destination/nested/file.txt", Attrs{Type: "file", Mode: 0o100644, Gen: 1})
 	fs.dirHandles[1] = &DirHandle{inode: &InodeRef{Path: "source/nested"}}
 	fs.fileHandles[2] = &FileHandle{path: "source/nested/file.txt"}
 	fs.mu.Unlock()
@@ -1118,7 +1119,7 @@ func TestFirstFileReadPrefetchesItsDirectoryAndListingPrefetchesNothing(t *testi
 		t.Fatalf("packs = %d after reading the prefetched siblings, want %d", got, packs+2)
 	}
 	for _, path := range []string{"docs/guide.md", "top.txt"} {
-		if _, err := os.Stat(filepath.Join(repo.BlobCacheDir, oids[path])); err == nil {
+		if _, err := os.Stat(blobcache.Path(repo.BlobCacheDir, oids[path])); err == nil {
 			t.Fatalf("%s was hydrated though nothing in its directory was read", path)
 		}
 	}
@@ -1349,7 +1350,7 @@ func readWholeFile(t *testing.T, fs *ArtifactFuse, inode fuseops.InodeID) string
 func waitForCachedBlob(t *testing.T, repo model.RepoConfig, oid string) {
 	t.Helper()
 	for {
-		if _, err := os.Stat(filepath.Join(repo.BlobCacheDir, oid)); err == nil {
+		if _, err := os.Stat(blobcache.Path(repo.BlobCacheDir, oid)); err == nil {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -1601,9 +1602,10 @@ func TestCreateThenCloseClearsPending(t *testing.T) {
 	}
 }
 
-// A new O_WRONLY open of a file chmodded to 0444, and a truncate without a
-// handle, fail with EACCES. Only descriptors opened before the chmod write.
-func TestReadOnlyFileRefusesNewWriter(t *testing.T) {
+// newChmoddedFile creates f.txt holding abc through fs, closes it, and
+// chmods it to mode. checksPermissions says the mount is an FSKit mount.
+func newChmoddedFile(t *testing.T, checksPermissions bool, mode os.FileMode) (*ArtifactFuse, *overlaystore.Store, fuseops.InodeID) {
+	t.Helper()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	cfg := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
@@ -1615,6 +1617,7 @@ func TestReadOnlyFileRefusesNewWriter(t *testing.T) {
 	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{}}, Overlay: ov}
 	resolver.SetGeneration(1)
 	fs := NewArtifactFuse(cfg, &Engine{Repo: cfg, Resolver: resolver, Overlay: ov})
+	fs.checksPermissions.Store(checksPermissions)
 	create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "f.txt", Mode: 0o644}
 	if err := fs.CreateFile(ctx, create); err != nil {
 		t.Fatal(err)
@@ -1622,30 +1625,34 @@ func TestReadOnlyFileRefusesNewWriter(t *testing.T) {
 	if err := fs.WriteFile(ctx, &fuseops.WriteFileOp{Inode: create.Entry.Child, Handle: create.Handle, Data: []byte("abc")}); err != nil {
 		t.Fatal(err)
 	}
-	if err := fs.FlushFile(ctx, &fuseops.FlushFileOp{Inode: create.Entry.Child, Handle: create.Handle}); err != nil {
-		t.Fatal(err)
-	}
 	if err := fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
 		t.Fatal(err)
 	}
-	ro := os.FileMode(0o444)
-	if err := fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Mode: &ro}); err != nil {
+	if err := fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Mode: &mode}); err != nil {
 		t.Fatal(err)
 	}
+	return fs, ov, create.Entry.Child
+}
+
+// On an FSKit mount, a new open for writing of a file chmodded to 0444, and a
+// truncate without a handle, fail with EACCES. Only descriptors opened before
+// the chmod write.
+func TestReadOnlyFileRefusesNewWriter(t *testing.T) {
+	ctx := context.Background()
+	fs, ov, inode := newChmoddedFile(t, true, 0o444)
 	for _, open := range []*fuseops.OpenFileOp{
-		{Inode: create.Entry.Child, OpenFlags: syscall.O_WRONLY},
-		{Inode: create.Entry.Child, OpenFlags: syscall.O_RDWR},
+		{Inode: inode, OpenFlags: syscall.O_WRONLY},
+		{Inode: inode, OpenFlags: syscall.O_RDWR},
 	} {
 		if got := kernelErrno(fs.OpenFile(ctx, open)); got != syscall.EACCES {
 			t.Errorf("open with flags %v = %v, want EACCES", open.OpenFlags, got)
 		}
 	}
 	zero := uint64(0)
-	if got := kernelErrno(fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Size: &zero})); got != syscall.EACCES {
+	if got := kernelErrno(fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: inode, Size: &zero})); got != syscall.EACCES {
 		t.Errorf("truncate without a handle = %v, want EACCES", got)
 	}
-	reader := &fuseops.OpenFileOp{Inode: create.Entry.Child, OpenFlags: syscall.O_RDONLY}
-	if err := fs.OpenFile(ctx, reader); err != nil {
+	if err := fs.OpenFile(ctx, &fuseops.OpenFileOp{Inode: inode, OpenFlags: syscall.O_RDONLY}); err != nil {
 		t.Errorf("read-only open of a 0444 file = %v", err)
 	}
 	e, _ := ov.Get("f.txt")
@@ -1654,40 +1661,41 @@ func TestReadOnlyFileRefusesNewWriter(t *testing.T) {
 	}
 }
 
-// A new open of a file chmodded to 0000 fails with EACCES.
+// On an FSKit mount, a new open of a file chmodded to 0000 fails with EACCES.
 func TestNoAccessFileRefusesReader(t *testing.T) {
 	ctx := context.Background()
-	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
-	ov, err := overlaystore.New(ctx, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ov.Close() })
-	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{}}, Overlay: ov}
-	resolver.SetGeneration(1)
-	fs := NewArtifactFuse(cfg, &Engine{Repo: cfg, Resolver: resolver, Overlay: ov})
-	create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "secret.txt", Mode: 0o644}
-	if err := fs.CreateFile(ctx, create); err != nil {
-		t.Fatal(err)
-	}
-	if err := fs.WriteFile(ctx, &fuseops.WriteFileOp{Inode: create.Entry.Child, Handle: create.Handle, Data: []byte("abc")}); err != nil {
-		t.Fatal(err)
-	}
-	_ = fs.FlushFile(ctx, &fuseops.FlushFileOp{Inode: create.Entry.Child, Handle: create.Handle})
-	_ = fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle})
-	none := os.FileMode(0)
-	if err := fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Mode: &none}); err != nil {
-		t.Fatal(err)
-	}
+	fs, _, inode := newChmoddedFile(t, true, 0)
 	for _, open := range []*fuseops.OpenFileOp{
-		{Inode: create.Entry.Child, OpenFlags: syscall.O_RDONLY},
-		{Inode: create.Entry.Child, OpenFlags: syscall.O_WRONLY},
-		{Inode: create.Entry.Child, OpenFlags: syscall.O_RDWR},
+		{Inode: inode, OpenFlags: syscall.O_RDONLY},
+		{Inode: inode, OpenFlags: syscall.O_WRONLY},
+		{Inode: inode, OpenFlags: syscall.O_RDWR},
 	} {
 		if got := kernelErrno(fs.OpenFile(ctx, open)); got != syscall.EACCES {
 			t.Errorf("open with flags %v = %v, want EACCES", open.OpenFlags, got)
 		}
+	}
+}
+
+// On a kernel mount, the adapter refuses no open and no truncate for the
+// entry's permission bits.
+func TestKernelMountAdapterSkipsPermissionCheck(t *testing.T) {
+	ctx := context.Background()
+	fs, ov, inode := newChmoddedFile(t, false, 0)
+	for _, open := range []*fuseops.OpenFileOp{
+		{Inode: inode, OpenFlags: syscall.O_RDONLY},
+		{Inode: inode, OpenFlags: syscall.O_WRONLY},
+		{Inode: inode, OpenFlags: syscall.O_RDWR},
+	} {
+		if err := fs.OpenFile(ctx, open); err != nil {
+			t.Errorf("open with flags %v = %v, want success", open.OpenFlags, err)
+		}
+	}
+	zero := uint64(0)
+	if err := fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: inode, Size: &zero}); err != nil {
+		t.Errorf("truncate without a handle = %v, want success", err)
+	}
+	if e, _ := ov.Get("f.txt"); e.SizeBytes != 0 {
+		t.Fatalf("size after the truncate = %d, want 0", e.SizeBytes)
 	}
 }
 

@@ -9,13 +9,14 @@ Repository-specific guidance for `artifact-fs`.
 - Flag blob bytes converted to `string`. Keep `BlobToCache` binary-safe by streaming `git cat-file --batch` output to disk.
 - Keep `GIT_NO_LAZY_FETCH=1` on `git cat-file --batch-check` in `batchResolveSizes`. Removing it turns size resolution in blobless clones into network round-trips.
 - Run a Git command that can lazy-fetch missing objects with `lazyFetchEnv()` and `configureCommandSession`, never `nonInteractiveGitEnv()`. `nonInteractiveGitEnv()` sets `GIT_SSH_COMMAND`, which overrides the repo's `core.sshCommand`, and an adopted worktree keeps that setting.
+- Add a blob cache file only with `blobcache.Stage` and `blobcache.Install`, and remove one only with `blobcache.Evict`. Each updates the counters `status` reads under the cache's `stats` flock. A direct write or unlink leaves the counters wrong until the next mount or `evict-cache` recounts them.
 - Normalize paths only with `model.CleanPath()`. Do not add local wrappers.
 - Use the canonical `model.*` interfaces for snapshot, overlay, hydrator, and gitstore access. Do not add subset interfaces around them.
 
 ## Architecture
 
 - `cmd/artifact-fs` is the only binary entrypoint.
-- `internal/cli` wires commands onto `daemon.Service`.
+- `internal/cli` runs the `daemon` command on `daemon.Service`, and every other command on `daemon.Controller`. Only `daemon.Service` mounts.
 - `internal/daemon` owns repo lifecycle: registry sync, snapshot publish, overlay reconcile, FUSE mount, watcher, refresh loop.
 - `internal/fusefs` is the merged view and writable filesystem layer.
 - `internal/gitstore` is the performance-sensitive git wrapper; most easy-to-break invariants live there.
@@ -27,6 +28,16 @@ Repository-specific guidance for `artifact-fs`.
 - `add-repo` is one-shot by default: register repo, clone blobless, build the initial snapshot, then exit. It does not mount FUSE or start background goroutines.
 - `add-repo --async` only registers prepare state. The daemon mounts a gated placeholder, prepares clone/fetch and snapshot in the background, then opens the gate and starts watcher/refresh.
 - `daemon` is long-running: it mounts registered repos and starts watcher, refresh, and hydrator workers.
+- The daemon holds a flock on `<root>/config/daemon.lock`. A second daemon on one state root fails. CLI commands probe that lock to learn whether a daemon runs.
+- The registry carries every request from the CLI to the daemon. The control socket only wakes the daemon.
+- Only the daemon writes `repo_runtime`. It writes the record at every transition and every retried failure. `status` reads that record and the stores, never daemon memory.
+- `unmount` and `remount` write an intent to `enabled` and `mount_request`, then nudge `<root>/config/daemon.sock`. They wait until `repo_runtime` echoes the request.
+- One sync loop serves every repo. Bound every per-repo step it runs, so one repo cannot stall the others. A mount waits at most `mountTimeout` through `fuse.MountContext`.
+- Unmount a repo only through `startUnmount`. It runs one unmount per repo on its own goroutine, because `unmount(2)` can hang on a dead FSKit volume. Wait only for an unmount you started, and at most `unmountTimeout` plus `unmountReturnSlack`.
+- Build a runtime only with `startRuntime`. Mount it only with `attachMount`, which checks every mount precondition. A dead mount whose unmount failed blocks a new mount while the mount table lists its mount point.
+- Mount with the runtime's op context. Only a stop cancels it, never the end of `Start`'s context. A stop unmounts first, then cancels the op context, which cancels the ops in flight, then closes the runtime's stores and its `git cat-file --batch` processes.
+- Unmount a mount the daemon did not make only when the daemon process before this one ran the repo and `ownsLeftover` matches the mount, or when it is an abandoned mount the fuse library failed to unmount. Leave every other mount alone. Record each repo a clean shutdown unmounted as stopped, unless the daemon still claims an earlier daemon's mount of it, so the next daemon claims none of its own mounts.
+- Back off a retried mount, HEAD reconcile or remote refresh with `retrier`. `status` shows each failure with its next attempt.
 - `git.CloneBlobless` already populates the git index with `read-tree HEAD`; be careful about extra index resets because they can discard staged state.
 
 ## Code conventions
@@ -40,7 +51,12 @@ Repository-specific guidance for `artifact-fs`.
 - Hold no lock while a blob hydrates. An `Engine` method that needs base content takes a `*Blobs` and returns a `notHydratedError` when a blob is missing. `Engine.Do` then hydrates with no lock held and reruns the method.
 - Open every blob an `Engine` method copies before it changes anything. A directory rename is the one exception: it opens each blob as it copies it, so it may already have promoted some directories and copied some files, all with base content, and the rerun completes it.
 - Take the FUSE locks in this order: `handleOps`, `DirHandle.mu`, the resolver's `transition`, `ArtifactFuse.mu`, `FileHandle.mu`.
+- Release each FUSE lock with `defer`, or hold it only around code that cannot panic. The fuse library recovers a panic in an op and keeps serving, so a lock left held blocks every later op.
 - Wrap an operation error's cause with `%w`, and let `toErrno` map it for the kernel. Do not return `syscall.EIO` for a failure that carries an errno.
+- Switch a runtime's generation only through `Service.switchGeneration`. It sends the kernel the invalidations the switch needs through `MountedFS.InvalidateChanged`.
+- Never wait on a kernel invalidation inside an op or while holding a lock an op takes. The kernel can hold a directory lock while it waits for that op's reply, and the invalidation waits for the same lock.
+- Record every entry reply with `allocEntry` and every attribute reply with `setReported`. `InvalidateChanged` compares what the kernel received with the merged view, and `allocEntry` drops the name's negative entry record. The exception is `GetInodeAttributes` for the root and the synthesized `.git` file: `InvalidateChanged` skips both.
+- Prune snapshot generations only through `pruneGenerations` on the daemon's `core`. An inode reads the generation of its last reported attributes, so a retired generation stays readable for `defaultGenerationRetention`.
 
 ## Writing tests
 

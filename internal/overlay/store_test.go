@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -39,7 +40,7 @@ func testStore(t *testing.T) (*Store, model.RepoConfig) {
 
 func cacheTestBlob(t *testing.T, cfg model.RepoConfig, oid string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, oid), []byte("base"), 0o644); err != nil {
+	if err := os.WriteFile(cachedBlobPath(t, cfg, oid), []byte("base"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -105,7 +106,7 @@ func TestSetModePreservesUncommittedModeAndReconcilesCommittedMode(t *testing.T)
 	ctx := context.Background()
 	baseData := []byte("base")
 	baseOID := testBlobOID(baseData)
-	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, baseOID), baseData, 0o644); err != nil {
+	if err := os.WriteFile(cachedBlobPath(t, cfg, baseOID), baseData, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	base := model.BaseNode{Path: "script.sh", Type: "file", Mode: 0o100644, ObjectOID: baseOID}
@@ -154,7 +155,7 @@ func TestReconcilePreservesUnstagedModeAfterContentCommit(t *testing.T) {
 	ctx := context.Background()
 	original := []byte("original")
 	originalOID := testBlobOID(original)
-	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, originalOID), original, 0o644); err != nil {
+	if err := os.WriteFile(cachedBlobPath(t, cfg, originalOID), original, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	base := model.BaseNode{Path: "script.sh", Type: "file", Mode: 0o100644, ObjectOID: originalOID}
@@ -192,7 +193,7 @@ func TestReconcileDoesNotDeleteConcurrentModeChange(t *testing.T) {
 	ctx := context.Background()
 	original := []byte("original")
 	originalOID := testBlobOID(original)
-	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, originalOID), original, 0o644); err != nil {
+	if err := os.WriteFile(cachedBlobPath(t, cfg, originalOID), original, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	base := model.BaseNode{Path: "script.sh", Type: "file", Mode: 0o100644, ObjectOID: originalOID}
@@ -238,7 +239,7 @@ func TestRenameBaseSymlinkReconcilesAfterCommit(t *testing.T) {
 	ctx := context.Background()
 	target := "../README.md"
 	oid := testBlobOID([]byte(target))
-	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, oid), []byte(target), 0o644); err != nil {
+	if err := os.WriteFile(cachedBlobPath(t, cfg, oid), []byte(target), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	base := model.BaseNode{Path: "docs/link", Type: "symlink", Mode: 0o120000, ObjectOID: oid}
@@ -1036,7 +1037,7 @@ func TestReconcileKeepsRenameWhenIdenticalSourceStillExists(t *testing.T) {
 	ctx := context.Background()
 	payload := []byte("same")
 	oid := testBlobOID(payload)
-	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, oid), payload, 0o644); err != nil {
+	if err := os.WriteFile(cachedBlobPath(t, cfg, oid), payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	base := model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: oid}
@@ -1111,7 +1112,7 @@ func TestEnsureCopyOnWritePreservesSize(t *testing.T) {
 	ctx := context.Background()
 
 	const oid = "abc123"
-	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, oid), []byte("payload"), 0o644); err != nil {
+	if err := os.WriteFile(cachedBlobPath(t, cfg, oid), []byte("payload"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1644,7 +1645,7 @@ func TestReconcileClassifiesWritesThatLandDuringItsLookups(t *testing.T) {
 	ctx := context.Background()
 	original := []byte("original")
 	originalOID := testBlobOID(original)
-	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, originalOID), original, 0o644); err != nil {
+	if err := os.WriteFile(cachedBlobPath(t, cfg, originalOID), original, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "committed.txt", model.BaseNode{Path: "committed.txt", Type: "file", Mode: 0o100644, ObjectOID: originalOID}); err != nil {
@@ -2164,4 +2165,14 @@ func TestReadOnlyModeFileAcceptsWrites(t *testing.T) {
 	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "onetwo" || e.Mode&0o777 != 0o444 {
 		t.Fatalf("ro.txt = %q, %v, mode %o; want onetwo and mode 444", data, err, e.Mode&0o777)
 	}
+}
+
+// cachedBlobPath returns oid's blob cache path, with its shard created.
+func cachedBlobPath(t *testing.T, cfg model.RepoConfig, oid string) string {
+	t.Helper()
+	path := blobcache.Path(cfg.BlobCacheDir, oid)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

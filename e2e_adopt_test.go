@@ -50,20 +50,21 @@ func TestE2EAdoptedWorktree(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc.SetMountRoot(mountDir)
-	if err := svc.AddRepo(ctx, model.RepoConfig{Name: repoName, AdoptGitDir: true, GitDir: gitDir, MountRoot: mountDir, Enabled: true}); err != nil {
+	ctl := newE2EController(t, root)
+	if err := ctl.AddRepo(ctx, model.RepoConfig{Name: repoName, AdoptGitDir: true, GitDir: gitDir, MountRoot: mountDir, Enabled: true}); err != nil {
 		cancel()
 		_ = svc.Close()
 		t.Fatalf("adopt worktree: %v", err)
 	}
 	errCh := startE2EDaemon(ctx, svc)
-	if err := waitForMount(svc, mountPath, 60*time.Second); err != nil {
+	if err := waitForMount(ctl, mountPath, 60*time.Second); err != nil {
 		cancel()
 		_ = svc.Close()
 		t.Fatalf("adopted worktree mount: %v", err)
 	}
 	defer stopE2EDaemon(t, svc, cancel, errCh, mountPath)
 	primeE2EMountPolling(t, mountPath)
-	initial, err := svc.Status(ctx, repoName)
+	initial, err := ctl.Status(ctx, repoName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +86,7 @@ func TestE2EAdoptedWorktree(t *testing.T) {
 		t.Fatalf("base checkout sees topic at %s, want the commit made through the mount, %s", got, head)
 	}
 	waitForCondition(t, 15*time.Second, "HEAD reconcile after the commit", func() (bool, string) {
-		st, err := svc.Status(ctx, repoName)
+		st, err := ctl.Status(ctx, repoName)
 		if err != nil {
 			return false, err.Error()
 		}

@@ -40,7 +40,7 @@ func TestAddRepoAsyncRegistersWithoutClone(t *testing.T) {
 		RefreshInterval: time.Minute,
 		Enabled:         true,
 	}
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -83,10 +83,10 @@ func TestAddRepoSyncReregistrationUpdatesExistingCloneBranch(t *testing.T) {
 	}
 	defer svc.Close()
 
-	if err := svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "feature", Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "feature", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -128,7 +128,7 @@ func TestSyncRegistrationIsNotMountedWhilePreparing(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", Enabled: true})
+		errCh <- svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", Enabled: true})
 	}()
 	waitFor(t, errCh, func() bool {
 		_, err := os.Stat(started)
@@ -141,11 +141,11 @@ func TestSyncRegistrationIsNotMountedWhilePreparing(t *testing.T) {
 	if cfg.PrepareState != model.PrepareStateSyncPreparing {
 		t.Fatalf("PrepareState = %q, want sync-preparing", cfg.PrepareState)
 	}
-	status, err := svc.Status(ctx, cfg.Name)
+	status, err := svc.ctl().Status(ctx, cfg.Name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.State != model.PrepareStatePreparing {
+	if status.State != string(model.PrepareStatePreparing) {
 		t.Fatalf("status state = %q, want preparing", status.State)
 	}
 	if err := svc.syncRepos(ctx); err != nil {
@@ -212,13 +212,13 @@ func TestSupersededPrepareDoesNotMutateExistingClone(t *testing.T) {
 
 	prepareErr := make(chan error, 1)
 	go func() {
-		prepareErr <- svc.Prepare(ctx, cfg.Name)
+		prepareErr <- svc.ctl().Prepare(ctx, cfg.Name)
 	}()
 	waitFor(t, prepareErr, func() bool {
 		current, err := svc.registry.GetRepo(ctx, cfg.Name)
 		return err == nil && current.PrepareState == model.PrepareStateSyncPreparing && current.ConfigVersion != cfg.ConfigVersion
 	})
-	if err := svc.AddRepoWithOptions(ctx, model.RepoConfig{
+	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{
 		Name:      cfg.Name,
 		RemoteURL: "https://new.example/repo.git",
 		Branch:    "main",
@@ -243,12 +243,12 @@ func TestSupersededPrepareDoesNotMutateExistingClone(t *testing.T) {
 func TestRepoPrepareLockSerializesServices(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	first, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	first, err := NewController(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.Close()
-	second, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	second, err := NewController(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +318,7 @@ func TestAddRepoAsyncRejectsInlineCredentials(t *testing.T) {
 		Branch:    "master",
 		Enabled:   true,
 	}
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err == nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err == nil {
 		t.Fatal("expected inline credential error")
 	}
 }
@@ -384,10 +384,10 @@ func TestAddRepoPreparedGitDirValidation(t *testing.T) {
 		PreparedGitDir: true,
 		Enabled:        true,
 	}
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{}); err == nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{}); err == nil {
 		t.Fatal("expected --prepared-gitdir requires --async error")
 	}
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err == nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err == nil {
 		t.Fatal("expected --git-dir required error")
 	}
 }
@@ -430,7 +430,7 @@ func TestSyncReposSkipsResetWhilePrepareWorkerInFlight(t *testing.T) {
 		Branch:    "master",
 		Enabled:   true,
 	}
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err = svc.registry.GetRepo(ctx, "repo")
@@ -443,11 +443,7 @@ func TestSyncReposSkipsResetWhilePrepareWorkerInFlight(t *testing.T) {
 		cfg:    cfg,
 		gate:   gate,
 		active: true,
-		state: model.RepoRuntimeState{
-			RepoID:       cfg.ID,
-			State:        repoStateMounted,
-			PrepareError: "",
-		},
+		mount:  mountServing,
 	}
 	svc.mu.Lock()
 	svc.running[cfg.ID] = rt
@@ -457,8 +453,8 @@ func TestSyncReposSkipsResetWhilePrepareWorkerInFlight(t *testing.T) {
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if rt.state.State != repoStateMounted {
-		t.Fatalf("runtime state = %q, want mounted", rt.state.State)
+	if got := rt.reportedState(); got != repoStateMounted {
+		t.Fatalf("runtime state = %q, want mounted", got)
 	}
 	if err := gate.Wait(ctx); err != nil {
 		t.Fatalf("gate was reset while prepare worker was in flight: %v", err)
@@ -486,7 +482,7 @@ func TestRestartRunningPrepareSkipsStalePreparingSnapshot(t *testing.T) {
 		Branch:    "master",
 		Enabled:   true,
 	}
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	latest, err := svc.registry.GetRepo(ctx, "repo")
@@ -504,18 +500,15 @@ func TestRestartRunningPrepareSkipsStalePreparingSnapshot(t *testing.T) {
 		cfg:    latest,
 		gate:   gate,
 		active: true,
-		state: model.RepoRuntimeState{
-			RepoID: latest.ID,
-			State:  repoStateMounted,
-		},
+		mount:  mountServing,
 	}
 	svc.mu.Lock()
 	svc.running[latest.ID] = rt
 	svc.mu.Unlock()
 
 	svc.restartRunningPrepareIfCurrent(ctx, stale, rt, false)
-	if rt.state.State != repoStateMounted {
-		t.Fatalf("runtime state = %q, want mounted", rt.state.State)
+	if got := rt.reportedState(); got != repoStateMounted {
+		t.Fatalf("runtime state = %q, want mounted", got)
 	}
 	if err := gate.Wait(ctx); err != nil {
 		t.Fatalf("gate was reset from stale registry snapshot: %v", err)
@@ -545,7 +538,7 @@ func TestRunPrepareFailurePersistsRedactedError(t *testing.T) {
 		FetchRef:       "master",
 		Enabled:        true,
 	}
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := svc.registry.GetRepo(ctx, "repo")
@@ -606,7 +599,7 @@ func TestStartPrepareWorkerTimesOutAndPersistsFailed(t *testing.T) {
 		Branch:    "master",
 		Enabled:   true,
 	}
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := svc.registry.GetRepo(ctx, "repo")
@@ -716,7 +709,7 @@ func TestAddRepoSyncFailureIsLoggedAndPersisted(t *testing.T) {
 	}
 	defer svc.Close()
 
-	err = svc.AddRepo(ctx, model.RepoConfig{
+	err = svc.ctl().AddRepo(ctx, model.RepoConfig{
 		Name:      "repo",
 		RemoteURL: "https://credential-user:super-secret@example.com/org/repo.git",
 		Branch:    "main",
@@ -748,7 +741,7 @@ func TestAddRepoSyncFailureIsLoggedAndPersisted(t *testing.T) {
 		strings.Contains(logOutput, "credential-user") || strings.Contains(logOutput, "super-secret") || strings.Contains(logOutput, "example.com") || strings.Contains(logOutput, "org/repo.git") {
 		t.Fatalf("sync preparation logs incomplete or unsafe: %s", logOutput)
 	}
-	status, statusErr := svc.Status(ctx, "repo")
+	status, statusErr := svc.ctl().Status(ctx, "repo")
 	if statusErr != nil {
 		t.Fatal(statusErr)
 	}
@@ -779,7 +772,7 @@ func TestAddRepoSyncTimeoutIsLoggedAndPersisted(t *testing.T) {
 	expirePrepareOnFile(svc, cloneStarted)
 	defer svc.Close()
 
-	err = svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", Enabled: true})
+	err = svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", Enabled: true})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("AddRepo error = %v, want deadline exceeded", err)
 	}
@@ -822,7 +815,7 @@ func TestAddRepoSyncCancellationIsLoggedAndPersisted(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", Enabled: true})
+		errCh <- svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", Enabled: true})
 	}()
 	waitFor(t, errCh, func() bool {
 		_, err := os.Stat(started)
@@ -885,7 +878,7 @@ func TestAddRepoSyncBuildTreeCancellationIsPersisted(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- svc.AddRepo(ctx, model.RepoConfig{Name: "repo", GitDir: filepath.Join(repo, ".git"), Branch: "master", Enabled: true})
+		errCh <- svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", GitDir: filepath.Join(repo, ".git"), Branch: "master", Enabled: true})
 	}()
 	waitFor(t, errCh, func() bool {
 		_, err := os.Stat(started)
@@ -931,7 +924,7 @@ func TestSyncPrepareRetryPersistsCurrentFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := svc.Prepare(ctx, "repo"); err == nil {
+	if err := svc.ctl().Prepare(ctx, "repo"); err == nil {
 		t.Fatal("expected prepare retry failure")
 	}
 	got, err := svc.registry.GetRepo(ctx, "repo")
@@ -1008,13 +1001,13 @@ func TestAddRepoSyncFailureDoesNotOverwriteNewerConfig(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", Enabled: true})
+		errCh <- svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", Enabled: true})
 	}()
 	waitFor(t, errCh, func() bool {
 		_, err := os.Stat(started)
 		return err == nil
 	})
-	if err := svc.AddRepoWithOptions(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", Enabled: true}, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", Enabled: true}, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(release, nil, 0o644); err != nil {
@@ -1071,7 +1064,7 @@ func TestRunPreparePreparedGitDirPublishesSnapshotAndMarksReady(t *testing.T) {
 		FetchRef:        "master",
 		Enabled:         true,
 	}
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := svc.registry.GetRepo(ctx, "repo")
@@ -1132,7 +1125,7 @@ func TestSyncPrepareRetainsPreviousGenerationForDaemonHandoff(t *testing.T) {
 	defer svc.Close()
 
 	cfg := model.RepoConfig{Name: "repo", ID: "repo", Branch: "master", GitDir: preparedGitDir, PreparedGitDir: true, FetchRef: "master", Enabled: true}
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := svc.registry.GetRepo(ctx, cfg.Name)
@@ -1247,7 +1240,7 @@ func TestRunPrepareFreshCloneSkipsSecondFetchForBranchFetchRef(t *testing.T) {
 				FetchRef:  fetchRef,
 				Enabled:   true,
 			}
-			if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+			if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 				t.Fatal(err)
 			}
 			got, err := svc.registry.GetRepo(ctx, "repo")
@@ -1319,7 +1312,7 @@ func TestRunPrepareDoesNotOpenGateWhenReadyPersistenceFails(t *testing.T) {
 		FetchRef:        "master",
 		Enabled:         true,
 	}
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := svc.registry.GetRepo(ctx, "repo")
@@ -1343,7 +1336,7 @@ func TestRunPrepareDoesNotOpenGateWhenReadyPersistenceFails(t *testing.T) {
 	}
 	defer db.Close()
 	if _, err := db.ExecContext(ctx, `CREATE TRIGGER reject_ready BEFORE UPDATE OF prepare_state ON repos
-		WHEN NEW.prepare_state = '`+model.PrepareStateReady+`' BEGIN SELECT RAISE(ABORT, '`+writeErr+`'); END`); err != nil {
+		WHEN NEW.prepare_state = '`+string(model.PrepareStateReady)+`' BEGIN SELECT RAISE(ABORT, '`+writeErr+`'); END`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1384,7 +1377,7 @@ func TestRunPrepareDoesNotMarkSupersededConfigReady(t *testing.T) {
 		FetchRef:        "master",
 		Enabled:         true,
 	}
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	first, err := svc.registry.GetRepo(ctx, "repo")
@@ -1392,7 +1385,7 @@ func TestRunPrepareDoesNotMarkSupersededConfigReady(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.GitDir = secondGitDir
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1431,7 +1424,7 @@ func TestRunPrepareDoesNotMarkSupersededConfigFailed(t *testing.T) {
 		FetchRef:        "master",
 		Enabled:         true,
 	}
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	first, err := svc.registry.GetRepo(ctx, "repo")
@@ -1439,7 +1432,7 @@ func TestRunPrepareDoesNotMarkSupersededConfigFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.GitDir = createPreparedGitDir(t, filepath.Join(tmp, "second"))
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1491,7 +1484,7 @@ func TestPrepareRequeuesReadyVerifiedSourceForRecovery(t *testing.T) {
 		RefreshInterval: time.Minute,
 		Enabled:         true,
 	}
-	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err = svc.registry.GetRepo(ctx, cfg.Name)
@@ -1513,7 +1506,7 @@ func TestPrepareRequeuesReadyVerifiedSourceForRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := svc.Prepare(ctx, cfg.Name); err != nil {
+	if err := svc.ctl().Prepare(ctx, cfg.Name); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 	cfg, err = svc.registry.GetRepo(ctx, cfg.Name)
@@ -1533,7 +1526,7 @@ func TestPrepareRequeuesReadyVerifiedSourceForRecovery(t *testing.T) {
 	if !recovered.AcquiredAt.After(initialAcquiredAt) {
 		t.Fatalf("recovery acquisition time = %v, want after %v", recovered.AcquiredAt, initialAcquiredAt)
 	}
-	st := svc.readPersistedStatus(ctx, recovered)
+	st := persistedStatus(ctx, recovered, model.RepoRuntimeRecord{}, false)
 	if !st.LastFetchAt.IsZero() || st.LastFetchResult != "never" {
 		t.Fatalf("recovery acquisition reported as remote refresh: %+v", st)
 	}
@@ -1577,7 +1570,7 @@ func expirePrepareOnFile(svc *Service, path string) {
 	}
 }
 
-func waitForPrepareState(t *testing.T, svc *Service, name string, state string) model.RepoConfig {
+func waitForPrepareState(t *testing.T, svc *Service, name string, state model.PrepareState) model.RepoConfig {
 	t.Helper()
 	var got model.RepoConfig
 	waitFor(t, nil, func() bool {

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
+	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/registry"
@@ -19,11 +21,11 @@ type AddRepoOptions struct {
 	Async bool
 }
 
-func (s *Service) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
+func (s *Controller) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
 	return s.AddRepoWithOptions(ctx, cfg, AddRepoOptions{})
 }
 
-func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, opts AddRepoOptions) error {
+func (s *Controller) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, opts AddRepoOptions) error {
 	if err := model.ValidateRepoName(cfg.Name); err != nil {
 		return err
 	}
@@ -108,7 +110,7 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 	return s.persistSyncPrepareFailure(ctx, cfg, registeredCfg, err)
 }
 
-func (s *Service) persistSyncPrepareFailure(ctx context.Context, cfg model.RepoConfig, registeredCfg model.RepoConfig, prepareErr error) error {
+func (s *Controller) persistSyncPrepareFailure(ctx context.Context, cfg model.RepoConfig, registeredCfg model.RepoConfig, prepareErr error) error {
 	stateErr := prepareErr
 	if errors.Is(prepareErr, context.DeadlineExceeded) {
 		stateErr = errors.New("prepare timed out")
@@ -127,7 +129,7 @@ func (s *Service) persistSyncPrepareFailure(ctx context.Context, cfg model.RepoC
 	return prepareErr
 }
 
-func (s *Service) persistSyncPrepareSuccess(ctx context.Context, cfg model.RepoConfig) error {
+func (s *Controller) persistSyncPrepareSuccess(ctx context.Context, cfg model.RepoConfig) error {
 	stateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prepareStateWriteTimeout)
 	defer cancel()
 	if err := s.registry.UpdatePrepareStateForConfig(stateCtx, cfg, "", ""); err != nil {
@@ -137,12 +139,9 @@ func (s *Service) persistSyncPrepareSuccess(ctx context.Context, cfg model.RepoC
 	return nil
 }
 
-func (s *Service) RemoveRepo(ctx context.Context, name string) error {
+func (s *Controller) RemoveRepo(ctx context.Context, name string) error {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
-		return err
-	}
-	if err := s.unmount(cfg.ID); err != nil {
 		return err
 	}
 	return s.withRepoConfigLock(ctx, cfg.Name, func() error {
@@ -162,11 +161,11 @@ func (s *Service) RemoveRepo(ctx context.Context, name string) error {
 	})
 }
 
-func (s *Service) ListRepos(ctx context.Context) ([]model.RepoConfig, error) {
+func (s *Controller) ListRepos(ctx context.Context) ([]model.RepoConfig, error) {
 	return s.registry.ListRepos(ctx)
 }
 
-func (s *Service) SetRefresh(ctx context.Context, name string, interval time.Duration, disabled bool) error {
+func (s *Controller) SetRefresh(ctx context.Context, name string, interval time.Duration, disabled bool) error {
 	if interval <= 0 && !disabled {
 		return errors.New("refresh interval must be positive")
 	}
@@ -179,14 +178,8 @@ func (s *Service) SetRefresh(ctx context.Context, name string, interval time.Dur
 	}
 	cfg.RefreshInterval = interval
 	cfg.RemoteRefreshDisabled = disabled
-	if err := s.registry.UpdateRefresh(ctx, cfg.ID, interval, disabled); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	rt := s.running[cfg.ID]
-	s.mu.Unlock()
-	s.updateRuntimeRefresh(rt, interval, disabled)
-	return nil
+	// The daemon applies the new interval at its next registry sync.
+	return s.registry.UpdateRefresh(ctx, cfg.ID, interval, disabled)
 }
 
 func (s *Service) updateRuntimeRefresh(rt *repoRuntime, interval time.Duration, disabled bool) {
@@ -218,7 +211,7 @@ func (s *Service) updateRuntimeRefresh(rt *repoRuntime, interval time.Duration, 
 	}
 }
 
-func (s *Service) FetchNow(ctx context.Context, name string) error {
+func (s *Controller) FetchNow(ctx context.Context, name string) error {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
 		return err
@@ -232,22 +225,12 @@ func (s *Service) FetchNow(ctx context.Context, name string) error {
 	if cfg.RemoteRefreshDisabled {
 		return errors.New("remote refresh is disabled for this repository")
 	}
-	if err := s.git.Fetch(ctx, cfg); err != nil {
-		return err
-	}
-	state, err := s.fetchState(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	s.mu.Lock()
-	if rt, ok := s.running[cfg.ID]; ok {
-		markFetchSuccess(&rt.state, time.Now(), state, rt.mfs != nil)
-	}
-	s.mu.Unlock()
-	return nil
+	// Status reads the fetch from FETCH_HEAD. Ahead and behind come from the
+	// daemon's next refresh.
+	return s.git.Fetch(ctx, cfg)
 }
 
-func (s *Service) Prepare(ctx context.Context, name string) error {
+func (s *Controller) Prepare(ctx context.Context, name string) error {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
 		return err
@@ -280,39 +263,107 @@ func (s *Service) Prepare(ctx context.Context, name string) error {
 		}
 		return s.persistSyncPrepareSuccess(ctx, cfg)
 	}
-	if !cfg.AdoptGitDir && strings.TrimSpace(cfg.FetchRef) == "" {
-		cfg.FetchRef = defaultFetchRef(cfg.Branch)
-	}
-	if s.resetRunningPrepareState(cfg) {
-		s.startPrepareWorker(ctx, cfg)
-	}
+	// The new config version makes the daemon prepare the repo again at its
+	// next registry sync.
 	return nil
 }
 
-func (s *Service) Remount(ctx context.Context, name string) error {
-	cfg, err := s.registry.GetRepo(ctx, name)
-	if err != nil {
-		return err
-	}
-	if err := s.unmount(cfg.ID); err != nil {
-		return err
-	}
-	if shouldMountAsync(cfg) {
-		if err := s.mountAsyncRepo(ctx, cfg); err != nil {
-			return err
-		}
-		if cfg.PrepareState == model.PrepareStatePreparing {
-			s.startPrepareWorker(ctx, cfg)
-		}
-		return nil
-	}
-	return s.mountRepo(ctx, cfg)
+// mountRequestTimeout bounds how long Unmount and Remount wait for the
+// daemon. Unmounting can take a minute: the daemon retries a busy unmount for
+// unmountTimeout, then drains the FUSE server for up to drainTimeout.
+const mountRequestTimeout = 2 * time.Minute
+
+// ErrNoDaemon is the error of a request that needs the running daemon.
+var ErrNoDaemon = errors.New("no artifact-fs daemon is running on this state root")
+
+// Unmount asks the running daemon to unmount name and keep it unmounted until
+// Remount, and waits for the outcome.
+func (s *Controller) Unmount(ctx context.Context, name string) error {
+	return s.requestMount(ctx, name, false)
 }
 
-func (s *Service) Unmount(ctx context.Context, name string) error {
+// Remount asks the running daemon to unmount name if it serves it and mount
+// it again, and waits for the outcome.
+func (s *Controller) Remount(ctx context.Context, name string) error {
+	return s.requestMount(ctx, name, true)
+}
+
+// requestMount records the intent in the registry, nudges the daemon over its
+// control socket, and waits until repo_runtime shows the daemon carried out
+// the request. The intent stays in the registry when the wait ends early, so
+// the daemon still carries it out unless a later request replaces it.
+func (s *Controller) requestMount(ctx context.Context, name string, mount bool) error {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
 		return err
 	}
-	return s.unmount(cfg.ID)
+	if live, err := daemonRunning(s.root); err != nil {
+		return err
+	} else if !live {
+		return fmt.Errorf("%w: start one with artifact-fs daemon", ErrNoDaemon)
+	}
+	if mount && cfg.PrepareState == model.PrepareStateSyncPreparing {
+		return fmt.Errorf("repo %s is still preparing", name)
+	}
+	request := rand.Text()
+	requested := time.Now()
+	if err := s.registry.RequestMount(ctx, cfg.ID, mount, request); err != nil {
+		return err
+	}
+	nudgeDaemon(s.root)
+	op := "unmount"
+	if mount {
+		op = "remount"
+	}
+	pending := fmt.Sprintf("the request stays pending until the daemon carries it out; run status --name %s", name)
+	timeout := time.NewTimer(cmp.Or(s.requestTimeout, mountRequestTimeout))
+	defer timeout.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		latest, err := s.registry.GetRepo(ctx, name)
+		if err != nil {
+			return err
+		}
+		if latest.MountRequest != request {
+			return fmt.Errorf("%s %s: a later unmount or remount request superseded this one", op, name)
+		}
+		rec, ok, err := s.registry.GetRuntime(ctx, cfg.ID)
+		if err != nil {
+			return err
+		}
+		if ok && rec.MountRequest == request {
+			failed := !rec.LastErrorAt.Before(requested) && (rec.LastErrorPhase == phaseUnmount || mount && rec.LastErrorPhase == phaseMount)
+			if failed {
+				return fmt.Errorf("%s %s failed in phase %s: %s; the daemon retries it until it succeeds or a later request replaces it", op, name, rec.LastErrorPhase, rec.LastError)
+			}
+			if !mount && rec.State == repoStateUnmounted || mount && rec.State != repoStateUnmounted {
+				return nil
+			}
+		}
+		if live, err := daemonRunning(s.root); err != nil {
+			return err
+		} else if !live {
+			return fmt.Errorf("%s %s: the daemon stopped before it carried out the request; %s", op, name, pending)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%s %s: %w; %s", op, name, ctx.Err(), pending)
+		case <-timeout.C:
+			return fmt.Errorf("%s %s: the daemon did not carry out the request within %s; %s", op, name, cmp.Or(s.requestTimeout, mountRequestTimeout), pending)
+		case <-ticker.C:
+		}
+	}
+}
+
+// EvictCache evicts the least recently accessed blobs from name's blob cache
+// until it holds at most maxBytes. A cache directory that repos share is
+// evicted as a whole.
+func (s *Controller) EvictCache(ctx context.Context, name string, maxBytes int64) (blobcache.EvictResult, error) {
+	cfg, err := s.registry.GetRepo(ctx, name)
+	if err != nil {
+		return blobcache.EvictResult{}, err
+	}
+	s.fillPaths(&cfg)
+	return blobcache.Evict(ctx, cfg.BlobCacheDir, maxBytes)
 }

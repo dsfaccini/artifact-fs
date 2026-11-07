@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -252,7 +253,7 @@ func (s *Store) EnsureCopyOnWrite(ctx context.Context, repo model.RepoConfig, pa
 	var src *os.File
 	if base.ObjectOID != "" {
 		var err error
-		src, err = os.Open(filepath.Join(repo.BlobCacheDir, base.ObjectOID))
+		src, err = os.Open(blobcache.Path(repo.BlobCacheDir, base.ObjectOID))
 		if err != nil {
 			return model.OverlayEntry{}, err
 		}

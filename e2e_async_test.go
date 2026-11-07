@@ -36,11 +36,11 @@ func TestE2EAsyncPreparedGitDirBlocksUntilReady(t *testing.T) {
 	repo := newAsyncPreparedE2ERepo(t, preparedGitDir, "main")
 
 	waitForCondition(t, 10*time.Second, "async repo preparing", func() (bool, string) {
-		st, err := repo.svc.Status(context.Background(), repoName)
+		st, err := repo.ctl.Status(context.Background(), repoName)
 		if err != nil {
 			return false, err.Error()
 		}
-		if st.State == model.PrepareStatePreparing {
+		if st.State == string(model.PrepareStatePreparing) {
 			return true, ""
 		}
 		return false, "state=" + st.State
@@ -95,11 +95,11 @@ func TestE2EAsyncPreparedGitDirFailureThenRetry(t *testing.T) {
 	repo := newAsyncPreparedE2ERepo(t, preparedGitDir, "main")
 
 	waitForCondition(t, 10*time.Second, "async prepare failure", func() (bool, string) {
-		st, err := repo.svc.Status(context.Background(), repoName)
+		st, err := repo.ctl.Status(context.Background(), repoName)
 		if err != nil {
 			return false, err.Error()
 		}
-		if st.State == model.PrepareStateFailed && st.PrepareError != "" {
+		if st.State == string(model.PrepareStateFailed) && st.PrepareError != "" {
 			return true, ""
 		}
 		return false, "state=" + st.State + " prepare_error=" + st.PrepareError
@@ -110,12 +110,12 @@ func TestE2EAsyncPreparedGitDirFailureThenRetry(t *testing.T) {
 	}
 
 	gitCmd(t, preparedWorktree, "remote", "set-url", "origin", remoteURL)
-	if err := repo.svc.Prepare(context.Background(), repoName); err != nil {
+	if err := repo.ctl.Prepare(context.Background(), repoName); err != nil {
 		t.Fatalf("prepare retry: %v", err)
 	}
 
 	waitForCondition(t, 30*time.Second, "async prepare retry ready", func() (bool, string) {
-		st, err := repo.svc.Status(context.Background(), repoName)
+		st, err := repo.ctl.Status(context.Background(), repoName)
 		if err != nil {
 			return false, err.Error()
 		}
@@ -194,6 +194,7 @@ func newAsyncPreparedE2ERepo(t *testing.T, preparedGitDir string, fetchRef strin
 		t.Fatal(err)
 	}
 	svc.SetMountRoot(mountDir)
+	ctl := newE2EController(t, root)
 
 	cfg := model.RepoConfig{
 		Name:            repoName,
@@ -206,7 +207,7 @@ func newAsyncPreparedE2ERepo(t *testing.T, preparedGitDir string, fetchRef strin
 		FetchRef:        fetchRef,
 		Enabled:         true,
 	}
-	if err := svc.AddRepoWithOptions(ctx, cfg, daemon.AddRepoOptions{Async: true}); err != nil {
+	if err := ctl.AddRepoWithOptions(ctx, cfg, daemon.AddRepoOptions{Async: true}); err != nil {
 		cancel()
 		_ = svc.Close()
 		t.Fatalf("add-repo async prepared-gitdir: %v", err)
@@ -214,7 +215,7 @@ func newAsyncPreparedE2ERepo(t *testing.T, preparedGitDir string, fetchRef strin
 
 	errCh := startE2EDaemon(ctx, svc)
 
-	if err := waitForMount(svc, mountPath, 60*time.Second); err != nil {
+	if err := waitForMount(ctl, mountPath, 60*time.Second); err != nil {
 		cancel()
 		_ = svc.Close()
 		t.Fatal(err)
@@ -225,6 +226,7 @@ func newAsyncPreparedE2ERepo(t *testing.T, preparedGitDir string, fetchRef strin
 		mountDir:  mountDir,
 		mountPath: mountPath,
 		svc:       svc,
+		ctl:       ctl,
 		cancel:    cancel,
 		errCh:     errCh,
 	}

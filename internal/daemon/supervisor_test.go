@@ -28,11 +28,11 @@ type resolverMount struct {
 	resolved *fusefs.Resolver
 }
 
-func (m *resolverMount) mount(cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+func (m *resolverMount) mount(ctx, opCtx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
 	m.mu.Lock()
 	m.resolved = engine.Resolver
 	m.mu.Unlock()
-	return m.next(cfg, engine, gate, logger)
+	return m.next(ctx, opCtx, cfg, engine, gate, logger)
 }
 
 func (m *resolverMount) resolver() *fusefs.Resolver {
@@ -83,7 +83,7 @@ func startDaemonWithMount(t *testing.T, mount mountFunc, mountPath string) *star
 	svc.SetMountRoot(filepath.Join(tmp, "mnt"))
 	svc.mount = d.mounts.mount
 	// A remote refresh never runs during the test, so only the HEAD watcher can start a reconcile.
-	if err := svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: d.workDir, Branch: "main", MountPath: mountPath, RefreshInterval: time.Hour, Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: d.workDir, Branch: "main", MountPath: mountPath, RefreshInterval: time.Hour, Enabled: true}); err != nil {
 		_ = svc.Close()
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func startDaemonWithMount(t *testing.T, mount mountFunc, mountPath string) *star
 		}
 	})
 	waitFor(t, d.startErr, func() bool {
-		st, err := svc.Status(ctx, "repo")
+		st, err := svc.ctl().Status(ctx, "repo")
 		return err == nil && st.State == repoStateMounted && d.mounts.resolver() != nil
 	})
 	return d
@@ -131,7 +131,7 @@ func (d *startedDaemon) moveMain(t *testing.T, oid string) {
 
 func (d *startedDaemon) status(t *testing.T) model.RepoRuntimeState {
 	t.Helper()
-	st, err := d.svc.Status(context.Background(), "repo")
+	st, err := d.svc.ctl().Status(context.Background(), "repo")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,9 +191,9 @@ func TestStartRetriesHEADReconcileAfterSnapshotLock(t *testing.T) {
 
 	want := d.commit(t, "README.md", "reconciled after the lock\n")
 	d.moveMain(t, want)
-	waitFor(t, d.startErr, func() bool { return strings.Contains(d.logs.String(), "snapshot publish failed") })
-	if st := d.status(t); st.CurrentHEADOID != initial.CurrentHEADOID || st.SnapshotGeneration != initial.SnapshotGeneration {
-		t.Fatalf("HEAD advanced while the snapshot was locked: %+v", st)
+	waitFor(t, d.startErr, func() bool { return d.status(t).LastErrorPhase == phaseHEADReconcile })
+	if st := d.status(t); st.CurrentHEADOID != initial.CurrentHEADOID || st.SnapshotGeneration != initial.SnapshotGeneration || st.NextRetryAt.IsZero() || !strings.Contains(st.LastError, "locked") {
+		t.Fatalf("status while the snapshot was locked = %+v, want the old HEAD and the retried failure", st)
 	}
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
@@ -232,14 +232,14 @@ func startConnFailureDaemon(t *testing.T, unmountFails int, mountPath string) (*
 
 func (m *connFailureMounts) releaseRemount() { m.releaseOnce.Do(func() { close(m.release) }) }
 
-func (m *connFailureMounts) mount(cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+func (m *connFailureMounts) mount(ctx, opCtx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
 	m.mu.Lock()
 	remount := len(m.calls) > 0
 	m.calls = append(m.calls, "mount")
 	m.mu.Unlock()
 	if remount {
 		<-m.release
-		return fakeMount(cfg, engine, gate, logger)
+		return fakeMount(ctx, opCtx, cfg, engine, gate, logger)
 	}
 	return &failedConnectionMount{m: m, err: fmt.Errorf("readMessage: transport to %s failed", cfg.RemoteURL)}, nil
 }
@@ -255,7 +255,8 @@ type failedConnectionMount struct {
 	err error
 }
 
-func (f *failedConnectionMount) Backend() string { return "fake" }
+func (f *failedConnectionMount) Backend() string          { return "fake" }
+func (f *failedConnectionMount) InvalidateChanged() error { return nil }
 
 func (f *failedConnectionMount) Join(ctx context.Context) error {
 	select {
@@ -269,7 +270,7 @@ func (f *failedConnectionMount) Join(ctx context.Context) error {
 	}
 }
 
-func (f *failedConnectionMount) Unmount() error {
+func (f *failedConnectionMount) Unmount(context.Context) error {
 	f.m.mu.Lock()
 	defer f.m.mu.Unlock()
 	if f.m.unmountFails > 0 {
@@ -365,7 +366,7 @@ func TestRemoveRepoUnmountsFailedConnectionLeftMounted(t *testing.T) {
 	m.releaseRemount()
 	// remove-repo runs in its own process, so the daemon's registry poll stops the runtime.
 	ctx := context.Background()
-	cliSvc, err := New(ctx, d.root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cliSvc, err := NewController(ctx, d.root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

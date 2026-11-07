@@ -4,6 +4,8 @@ import (
 	"cmp"
 	"context"
 	"time"
+
+	"github.com/cloudflare/artifact-fs/internal/snapshot"
 )
 
 func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
@@ -28,10 +30,9 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 		return err
 	}
 	s.mu.Lock()
-	prevOID := rt.state.CurrentHEADOID
-	prevRef := rt.state.CurrentHEADRef
-	prevGen := rt.state.SnapshotGeneration
+	prev := rt.head
 	s.mu.Unlock()
+	prevOID, prevRef, prevGen := prev.oid, prev.ref, prev.gen
 	storedOID, storedRef, gen, stateErr := rt.snapshot.ReadState(ctx)
 	// A failed overlay transition can leave the published snapshot ahead of the active generation.
 	if oid == prevOID && stateErr == nil && storedOID == oid && gen == prevGen {
@@ -47,9 +48,10 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 		}
 		s.mu.Lock()
 		if s.running[cfg.ID] == rt && !rt.stopping {
-			rt.state.CurrentHEADRef = ref
+			rt.head.ref = ref
 		}
 		s.mu.Unlock()
+		s.recordRuntimeState(rt, phaseHEADReconcile)
 		return nil
 	}
 	if stateErr != nil || storedOID != oid || storedRef != ref || gen == 0 {
@@ -73,7 +75,7 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 	} else if ctx.Err() == nil {
 		s.logger.Warn("commit timestamp unavailable", "repo", cfg.Name, "error", timestampErr)
 	}
-	if err := rt.resolver.SwitchGeneration(ctx, gen, commitTime); err != nil {
+	if err := s.switchGeneration(ctx, rt, gen, commitTime); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -83,13 +85,62 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 
 	s.mu.Lock()
 	if s.running[cfg.ID] == rt {
-		setHeadState(&rt.state, oid, ref, gen)
+		rt.head = servedHead{oid: oid, ref: ref, gen: gen}
 	}
 	s.mu.Unlock()
-	if err := rt.snapshot.PruneGenerations(ctx, min(prevGen, gen-1)); err != nil {
+	s.recordRuntimeState(rt, phaseHEADReconcile)
+	if err := s.pruneGenerations(ctx, rt, rt.snapshot, min(prevGen, gen-1)); err != nil {
 		s.logger.Warn("snapshot generation cleanup failed", "repo", cfg.Name, "error", err)
 	}
 	return nil
+}
+
+// switchGeneration switches rt's resolver to gen, then tells the kernel to
+// drop what it caches that the switch changed. It records when the previous
+// generation retired.
+func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, commitTime int64) error {
+	prev := rt.resolver.Generation()
+	if err := rt.resolver.SwitchGeneration(ctx, gen, commitTime); err != nil {
+		return err
+	}
+	if prev != 0 && prev != gen {
+		rt.retiredMu.Lock()
+		rt.retired = append(rt.retired, retiredGeneration{gen: prev, at: time.Now()})
+		rt.retiredMu.Unlock()
+	}
+	s.mu.Lock()
+	mfs := rt.mfs
+	serving := rt.mount == mountServing
+	name := rt.cfg.Name
+	s.mu.Unlock()
+	if serving {
+		if err := mfs.InvalidateChanged(); err != nil {
+			s.logger.Warn("kernel cache invalidation failed", "repo", name, "error", err)
+		}
+	}
+	return nil
+}
+
+// pruneGenerations prunes snap's generations below keepFrom, except those
+// that rt, when not nil, retired within the retention window. An inode whose
+// attributes the kernel received before a switch keeps reading the generation
+// they came from until it asks again.
+func (s *core) pruneGenerations(ctx context.Context, rt *repoRuntime, snap *snapshot.Store, keepFrom int64) error {
+	if rt != nil {
+		retention := cmp.Or(s.generationRetention, defaultGenerationRetention)
+		now := time.Now()
+		rt.retiredMu.Lock()
+		retired := rt.retired[:0]
+		for _, r := range rt.retired {
+			if now.Sub(r.at) < retention {
+				retired = append(retired, r)
+				keepFrom = min(keepFrom, r.gen)
+			}
+		}
+		rt.retired = retired
+		rt.retiredMu.Unlock()
+	}
+	return snap.PruneGenerations(ctx, keepFrom)
 }
 
 func (s *Service) signalHEADReconcile(rt *repoRuntime) {
@@ -110,8 +161,7 @@ func (s *Service) signalHEADReconcile(rt *repoRuntime) {
 }
 
 func (s *Service) headReconcileLoop(rt *repoRuntime) {
-	minBackoff := cmp.Or(s.headReconcileBackoff, headReconcileMinBackoff)
-	backoff := minBackoff
+	retry := newRetrier(phaseHEADReconcile, cmp.Or(s.headReconcileBackoff, headReconcileMinBackoff), headReconcileMaxBackoff)
 	for {
 		select {
 		case <-rt.ctx.Done():
@@ -120,15 +170,19 @@ func (s *Service) headReconcileLoop(rt *repoRuntime) {
 		}
 
 		for {
-			if err := s.reconcileHEAD(rt.ctx, rt); err == nil {
-				backoff = minBackoff
+			err := s.reconcileHEAD(rt.ctx, rt)
+			if err == nil {
+				retry.succeed()
 				break
 			}
 			if rt.ctx.Err() != nil {
 				return
 			}
-
-			timer := time.NewTimer(backoff)
+			s.mu.Lock()
+			cfg := rt.cfg
+			s.mu.Unlock()
+			// A HEAD change can also start the retry early.
+			timer := time.NewTimer(s.retryFailure(cfg, retry, err))
 			select {
 			case <-rt.ctx.Done():
 				timer.Stop()
@@ -137,7 +191,6 @@ func (s *Service) headReconcileLoop(rt *repoRuntime) {
 				timer.Stop()
 			case <-timer.C:
 			}
-			backoff = min(backoff*2, headReconcileMaxBackoff)
 		}
 	}
 }

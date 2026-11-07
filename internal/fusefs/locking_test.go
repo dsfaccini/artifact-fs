@@ -237,6 +237,51 @@ func TestUnlinkWithoutOpenHandleFetchesNothing(t *testing.T) {
 	}
 }
 
+// panickingOverlay panics in CreateFile and Remove, as a bug in an op would.
+type panickingOverlay struct{ model.OverlayStore }
+
+func (panickingOverlay) CreateFile(context.Context, string, uint32) (model.OverlayEntry, error) {
+	panic("overlay bug")
+}
+
+func (panickingOverlay) Remove(context.Context, string) error { panic("overlay bug") }
+
+// The fuse library recovers a panic in an op and keeps serving. An op that
+// panics while it holds handleOps, shared or exclusively, must release it, or
+// every later Unlink and Rename blocks forever.
+func TestPanickingOpReleasesHandleOps(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		op   func(f trackedFixture) error
+	}{
+		{"shared", func(f trackedFixture) error {
+			return f.fs.CreateFile(context.Background(), &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "new.txt", Mode: 0o644})
+		}},
+		{"exclusive", func(f trackedFixture) error {
+			return f.fs.Unlink(context.Background(), &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "other.txt"})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTrackedFixture(t)
+			overlay := panickingOverlay{f.store}
+			f.resolver.Overlay = overlay
+			f.engine.Overlay = overlay
+			recovered := func() (r any) {
+				defer func() { r = recover() }()
+				_ = tc.op(f)
+				return nil
+			}()
+			if recovered == nil {
+				t.Fatal("op did not panic")
+			}
+			if !f.fs.handleOps.TryLock() {
+				t.Fatal("handleOps is still held after the op panicked")
+			}
+			f.fs.handleOps.Unlock()
+		})
+	}
+}
+
 func TestUnlinkKeepsOpenHandleContent(t *testing.T) {
 	f := newTrackedFixture(t)
 	inode := f.lookup(t, fuseops.RootInodeID, "file.txt")
@@ -1002,8 +1047,9 @@ func TestSwitchGenerationServesReadsWhileItLooksUpTheBase(t *testing.T) {
 	if _, gen, _, err := f.resolver.ResolvePathState("link"); !errors.Is(err, fs.ErrNotExist) || gen != 1 {
 		t.Fatalf("link during the lookups = generation %d, %v; want generation 1, ErrNotExist", gen, err)
 	}
-	if err := f.fs.LookUpInode(ctx, &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "link"}); kernelErrno(err) != syscall.ENOENT {
-		t.Fatalf("LookUpInode(link) during the lookups = %v, want ENOENT", err)
+	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "link"}
+	if err := f.fs.LookUpInode(ctx, lookup); !lookupMissed(err, lookup) {
+		t.Fatalf("LookUpInode(link) during the lookups = inode %d, %v; want a miss", lookup.Entry.Child, err)
 	}
 	if got := f.read(t, inode, f.open(t, inode)); got != "file one" {
 		t.Fatalf("file.txt during the lookups = %q, want generation 1's content", got)

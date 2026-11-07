@@ -99,7 +99,7 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 	if err := os.Rename(filepath.Join(target, ".git"), cfg.GitDir); err != nil {
 		return err
 	}
-	s.invalidateBatchPool(cfg.GitDir)
+	s.CloseBatchPool(cfg.GitDir)
 	return nil
 }
 
@@ -207,7 +207,7 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 		return model.PreparedSource{}, err
 	}
 	candidateGitDir = ""
-	s.invalidateBatchPool(cfg.GitDir)
+	s.CloseBatchPool(cfg.GitDir)
 	prepared.Acquired = true
 	return prepared, nil
 }

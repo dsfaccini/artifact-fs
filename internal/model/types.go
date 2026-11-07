@@ -48,9 +48,8 @@ type RepoConfig struct {
 	PreparedGitDir        bool
 	AdoptGitDir           bool
 	FetchRef              string
-	PrepareState          string
+	PrepareState          PrepareState
 	PrepareError          string
-	MountError            string
 	RequiredCommit        string
 	HistoryDepth          int
 	RemoteRefreshDisabled bool
@@ -58,35 +57,90 @@ type RepoConfig struct {
 	AcquiredCommit        string
 	AcquiredAt            time.Time
 	ConfigVersion         string
+	// MountRequest identifies the latest unmount or remount the CLI asked for.
+	MountRequest string
+}
+
+// RepoRuntimeRecord is what the daemon last recorded about a repo. Only the
+// daemon writes it.
+type RepoRuntimeRecord struct {
+	RepoID RepoID
+	State  string
+	// Phase is the step the repo's runtime is in or last finished.
+	Phase string
+	// LastError is the redacted error of the last failure that has not yet
+	// succeeded on retry, and LastErrorPhase the step that failed.
+	LastError      string
+	LastErrorPhase string
+	LastErrorAt    time.Time
+	NextRetryAt    time.Time
+	// Attempts counts the consecutive failures of LastErrorPhase.
+	Attempts         int
+	ServedGeneration int64
+	ServedCommit     string
+	ServedRef        string
+	LastFetchAt      time.Time
+	LastFetchResult  string
+	AheadCount       int
+	BehindCount      int
+	Diverged         bool
+	// MountRequest is the CLI request the daemon last carried out.
+	MountRequest string
+	UpdatedAt    time.Time
 }
 
 type RepoRuntimeState struct {
-	RepoID                RepoID
-	CurrentHEADOID        string
-	CurrentHEADRef        string
-	SnapshotGeneration    int64
-	LastFetchAt           time.Time
-	LastFetchResult       string
-	AheadCount            int
-	BehindCount           int
-	Diverged              bool
-	HydratedBlobCount     int64
-	HydratedBlobBytes     int64
-	DirtyOverlay          bool
-	State                 string
-	PrepareError          string
+	RepoID             RepoID
+	CurrentHEADOID     string
+	CurrentHEADRef     string
+	SnapshotGeneration int64
+	LastFetchAt        time.Time
+	LastFetchResult    string
+	AheadCount         int
+	BehindCount        int
+	Diverged           bool
+	HydratedBlobCount  int64
+	HydratedBlobBytes  int64
+	DirtyOverlay       bool
+	State              string
+	PrepareError       string
+	// MountError is LastError when the mount or serve phase failed last.
 	MountError            string
 	SourceRef             string
 	RequiredCommit        string
 	Acquisition           string
 	RemoteRefreshDisabled bool
+	// Published is the generation the snapshot store last published. Served
+	// is the one the daemon's mount serves, which lags Published after a
+	// failed overlay transition. CurrentHEADOID, CurrentHEADRef and
+	// SnapshotGeneration report Served while the daemon serves the repo, and
+	// Published otherwise.
+	PublishedHEADOID    string
+	PublishedHEADRef    string
+	PublishedGeneration int64
+	ServedHEADOID       string
+	ServedHEADRef       string
+	ServedGeneration    int64
+	Phase               string
+	LastError           string
+	LastErrorPhase      string
+	LastErrorAt         time.Time
+	NextRetryAt         time.Time
+	Attempts            int
 }
 
+// PrepareState is where a repo's preparation stands. The empty state is a
+// repo add-repo prepared, which the daemon mounts without preparing it, or,
+// with PrepareError set, whose preparation failed.
+type PrepareState string
+
 const (
-	PrepareStatePreparing     = "preparing"
-	PrepareStateSyncPreparing = "sync-preparing"
-	PrepareStateReady         = "ready"
-	PrepareStateFailed        = "failed"
+	// PrepareStatePreparing is an async repo whose preparation the daemon runs.
+	PrepareStatePreparing PrepareState = "preparing"
+	// PrepareStateSyncPreparing is a repo the CLI prepares; the daemon waits.
+	PrepareStateSyncPreparing PrepareState = "sync-preparing"
+	PrepareStateReady         PrepareState = "ready"
+	PrepareStateFailed        PrepareState = "failed"
 )
 
 // BaseNode represents a tracked entry from the git tree. Inode IDs are assigned

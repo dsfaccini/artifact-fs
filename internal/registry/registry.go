@@ -38,6 +38,34 @@ var migrations = []meta.Migration{
 	},
 	// Nothing reads or writes remote_url_secret_ref.
 	meta.SQL(`ALTER TABLE repos DROP COLUMN remote_url_secret_ref`),
+	// The daemon records what it observes in repo_runtime, which replaces
+	// mount_error. mount_request carries the CLI's unmount and remount intents.
+	// mount_error stays, unused: a daemon of an earlier build, still running
+	// when a newer command migrates the database, keeps reading it. A later
+	// migration drops it.
+	meta.SQL(
+		`CREATE TABLE repo_runtime (
+		  repo_id TEXT PRIMARY KEY,
+		  state TEXT NOT NULL DEFAULT '',
+		  phase TEXT NOT NULL DEFAULT '',
+		  last_error TEXT NOT NULL DEFAULT '',
+		  last_error_phase TEXT NOT NULL DEFAULT '',
+		  last_error_at_ns INTEGER NOT NULL DEFAULT 0,
+		  next_retry_at_ns INTEGER NOT NULL DEFAULT 0,
+		  attempts INTEGER NOT NULL DEFAULT 0,
+		  served_generation INTEGER NOT NULL DEFAULT 0,
+		  served_commit TEXT NOT NULL DEFAULT '',
+		  served_ref TEXT NOT NULL DEFAULT '',
+		  last_fetch_at_ns INTEGER NOT NULL DEFAULT 0,
+		  last_fetch_result TEXT NOT NULL DEFAULT '',
+		  ahead INTEGER NOT NULL DEFAULT 0,
+		  behind INTEGER NOT NULL DEFAULT 0,
+		  diverged INTEGER NOT NULL DEFAULT 0,
+		  mount_request TEXT NOT NULL DEFAULT '',
+		  updated_at_ns INTEGER NOT NULL DEFAULT 0
+		)`,
+		`ALTER TABLE repos ADD COLUMN mount_request TEXT NOT NULL DEFAULT ''`,
+	),
 }
 
 const reposTableV1 = `CREATE TABLE IF NOT EXISTS repos (
@@ -152,7 +180,7 @@ func (s *Store) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
 	acquired_at_ns=excluded.acquired_at_ns,
 	config_version=excluded.config_version,
 	updated_at_ns=excluded.updated_at_ns
-	`, string(cfg.ID), cfg.Name, cfg.MountRoot, cfg.MountPath, cfg.RemoteURL, cfg.RemoteURLRedacted, cfg.Branch, int64(cfg.RefreshInterval.Seconds()), int64(cfg.RefreshInterval), cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath, cfg.OverlayDBPath, boolToInt(cfg.Enabled), boolToInt(cfg.PreparedGitDir), boolToInt(cfg.AdoptGitDir), cfg.FetchRef, cfg.PrepareState, cfg.PrepareError, cfg.RequiredCommit, cfg.HistoryDepth, boolToInt(cfg.RemoteRefreshDisabled), cfg.AcquiredRef, cfg.AcquiredCommit, acquiredAtNS, cfg.ConfigVersion, now, now)
+	`, string(cfg.ID), cfg.Name, cfg.MountRoot, cfg.MountPath, cfg.RemoteURL, cfg.RemoteURLRedacted, cfg.Branch, int64(cfg.RefreshInterval.Seconds()), int64(cfg.RefreshInterval), cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath, cfg.OverlayDBPath, boolToInt(cfg.Enabled), boolToInt(cfg.PreparedGitDir), boolToInt(cfg.AdoptGitDir), cfg.FetchRef, string(cfg.PrepareState), cfg.PrepareError, cfg.RequiredCommit, cfg.HistoryDepth, boolToInt(cfg.RemoteRefreshDisabled), cfg.AcquiredRef, cfg.AcquiredCommit, acquiredAtNS, cfg.ConfigVersion, now, now)
 	return err
 }
 
@@ -178,27 +206,131 @@ func (s *Store) UpdateRefresh(ctx context.Context, repoID model.RepoID, interval
 	return nil
 }
 
-func (s *Store) UpdatePrepareState(ctx context.Context, repoID model.RepoID, state string, prepareErr string) error {
+func (s *Store) UpdatePrepareState(ctx context.Context, repoID model.RepoID, state model.PrepareState, prepareErr string) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE repos
 		SET prepare_state=?, prepare_error=?, updated_at_ns=?
 		WHERE repo_id=?
-	`, state, prepareErr, time.Now().UnixNano(), string(repoID))
+	`, string(state), prepareErr, time.Now().UnixNano(), string(repoID))
 	return err
 }
 
-// UpdateMountError records the last FUSE mount error. An empty msg clears it.
-func (s *Store) UpdateMountError(ctx context.Context, repoID model.RepoID, msg string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE repos SET mount_error=? WHERE repo_id=?`, msg, string(repoID))
+// RequestMount records the CLI's unmount (enabled false) or remount (enabled
+// true) intent under request, which the daemon echoes in repo_runtime once it
+// carried it out.
+func (s *Store) RequestMount(ctx context.Context, repoID model.RepoID, enabled bool, request string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE repos SET enabled=?, mount_request=?, updated_at_ns=? WHERE repo_id=?`, boolToInt(enabled), request, time.Now().UnixNano(), string(repoID))
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return errors.New("repo not found")
+	}
+	return nil
+}
+
+// PutRuntime replaces the daemon's record of rec.RepoID.
+func (s *Store) PutRuntime(ctx context.Context, rec model.RepoRuntimeRecord) error {
+	_, err := s.db.ExecContext(ctx, `
+	INSERT OR REPLACE INTO repo_runtime (`+runtimeColumns+`)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, string(rec.RepoID), rec.State, rec.Phase, rec.LastError, rec.LastErrorPhase, unixNano(rec.LastErrorAt), unixNano(rec.NextRetryAt), rec.Attempts, rec.ServedGeneration, rec.ServedCommit, rec.ServedRef, unixNano(rec.LastFetchAt), rec.LastFetchResult, rec.AheadCount, rec.BehindCount, boolToInt(rec.Diverged), rec.MountRequest, time.Now().UnixNano())
 	return err
 }
 
-func (s *Store) BeginPrepare(ctx context.Context, cfg model.RepoConfig, state string, configVersion string) error {
+const runtimeColumns = `repo_id, state, phase, last_error, last_error_phase, last_error_at_ns, next_retry_at_ns, attempts, served_generation, served_commit, served_ref, last_fetch_at_ns, last_fetch_result, ahead, behind, diverged, mount_request, updated_at_ns`
+
+// GetRuntime returns the daemon's record of repoID, and false when it has none.
+func (s *Store) GetRuntime(ctx context.Context, repoID model.RepoID) (model.RepoRuntimeRecord, bool, error) {
+	rec, err := scanRuntime(s.db.QueryRowContext(ctx, `SELECT `+runtimeColumns+` FROM repo_runtime WHERE repo_id=?`, string(repoID)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.RepoRuntimeRecord{}, false, nil
+	}
+	if err != nil {
+		return model.RepoRuntimeRecord{}, false, err
+	}
+	return rec, true, nil
+}
+
+func scanRuntime(row interface{ Scan(...any) error }) (model.RepoRuntimeRecord, error) {
+	var rec model.RepoRuntimeRecord
+	var lastErrorAt, nextRetryAt, lastFetchAt, updatedAt int64
+	var diverged int
+	if err := row.Scan(&rec.RepoID, &rec.State, &rec.Phase, &rec.LastError, &rec.LastErrorPhase, &lastErrorAt, &nextRetryAt, &rec.Attempts, &rec.ServedGeneration, &rec.ServedCommit, &rec.ServedRef, &lastFetchAt, &rec.LastFetchResult, &rec.AheadCount, &rec.BehindCount, &diverged, &rec.MountRequest, &updatedAt); err != nil {
+		return model.RepoRuntimeRecord{}, err
+	}
+	rec.LastErrorAt = fromUnixNano(lastErrorAt)
+	rec.NextRetryAt = fromUnixNano(nextRetryAt)
+	rec.LastFetchAt = fromUnixNano(lastFetchAt)
+	rec.UpdatedAt = fromUnixNano(updatedAt)
+	rec.Diverged = diverged == 1
+	return rec, nil
+}
+
+// DeleteRuntime removes the daemon's record of repoID.
+func (s *Store) DeleteRuntime(ctx context.Context, repoID model.RepoID) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM repo_runtime WHERE repo_id=?`, string(repoID))
+	return err
+}
+
+// ClearRuntime removes every daemon record and returns them. A starting
+// daemon serves nothing yet, so a record a stopped daemon left behind is
+// stale, but it tells which repos that daemon ran.
+func (s *Store) ClearRuntime(ctx context.Context) ([]model.RepoRuntimeRecord, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT `+runtimeColumns+` FROM repo_runtime ORDER BY repo_id`)
+	if err != nil {
+		return nil, err
+	}
+	var recs []model.RepoRuntimeRecord
+	for rows.Next() {
+		rec, err := scanRuntime(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		recs = append(recs, rec)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM repo_runtime`); err != nil {
+		return nil, err
+	}
+	return recs, tx.Commit()
+}
+
+func unixNano(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+func fromUnixNano(ns int64) time.Time {
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+func (s *Store) BeginPrepare(ctx context.Context, cfg model.RepoConfig, state model.PrepareState, configVersion string) error {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE repos
 		SET prepare_state=?, prepare_error='', config_version=?, updated_at_ns=?
 		WHERE repo_id=? AND config_version=?
-	`, state, configVersion, time.Now().UnixNano(), string(cfg.ID), cfg.ConfigVersion)
+	`, string(state), configVersion, time.Now().UnixNano(), string(cfg.ID), cfg.ConfigVersion)
 	if err != nil {
 		return err
 	}
@@ -212,7 +344,7 @@ func (s *Store) BeginPrepare(ctx context.Context, cfg model.RepoConfig, state st
 	return nil
 }
 
-func (s *Store) UpdatePrepareStateForConfig(ctx context.Context, cfg model.RepoConfig, state string, prepareErr string) error {
+func (s *Store) UpdatePrepareStateForConfig(ctx context.Context, cfg model.RepoConfig, state model.PrepareState, prepareErr string) error {
 	res, err := s.db.ExecContext(ctx, `
 	UPDATE repos
 	SET prepare_state=?, prepare_error=?, updated_at_ns=?
@@ -232,7 +364,7 @@ func (s *Store) UpdatePrepareStateForConfig(ctx context.Context, cfg model.RepoC
 	  AND history_depth=?
 	  AND refresh_disabled=?
 	  AND config_version=?
-	`, state, prepareErr, time.Now().UnixNano(), string(cfg.ID), cfg.Branch, cfg.RemoteURL, boolToInt(cfg.PreparedGitDir), boolToInt(cfg.AdoptGitDir), cfg.FetchRef, cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath, cfg.OverlayDBPath, cfg.MountPath, cfg.RequiredCommit, cfg.HistoryDepth, boolToInt(cfg.RemoteRefreshDisabled), cfg.ConfigVersion)
+	`, string(state), prepareErr, time.Now().UnixNano(), string(cfg.ID), cfg.Branch, cfg.RemoteURL, boolToInt(cfg.PreparedGitDir), boolToInt(cfg.AdoptGitDir), cfg.FetchRef, cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath, cfg.OverlayDBPath, cfg.MountPath, cfg.RequiredCommit, cfg.HistoryDepth, boolToInt(cfg.RemoteRefreshDisabled), cfg.ConfigVersion)
 	if err != nil {
 		return err
 	}
@@ -279,12 +411,12 @@ func (s *Store) RemoveRepo(ctx context.Context, name string) error {
 }
 
 func (s *Store) GetRepo(ctx context.Context, name string) (model.RepoConfig, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, adopt_gitdir, fetch_ref, prepare_state, prepare_error, mount_error, required_commit, history_depth, refresh_disabled, acquired_ref, acquired_commit, acquired_at_ns, config_version FROM repos WHERE name=?`, name)
+	row := s.db.QueryRowContext(ctx, `SELECT repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, adopt_gitdir, fetch_ref, prepare_state, prepare_error, required_commit, history_depth, refresh_disabled, acquired_ref, acquired_commit, acquired_at_ns, config_version, mount_request FROM repos WHERE name=?`, name)
 	return scanRepo(row)
 }
 
 func (s *Store) ListRepos(ctx context.Context) ([]model.RepoConfig, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, adopt_gitdir, fetch_ref, prepare_state, prepare_error, mount_error, required_commit, history_depth, refresh_disabled, acquired_ref, acquired_commit, acquired_at_ns, config_version FROM repos ORDER BY name`)
+	rows, err := s.db.QueryContext(ctx, `SELECT repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, adopt_gitdir, fetch_ref, prepare_state, prepare_error, required_commit, history_depth, refresh_disabled, acquired_ref, acquired_commit, acquired_at_ns, config_version, mount_request FROM repos ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -313,7 +445,7 @@ func scanRepo(s scanner) (model.RepoConfig, error) {
 	var adoptGitDir int
 	var refreshDisabled int
 	var acquiredAtNS int64
-	if err := s.Scan(&cfg.ID, &cfg.Name, &cfg.MountRoot, &cfg.MountPath, &cfg.RemoteURL, &cfg.RemoteURLRedacted, &cfg.Branch, &refresh, &refreshNS, &cfg.GitDir, &cfg.OverlayDir, &cfg.BlobCacheDir, &cfg.MetaDBPath, &cfg.OverlayDBPath, &enabled, &preparedGitDir, &adoptGitDir, &cfg.FetchRef, &cfg.PrepareState, &cfg.PrepareError, &cfg.MountError, &cfg.RequiredCommit, &cfg.HistoryDepth, &refreshDisabled, &cfg.AcquiredRef, &cfg.AcquiredCommit, &acquiredAtNS, &cfg.ConfigVersion); err != nil {
+	if err := s.Scan(&cfg.ID, &cfg.Name, &cfg.MountRoot, &cfg.MountPath, &cfg.RemoteURL, &cfg.RemoteURLRedacted, &cfg.Branch, &refresh, &refreshNS, &cfg.GitDir, &cfg.OverlayDir, &cfg.BlobCacheDir, &cfg.MetaDBPath, &cfg.OverlayDBPath, &enabled, &preparedGitDir, &adoptGitDir, &cfg.FetchRef, &cfg.PrepareState, &cfg.PrepareError, &cfg.RequiredCommit, &cfg.HistoryDepth, &refreshDisabled, &cfg.AcquiredRef, &cfg.AcquiredCommit, &acquiredAtNS, &cfg.ConfigVersion, &cfg.MountRequest); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return cfg, fmt.Errorf("repo not found")
 		}

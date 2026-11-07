@@ -39,7 +39,7 @@ func preparationFailurePhase(err error) string {
 	return preparePhaseUnknown
 }
 
-func (s *Service) configVersionIsCurrent(ctx context.Context, cfg model.RepoConfig) (bool, error) {
+func (s *core) configVersionIsCurrent(ctx context.Context, cfg model.RepoConfig) (bool, error) {
 	latest, err := s.registry.GetRepo(ctx, cfg.Name)
 	if err != nil {
 		return false, err
@@ -104,7 +104,7 @@ func normalizeSourceConfig(cfg *model.RepoConfig) error {
 	return nil
 }
 
-func (s *Service) prepareConfigStillCurrent(ctx context.Context, cfg model.RepoConfig) bool {
+func (s *core) prepareConfigStillCurrent(ctx context.Context, cfg model.RepoConfig) bool {
 	latest, err := s.registry.GetRepo(ctx, cfg.Name)
 	if err != nil {
 		s.logger.Error("repo prepare state refresh failed", "repo", cfg.Name, "error", err)
@@ -120,7 +120,7 @@ func (s *Service) prepareConfigStillCurrent(ctx context.Context, cfg model.RepoC
 // prepareRepo clones the git repo and builds the initial snapshot. It does NOT
 // start a FUSE mount or any background goroutines, so it's safe to call from
 // short-lived CLI commands like add-repo.
-func (s *Service) prepareRepo(ctx context.Context, cfg model.RepoConfig) (retErr error) {
+func (s *core) prepareRepo(ctx context.Context, cfg model.RepoConfig) (retErr error) {
 	started := time.Now()
 	safeRepo := auth.RedactLogString(cfg.Name)
 	safeBranch := auth.RedactLogString(cfg.Branch)
@@ -203,7 +203,7 @@ func (s *Service) prepareRepo(ctx context.Context, cfg model.RepoConfig) (retErr
 	})
 }
 
-func (s *Service) prepareSource(ctx context.Context, cfg model.RepoConfig) (model.PreparedSource, error) {
+func (s *core) prepareSource(ctx context.Context, cfg model.RepoConfig) (model.PreparedSource, error) {
 	if cfg.AdoptGitDir {
 		if err := s.git.ConfigureAdoptedWorktree(ctx, cfg); err != nil {
 			return model.PreparedSource{}, err
@@ -233,7 +233,7 @@ func (s *Service) prepareSource(ctx context.Context, cfg model.RepoConfig) (mode
 	return model.PreparedSource{Ref: headRef, Commit: headOID}, nil
 }
 
-func (s *Service) recordAcquisition(ctx context.Context, cfg model.RepoConfig, source model.PreparedSource) error {
+func (s *core) recordAcquisition(ctx context.Context, cfg model.RepoConfig, source model.PreparedSource) error {
 	if !source.Verified || (!source.Acquired && cfg.AcquiredRef == source.Ref && strings.EqualFold(cfg.AcquiredCommit, source.Commit)) {
 		return nil
 	}
@@ -243,7 +243,7 @@ func (s *Service) recordAcquisition(ctx context.Context, cfg model.RepoConfig, s
 // ensurePreparedRepo makes sure the repo is cloned and has an initial snapshot.
 // The returned snapshot store remains open for callers that need to continue
 // into runtime startup.
-func (s *Service) ensurePreparedRepo(ctx context.Context, cfg model.RepoConfig, pruneOldGenerations bool) (*snapshot.Store, string, string, int64, error) {
+func (s *core) ensurePreparedRepo(ctx context.Context, cfg model.RepoConfig, pruneOldGenerations bool) (*snapshot.Store, string, string, int64, error) {
 	if err := os.MkdirAll(cfg.MountPath, 0o755); err != nil {
 		return nil, "", "", 0, withPreparationPhase(preparePhaseInitializeStorage, err)
 	}
@@ -281,7 +281,7 @@ func (s *Service) ensurePreparedRepo(ctx context.Context, cfg model.RepoConfig, 
 		}
 		if pruneOldGenerations {
 			failurePhase = preparePhaseCleanupSnapshot
-			return snap.PruneGenerations(ctx, gen)
+			return s.pruneGenerations(ctx, nil, snap, gen)
 		}
 		return nil
 	})
@@ -345,7 +345,7 @@ func (s *Service) supersedePrepare(id model.RepoID) {
 	s.mu.Unlock()
 }
 
-func (s *Service) withPrepareTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+func (s *core) withPrepareTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	if s.prepareContext != nil {
 		return s.prepareContext(ctx)
 	}
@@ -354,15 +354,16 @@ func (s *Service) withPrepareTimeout(ctx context.Context) (context.Context, cont
 
 func (s *Service) resetRunningPrepareState(cfg model.RepoConfig) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	rt, ok := s.running[cfg.ID]
 	if !ok || rt.gate == nil {
+		s.mu.Unlock()
 		return false
 	}
 	rt.gate.Reset()
 	rt.cfg = cfg
-	rt.state.State = model.PrepareStatePreparing
-	rt.state.PrepareError = ""
+	rt.prepare = model.PrepareStatePreparing
+	s.mu.Unlock()
+	s.recordRuntimeState(rt)
 	return true
 }
 
@@ -589,7 +590,10 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 			if !current {
 				return registry.ErrRepoChanged
 			}
-			return snap.PruneGenerations(cleanupCtx, min(prevGen, gen-1))
+			s.mu.Lock()
+			rt := s.running[cfg.ID]
+			s.mu.Unlock()
+			return s.pruneGenerations(cleanupCtx, rt, snap, min(prevGen, gen-1))
 		})
 		if cleanupErr != nil && !errors.Is(cleanupErr, registry.ErrRepoChanged) {
 			s.logger.Warn("snapshot generation cleanup failed", "repo", cfg.Name, "error", cleanupErr)
@@ -672,7 +676,7 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	} else {
 		s.logger.Warn("commit timestamp unavailable", "repo", cfg.Name, "error", err)
 	}
-	if err := rt.resolver.SwitchGeneration(ctx, gen, commitTime); err != nil {
+	if err := s.switchGeneration(ctx, rt, gen, commitTime); err != nil {
 		return err
 	}
 	if !s.prepareConfigStillCurrent(ctx, cfg) {
@@ -686,16 +690,16 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	rt.cfg = cfg
 	rt.cfg.PrepareState = model.PrepareStateReady
 	rt.cfg.PrepareError = ""
-	setHeadState(&rt.state, headOID, headRef, gen)
-	rt.state.State = repoStateMounted
-	rt.state.PrepareError = ""
+	rt.head = servedHead{oid: headOID, ref: headRef, gen: gen}
+	rt.prepare = model.PrepareStateReady
 	s.mu.Unlock()
 	rt.gate.MarkReady()
+	s.recordRuntimeState(rt)
 	s.startRepoBackground(rt)
 	return nil
 }
 
-func (s *Service) setPrepareState(ctx context.Context, cfg model.RepoConfig, state string, stateErr error) error {
+func (s *Service) setPrepareState(ctx context.Context, cfg model.RepoConfig, state model.PrepareState, stateErr error) error {
 	return s.applyPrepareState(ctx, cfg, state, stateErr, true)
 }
 
@@ -703,7 +707,7 @@ func (s *Service) setPrepareStateBeforeReadyGate(ctx context.Context, cfg model.
 	return s.applyPrepareState(ctx, cfg, model.PrepareStateReady, nil, false)
 }
 
-func (s *Service) applyPrepareState(ctx context.Context, cfg model.RepoConfig, state string, stateErr error, applyReadyRuntime bool) error {
+func (s *Service) applyPrepareState(ctx context.Context, cfg model.RepoConfig, state model.PrepareState, stateErr error, applyReadyRuntime bool) error {
 	msg := ""
 	if stateErr != nil {
 		msg = auth.RedactLogString(stateErr.Error(), cfg.RemoteURL)
@@ -717,11 +721,11 @@ func (s *Service) applyPrepareState(ctx context.Context, cfg model.RepoConfig, s
 			s.mu.Unlock()
 			return nil
 		}
+		defer s.recordRuntimeState(rt)
 		rt.cfg.PrepareState = state
 		rt.cfg.PrepareError = msg
-		rt.state.PrepareError = msg
 		if state != model.PrepareStateReady || applyReadyRuntime {
-			rt.state.State = runtimeStateForPrepareState(state)
+			rt.prepare = state
 		}
 		if rt.gate != nil {
 			switch state {
@@ -740,7 +744,7 @@ func (s *Service) applyPrepareState(ctx context.Context, cfg model.RepoConfig, s
 	return nil
 }
 
-func (s *Service) publishSnapshot(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, oid string, ref string) (int64, string, error) {
+func (s *core) publishSnapshot(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, oid string, ref string) (int64, string, error) {
 	nodes, err := s.git.BuildTreeIndex(ctx, cfg, oid)
 	if err != nil {
 		return 0, snapshotPhaseBuild, err
@@ -756,7 +760,7 @@ func isAsyncRepo(cfg model.RepoConfig) bool {
 	if cfg.PreparedGitDir {
 		return true
 	}
-	switch strings.TrimSpace(cfg.PrepareState) {
+	switch cfg.PrepareState {
 	case model.PrepareStatePreparing, model.PrepareStateReady, model.PrepareStateFailed:
 		return true
 	default:
@@ -768,20 +772,13 @@ func shouldMountAsync(cfg model.RepoConfig) bool {
 	return isPendingOrFailedPrepareState(cfg.PrepareState)
 }
 
-func isPendingOrFailedPrepareState(state string) bool {
-	switch strings.TrimSpace(state) {
+func isPendingOrFailedPrepareState(state model.PrepareState) bool {
+	switch state {
 	case model.PrepareStatePreparing, model.PrepareStateFailed:
 		return true
 	default:
 		return false
 	}
-}
-
-func runtimeStateForPrepareState(state string) string {
-	if state == model.PrepareStateReady {
-		return repoStateMounted
-	}
-	return state
 }
 
 func prepareGateError(msg string) error {

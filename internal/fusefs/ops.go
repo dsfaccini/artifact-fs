@@ -128,13 +128,15 @@ func (e *Engine) Do(ctx context.Context, lock sync.Locker, op func(context.Conte
 	b := &Blobs{}
 	opCtx := context.WithoutCancel(ctx)
 	for {
-		if lock != nil {
-			lock.Lock()
-		}
-		err := op(opCtx, b)
-		if lock != nil {
-			lock.Unlock()
-		}
+		err := func() error {
+			if lock != nil {
+				lock.Lock()
+				// The fuse library recovers a panic in op and keeps serving, so
+				// a panic must not leave lock held.
+				defer lock.Unlock()
+			}
+			return op(opCtx, b)
+		}()
 		var missing *notHydratedError
 		if !errors.As(err, &missing) {
 			return err
@@ -214,6 +216,45 @@ type Attrs struct {
 	// Gen is the snapshot generation the attributes came from, or 0 when they
 	// came from the overlay.
 	Gen int64
+	// Blob is the blob of a base file or symlink, and empty for a directory
+	// or an overlay entry.
+	Blob string
+}
+
+// Identity is what the kernel holds about a path apart from its size and
+// timestamps: its type, its permission bits, and its Attrs.Blob.
+type Identity struct {
+	Type string
+	Perm uint32
+	Blob string
+}
+
+func (a Attrs) identity() Identity {
+	return Identity{Type: a.Type, Perm: a.Mode & 0o777, Blob: a.Blob}
+}
+
+// Identity returns the identity of path in the merged view, and false when
+// path does not exist. It hydrates nothing.
+func (e *Engine) Identity(path string) (Identity, bool, error) {
+	n, err := e.Resolver.ResolvePath(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return Identity{}, false, nil
+	}
+	if err != nil {
+		return Identity{}, false, err
+	}
+	if n.FromOverlay {
+		return Identity{Type: n.Overlay.NodeType(), Perm: n.Overlay.Mode & 0o777}, true, nil
+	}
+	return Identity{Type: n.Base.Type, Perm: normalizeMode(n.Base.Mode, n.Base.Type) & 0o777, Blob: baseBlob(n.Base)}, true, nil
+}
+
+// baseBlob returns the blob of a base file or symlink, and empty for a directory.
+func baseBlob(n model.BaseNode) string {
+	if n.Type == "dir" {
+		return ""
+	}
+	return n.ObjectOID
 }
 
 // Attrs returns the attributes of path. A base file or symlink whose size the
@@ -244,7 +285,7 @@ func (e *Engine) Attrs(b *Blobs, path string) (Attrs, error) {
 		commitTime = gen // fallback: commit time unavailable
 	}
 	mt := time.Unix(commitTime, 0)
-	return Attrs{Mode: normalizeMode(n.Base.Mode, n.Base.Type), Size: size, Type: n.Base.Type, Mtime: mt, Ctime: mt, Gen: gen}, nil
+	return Attrs{Mode: normalizeMode(n.Base.Mode, n.Base.Type), Size: size, Type: n.Base.Type, Mtime: mt, Ctime: mt, Gen: gen, Blob: baseBlob(n.Base)}, nil
 }
 
 // ReadDir lists path with the generation and commit time it listed.
@@ -294,10 +335,8 @@ const (
 )
 
 // checkOwnerAccess refuses access when mode lacks any of its owner permission
-// bits. The mount serves one user, so the owner's bits decide. An overlay
-// file's backing file stays owner-writable whatever its mode, so this check
-// is what enforces the mode. A base file's mode from Git, 644 or 755, grants
-// the owner both bits.
+// bits. The mount serves one user, so the owner's bits decide. A base file's
+// mode from Git, 644 or 755, grants the owner both bits.
 func checkOwnerAccess(mode, access uint32) error {
 	if access&^mode != 0 {
 		return syscall.EACCES
@@ -307,36 +346,37 @@ func checkOwnerAccess(mode, access uint32) error {
 
 // OpenFile opens path's content for a new file handle: the overlay file, as
 // generation -1, or else the base blob of generation gen, or of the current
-// generation when gen is 0, with the generation it opened. access holds the
-// owner permission bits the handle needs; a handle that may read prefetches
-// the directory of a base file it opens.
-func (e *Engine) OpenFile(ctx context.Context, b *Blobs, path string, gen int64, access uint32) (*os.File, int64, error) {
+// generation when gen is 0, with the generation and the blob it opened.
+// forRead says the handle may read, so opening a base file prefetches its
+// directory. access holds the owner permission bits to check the entry's mode
+// against, none when the adapter does not check permissions.
+func (e *Engine) OpenFile(ctx context.Context, b *Blobs, path string, gen int64, forRead bool, access uint32) (*os.File, int64, string, error) {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
 	path = model.CleanPath(path)
 	if ov, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	} else if ok {
 		if ov.IsDeleted() {
-			return nil, 0, os.ErrNotExist
+			return nil, 0, "", os.ErrNotExist
 		}
 		if err := checkOwnerAccess(ov.Mode, access); err != nil {
-			return nil, 0, err
+			return nil, 0, "", err
 		}
 		f, err := os.OpenFile(ov.BackingPath, os.O_RDWR, 0)
 		if err != nil {
 			f, err = os.Open(ov.BackingPath)
 		}
-		return f, -1, err
+		return f, -1, "", err
 	}
-	f, gen, err := e.openBase(ctx, b, path, gen)
+	f, n, gen, err := e.openBase(ctx, b, path, gen)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
-	if access&ownerRead != 0 {
+	if forRead {
 		e.prefetchSiblings(ctx, path)
 	}
-	return f, gen, nil
+	return f, gen, n.ObjectOID, nil
 }
 
 // Read fills dst from path at off and returns the filled prefix of dst.
@@ -380,7 +420,7 @@ func (e *Engine) BaseCacheFile(ctx context.Context, b *Blobs, path string, gen i
 		}
 		return nil, 0, false, nil
 	}
-	f, gen, err := e.openBase(ctx, b, path, gen)
+	f, _, gen, err := e.openBase(ctx, b, path, gen)
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -390,8 +430,8 @@ func (e *Engine) BaseCacheFile(ctx context.Context, b *Blobs, path string, gen i
 
 // openBase opens the base blob of path at generation gen, or at the current
 // generation when gen is 0 or HEAD reconciliation pruned gen, and returns the
-// generation it opened. The caller holds the transition read lock.
-func (e *Engine) openBase(ctx context.Context, b *Blobs, path string, gen int64) (*os.File, int64, error) {
+// node and the generation it opened. The caller holds the transition read lock.
+func (e *Engine) openBase(ctx context.Context, b *Blobs, path string, gen int64) (*os.File, model.BaseNode, int64, error) {
 	current := e.Resolver.Generation()
 	if gen == 0 {
 		gen = current
@@ -403,16 +443,16 @@ func (e *Engine) openBase(ctx context.Context, b *Blobs, path string, gen int64)
 		n, ok, err = e.Resolver.Snapshot.LookupNode(ctx, gen, path)
 	}
 	if err != nil {
-		return nil, 0, err
+		return nil, model.BaseNode{}, 0, err
 	}
 	if !ok {
-		return nil, 0, fs.ErrNotExist
+		return nil, model.BaseNode{}, 0, fs.ErrNotExist
 	}
 	f, err := b.open(n)
 	if err != nil {
-		return nil, 0, err
+		return nil, model.BaseNode{}, 0, err
 	}
-	return f, gen, nil
+	return f, n, gen, nil
 }
 
 func (e *Engine) Write(ctx context.Context, b *Blobs, path string, off int64, data []byte) (int, error) {
@@ -805,8 +845,9 @@ var errAttrUnsupported = fmt.Errorf("%w: %w", syscall.ENOTSUP, fs.ErrInvalid)
 // then returns its attributes. Changing a base file copies it into the
 // overlay first.
 // SetAttributes changes path's size, mode and mtime. sizeAccess holds the
-// owner permission bits a size change needs: ownerWrite for a truncate
-// without a handle, and none through a handle, whose open was checked.
+// owner permission bits to check a size change against: ownerWrite for a
+// truncate without a handle when the adapter checks permissions, and none
+// otherwise.
 func (e *Engine) SetAttributes(ctx context.Context, b *Blobs, path string, size *int64, sizeAccess uint32, mode *uint32, mtime *time.Time) (Attrs, error) {
 	if err := func() error {
 		e.Resolver.transition.RLock()
