@@ -397,7 +397,7 @@ func TestSyncPreparationFetchRefKeepsHistoryDepth(t *testing.T) {
 	// A later fetch adds only the new commits to the history it has.
 	commitFile(t, remote, "AGAIN.md", "again\n")
 	commitFile(t, remote, "LAST.md", "last\n")
-	if err := svc.ctl().Prepare(ctx, "repo"); err != nil {
+	if _, err := svc.ctl().Prepare(ctx, "repo"); err != nil {
 		t.Fatal(err)
 	}
 	if got := commits(); got != "3" {
