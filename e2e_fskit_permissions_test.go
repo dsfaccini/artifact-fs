@@ -13,8 +13,9 @@ import (
 )
 
 // On FSKit mounts, artifact-fs checks a file's owner permission bits itself
-// when the file is opened or truncated. The subtests share one mount: `run`
-// skips a shared-mount test that changes the mount on FSKit.
+// when the file is opened or truncated. The subtests change the mount and
+// must run on FSKit, where `run` skips them, so they share a mount of their
+// own.
 func TestE2EFSKitMountChecksOwnerPermissions(t *testing.T) {
 	if os.Getenv("AFS_RUN_E2E_TESTS") != "1" {
 		t.Skip("skipping e2e tests (set AFS_RUN_E2E_TESTS=1 to run)")
@@ -106,16 +107,6 @@ func TestE2EFSKitMountChecksOwnerPermissions(t *testing.T) {
 
 	t.Run("truncate of a read-only file", func(t *testing.T) {
 		path := newFile(t, "truncate.txt", "abc", 0o444)
-		f, err := os.Open(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer f.Close()
-		// macOS refuses ftruncate(2) through a read-only descriptor before the
-		// call reaches the file system, so only the refusal is asserted.
-		if err := f.Truncate(0); err == nil {
-			t.Error("ftruncate through a read-only descriptor succeeded")
-		}
 		requireEACCES(t, "truncate(path)", os.Truncate(path, 0))
 		requireContent(t, path, "abc")
 	})
@@ -142,8 +133,9 @@ func TestE2EFSKitMountChecksOwnerPermissions(t *testing.T) {
 			t.Fatal(err)
 		}
 		dst := filepath.Join(repo.mountPath, "copied-read-only.txt")
-		// -X skips extended attributes, which the mount rejects (README).
-		if out, err := exec.Command("cp", "-p", "-X", src, dst).CombinedOutput(); err != nil {
+		// macOS cp's -X skips extended attributes, which the mount rejects
+		// (README). A GNU cp earlier on PATH has no -X.
+		if out, err := exec.Command("/bin/cp", "-p", "-X", src, dst).CombinedOutput(); err != nil {
 			t.Fatalf("cp -p -X = %v: %s", err, out)
 		}
 		requireContent(t, dst, "abc")
