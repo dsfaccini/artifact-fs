@@ -14,7 +14,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -103,11 +102,6 @@ type ArtifactFuse struct {
 	// notifier is nil when nothing should reach the kernel. fs.mu guards it:
 	// the mount publishes it after ops may have started.
 	notifier kernelNotifier
-
-	// checksPermissions is set while an FSKit mount serves the ops. The
-	// adapter then checks each open, and each truncate without a handle,
-	// against the entry's owner permission bits itself.
-	checksPermissions atomic.Bool
 }
 
 type InodeRef struct {
@@ -172,6 +166,8 @@ type FileHandle struct {
 	// wrote says the handle created or wrote its file, so its flush commits
 	// the path's pending writes. A reader's close leaves them coalescing.
 	wrote bool
+	// writable says the handle's access mode allows writes.
+	writable bool
 }
 
 // ReaddirEntry holds child metadata, avoiding per-child Getattr or snapshot lookups.
@@ -522,6 +518,21 @@ func (fs *ArtifactFuse) fileHandle(handleID fuseops.HandleID) (*FileHandle, erro
 	return fh, nil
 }
 
+// handleWritable says id names an open handle whose access mode allows
+// writes. A nil id, from truncate(2), names none.
+func (fs *ArtifactFuse) handleWritable(id *fuseops.HandleID) bool {
+	if id == nil {
+		return false
+	}
+	fh, err := fs.fileHandle(*id)
+	if err != nil {
+		return false
+	}
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	return fh.writable
+}
+
 func (fs *ArtifactFuse) closeCachedFilesForPath(path string) {
 	fs.mu.RLock()
 	var handles []*FileHandle
@@ -850,6 +861,13 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 }
 
 func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp) error {
+	return fs.setInodeAttributes(ctx, op, false)
+}
+
+// setInodeAttributes changes an inode's attributes. checkPermissions checks a
+// size change against the entry's owner write bit, unless it comes through a
+// handle whose access mode allows writes.
+func (fs *ArtifactFuse) setInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp, checkPermissions bool) error {
 	return fs.shared(ctx, func(ctx context.Context, b *Blobs) error {
 		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 		if err != nil {
@@ -872,10 +890,8 @@ func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetI
 		if changesContent {
 			fs.closeCachedFilesForPath(ref.Path)
 		}
-		// A size change without a handle is truncate(2), which needs write
-		// permission; ftruncate(2) uses a handle whose open was checked.
 		var sizeAccess uint32
-		if op.Handle == nil && fs.checksPermissions.Load() {
+		if op.Size != nil && checkPermissions && !fs.handleWritable(op.Handle) {
 			sizeAccess = ownerWrite
 		}
 		attrs, err := fs.engine.SetAttributes(ctx, b, ref.Path, size, sizeAccess, mode, op.Mtime)
@@ -1069,20 +1085,30 @@ func (fs *ArtifactFuse) ReleaseDirHandle(_ context.Context, op *fuseops.ReleaseD
 }
 
 func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) error {
+	return fs.openFile(ctx, op, false)
+}
+
+// openFile opens a handle. checkPermissions checks the open against the
+// entry's owner permission bits: read and write for the access mode, and
+// write for O_TRUNC.
+func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, checkPermissions bool) error {
 	return fs.shared(ctx, func(ctx context.Context, b *Blobs) error {
 		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 		if err != nil {
 			return err
 		}
-		fh := &FileHandle{inode: ref, path: ref.Path}
+		fh := &FileHandle{inode: ref, path: ref.Path, writable: !op.OpenFlags.IsReadOnly()}
 		if ref.Path != ".git" {
 			var access uint32
-			if fs.checksPermissions.Load() {
+			if checkPermissions {
 				access = ownerRead | ownerWrite
 				if op.OpenFlags.IsReadOnly() {
 					access = ownerRead
 				} else if op.OpenFlags.IsWriteOnly() {
 					access = ownerWrite
+				}
+				if op.OpenFlags&syscall.O_TRUNC != 0 {
+					access |= ownerWrite
 				}
 			}
 			// An open for writing only reads nothing, so it prefetches nothing.
@@ -1197,7 +1223,7 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 		}
 		fs.mu.Lock()
 		ref := fs.allocEntry(op.Parent, op.Name, childPath, Attrs{Type: "file", Mode: uint32(op.Mode)})
-		fh := &FileHandle{inode: ref, path: childPath, wrote: true}
+		fh := &FileHandle{inode: ref, path: childPath, wrote: true, writable: !op.OpenFlags.IsReadOnly()}
 		handle := fs.nextHandleID
 		fs.nextHandleID++
 		fs.fileHandles[handle] = fh
@@ -1453,6 +1479,25 @@ const FSSubtype = "artifact-fs"
 // retry a busy mount.
 func UnmountPath(dir string) error { return fuse.Unmount(dir) }
 
+// newFileSystemServer is fuseutil.NewFileSystemServer. Package tests replace
+// it to reach the file system each mount attempt serves.
+var newFileSystemServer = fuseutil.NewFileSystemServer
+
+// permissionCheckingFS serves an FSKit mount: artifact-fs checks permissions
+// itself there. It checks each open, and each size change not made through a
+// handle that may write, against the entry's owner permission bits.
+type permissionCheckingFS struct {
+	*ArtifactFuse
+}
+
+func (fs permissionCheckingFS) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) error {
+	return fs.openFile(ctx, op, true)
+}
+
+func (fs permissionCheckingFS) SetInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp) error {
+	return fs.setInodeAttributes(ctx, op, true)
+}
+
 // newNotifier is fuse.NewNotifier. Package tests replace it to tell the
 // Notifiers of two mount attempts apart.
 var newNotifier = fuse.NewNotifier
@@ -1580,10 +1625,11 @@ func MountRepoWithGate(ctx, opCtx context.Context, repo model.RepoConfig, engine
 		// Server.
 		notifier := newNotifier()
 		notifiers[fskit] = notifier
-		// The mount serves ops as soon as it starts. Attempts run in turn, and
-		// the last one is the one that mounted.
-		fsint.checksPermissions.Store(fskit)
-		server := fuse.NewServerWithNotifier(notifier, fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate)))
+		var served fuseutil.FileSystem = fsint
+		if fskit {
+			served = permissionCheckingFS{fsint}
+		}
+		server := fuse.NewServerWithNotifier(notifier, newFileSystemServer(NewGatedFileSystem(served, gate)))
 		return fuseMount(ctx, repo.MountPath, server, &cfg)
 	}
 

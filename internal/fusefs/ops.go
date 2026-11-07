@@ -843,21 +843,20 @@ var errAttrUnsupported = fmt.Errorf("%w: %w", syscall.ENOTSUP, fs.ErrInvalid)
 
 // SetAttributes applies each of size, mode, and mtime that is not nil to path,
 // then returns its attributes. Changing a base file copies it into the
-// overlay first.
-// SetAttributes changes path's size, mode and mtime. sizeAccess holds the
-// owner permission bits to check a size change against: ownerWrite for a
-// truncate without a handle when the adapter checks permissions, and none
-// otherwise.
+// overlay first. sizeAccess holds the owner permission bits to check a size
+// change against, none when the adapter does not check it.
 func (e *Engine) SetAttributes(ctx context.Context, b *Blobs, path string, size *int64, sizeAccess uint32, mode *uint32, mtime *time.Time) (Attrs, error) {
 	if err := func() error {
 		e.Resolver.transition.RLock()
 		defer e.Resolver.transition.RUnlock()
 		if size != nil {
-			if ov, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
-				return err
-			} else if ok && !ov.IsDeleted() {
-				if err := checkOwnerAccess(ov.Mode, sizeAccess); err != nil {
+			if sizeAccess != 0 {
+				if ov, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
 					return err
+				} else if ok && !ov.IsDeleted() {
+					if err := checkOwnerAccess(ov.Mode, sizeAccess); err != nil {
+						return err
+					}
 				}
 			}
 			if err := e.ensureOverlay(ctx, b, path); err != nil {

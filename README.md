@@ -77,7 +77,9 @@ transport that mounted each repo.
 After a HEAD change, an FSKit mount can show the old commit for longer than the
 other backends; see [Kernel caches after a HEAD change](#kernel-caches-after-a-head-change).
 FSKit reuses directory handles across enumerations. Every backend lists a
-directory again when an enumeration restarts. Both macOS backends reject extended
+directory again when an enumeration restarts. On FSKit mounts, artifact-fs
+checks a file's owner permission bits itself when the file is opened or
+truncated. Both macOS backends reject extended
 attributes, so macOS writes no AppleDouble `._` files to store them. macOS
 attaches extended attributes such as `com.apple.provenance` to nearly every local
 file, so copying files onto the mount with `cp` or `ditto` may fail; `cp -X`

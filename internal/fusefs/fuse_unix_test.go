@@ -22,6 +22,7 @@ import (
 	overlaystore "github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 	"github.com/dsfaccini/fuse/fuseops"
+	"github.com/dsfaccini/fuse/fuseutil"
 )
 
 type localOverlayFuseFixture struct {
@@ -1602,9 +1603,10 @@ func TestCreateThenCloseClearsPending(t *testing.T) {
 	}
 }
 
-// newChmoddedFile creates f.txt holding abc through fs, closes it, and
-// chmods it to mode. checksPermissions says the mount is an FSKit mount.
-func newChmoddedFile(t *testing.T, checksPermissions bool, mode os.FileMode) (*ArtifactFuse, *overlaystore.Store, fuseops.InodeID) {
+// newChmoddedFile creates f.txt holding abc, closes it, and chmods it to
+// mode, through the file system an FSKit mount serves when fskit is set and
+// a kernel mount serves otherwise.
+func newChmoddedFile(t *testing.T, fskit bool, mode os.FileMode) (fuseutil.FileSystem, *overlaystore.Store, fuseops.InodeID) {
 	t.Helper()
 	ctx := context.Background()
 	tmp := t.TempDir()
@@ -1616,8 +1618,11 @@ func newChmoddedFile(t *testing.T, checksPermissions bool, mode os.FileMode) (*A
 	t.Cleanup(func() { _ = ov.Close() })
 	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{}}, Overlay: ov}
 	resolver.SetGeneration(1)
-	fs := NewArtifactFuse(cfg, &Engine{Repo: cfg, Resolver: resolver, Overlay: ov})
-	fs.checksPermissions.Store(checksPermissions)
+	af := NewArtifactFuse(cfg, &Engine{Repo: cfg, Resolver: resolver, Overlay: ov})
+	var fs fuseutil.FileSystem = af
+	if fskit {
+		fs = permissionCheckingFS{af}
+	}
 	create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "f.txt", Mode: 0o644}
 	if err := fs.CreateFile(ctx, create); err != nil {
 		t.Fatal(err)
@@ -1634,15 +1639,16 @@ func newChmoddedFile(t *testing.T, checksPermissions bool, mode os.FileMode) (*A
 	return fs, ov, create.Entry.Child
 }
 
-// On an FSKit mount, a new open for writing of a file chmodded to 0444, and a
-// truncate without a handle, fail with EACCES. Only descriptors opened before
-// the chmod write.
+// On an FSKit mount, a new open for writing or with O_TRUNC of a file
+// chmodded to 0444, and a truncate without a handle, fail with EACCES. Only
+// descriptors opened for writing before the chmod write.
 func TestReadOnlyFileRefusesNewWriter(t *testing.T) {
 	ctx := context.Background()
 	fs, ov, inode := newChmoddedFile(t, true, 0o444)
 	for _, open := range []*fuseops.OpenFileOp{
 		{Inode: inode, OpenFlags: syscall.O_WRONLY},
 		{Inode: inode, OpenFlags: syscall.O_RDWR},
+		{Inode: inode, OpenFlags: syscall.O_RDONLY | syscall.O_TRUNC},
 	} {
 		if got := kernelErrno(fs.OpenFile(ctx, open)); got != syscall.EACCES {
 			t.Errorf("open with flags %v = %v, want EACCES", open.OpenFlags, got)
@@ -1658,6 +1664,95 @@ func TestReadOnlyFileRefusesNewWriter(t *testing.T) {
 	e, _ := ov.Get("f.txt")
 	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "abc" {
 		t.Fatalf("content = %q, %v; want abc kept", data, err)
+	}
+}
+
+// On an FSKit mount, a handle opened for writing before a chmod to 0444
+// still writes and truncates through ftruncate(2).
+func TestHandleOpenedForWriteBeforeChmodKeepsWriting(t *testing.T) {
+	ctx := context.Background()
+	fs, ov, inode := newChmoddedFile(t, true, 0o644)
+	open := &fuseops.OpenFileOp{Inode: inode, OpenFlags: syscall.O_WRONLY}
+	if err := fs.OpenFile(ctx, open); err != nil {
+		t.Fatal(err)
+	}
+	ro := os.FileMode(0o444)
+	if err := fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: inode, Mode: &ro}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.WriteFile(ctx, &fuseops.WriteFileOp{Inode: inode, Handle: open.Handle, Offset: 3, Data: []byte("def")}); err != nil {
+		t.Fatalf("write through the earlier handle = %v", err)
+	}
+	two := uint64(2)
+	if err := fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: inode, Handle: &open.Handle, Size: &two}); err != nil {
+		t.Fatalf("ftruncate through the earlier handle = %v", err)
+	}
+	e, _ := ov.Get("f.txt")
+	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "ab" {
+		t.Fatalf("content = %q, %v; want ab", data, err)
+	}
+}
+
+// On an FSKit mount, ftruncate(2) through a read-only handle of a 0444 file
+// fails with EACCES.
+func TestReadOnlyHandleCannotTruncateReadOnlyFile(t *testing.T) {
+	ctx := context.Background()
+	fs, ov, inode := newChmoddedFile(t, true, 0o444)
+	open := &fuseops.OpenFileOp{Inode: inode, OpenFlags: syscall.O_RDONLY}
+	if err := fs.OpenFile(ctx, open); err != nil {
+		t.Fatal(err)
+	}
+	zero := uint64(0)
+	if got := kernelErrno(fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: inode, Handle: &open.Handle, Size: &zero})); got != syscall.EACCES {
+		t.Errorf("ftruncate through a read-only handle = %v, want EACCES", got)
+	}
+	e, _ := ov.Get("f.txt")
+	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "abc" {
+		t.Fatalf("content = %q, %v; want abc kept", data, err)
+	}
+}
+
+// lookupCountingOverlay counts the overlay lookups an op makes.
+type lookupCountingOverlay struct {
+	model.OverlayStore
+	lookups int
+}
+
+func (o *lookupCountingOverlay) Lookup(ctx context.Context, path string) (model.OverlayEntry, bool, error) {
+	o.lookups++
+	return o.OverlayStore.Lookup(ctx, path)
+}
+
+// Only a size change an FSKit mount serves looks the entry's mode up for the
+// permission check.
+func TestKernelMountTruncateSkipsThePermissionLookup(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	store, err := overlaystore.New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	ov := &lookupCountingOverlay{OverlayStore: store}
+	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{}}, Overlay: ov}
+	resolver.SetGeneration(1)
+	kernel := NewArtifactFuse(cfg, &Engine{Repo: cfg, Resolver: resolver, Overlay: ov})
+	create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "f.txt", Mode: 0o644}
+	if err := kernel.CreateFile(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	lookupsFor := func(fs fuseutil.FileSystem) int {
+		t.Helper()
+		ov.lookups = 0
+		one := uint64(1)
+		if err := fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Size: &one}); err != nil {
+			t.Fatal(err)
+		}
+		return ov.lookups
+	}
+	if kernelLookups, fskitLookups := lookupsFor(kernel), lookupsFor(permissionCheckingFS{kernel}); kernelLookups >= fskitLookups {
+		t.Fatalf("truncate looked the entry up %d times on a kernel mount and %d on an FSKit mount, want fewer on the kernel mount", kernelLookups, fskitLookups)
 	}
 }
 
