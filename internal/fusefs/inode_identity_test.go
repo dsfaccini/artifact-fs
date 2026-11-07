@@ -4,10 +4,8 @@ package fusefs
 
 import (
 	"context"
-	"errors"
 	"os"
 	"slices"
-	"syscall"
 	"testing"
 
 	"github.com/dsfaccini/fuse/fuseops"
@@ -49,11 +47,11 @@ func TestDirectoryInodeNumberSurvivesForgetAfterRename(t *testing.T) {
 			if err := f.fs.Rename(ctx, rename); err != nil {
 				t.Fatalf("Rename: %v", err)
 			}
-			// A revalidation that still carries the old name gets ENOENT, so
-			// the kernel invalidates the dentry that now names dst.
+			// A revalidation that still carries the old name misses, so the
+			// kernel invalidates the dentry that now names dst.
 			stale := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "src"}
-			if err := f.fs.LookUpInode(ctx, stale); !errors.Is(err, syscall.ENOENT) {
-				t.Fatalf("LookUpInode(src) after rename = %v, want ENOENT", err)
+			if err := f.fs.LookUpInode(ctx, stale); !lookupMissed(err, stale) {
+				t.Fatalf("LookUpInode(src) after rename = inode %d, %v; want a miss", stale.Entry.Child, err)
 			}
 			if forget {
 				for _, id := range []fuseops.InodeID{f.fileInode, f.nestInode, f.srcInode} {
