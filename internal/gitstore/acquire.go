@@ -78,7 +78,7 @@ func (s *Store) CloneBlobless(ctx context.Context, cfg model.RepoConfig) error {
 		return err
 	}
 	// Populate the index so git status works inside the mount.
-	if _, err := runGit(ctx, targetGitDir, "read-tree", "HEAD"); err != nil {
+	if _, err := runNetworkGit(ctx, targetGitDir, nil, "read-tree", "HEAD"); err != nil {
 		return err
 	}
 	if err := os.Rename(filepath.Join(target, ".git"), cfg.GitDir); err != nil {
@@ -301,7 +301,7 @@ func prepareFixedHEAD(ctx context.Context, gitDir string, commit string, resetIn
 	if !resetIndex {
 		return nil
 	}
-	_, err = runGit(ctx, gitDir, "read-tree", commit)
+	_, err = runNetworkGit(ctx, gitDir, nil, "read-tree", commit)
 	return err
 }
 
@@ -597,14 +597,14 @@ func (s *Store) rollbackLandedReadTree(ctx context.Context, gitDir string, index
 	ctx, cancel := s.rollbackContext(ctx)
 	defer cancel()
 	// A submodule.<name>.ignore setting would hide a changed gitlink.
-	changed, err := runGit(ctx, gitDir, "diff-tree", "-r", "-z", "--name-only", "--ignore-submodules=none", oldOID, newOID)
+	changed, err := runNetworkGit(ctx, gitDir, nil, "diff-tree", "-r", "-z", "--name-only", "--ignore-submodules=none", oldOID, newOID)
 	if err != nil {
 		return errors.Join(cause, fmt.Errorf("check index after read-tree failure: %w", err))
 	}
 	if changed == "" {
 		return cause
 	}
-	notNew, err := runGit(ctx, gitDir, "diff-index", "--cached", "-z", "--name-only", "--ignore-submodules=none", newOID)
+	notNew, err := runNetworkGit(ctx, gitDir, nil, "diff-index", "--cached", "-z", "--name-only", "--ignore-submodules=none", newOID)
 	if err != nil {
 		return errors.Join(cause, fmt.Errorf("check index after read-tree failure: %w", err))
 	}
@@ -674,8 +674,10 @@ func currentOrEmptyTreeOID(ctx context.Context, gitDir string) (string, error) {
 	return strings.TrimSpace(oid), nil
 }
 
+// readTreeTransition moves the index from oldOID's tree to newOID's. In a git
+// dir cloned without trees, read-tree fetches the trees it lacks.
 func readTreeTransition(ctx context.Context, gitDir string, oldOID string, newOID string) error {
-	_, err := runGit(ctx, gitDir, "read-tree", "-m", oldOID, newOID)
+	_, err := runNetworkGit(ctx, gitDir, nil, "read-tree", "-m", oldOID, newOID)
 	return err
 }
 

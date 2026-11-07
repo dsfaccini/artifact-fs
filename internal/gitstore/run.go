@@ -68,9 +68,10 @@ func setGitWorktreeDirectory(cmd *exec.Cmd, extraEnv []string) {
 	}
 }
 
-// runNetworkGit runs a Git command that contacts a remote as a lazy fetch
-// does: with lazyFetchEnv, then extraEnv, in its own session, so neither Git
-// nor SSH can prompt. Without it, git runs in a background process group, and
+// runNetworkGit runs a Git command that can contact a remote, such as a fetch
+// or a read-tree that lazily fetches missing trees, as a lazy fetch does:
+// with lazyFetchEnv, then extraEnv, in its own session, so neither Git nor
+// SSH can prompt. Without it, git runs in a background process group, and
 // the terminal stops it at a prompt. Credential helpers and the askpass
 // programs the user set still run.
 func runNetworkGit(ctx context.Context, gitDir string, extraEnv []string, args ...string) (string, error) {

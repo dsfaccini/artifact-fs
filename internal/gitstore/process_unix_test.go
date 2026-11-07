@@ -90,6 +90,14 @@ func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
 		{"batch blob fetch", "blob:none", false, false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, blob string) error {
 			return store.FetchMissingBlobs(ctx, cfg.RepoPaths, []string{blob})
 		}},
+		// A clone without trees and with no checkout has no index, so its
+		// read-tree fetches HEAD's trees.
+		{"index init", "tree:0", false, false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
+			return store.EnsureIndexInitialized(ctx, cfg)
+		}},
+		{"branch transition", "tree:0", false, false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
+			return store.PrepareFetchedBranch(ctx, cfg, "main")
+		}},
 		{"refresh fetch", "blob:none", false, false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
 			return store.FetchNonInteractive(ctx, cfg)
 		}},
