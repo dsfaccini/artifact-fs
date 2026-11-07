@@ -129,9 +129,9 @@ func runGitCommand(ctx context.Context, cmd *exec.Cmd, gitDir string, extraEnv [
 	msg = redactTruncatedCredentialPrefix(msg, credentials)
 	msg = auth.RedactString(msg)
 	var cause error
-	if msg != "" && !(contextErr != nil && strings.EqualFold(msg, "signal: killed")) {
+	if msg != "" && !(contextErr != nil && isCancellationSignal(msg)) {
 		cause = errors.New(msg)
-	} else if runErr != nil && !(contextErr != nil && strings.EqualFold(strings.TrimSpace(runErr.Error()), "signal: killed")) {
+	} else if runErr != nil && !(contextErr != nil && isCancellationSignal(strings.TrimSpace(runErr.Error()))) {
 		cause = errors.New(auth.RedactString(runErr.Error()))
 	}
 	exitCode := -1
@@ -141,8 +141,15 @@ func runGitCommand(ctx context.Context, cmd *exec.Cmd, gitDir string, extraEnv [
 	return out, &gitCommandError{cause: cause, contextErr: contextErr, retryable: retryable, exitCode: exitCode}
 }
 
+// isCancellationSignal reports whether msg names only a signal that
+// terminateCommandProcessGroup sends, which a canceled command's context error
+// already explains.
+func isCancellationSignal(msg string) bool {
+	return strings.EqualFold(msg, "signal: terminated") || strings.EqualFold(msg, "signal: killed")
+}
+
 func configureCancelableCommand(cmd *exec.Cmd) {
 	configureCommandProcessGroup(cmd)
-	cmd.Cancel = func() error { return killCommandProcessGroup(cmd) }
+	cmd.Cancel = func() error { return terminateCommandProcessGroup(cmd) }
 	cmd.WaitDelay = gitCommandWaitDelay
 }

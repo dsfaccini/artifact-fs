@@ -421,6 +421,11 @@ func (p *batchPool) closeAll() {
 	p.free = nil
 	p.signalLocked()
 	p.mu.Unlock()
+	// Signal every process before waiting for any, so a close waits for the
+	// slowest one, not for each in turn.
+	for _, b := range all {
+		b.terminate()
+	}
 	for _, b := range all {
 		b.kill()
 	}
@@ -456,6 +461,8 @@ type batchCatFile struct {
 	stderr     *gitStderrLogger
 	logger     *slog.Logger
 	closeOnce  sync.Once
+	// terminateOnce guards the signals, which closeAll sends before kill.
+	terminateOnce sync.Once
 }
 
 func newBatchCatFile(gitDir string, logger *slog.Logger) (*batchCatFile, error) {
@@ -546,16 +553,24 @@ func (b *batchCatFile) close() {
 
 func (b *batchCatFile) kill() {
 	b.shutdown(true)
+}
 
+// terminate closes b's stdout and stops its session with
+// terminateCommandProcessGroup, so a lazy fetch it runs removes its locks. It
+// does not wait for b to exit.
+func (b *batchCatFile) terminate() {
+	b.terminateOnce.Do(func() {
+		if b.stdoutPipe != nil {
+			_ = b.stdoutPipe.Close()
+		}
+		_ = terminateCommandProcessGroup(b.cmd)
+	})
 }
 
 func (b *batchCatFile) shutdown(kill bool) {
 	b.closeOnce.Do(func() {
 		if kill {
-			if b.stdoutPipe != nil {
-				_ = b.stdoutPipe.Close()
-			}
-			_ = killCommandProcessGroup(b.cmd)
+			b.terminate()
 		}
 		if b.stdin != nil {
 			_ = b.stdin.Close()
