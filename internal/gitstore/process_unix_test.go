@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -22,17 +23,38 @@ import (
 )
 
 // sshSessionReportEnv makes this test binary act as an SSH command that
-// writes its session ID and SSH_ASKPASS_REQUIRE to the named file and fails.
+// appends a line with its session ID and SSH_ASKPASS_REQUIRE to the named
+// file and fails.
 const sshSessionReportEnv = "AFS_TEST_SSH_SESSION_REPORT"
+
+// sshServeOnceEnv makes the first run of that SSH command serve the named
+// repository with git-upload-pack instead of failing, so a command that
+// contacts the remote twice reaches its second contact.
+const sshServeOnceEnv = "AFS_TEST_SSH_SERVE_ONCE"
 
 func init() {
 	if report := os.Getenv(sshSessionReportEnv); report != "" {
+		_, statErr := os.Stat(report)
+		first := errors.Is(statErr, os.ErrNotExist)
 		sid, err := unix.Getsid(0)
 		if err == nil {
-			err = os.WriteFile(report, []byte(strconv.Itoa(sid)+" "+os.Getenv("SSH_ASKPASS_REQUIRE")), 0o600)
+			var f *os.File
+			if f, err = os.OpenFile(report, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+				_, err = fmt.Fprintf(f, "%d %s\n", sid, os.Getenv("SSH_ASKPASS_REQUIRE"))
+				err = errors.Join(err, f.Close())
+			}
 		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if repo := os.Getenv(sshServeOnceEnv); repo != "" && first {
+			cmd := exec.Command("git-upload-pack", repo)
+			cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+			if err := cmd.Run(); err != nil {
+				os.Exit(1)
+			}
+			os.Exit(0)
 		}
 		os.Exit(1)
 	}
@@ -48,41 +70,47 @@ func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
 		filter string
-		// sshEnv names the SSH command in GIT_SSH_COMMAND, for a command that
-		// runs before a repo config exists to hold core.sshCommand.
-		sshEnv bool
-		read   func(ctx context.Context, store *Store, cfg model.RepoConfig, commit, blob string) error
+		// globalSSH names the SSH command in command-scope config, as a
+		// global core.sshCommand would, for a command that runs before a repo
+		// config exists to hold core.sshCommand.
+		globalSSH bool
+		// serveOnce lets the first SSH contact succeed, for a command that
+		// contacts the remote twice.
+		serveOnce bool
+		read      func(ctx context.Context, store *Store, cfg model.RepoConfig, commit, blob string) error
 	}{
-		{"blob", "blob:none", false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, blob string) error {
+		{"blob", "blob:none", false, false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, blob string) error {
 			_, err := store.BlobToCache(ctx, cfg.RepoPaths, blob, filepath.Join(filepath.Dir(cfg.GitDir), "cache", blob))
 			return err
 		}},
-		{"tree", "tree:0", false, func(ctx context.Context, store *Store, cfg model.RepoConfig, commit, _ string) error {
+		{"tree", "tree:0", false, false, func(ctx context.Context, store *Store, cfg model.RepoConfig, commit, _ string) error {
 			_, err := store.BuildTreeIndex(ctx, cfg, commit)
 			return err
 		}},
-		{"batch blob fetch", "blob:none", false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, blob string) error {
+		{"batch blob fetch", "blob:none", false, false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, blob string) error {
 			return store.FetchMissingBlobs(ctx, cfg.RepoPaths, []string{blob})
 		}},
-		{"refresh fetch", "blob:none", false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
+		{"refresh fetch", "blob:none", false, false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
 			return store.FetchNonInteractive(ctx, cfg)
 		}},
-		{"prepare fetch", "blob:none", false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
+		{"prepare fetch", "blob:none", false, false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
 			return store.FetchRefWithCredentials(ctx, cfg, "refs/heads/main")
 		}},
-		{"clone", "blob:none", true, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
+		{"clone", "blob:none", true, false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
 			return store.CloneBlobless(ctx, elsewhere(cfg, "refs/heads/main"))
 		}},
-		{"clone of an exact ref", "blob:none", true, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
+		{"clone of an exact ref", "blob:none", true, true, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
 			return store.CloneBlobless(ctx, elsewhere(cfg, "refs/tags/v1"))
 		}},
-		{"verified source fetch", "blob:none", true, func(ctx context.Context, store *Store, cfg model.RepoConfig, commit, _ string) error {
+		{"verified source fetch", "blob:none", true, false, func(ctx context.Context, store *Store, cfg model.RepoConfig, commit, _ string) error {
 			_, err := store.PrepareSource(ctx, elsewhere(cfg, ""), model.SourceRequirement{Ref: "refs/heads/main", RequiredCommit: commit})
 			return err
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			gittest.IsolatePrompts(t)
+			// Git would first probe an SSH command it does not know with -G.
+			t.Setenv("GIT_SSH_VARIANT", "ssh")
 			tmp := t.TempDir()
 			gitDir, commit, blob := partialClone(t, tmp, tt.filter)
 			exe, err := os.Executable()
@@ -90,9 +118,16 @@ func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
 				t.Fatal(err)
 			}
 			run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", sshRemote)
-			run(t, "git", "--git-dir", gitDir, "config", "core.sshCommand", shellQuote(exe))
-			if tt.sshEnv {
-				t.Setenv("GIT_SSH_COMMAND", shellQuote(exe))
+			run(t, "git", "--git-dir", gitDir, "config", "core.sshCommand", shellScriptQuote(exe))
+			if tt.globalSSH {
+				t.Setenv("GIT_CONFIG_COUNT", "1")
+				t.Setenv("GIT_CONFIG_KEY_0", "core.sshCommand")
+				t.Setenv("GIT_CONFIG_VALUE_0", shellScriptQuote(exe))
+			}
+			if tt.serveOnce {
+				src := filepath.Join(tmp, "src")
+				run(t, "git", "-C", src, "tag", "v1")
+				t.Setenv(sshServeOnceEnv, src)
 			}
 			report := filepath.Join(tmp, "ssh-session")
 			t.Setenv(sshSessionReportEnv, report)
@@ -113,12 +148,18 @@ func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			sid, askpass, _ := strings.Cut(string(data), " ")
-			if sid == strconv.Itoa(testSID) {
-				t.Fatalf("core.sshCommand ran in the caller's session %d, which can have a controlling terminal", testSID)
+			contacts := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+			if tt.serveOnce && len(contacts) < 2 {
+				t.Fatalf("git contacted the remote %d times, want a second contact after the served one", len(contacts))
 			}
-			if askpass != "never" {
-				t.Fatalf("core.sshCommand ran with SSH_ASKPASS_REQUIRE=%q, want never", askpass)
+			for _, contact := range contacts {
+				sid, askpass, _ := strings.Cut(contact, " ")
+				if sid == strconv.Itoa(testSID) {
+					t.Fatalf("core.sshCommand ran in the caller's session %d, which can have a controlling terminal", testSID)
+				}
+				if askpass != "never" {
+					t.Fatalf("core.sshCommand ran with SSH_ASKPASS_REQUIRE=%q, want never", askpass)
+				}
 			}
 		})
 	}
@@ -309,4 +350,93 @@ func TestRunGitEscapedDescriptorHelper(t *testing.T) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
+}
+
+// The daemon prepares a --prepared-gitdir with FetchRefAmbient. It must run
+// the git dir's own core.sshCommand, such as one that selects a deploy key.
+func TestPreparedGitDirFetchHonorsCoreSSHCommand(t *testing.T) {
+	gittest.IsolatePrompts(t)
+	tmp := t.TempDir()
+	gitDir, _, _ := partialClone(t, tmp, "blob:none")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", "ssh://git@example.invalid/repo.git")
+	run(t, "git", "--git-dir", gitDir, "config", "core.sshCommand", shellScriptQuote(exe))
+	report := filepath.Join(tmp, "ssh-session")
+	t.Setenv(sshSessionReportEnv, report)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store.gitRetryDelays = nil
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{PreparedGitDir: true}}
+	if err := store.FetchRefAmbient(ctx, cfg, "refs/heads/main"); err == nil {
+		t.Fatal("fetched through an SSH command that fails")
+	}
+	if _, err := os.Stat(report); err != nil {
+		t.Fatalf("the preparation fetch did not run the git dir's core.sshCommand: %v", err)
+	}
+}
+
+// Git runs SSH without BatchMode, so SSH can still ask to accept an unknown
+// host key or for a key's passphrase. Without a controlling terminal and with
+// askpass disabled, both prompts fail. DISPLAY makes the SSH_ASKPASS that
+// IsolatePrompts records eligible for both prompts.
+func TestNetworkGitSSHPromptsFailWithoutTerminal(t *testing.T) {
+	sshd, err := exec.LookPath("sshd")
+	if err != nil {
+		sshd = "/usr/sbin/sshd"
+	}
+	if _, err := os.Stat(sshd); err != nil {
+		t.Skipf("no sshd to answer SSH: %v", err)
+	}
+	askpassRuns := gittest.IsolatePrompts(t)
+	t.Setenv("DISPLAY", ":0")
+	tmp := t.TempDir()
+	keys := filepath.Join(tmp, "keys")
+	if err := os.Mkdir(keys, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	hostKey, userKey := filepath.Join(keys, "host"), filepath.Join(keys, "user")
+	run(t, "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", hostKey)
+	run(t, "ssh-keygen", "-q", "-t", "ed25519", "-N", "a passphrase", "-f", userKey)
+	// Without the public key, SSH must decrypt the private key to offer it.
+	if err := os.Remove(userKey + ".pub"); err != nil {
+		t.Fatal(err)
+	}
+	sshdConfig := filepath.Join(keys, "sshd_config")
+	if err := os.WriteFile(sshdConfig, []byte("HostKey "+hostKey+"\nPidFile none\nStrictModes no\nUsePAM no\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	knownHosts := filepath.Join(keys, "known_hosts")
+	if err := os.WriteFile(knownHosts, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// OpenSSH's own tests serve SSH this way, without a listening daemon.
+	ssh := "ssh -F /dev/null -o IdentityAgent=none -o GlobalKnownHostsFile=/dev/null -o 'ProxyCommand=" + sshd + " -i -f " + sshdConfig + "'"
+	probe := ssh + " -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=none git@localhost true"
+	if out, _ := exec.Command("sh", "-c", probe).CombinedOutput(); !strings.Contains(string(out), "Permission denied") {
+		t.Skipf("sshd -i does not serve SSH here: %s", out)
+	}
+	gitDir, _, _ := partialClone(t, tmp, "blob:none")
+	run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", "ssh://git@localhost/repo.git")
+	store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store.gitRetryDelays = nil
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}}
+	for _, tt := range []struct {
+		name, ssh, want string
+	}{
+		{"unknown host key", ssh + " -o UserKnownHostsFile=" + knownHosts, "Host key verification failed"},
+		{"key passphrase", ssh + " -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -i " + userKey, "Permission denied"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			run(t, "git", "--git-dir", gitDir, "config", "core.sshCommand", tt.ssh)
+			err := store.FetchRefAmbient(t.Context(), cfg, "refs/heads/main")
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("fetch error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+	gittest.RequireNoPrompt(t, askpassRuns)
 }

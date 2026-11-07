@@ -298,13 +298,12 @@ type Registry interface {
 // and reads blobs for the hydrator.
 type GitStore interface {
 	CloneBlobless(ctx context.Context, cfg RepoConfig) error
-	CloneBloblessNonInteractive(ctx context.Context, cfg RepoConfig) error
 	PrepareSource(ctx context.Context, cfg RepoConfig, requirement SourceRequirement) (PreparedSource, error)
 	ValidateAmbientRemote(repo RepoConfig) error
-	ConfigureRemoteNonInteractive(ctx context.Context, repo RepoConfig) error
+	ConfigureRemoteAmbient(ctx context.Context, repo RepoConfig) error
 	ConfigureRemoteWithCredentials(ctx context.Context, repo RepoConfig) error
 	FetchNonInteractive(ctx context.Context, repo RepoConfig) error
-	FetchRefNonInteractive(ctx context.Context, repo RepoConfig, ref string) error
+	FetchRefAmbient(ctx context.Context, repo RepoConfig, ref string) error
 	FetchRefWithCredentials(ctx context.Context, repo RepoConfig, ref string) error
 	PrepareFetchedBranch(ctx context.Context, repo RepoConfig, ref string) error
 	ValidatePreparedGitDir(ctx context.Context, repo RepoConfig) error

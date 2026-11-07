@@ -125,7 +125,8 @@ func (c *expiringContext) Err() error {
 // IsolatePrompts keeps the machine's prompt programs and SSH settings out of
 // a test's Git commands; IsolateConfig already isolates Git config. It sets
 // SSH_ASKPASS, which Git falls back to for its own prompts, to a program that
-// records each run in the returned file.
+// records each run in the returned file. The program answers no, which also
+// refuses an SSH host key, so a prompt that runs ends instead of repeating.
 func IsolatePrompts(t *testing.T) string {
 	t.Helper()
 	for _, key := range []string{"GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "SSH_ASKPASS_REQUIRE"} {
@@ -135,7 +136,7 @@ func IsolatePrompts(t *testing.T) string {
 	dir := t.TempDir()
 	runs := filepath.Join(dir, "askpass-runs")
 	askpass := filepath.Join(dir, "askpass")
-	if err := os.WriteFile(askpass, []byte("#!/bin/sh\necho \"$*\" >> '"+runs+"'\necho guessed\n"), 0o755); err != nil {
+	if err := os.WriteFile(askpass, []byte("#!/bin/sh\necho \"$*\" >> '"+runs+"'\necho no\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("SSH_ASKPASS", askpass)

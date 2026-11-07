@@ -541,13 +541,13 @@ func TestBuildTreeIndexLazyTreeFetchDoesNotPrompt(t *testing.T) {
 	gittest.RequireNoPrompt(t, askpassRuns)
 }
 
-func TestCloneBloblessNonInteractiveSkipsSSHAskpass(t *testing.T) {
+func TestCloneBloblessSkipsSSHAskpass(t *testing.T) {
 	askpassRuns := gittest.IsolatePrompts(t)
 	tmp := t.TempDir()
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: gittest.UnauthorizedRemote(t), Branch: "main"}}
-	err := New(slog.New(slog.NewTextHandler(io.Discard, nil))).CloneBloblessNonInteractive(context.Background(), cfg)
+	err := New(slog.New(slog.NewTextHandler(io.Discard, nil))).CloneBlobless(context.Background(), cfg)
 	if err == nil || !strings.Contains(err.Error(), "terminal prompts disabled") {
-		t.Fatalf("CloneBloblessNonInteractive error = %v, want a non-interactive failure", err)
+		t.Fatalf("CloneBlobless error = %v, want a non-interactive failure", err)
 	}
 	gittest.RequireNoPrompt(t, askpassRuns)
 }

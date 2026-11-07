@@ -3,7 +3,6 @@ package gitstore
 import (
 	"errors"
 	"net/url"
-	"os"
 	"strings"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
@@ -183,149 +182,12 @@ func isSCPStyleRemote(raw string) bool {
 	return at > 0 && colon > at
 }
 
-// nonInteractiveGitEnv keeps Git and SSH from prompting. An empty SSH_ASKPASS
-// stops Git from falling back to a desktop askpass program; one the user set
-// through GIT_ASKPASS or core.askPass still runs.
-func nonInteractiveGitEnv() []string {
-	return []string{"GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS=", "GIT_SSH_COMMAND=" + sshBatchModeCommand(os.Getenv("GIT_SSH_COMMAND"))}
-}
-
-// lazyFetchEnv keeps a lazy fetch, which reading a missing object starts, from
-// prompting. Run the command with configureCommandSession too. Unlike
-// nonInteractiveGitEnv, it leaves GIT_SSH_COMMAND unset, because that would
-// override the repo's core.sshCommand, which an adopted worktree keeps.
-// Without a controlling terminal SSH cannot prompt, and SSH_ASKPASS_REQUIRE
-// keeps it from opening an askpass dialog instead.
+// lazyFetchEnv keeps a Git command that contacts a remote from prompting. Run
+// the command with configureCommandSession too: without a controlling
+// terminal SSH cannot prompt, and SSH_ASKPASS_REQUIRE keeps it from opening an
+// askpass dialog instead. It leaves GIT_SSH_COMMAND unset, so the repo's
+// core.sshCommand, which an adopted worktree or a prepared git dir keeps,
+// still applies.
 func lazyFetchEnv() []string {
 	return []string{"GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS=", "SSH_ASKPASS_REQUIRE=never"}
-}
-
-func sshBatchModeCommand(existing string) string {
-	existing = strings.TrimSpace(existing)
-	if existing == "" {
-		return "ssh -o BatchMode=yes"
-	}
-	tokens := splitShellFields(existing)
-	filtered := make([]string, 0, len(tokens)+2)
-	for i := 0; i < len(tokens); i++ {
-		tok := tokens[i]
-		lower := strings.ToLower(tok)
-		if lower == "-o" && i+1 < len(tokens) && isBatchModeOption(tokens[i+1]) {
-			i++
-			continue
-		}
-		if strings.HasPrefix(lower, "-obatchmode=") {
-			continue
-		}
-		filtered = append(filtered, tok)
-	}
-	if len(filtered) == 0 {
-		filtered = append(filtered, "ssh")
-	}
-	filtered = append(filtered, "-o", "BatchMode=yes")
-	for i, tok := range filtered {
-		filtered[i] = shellQuote(tok)
-	}
-	return strings.Join(filtered, " ")
-}
-
-func splitShellFields(s string) []string {
-	var fields []string
-	var b strings.Builder
-	var quote rune
-	escaped := false
-	for _, r := range s {
-		if escaped {
-			if r == '$' {
-				b.WriteString(`\$`)
-			} else {
-				b.WriteRune(r)
-			}
-			escaped = false
-			continue
-		}
-		switch {
-		case quote != 0:
-			if r == quote {
-				quote = 0
-			} else if r == '$' && quote == '\'' {
-				b.WriteString(`\$`)
-			} else if r == '\\' && quote == '"' {
-				escaped = true
-			} else {
-				b.WriteRune(r)
-			}
-		case r == '\'' || r == '"':
-			quote = r
-		case r == '\\':
-			escaped = true
-		case r == ' ' || r == '\t' || r == '\n':
-			if b.Len() > 0 {
-				fields = append(fields, b.String())
-				b.Reset()
-			}
-		default:
-			b.WriteRune(r)
-		}
-	}
-	if escaped {
-		b.WriteRune('\\')
-	}
-	if b.Len() > 0 {
-		fields = append(fields, b.String())
-	}
-	return fields
-}
-
-func isBatchModeOption(opt string) bool {
-	parts := strings.Fields(strings.ToLower(strings.TrimSpace(opt)))
-	if len(parts) == 0 {
-		return false
-	}
-	return parts[0] == "batchmode" || strings.HasPrefix(parts[0], "batchmode=")
-}
-
-func shellQuote(s string) string {
-	if s == "" {
-		return "''"
-	}
-	if strings.Contains(s, "$") {
-		return doubleQuote(s)
-	}
-	if isShellSafe(s) {
-		return s
-	}
-	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
-}
-
-func doubleQuote(s string) string {
-	var b strings.Builder
-	b.WriteByte('"')
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' && i+1 < len(s) && s[i+1] == '$' {
-			b.WriteString(`\$`)
-			i++
-			continue
-		}
-		switch s[i] {
-		case '\\', '"', '`':
-			b.WriteByte('\\')
-		}
-		b.WriteByte(s[i])
-	}
-	b.WriteByte('"')
-	return b.String()
-}
-
-func isShellSafe(s string) bool {
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
-			continue
-		}
-		if strings.ContainsRune("@%_+=:,./-~$", r) {
-			continue
-		}
-		return false
-	}
-	return true
 }

@@ -24,14 +24,6 @@ type fetchRefInfo struct {
 }
 
 func (s *Store) CloneBlobless(ctx context.Context, cfg model.RepoConfig) error {
-	return s.cloneBlobless(ctx, cfg, nil)
-}
-
-func (s *Store) CloneBloblessNonInteractive(ctx context.Context, cfg model.RepoConfig) error {
-	return s.cloneBlobless(ctx, cfg, nonInteractiveGitEnv())
-}
-
-func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEnv []string) error {
 	if _, err := os.Stat(cfg.GitDir); err == nil {
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -44,12 +36,10 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 
 	// Strip credentials from the CLI-visible URL; pass them via a credential helper
 	// so they don't appear in ps output.
-	safeURL, credHelper, err := credentialEnv(cfg.RemoteURL)
+	safeURL, env, err := credentialEnv(cfg.RemoteURL)
 	if err != nil {
 		return err
 	}
-	env := append([]string{}, extraEnv...)
-	env = append(env, credHelper...)
 
 	var target string
 	attempt := func() error {
@@ -133,11 +123,10 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return model.PreparedSource{}, err
 	}
-	safeURL, credHelper, err := credentialEnv(cfg.RemoteURL)
+	safeURL, env, err := credentialEnv(cfg.RemoteURL)
 	if err != nil {
 		return model.PreparedSource{}, err
 	}
-	env := append(nonInteractiveGitEnv(), credHelper...)
 	var candidateGitDir string
 	attempt := func() error {
 		if candidateGitDir != "" {
@@ -373,8 +362,10 @@ func fetchDepth(ctx context.Context, repo model.RepoConfig, branch string) int {
 	return repo.HistoryDepth
 }
 
-func (s *Store) FetchRefNonInteractive(ctx context.Context, repo model.RepoConfig, ref string) error {
-	return s.fetchRef(ctx, repo, ref, nonInteractiveGitEnv())
+// FetchRefAmbient fetches ref with the credentials Git finds on its own, for a
+// repo whose remote holds none.
+func (s *Store) FetchRefAmbient(ctx context.Context, repo model.RepoConfig, ref string) error {
+	return s.fetchRef(ctx, repo, ref, nil)
 }
 
 func (s *Store) FetchRefWithCredentials(ctx context.Context, repo model.RepoConfig, ref string) error {
@@ -440,8 +431,10 @@ func (s *Store) startRemotesForLogging(ctx context.Context, repo model.RepoConfi
 	}, cancel
 }
 
-func (s *Store) ConfigureRemoteNonInteractive(ctx context.Context, repo model.RepoConfig) error {
-	return s.configureRemote(ctx, repo, repo.RemoteURL, nonInteractiveGitEnv())
+// ConfigureRemoteAmbient points origin at repo's remote, which holds no
+// credentials.
+func (s *Store) ConfigureRemoteAmbient(ctx context.Context, repo model.RepoConfig) error {
+	return s.configureRemote(ctx, repo, repo.RemoteURL, nil)
 }
 
 func (s *Store) ConfigureRemoteWithCredentials(ctx context.Context, repo model.RepoConfig) error {
