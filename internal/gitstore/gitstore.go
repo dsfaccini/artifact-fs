@@ -20,7 +20,9 @@ type Store struct {
 	poolMaxSize    int
 	pools          map[string]*batchPool // gitDir -> pool
 	gitRetryDelays []time.Duration
-	closed         bool
+	// rollbackTimeout bounds each rollback. Tests shorten it.
+	rollbackTimeout time.Duration
+	closed          bool
 }
 
 func New(logger *slog.Logger) *Store {
@@ -28,10 +30,11 @@ func New(logger *slog.Logger) *Store {
 		logger = slog.Default()
 	}
 	return &Store{
-		logger:         logger,
-		poolMaxSize:    4,
-		pools:          map[string]*batchPool{},
-		gitRetryDelays: append([]time.Duration(nil), defaultGitRetryDelays...),
+		logger:          logger,
+		poolMaxSize:     4,
+		pools:           map[string]*batchPool{},
+		gitRetryDelays:  append([]time.Duration(nil), defaultGitRetryDelays...),
+		rollbackTimeout: defaultRollbackTimeout,
 	}
 }
 

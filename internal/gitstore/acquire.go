@@ -475,14 +475,14 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 		}
 		oldHeadOID, err := refOIDOrZero(ctx, repo.GitDir, "HEAD")
 		if err != nil {
-			return rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+			return s.rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
 		}
 		updateArgs := []string{"update-ref", "--no-deref", "HEAD", oid}
 		if strings.Trim(oldHeadOID, "0") != "" {
 			updateArgs = append(updateArgs, oldHeadOID)
 		}
 		if _, err := runGit(ctx, repo.GitDir, updateArgs...); err != nil {
-			return rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+			return s.rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
 		}
 		return nil
 	}
@@ -500,12 +500,16 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 		return err
 	}
 	if _, err := runGit(ctx, repo.GitDir, "update-ref", refName, oid, oldBranchOID); err != nil {
-		return rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+		return s.rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
 	}
 	if _, err := runGit(ctx, repo.GitDir, "symbolic-ref", "HEAD", refName); err != nil {
-		refErr := restoreRef(ctx, repo.GitDir, refName, oldBranchOID, oid)
-		indexErr := rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
-		return errors.Join(indexErr, refErr)
+		// The index goes first, so a ref restore that uses up the deadline
+		// cannot keep it from HEAD. The next preparation's read-tree would
+		// carry an index that differs from HEAD over as staged changes.
+		ctx, cancel := s.rollbackContext(ctx)
+		defer cancel()
+		indexErr := restoreIndex(ctx, repo.GitDir, oid, oldOID, err)
+		return errors.Join(indexErr, restoreRef(ctx, repo.GitDir, refName, oldBranchOID, oid))
 	}
 	if _, err := runGit(ctx, repo.GitDir, "branch", "--set-upstream-to", "origin/"+target.branch, target.branch); err != nil {
 		s.logger.WarnContext(ctx, "set upstream failed", "repo", repo.Name, "error", err)
@@ -521,18 +525,26 @@ func refOIDOrZero(ctx context.Context, gitDir string, refName string) (string, e
 	return zeroOIDForGitDir(ctx, gitDir)
 }
 
-// rollbackTimeout bounds a rollback, which runs after its caller's context
-// ended too: a canceled preparation must still restore the index and refs it
-// changed.
-const rollbackTimeout = 30 * time.Second
+// defaultRollbackTimeout bounds a rollback, all its steps together. A
+// rollback runs after its caller's context ended too: a canceled preparation
+// must still restore the index and refs it changed. It stays below the
+// daemon's drainTimeout, so a stop's drain outlasts the rollback of the
+// preparation it cancels.
+const defaultRollbackTimeout = 20 * time.Second
 
-func rollbackContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+// rollbackContext is the context of one rollback: it outlives ctx's
+// cancellation and ends after s.rollbackTimeout.
+func (s *Store) rollbackContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), s.rollbackTimeout)
 }
 
-func rollbackIndexTransition(ctx context.Context, gitDir string, fromOID string, toOID string, cause error) error {
-	ctx, cancel := rollbackContext(ctx)
+func (s *Store) rollbackIndexTransition(ctx context.Context, gitDir string, fromOID string, toOID string, cause error) error {
+	ctx, cancel := s.rollbackContext(ctx)
 	defer cancel()
+	return restoreIndex(ctx, gitDir, fromOID, toOID, cause)
+}
+
+func restoreIndex(ctx context.Context, gitDir string, fromOID string, toOID string, cause error) error {
 	if err := readTreeTransition(ctx, gitDir, fromOID, toOID); err != nil {
 		return errors.Join(cause, fmt.Errorf("restore index after ref update failure: %w", err))
 	}
@@ -540,8 +552,6 @@ func rollbackIndexTransition(ctx context.Context, gitDir string, fromOID string,
 }
 
 func restoreRef(ctx context.Context, gitDir string, refName string, oldOID string, newOID string) error {
-	ctx, cancel := rollbackContext(ctx)
-	defer cancel()
 	if _, err := runGit(ctx, gitDir, "update-ref", refName, oldOID, newOID); err != nil {
 		return fmt.Errorf("restore ref after HEAD update failure: %w", err)
 	}

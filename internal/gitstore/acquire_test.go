@@ -108,6 +108,68 @@ func TestPrepareFetchedBranchConflictDoesNotMoveHEAD(t *testing.T) {
 	}
 }
 
+// A rollback that needs two steps ends at one deadline, so it cannot outlast
+// the daemon's drain of the preparation it rolls back.
+func TestPrepareFetchedBranchRollbackStepsShareOneDeadline(t *testing.T) {
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, "git", "init", "--initial-branch", "main", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	run(t, "git", "-C", repo, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(repo, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "feature.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "feature")
+	featureOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	run(t, "git", "-C", repo, "checkout", "main")
+	run(t, "git", "-C", repo, "branch", "-D", "feature")
+	run(t, "git", "-C", repo, "update-ref", "refs/remotes/origin/feature", featureOID)
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Pointing HEAD at the branch fails, which takes a two-step rollback. Its
+	// first step hangs past the rollback's deadline, and a step that starts
+	// after it marks itself late.
+	failed := filepath.Join(tmp, "symbolic-ref-failed")
+	firstStep := filepath.Join(tmp, "first-step")
+	lateStep := filepath.Join(tmp, "late-step")
+	script := "#!/bin/sh\nif [ \"$1\" = symbolic-ref ] && [ \"$2\" = HEAD ] && [ \"$#\" = 3 ]; then\n  : > \"$AFS_FAILED\"\n  exit 1\nfi\nif [ -e \"$AFS_FAILED\" ]; then\n  if [ ! -e \"$AFS_FIRST_STEP\" ]; then\n    : > \"$AFS_FIRST_STEP\"\n    sleep 60\n    exit 1\n  fi\n  : > \"$AFS_LATE_STEP\"\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AFS_REAL_GIT", realGit)
+	t.Setenv("AFS_FAILED", failed)
+	t.Setenv("AFS_FIRST_STEP", firstStep)
+	t.Setenv("AFS_LATE_STEP", lateStep)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	store := New(nil)
+	store.rollbackTimeout = time.Second
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: filepath.Join(repo, ".git")}}
+	if err := store.PrepareFetchedBranch(context.Background(), cfg, "feature"); err == nil {
+		t.Fatal("PrepareFetchedBranch succeeded although HEAD could not move")
+	}
+	if _, err := os.Stat(firstStep); err != nil {
+		t.Fatalf("the rollback's first step did not run: %v", err)
+	}
+	if _, err := os.Stat(lateStep); err == nil {
+		t.Fatal("a rollback step started after the rollback's deadline passed")
+	}
+}
+
 func TestFetchRefNonInteractiveAndPrepareFetchedBranch(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()

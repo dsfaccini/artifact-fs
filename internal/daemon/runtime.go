@@ -31,7 +31,9 @@ const (
 	// does not hang takes to return.
 	unmountReturnSlack = time.Second
 	// drainTimeout bounds how long a stop waits for a runtime's workers and
-	// its FUSE server once it is unmounted.
+	// its FUSE server once it is unmounted. It stays above gitstore's
+	// rollback timeout, so a stop waits out the rollback of the preparation
+	// it cancels.
 	drainTimeout = 30 * time.Second
 )
 

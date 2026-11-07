@@ -576,3 +576,78 @@ func TestCanceledPreparationRestoresTheIndex(t *testing.T) {
 		t.Fatalf("the index differs from HEAD in %q", staged)
 	}
 }
+
+// A preparation canceled while git read-tree holds index.lock leaves no lock
+// behind, so the next preparation succeeds.
+func TestCanceledReadTreeLeavesNoIndexLock(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	runCmd(t, "git", "init", "--initial-branch", "main", remote)
+	commitFile(t, remote, "README.md", "main\n")
+	clone := filepath.Join(tmp, "clone")
+	runCmd(t, "git", "clone", remote, clone)
+	advanced := commitFile(t, remote, "ADVANCED.md", "advanced\n")
+	gitDir := filepath.Join(clone, ".git")
+
+	// git read-tree runs the fsmonitor hook while it holds index.lock. The
+	// hook hangs there once, until the preparation is canceled.
+	blocked := filepath.Join(tmp, "read-tree-blocked")
+	hook := filepath.Join(tmp, "fsmonitor-hook")
+	script := "#!/bin/sh\nif [ -e \"$AFS_INDEX_LOCK\" ] && [ ! -e \"$AFS_BLOCKED\" ]; then\n  : > \"$AFS_BLOCKED\"\n  sleep 60\nfi\nexit 1\n"
+	if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", clone, "config", "core.fsmonitor", hook)
+	t.Setenv("AFS_INDEX_LOCK", filepath.Join(gitDir, "index.lock"))
+	t.Setenv("AFS_BLOCKED", blocked)
+
+	root := filepath.Join(tmp, "artifact-fs")
+	svc, err := New(ctx, root, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = svc.Close()
+		}
+	}()
+	svc.mount = (&recordingMount{}).mount
+	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: gitDir}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + remote, Branch: "main"}, Enabled: true}, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, nil, func() bool {
+		_, err := os.Stat(blocked)
+		return err == nil
+	})
+	// Stopping the daemon cancels the preparation.
+	closed = true
+	if err := svc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := New(ctx, root, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	restarted.mount = (&recordingMount{}).mount
+	if err := restarted.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	restarted.prepareWorkers.Wait()
+	stored, err := restarted.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.PrepareState != model.PrepareStateReady {
+		t.Fatalf("the next preparation ended %q with %q, want ready", stored.PrepareState, stored.PrepareError)
+	}
+	if head := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "rev-parse", "HEAD")); head != advanced {
+		t.Fatalf("HEAD = %s, want %s", head, advanced)
+	}
+}

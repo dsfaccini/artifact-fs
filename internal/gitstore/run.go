@@ -127,6 +127,6 @@ func runGitWithEnvCapture(ctx context.Context, gitDir string, extraEnv []string,
 
 func configureCancelableCommand(cmd *exec.Cmd) {
 	configureCommandProcessGroup(cmd)
-	cmd.Cancel = func() error { return killCommandProcessGroup(cmd) }
+	cmd.Cancel = func() error { return terminateCommandProcessGroup(cmd) }
 	cmd.WaitDelay = gitCommandWaitDelay
 }

@@ -17,3 +17,8 @@ func killCommandProcessGroup(cmd *exec.Cmd) error {
 	}
 	return cmd.Process.Kill()
 }
+
+// terminateCommandProcessGroup kills cmd: Windows has no SIGTERM.
+func terminateCommandProcessGroup(cmd *exec.Cmd) error {
+	return killCommandProcessGroup(cmd)
+}

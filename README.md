@@ -242,7 +242,7 @@ The cache shards blobs by the first two hex characters of their object ID, `<blo
 
 ## Logging
 
-ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the mode, source, attempt, phase, state, duration, and deadline. Clone and fetch operations retry known transient transport failures up to three total attempts. Preparation has a 30-minute timeout. Caller cancellation stops the active Git command and retry backoff; synchronous preparation records a redacted `prepare canceled` status, while daemon shutdown leaves async preparation queued for restart.
+ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the mode, source, attempt, phase, state, duration, and deadline. Clone and fetch operations retry known transient transport failures up to three total attempts. Preparation has a 30-minute timeout. Caller cancellation stops the active Git command and retry backoff. The command gets `SIGTERM`, so Git removes the lock files it created, such as `index.lock`, and `SIGKILL` 250 ms later if it still runs. A branch update that fails or is canceled after Git moved the index restores the index, then the branch, within 20 seconds in all. Synchronous preparation records a redacted `prepare canceled` status, while daemon shutdown leaves async preparation queued for restart.
 
 Existing-clone preparation reports remote configuration, fetch, and branch update as separate `configure_remote`, `fetch`, and `update_branch` phases.
 

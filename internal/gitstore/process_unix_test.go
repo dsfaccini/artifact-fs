@@ -118,7 +118,8 @@ func TestRunGitCancellationKillsDescendants(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The child marks git started only once its sleep runs, so the cancel cannot race the fork.
-	script := "#!/bin/sh\n(exec 3>\"$AFS_CHILD_FIFO\"; sleep 60 & : > \"$AFS_GIT_STARTED\"; wait; : > \"$AFS_CHILD_FINISHED\") &\nwait\n"
+	// The child and its sleep ignore SIGTERM, so only the SIGKILL that follows it ends them.
+	script := "#!/bin/sh\n(trap '' TERM; exec 3>\"$AFS_CHILD_FIFO\"; sleep 60 & : > \"$AFS_GIT_STARTED\"; wait; : > \"$AFS_CHILD_FINISHED\") &\nwait\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
