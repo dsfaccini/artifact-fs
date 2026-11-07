@@ -214,7 +214,7 @@ func TestPrepareOnReadyVerifiedRepoKeepsItsMount(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if err := svc.ctl().Prepare(ctx, cfg.Name); err != nil {
+			if _, err := svc.ctl().Prepare(ctx, cfg.Name); err != nil {
 				t.Fatal(err)
 			}
 			if err := svc.syncRepos(ctx); err != nil {
@@ -265,7 +265,7 @@ func TestPrepareOnServedSyncRepoKeepsItsMount(t *testing.T) {
 	}
 
 	advanced := commitFile(t, filepath.Join(tmp, "remote"), "ADVANCED.md", "advanced\n")
-	if err := ctl.Prepare(ctx, "repo"); err != nil {
+	if _, err := ctl.Prepare(ctx, "repo"); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.syncRepos(ctx); err != nil {
@@ -410,7 +410,7 @@ func TestPrepareCancelsTheAsyncPreparationItSupersedes(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, nil, func() bool { return clones("start") == 1 })
-	if err := svc.ctl().Prepare(ctx, "repo"); err != nil {
+	if _, err := svc.ctl().Prepare(ctx, "repo"); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.syncRepos(ctx); err != nil {
@@ -439,7 +439,7 @@ func TestFailedSyncPrepareKeepsServingAcrossRestart(t *testing.T) {
 	if err := os.Rename(remote, filepath.Join(tmp, "remote-gone")); err != nil {
 		t.Fatal(err)
 	}
-	if err := ctl.Prepare(ctx, "repo"); err == nil {
+	if _, err := ctl.Prepare(ctx, "repo"); err == nil {
 		t.Fatal("prepare from a missing remote succeeded")
 	}
 	if err := svc.syncRepos(ctx); err != nil {

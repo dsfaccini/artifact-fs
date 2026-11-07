@@ -466,10 +466,10 @@ func TestE2E(t *testing.T) {
 		)
 
 		// Poll until reconciliation completes. The watcher polls HEAD at
-		// 500ms; after detecting the change, onHEADChanged re-indexes the
-		// tree, reconciles the overlay, refreshes the git index, and swaps
-		// the snapshot generation. When git status reports the committed
-		// file as clean, all of that has finished.
+		// 500ms; after detecting the change, reconcileHEAD publishes the new
+		// commit's tree, reconciles the overlay, and switches the snapshot
+		// generation. When git status reports the committed file as clean,
+		// all of that has finished.
 		deadline := time.Now().Add(10 * time.Second)
 		reconciled := false
 		for time.Now().Before(deadline) {

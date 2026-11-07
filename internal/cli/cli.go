@@ -56,10 +56,10 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		},
 		{
 			Name:  "add-repo",
-			Usage: "add and mount a repository",
+			Usage: "register a repository and prepare it for the daemon to mount",
 			Flags: []ucli.Flag{
 				&ucli.StringFlag{Name: "name", Usage: "repo name (required)"},
-				&ucli.StringFlag{Name: "remote", Usage: "remote URL (required)"},
+				&ucli.StringFlag{Name: "remote", Usage: "remote URL; required unless --adopt-gitdir or --prepared-gitdir is set"},
 				&ucli.StringFlag{Name: "branch", Usage: "deprecated alias for --ref refs/heads/<branch>"},
 				&ucli.StringFlag{Name: "ref", Value: "refs/heads/main", Usage: "source ref: a full ref name, a branch name, or origin/<branch>"},
 				&ucli.StringFlag{Name: "require-commit", Usage: "require the source ref to resolve to this exact commit"},
@@ -82,6 +82,9 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					if c.IsSet("ref") {
 						return fmt.Errorf("--ref and --branch cannot be used together")
 					}
+					// The alias names refs/heads/<branch> literally, so --branch
+					// origin/X reaches a branch named origin/X, which
+					// model.CanonicalRef would read as X.
 					ref = "refs/heads/" + strings.TrimPrefix(branch, "refs/heads/")
 				}
 				requiredCommit := strings.TrimSpace(c.String("require-commit"))
@@ -179,8 +182,13 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			return nil
 		}),
 		nameCommand("prepare", "prepare a repository again without unmounting it", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Controller, name string, w io.Writer) error {
-			if err := svc.Prepare(c, name); err != nil {
+			prepared, err := svc.Prepare(c, name)
+			if err != nil {
 				return err
+			}
+			if !prepared {
+				fmt.Fprintf(w, "%s is ready; nothing to prepare\n", name)
+				return nil
 			}
 			fmt.Fprintf(w, "preparing %s\n", name)
 			return nil
@@ -194,6 +202,8 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					return err
 				}
 				for _, r := range repos {
+					// Only refs/heads/ is shortened. model.BranchName would also
+					// shorten an older verified source's refs/remotes/origin/X.
 					displayRef := r.Branch
 					if branch, ok := strings.CutPrefix(displayRef, "refs/heads/"); ok {
 						displayRef = branch
@@ -389,7 +399,7 @@ func formatLastFetchAt(at time.Time) string {
 	if at.IsZero() {
 		return "never"
 	}
-	return at.Format(time.RFC3339)
+	return at.UTC().Format(time.RFC3339)
 }
 
 func formatLastFetchResult(result string) string {

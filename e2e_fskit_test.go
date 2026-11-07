@@ -198,7 +198,7 @@ func TestSharedMountReadOnlyTestChangesMountHelper(t *testing.T) {
 			run(t, writer, "git", "add", "ADVANCED.md")
 			run(t, writer, "git", "-c", "user.name=E2E Test", "-c", "user.email=e2e@test", "commit", "-m", "advance HEAD")
 			run(t, writer, "git", "push", "origin", "main")
-			if err := repo.ctl.Prepare(ctx, repoName); err != nil {
+			if _, err := repo.ctl.Prepare(ctx, repoName); err != nil {
 				t.Fatal(err)
 			}
 		default:

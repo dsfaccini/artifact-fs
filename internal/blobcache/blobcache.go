@@ -155,7 +155,8 @@ type candidate struct {
 var testHookBeforeEvictBatch func()
 
 // Evict removes blobs in order of least recent access time until the cache
-// holds at most maxBytes, or until ctx ends. It first recounts the cache, so
+// holds at most maxBytes, or until ctx ends. A maxBytes of 0 empties the
+// cache, the empty blob included. It first recounts the cache, so
 // it also corrects counters that drifted. It unlinks each blob, so a handle
 // open on it keeps reading the blob, and the next open of its path hydrates
 // it again. A blob read or replaced after Evict listed it stays.
@@ -176,7 +177,7 @@ func Evict(ctx context.Context, dir string, maxBytes int64) (EvictResult, error)
 	st, candidates, err := recountLocked(ctx, dir, lock)
 	_ = lock.Close()
 	res := EvictResult{Remaining: st}
-	if err != nil || st.Bytes <= maxBytes {
+	if err != nil || fits(st, maxBytes) {
 		return res, err
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].atime.Before(candidates[j].atime) })
@@ -219,7 +220,7 @@ func evictBatchLocked(ctx context.Context, dir string, maxBytes int64, candidate
 		res.Remaining = st
 	}()
 	n := 0
-	for ; n < len(candidates) && n < evictBatch && st.Bytes > maxBytes; n++ {
+	for ; n < len(candidates) && n < evictBatch && !fits(st, maxBytes); n++ {
 		if err := ctx.Err(); err != nil {
 			return nil, false, err
 		}
@@ -239,7 +240,13 @@ func evictBatchLocked(ctx context.Context, dir string, maxBytes int64, candidate
 		res.Evicted++
 		res.EvictedBytes += cur.Size()
 	}
-	return candidates[n:], st.Bytes <= maxBytes, nil
+	return candidates[n:], fits(st, maxBytes), nil
+}
+
+// fits reports whether a cache with st fits maxBytes. Only an empty cache
+// fits 0, because the empty blob holds no bytes.
+func fits(st Stats, maxBytes int64) bool {
+	return st.Bytes <= maxBytes && (maxBytes > 0 || st.Blobs == 0)
 }
 
 // lockStats opens dir's stats file and takes an exclusive flock on it.

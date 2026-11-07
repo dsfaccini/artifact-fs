@@ -444,10 +444,8 @@ func scanRepo(s scanner) (model.RepoConfig, error) {
 	}
 	if refreshNS > 0 {
 		cfg.RefreshInterval = time.Duration(refreshNS)
-	} else if refresh > 0 {
-		cfg.RefreshInterval = time.Duration(refresh) * time.Second
 	} else {
-		cfg.RefreshInterval = 30 * time.Second
+		cfg.RefreshInterval = time.Duration(refresh) * time.Second
 	}
 	cfg.Enabled = enabled == 1
 	cfg.PreparedGitDir = preparedGitDir == 1

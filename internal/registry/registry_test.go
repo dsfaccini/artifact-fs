@@ -9,6 +9,32 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
+// Readers trust the stored config, so a refresh policy without an interval
+// reads back as stored.
+func TestUpdateRefreshNeverRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	store, err := New(ctx, filepath.Join(t.TempDir(), "repos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo"}, RepoSpec: model.RepoSpec{Branch: "refs/heads/main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Minute}, Enabled: true}
+	if err := store.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	never := model.RefreshPolicy{RemoteRefreshDisabled: true}
+	if err := store.UpdateRefresh(ctx, cfg.ID, never); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RefreshPolicy != never {
+		t.Fatalf("refresh policy = %+v, want %+v", got.RefreshPolicy, never)
+	}
+}
+
 func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	store, err := New(ctx, filepath.Join(t.TempDir(), "repos.sqlite"))
