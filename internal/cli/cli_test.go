@@ -322,7 +322,8 @@ func TestPrepareCLIReportsNothingToPrepare(t *testing.T) {
 }
 
 // add-repo registers and prepares a repo, and only the daemon mounts it.
-// --adopt-gitdir and --prepared-gitdir take no --remote.
+// --adopt-gitdir and --prepared-gitdir take no --remote, and --require-commit
+// takes no --fetch-ref.
 func TestAddRepoHelpDescribesRegistration(t *testing.T) {
 	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
 	stdout, stderr, code := runCLI(t, "add-repo", "--help")
@@ -332,6 +333,7 @@ func TestAddRepoHelpDescribesRegistration(t *testing.T) {
 	for _, want := range []string{
 		"register a repository and prepare it for the daemon to mount",
 		"remote URL; required unless --adopt-gitdir or --prepared-gitdir is set",
+		"ref to fetch and serve; defaults to --ref; cannot be combined with --require-commit",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("add-repo --help = %q, want %q", stdout, want)

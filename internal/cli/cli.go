@@ -71,7 +71,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				&ucli.BoolFlag{Name: "prepared-gitdir", Usage: "use an existing git dir for async preparation"},
 				&ucli.StringFlag{Name: "git-dir", Usage: "explicit git dir path"},
 				&ucli.StringFlag{Name: "blob-cache-dir", Usage: "directory for hydrated blobs; may be shared between repositories"},
-				&ucli.StringFlag{Name: "fetch-ref", Usage: "ref to fetch and serve; defaults to --ref"},
+				&ucli.StringFlag{Name: "fetch-ref", Usage: "ref to fetch and serve; defaults to --ref; cannot be combined with --require-commit"},
 			},
 			Action: withController(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Controller) error {
 				name := strings.TrimSpace(c.String("name"))
@@ -82,9 +82,9 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					if c.IsSet("ref") {
 						return fmt.Errorf("--ref and --branch cannot be used together")
 					}
-					// The alias names refs/heads/<branch> literally, so --branch
-					// origin/X reaches a branch named origin/X, which
-					// model.CanonicalRef would read as X.
+					// The alias drops one leading refs/heads/ and stores the rest
+					// under refs/heads/, so --branch origin/X reaches a branch named
+					// origin/X, which model.CanonicalRef would read as X.
 					ref = "refs/heads/" + strings.TrimPrefix(branch, "refs/heads/")
 				}
 				requiredCommit := strings.TrimSpace(c.String("require-commit"))
