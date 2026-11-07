@@ -116,7 +116,10 @@ type RepoRuntimeRecord struct {
 	Diverged         bool
 	// MountRequest is the CLI request the daemon last carried out.
 	MountRequest string
-	UpdatedAt    time.Time
+	// ClaimsLeftover reports that the daemon still claims a mount an earlier
+	// daemon left at the repo's mount point, so the next daemon claims it too.
+	ClaimsLeftover bool
+	UpdatedAt      time.Time
 }
 
 type RepoRuntimeState struct {

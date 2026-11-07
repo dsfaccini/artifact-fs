@@ -92,6 +92,85 @@ func TestHangingUnmountStallsOnlyItsRepo(t *testing.T) {
 	})
 }
 
+// blockedUnmountMount is a live mount whose unmount blocks until release
+// closes, as unmount(2) can on a busy volume.
+type blockedUnmountMount struct {
+	*fakeMountedFS
+	entered, release chan struct{}
+	enterOnce        sync.Once
+}
+
+func (m *blockedUnmountMount) Unmount(ctx context.Context) error {
+	m.enterOnce.Do(func() { close(m.entered) })
+	<-m.release
+	return m.fakeMountedFS.Unmount(ctx)
+}
+
+// A stop runs off the sync loop: while one repo's unmount is blocked, the
+// daemon mounts another repo, and the blocked stop has not given up.
+func TestSyncLoopMountsAnotherRepoWhileAStopIsBlocked(t *testing.T) {
+	blocked := &blockedUnmountMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, entered: make(chan struct{}), release: make(chan struct{})}
+	var mounts atomic.Int32
+	d := startDaemonWithMount(t, func(ctx, opCtx context.Context, cfg model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
+		if mounts.Add(1) == 1 {
+			return blocked, nil
+		}
+		return fakeMount(ctx, opCtx, cfg, engine, gate, logger, redact)
+	}, "")
+	ctx := context.Background()
+	unmounted := make(chan error, 1)
+	go func() { unmounted <- d.svc.ctl().Unmount(ctx, "repo") }()
+	select {
+	case <-blocked.entered:
+	case err := <-d.startErr:
+		t.Fatalf("Start returned before the stop's unmount began: %v", err)
+	}
+	if err := d.svc.ctl().AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "other"}, RepoSpec: model.RepoSpec{RemoteURL: d.workDir, Branch: "main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Hour}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, d.startErr, func() bool {
+		st, err := d.svc.ctl().Status(ctx, "other")
+		return err == nil && st.State == repoStateMounted
+	})
+	if st := d.status(t); st.LastErrorPhase == phaseUnmount {
+		t.Fatalf("the blocked stop gave up before the other repo mounted: %s; the sync loop waited for it", st.LastError)
+	}
+	close(blocked.release)
+	if err := <-unmounted; err != nil {
+		t.Fatalf("Unmount = %v", err)
+	}
+}
+
+// A stop whose unmount has not returned in time shows as an unmount failure,
+// retried at the next sync, while the stop keeps running.
+func TestStatusShowsAStopWhoseUnmountHasNotReturned(t *testing.T) {
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	blocked := &blockedUnmountMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, entered: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { close(blocked.release) })
+	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
+		return blocked, nil
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.registry.RequestMount(ctx, "repo", false, "stop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-blocked.entered
+	// The unmount has run past its bound.
+	svc.mu.Lock()
+	svc.running["repo"].stop.started = time.Now().Add(-unmountTimeout - unmountReturnSlack - time.Second)
+	svc.mu.Unlock()
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	requireFailure(t, ctl, phaseUnmount, "unmount has not returned")
+}
+
 // recordingMountTable stands in for the kernel's mount table: it lists entry
 // at path until something unmounts path.
 type recordingMountTable struct {
@@ -373,6 +452,44 @@ func TestFailedCloseKeepsTheLeftoverClaim(t *testing.T) {
 	}
 }
 
+// A daemon whose unmount of the earlier daemon's leftover failed before the
+// repo's runtime started still claims that leftover after it stops, so the
+// next daemon unmounts it. The claim leaves the reported state alone: status
+// shows the repo unmounted, not degraded.
+func TestFailedLeftoverUnmountKeepsTheClaimAcrossARestart(t *testing.T) {
+	first, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	cfg, err := first.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.registry.PutRuntime(ctx, model.RepoRuntimeRecord{RepoID: cfg.ID, State: repoStateMounted, Phase: phaseServe}); err != nil {
+		t.Fatal(err)
+	}
+	table := &recordingMountTable{path: cfg.MountPath, entry: ownMountEntry("repo"), held: true, unmountErr: errors.New("busy")}
+	first.mountPointEntry = table.mountPointEntry
+	first.unmountPath = table.unmountPath
+	first.mount = table.mount
+	startCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- first.Start(startCtx) }()
+	waitFor(t, done, func() bool {
+		st, err := ctl.Status(ctx, "repo")
+		return err == nil && st.LastErrorPhase == phaseMount
+	})
+	if st, err := ctl.Status(ctx, "repo"); err != nil || st.State != repoStateUnmounted {
+		t.Fatalf("status after the failed leftover unmount = %+v, %v; want the repo unmounted", st, err)
+	}
+	cancel()
+	<-done
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	if got, want := nextDaemonCalls(t, first.root, cfg.MountPath), []string{"unmount " + cfg.MountPath, "mount"}; !slices.Equal(got, want) {
+		t.Fatalf("calls = %q, want %q; the next daemon lost the claim on the leftover", got, want)
+	}
+}
+
 // status shows the last refresh of a daemon that stopped cleanly.
 func TestCleanStopKeepsTheLastRefreshInStatus(t *testing.T) {
 	svc, ctl := newSyncedDaemon(t)
@@ -470,9 +587,7 @@ func TestCleanStopClearsAnEarlierUnmountFailure(t *testing.T) {
 	if err := svc.registry.RequestMount(ctx, cfg.ID, false, "stop"); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.syncRepos(ctx); err != nil {
-		t.Fatal(err)
-	}
+	syncAndFinishStops(t, svc)
 	requireFailure(t, ctl, phaseUnmount, "busy")
 	if err := svc.Close(); err != nil {
 		t.Fatalf("Close = %v", err)
@@ -613,9 +728,7 @@ func TestStopCancelsTheOpsOfItsMount(t *testing.T) {
 	if err := svc.registry.RequestMount(ctx, "repo", false, "unmount-request"); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.syncRepos(ctx); err != nil {
-		t.Fatal(err)
-	}
+	syncAndFinishStops(t, svc)
 	if !errors.Is(opCtx.Err(), context.Canceled) {
 		t.Fatalf("op context after the stop: %v, want canceled", opCtx.Err())
 	}
@@ -1035,9 +1148,7 @@ func TestStopFinishesAfterAnExternalUnmount(t *testing.T) {
 	if err := svc.registry.RequestMount(ctx, "repo", false, "unmount-request"); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.syncRepos(ctx); err != nil {
-		t.Fatal(err)
-	}
+	syncAndFinishStops(t, svc)
 	svc.mu.Lock()
 	_, running := svc.running["repo"]
 	svc.mu.Unlock()

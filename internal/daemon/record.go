@@ -33,8 +33,9 @@ func (s *Service) recordPhase(cfg model.RepoConfig, phase string) {
 var errFUSEServerExited = errors.New("FUSE server exited")
 
 // recordRuntime applies update, under s.mu, to the daemon's record of id and
-// writes the record to repo_runtime, which status reads. The caller must not
-// hold s.mu.
+// writes the record to repo_runtime, which status reads. The record also
+// carries whether the daemon claims a leftover at id's mount point. The
+// caller must not hold s.mu.
 func (s *Service) recordRuntime(id model.RepoID, update func(*model.RepoRuntimeRecord)) {
 	s.recordMu.Lock()
 	defer s.recordMu.Unlock()
@@ -50,6 +51,7 @@ func (s *Service) recordRuntimeLocked(id model.RepoID, update func(*model.RepoRu
 		s.records[id] = rec
 	}
 	update(rec)
+	rec.ClaimsLeftover = s.leftovers[id]
 	written := *rec
 	s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), prepareStateWriteTimeout)

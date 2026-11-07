@@ -171,6 +171,26 @@ func startService(t *testing.T, svc *Service) <-chan error {
 	return done
 }
 
+// syncAndFinishStops runs one registry sync on svc and waits for each stop
+// it started, which runs off the sync loop.
+func syncAndFinishStops(t *testing.T, svc *Service) {
+	t.Helper()
+	if err := svc.syncRepos(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.Lock()
+	var stops []*unmountOp
+	for _, rt := range svc.running {
+		if rt.stop != nil {
+			stops = append(stops, rt.stop)
+		}
+	}
+	svc.mu.Unlock()
+	for _, op := range stops {
+		<-op.done
+	}
+}
+
 func TestUnmountReportsTheDaemonsFailure(t *testing.T) {
 	svc, ctl := newSyncedDaemon(t)
 	svc.mountPointEntry = heldMountPoint
