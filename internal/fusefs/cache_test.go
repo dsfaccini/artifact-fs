@@ -414,3 +414,41 @@ func TestInvalidateChangedDropsWrittenPagesWhenABaseBlobReturns(t *testing.T) {
 		t.Fatalf("inodes the switch back to blob-a invalidated = %v, want file.txt (%d)", after[len(before):], inode)
 	}
 }
+
+// A lookup or getattr between a switch and its pass reports the new blob, so
+// the identity the kernel received already matches the merged view when the
+// pass compares them. The kernel's pages can still hold the old blob: the
+// macFUSE kernel extension ignores a lookup's attributes for an inode it
+// holds, and drops pages on a getattr only when the size changed. The pass
+// must still invalidate the inode, and a later switch that keeps the file
+// must not invalidate it again.
+func TestSwitchPassInvalidatesInodeAReplyUpdatedFirst(t *testing.T) {
+	for _, reply := range []string{"none", "lookup", "getattr"} {
+		t.Run(reply, func(t *testing.T) {
+			f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
+			held := f.lookup(fuseops.RootInodeID, "file.txt")
+			f.open(held)
+			f.switchTo(baseFile("file.txt", "blob-B", 0o100644))
+			switch reply {
+			case "lookup":
+				f.lookup(fuseops.RootInodeID, "file.txt")
+			case "getattr":
+				f.getattr(held)
+			}
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if inodes, _ := f.notifier.recorded(); !slices.Equal(inodes, []fuseops.InodeID{held}) {
+				t.Fatalf("pass invalidated inodes %v, want held inode %d, whose pages hold blob-A", inodes, held)
+			}
+			f.getattr(held)
+			f.switchTo(baseFile("file.txt", "blob-B", 0o100644))
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if inodes, _ := f.notifier.recorded(); len(inodes) != 1 {
+				t.Fatalf("a switch that kept file.txt invalidated it again: inodes %v", inodes)
+			}
+		})
+	}
+}
