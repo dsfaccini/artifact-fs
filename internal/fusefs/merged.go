@@ -101,7 +101,20 @@ func (r *Resolver) resolvePath(path string) (ResolvedNode, error) {
 	} else if ok {
 		return ResolvedNode{Base: n}, nil
 	}
+	// The listing of path's parent shows path as a directory when overlay
+	// entries lie below it, as mergeChildren decides.
+	if below, err := r.Overlay.HasEntryBelow(context.Background(), path); err != nil {
+		return ResolvedNode{}, err
+	} else if below {
+		return ResolvedNode{Base: implicitDir(path)}, nil
+	}
 	return ResolvedNode{}, fs.ErrNotExist
+}
+
+// implicitDir is the directory at path that only overlay entries below it
+// imply, such as one a HEAD change removed while it held untracked files.
+func implicitDir(path string) model.BaseNode {
+	return model.BaseNode{Path: path, Type: "dir", Mode: 0o755, SizeState: "known"}
 }
 
 func (r *Resolver) Getattr(path string) (mode uint32, size int64, nodeType string, mtime time.Time, ctime time.Time, err error) {
@@ -219,7 +232,7 @@ func mergeChildren(path string, children []model.BaseNode, ovEntries []model.Ove
 			continue
 		}
 		if _, ok := set[name]; !ok {
-			set[name] = entry{name: name, typ: "dir", base: model.BaseNode{Type: "dir", Mode: 0o755, SizeState: "known"}}
+			set[name] = entry{name: name, typ: "dir", base: implicitDir(model.CleanPath(filepath.Join(path, name)))}
 		}
 	}
 	out := make([]ReaddirEntry, 0, len(set))

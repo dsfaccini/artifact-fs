@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -1985,6 +1986,76 @@ func TestCreateFileKeepsExistingEntry(t *testing.T) {
 	attrs := &fuseops.LookUpInodeOp{Parent: f.nestInode, Name: "base.txt"}
 	if err := f.fs.LookUpInode(ctx, attrs); err != nil || attrs.Entry.Attributes.Size != uint64(base.SizeBytes) {
 		t.Fatalf("base file after CreateFile = size %d, %v; want size %d", attrs.Entry.Attributes.Size, err, base.SizeBytes)
+	}
+}
+
+// The kernel can send MKDIR or SYMLINK for a name its lookup missed before a
+// HEAD change added it. The op must fail with EEXIST and keep the base file.
+func TestMkDirAndCreateSymlinkKeepEntryASwitchAdded(t *testing.T) {
+	for _, op := range []string{"MkDir", "CreateSymlink"} {
+		t.Run(op, func(t *testing.T) {
+			f := newCacheFixture(t)
+			if got := f.lookup(fuseops.RootInodeID, "x"); got != 0 {
+				t.Fatalf("lookup of x before the switch = inode %d, want a miss", got)
+			}
+			f.switchTo(baseFile("x", "blob-X", 0o100644))
+			var err error
+			if op == "MkDir" {
+				err = f.fs.MkDir(f.ctx, &fuseops.MkDirOp{Parent: fuseops.RootInodeID, Name: "x", Mode: os.ModeDir | 0o755})
+			} else {
+				err = f.fs.CreateSymlink(f.ctx, &fuseops.CreateSymlinkOp{Parent: fuseops.RootInodeID, Name: "x", Target: "elsewhere"})
+			}
+			id, exists, idErr := f.fs.engine.Identity("x")
+			if idErr != nil {
+				t.Fatal(idErr)
+			}
+			if kernelErrno(err) != syscall.EEXIST || !exists || id.Type != "file" || id.Blob != "blob-X" {
+				t.Fatalf("%s over base file x = %v, and x is now %+v (exists %t); want EEXIST and the base file kept", op, err, id, exists)
+			}
+		})
+	}
+}
+
+// A listing shows a directory that only overlay entries below it imply: one a
+// HEAD change removed while it held an untracked file, or one whose file a
+// write through a held inode recreated. A lookup of it finds a directory.
+func TestLookUpFindsImplicitDirectory(t *testing.T) {
+	for _, how := range []string{"untracked file", "write through held inode"} {
+		t.Run(how, func(t *testing.T) {
+			f := newCacheFixture(t, baseDir("d", "d1"), baseFile("d/file.txt", "blob-A", 0o100644))
+			d := f.lookup(fuseops.RootInodeID, "d")
+			held := f.lookup(d, "file.txt")
+			open := f.open(held)
+			if how == "untracked file" {
+				create := &fuseops.CreateFileOp{Parent: d, Name: "new.txt", Mode: 0o644}
+				if err := f.fs.CreateFile(f.ctx, create); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.switchTo()
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if how == "write through held inode" {
+				if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("new")}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			listed, _, _, err := f.fs.engine.ReadDir(f.ctx, ".")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.ContainsFunc(listed, func(e ReaddirEntry) bool { return e.Name == "d" && e.Type == "dir" }) {
+				t.Fatalf("root listing %+v lacks directory d", listed)
+			}
+			op := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "d"}
+			if err := f.fs.LookUpInode(f.ctx, op); err != nil || op.Entry.Child == 0 || !op.Entry.Attributes.Mode.IsDir() {
+				t.Fatalf("lookup of d, which the root listing shows, = inode %d mode %v, %v; want a directory", op.Entry.Child, op.Entry.Attributes.Mode, err)
+			}
+		})
 	}
 }
 
