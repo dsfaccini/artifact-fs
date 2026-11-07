@@ -484,9 +484,14 @@ the inode, so Git's stat data stays valid. A rename moves the numbers of the
 whole subtree. A path that stops existing retires its number: an unlink, rmdir
 or rename over it through the mount, or a HEAD change that removes it. A file or
 directory made there later gets a new number, even while the old inode is still
-open. The mount keeps one mapping per existing path the kernel has looked up.
-After each HEAD change, it lists each directory that holds such a path once to
-find the paths that vanished.
+open. Numbers last for one mount: a remount or a daemon restart numbers paths
+again.
+
+The mount keeps one mapping per existing path the kernel has looked up. After
+each HEAD change, it finds the paths that vanished: it reads the overlay once
+and lists the snapshot children of each directory that holds such a path. On
+Linux and the macFUSE kernel extension, a path whose inode the kernel holds
+gets the per-path identity check that decides its invalidations instead.
 
 ### Subsystems
 

@@ -8,6 +8,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/dsfaccini/fuse/fuseops"
 )
 
@@ -210,17 +211,216 @@ func TestSwitchRetiresInodeNumbersOfVanishedPaths(t *testing.T) {
 // A create can land between a switch that removed its path and the pass that
 // retires the path's number. It still gets a new number.
 func TestCreateBeforeTheSwitchPassGetsNewInodeNumber(t *testing.T) {
-	f := newCacheFixture(t, baseFile("file.txt", "old", 0o100644))
-	held := f.lookup(fuseops.RootInodeID, "file.txt")
-	f.switchTo()
-	create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "file.txt", Mode: 0o644}
-	if err := f.fs.CreateFile(f.ctx, create); err != nil {
-		t.Fatalf("CreateFile: %v", err)
+	for _, tt := range []struct {
+		name   string
+		create func(*cacheFixture) (fuseops.InodeID, error)
+	}{
+		{"CreateFile", func(f *cacheFixture) (fuseops.InodeID, error) {
+			op := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "file.txt", Mode: 0o644}
+			err := f.fs.CreateFile(f.ctx, op)
+			if err == nil {
+				f.t.Cleanup(func() {
+					_ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: op.Handle})
+				})
+			}
+			return op.Entry.Child, err
+		}},
+		{"MkDir", func(f *cacheFixture) (fuseops.InodeID, error) {
+			op := &fuseops.MkDirOp{Parent: fuseops.RootInodeID, Name: "file.txt", Mode: os.ModeDir | 0o755}
+			err := f.fs.MkDir(f.ctx, op)
+			return op.Entry.Child, err
+		}},
+		{"CreateSymlink", func(f *cacheFixture) (fuseops.InodeID, error) {
+			op := &fuseops.CreateSymlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt", Target: "elsewhere"}
+			err := f.fs.CreateSymlink(f.ctx, op)
+			return op.Entry.Child, err
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newCacheFixture(t, baseFile("file.txt", "old", 0o100644))
+			held := f.lookup(fuseops.RootInodeID, "file.txt")
+			f.switchTo()
+			created, err := tt.create(f)
+			if err != nil {
+				t.Fatalf("%s: %v", tt.name, err)
+			}
+			if created == held {
+				t.Fatalf("%s took inode %d of the file the switch removed", tt.name, held)
+			}
+		})
 	}
-	t.Cleanup(func() {
-		_ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: create.Handle})
-	})
-	if create.Entry.Child == held {
-		t.Fatalf("created file took inode %d of the file the switch removed", held)
+}
+
+// An inode the kernel still holds after a switch removed its path is
+// invalidated when a later switch brings the path back with another blob:
+// getattr and reads on the inode resolve the path again, so the kernel's
+// pages of the old blob must go.
+func TestSwitchInvalidatesHeldInodeWhosePathReturns(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	f.open(held)
+	f.switchTo()
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := f.notifier.recorded()
+	f.switchTo(baseFile("file.txt", "blob-B", 0o100644))
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if after, _ := f.notifier.recorded(); !slices.Equal(after[len(before):], []fuseops.InodeID{held}) {
+		t.Fatalf("inodes invalidated when file.txt came back with blob-B = %v, want the held inode %d", after[len(before):], held)
+	}
+}
+
+// hookedOverlay runs each hook once: after a rename commits, after a listing,
+// or after a removal.
+type hookedOverlay struct {
+	model.OverlayStore
+	afterRename, afterList, afterRemove func()
+}
+
+func fire(hook *func()) {
+	if h := *hook; h != nil {
+		*hook = nil
+		h()
+	}
+}
+
+func (o *hookedOverlay) Rename(ctx context.Context, oldPath, newPath string, sourceTracked bool) error {
+	err := o.OverlayStore.Rename(ctx, oldPath, newPath, sourceTracked)
+	if err == nil {
+		fire(&o.afterRename)
+	}
+	return err
+}
+
+func (o *hookedOverlay) RenameTree(ctx context.Context, oldPath, newPath string, src, dst []string) error {
+	err := o.OverlayStore.RenameTree(ctx, oldPath, newPath, src, dst)
+	if err == nil {
+		fire(&o.afterRename)
+	}
+	return err
+}
+
+func (o *hookedOverlay) ListByPrefix(ctx context.Context, prefix string) ([]model.OverlayEntry, error) {
+	out, err := o.OverlayStore.ListByPrefix(ctx, prefix)
+	fire(&o.afterList)
+	return out, err
+}
+
+func (o *hookedOverlay) Remove(ctx context.Context, path string) error {
+	err := o.OverlayStore.Remove(ctx, path)
+	if err == nil {
+		fire(&o.afterRemove)
+	}
+	return err
+}
+
+// hookOverlay routes f's overlay through a hookedOverlay.
+func hookOverlay(f *cacheFixture) *hookedOverlay {
+	ov := &hookedOverlay{OverlayStore: f.resolver.Overlay}
+	f.resolver.Overlay, f.fs.engine.Overlay = ov, ov
+	return ov
+}
+
+// A rename commits the overlay before it moves the mappings. A switch pass
+// that runs between the two sees the old names missing, and must not unmap
+// the numbers the rename is moving.
+func TestSwitchPassDuringRenameKeepsMovedNumbers(t *testing.T) {
+	f := newCacheFixture(t)
+	ov := hookOverlay(f)
+	mkdir := &fuseops.MkDirOp{Parent: fuseops.RootInodeID, Name: "src", Mode: os.ModeDir | 0o755}
+	if err := f.fs.MkDir(f.ctx, mkdir); err != nil {
+		t.Fatal(err)
+	}
+	create := &fuseops.CreateFileOp{Parent: mkdir.Entry.Child, Name: "file.txt", Mode: 0o644}
+	if err := f.fs.CreateFile(f.ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	forget(t, f.fs, create.Entry.Child)
+	ran := false
+	ov.afterRename = func() {
+		ran = true
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Error(err)
+		}
+	}
+	if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "src", NewParent: fuseops.RootInodeID, NewName: "dst"}); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if !ran {
+		t.Fatal("the switch pass did not run inside the rename")
+	}
+	dst := f.lookup(fuseops.RootInodeID, "dst")
+	file := f.lookup(dst, "file.txt")
+	if got, want := []fuseops.InodeID{dst, file}, []fuseops.InodeID{mkdir.Entry.Child, create.Entry.Child}; !slices.Equal(got, want) {
+		t.Fatalf("inodes of dst and dst/file.txt = %v, want the numbers they had under src: %v", got, want)
+	}
+}
+
+// A create can land while the switch pass lists the overlay, after the pass
+// read the mappings. The pass then finds the path missing, and must leave the
+// created path's mapping alone.
+func TestCreateDuringSwitchPassKeepsItsNumber(t *testing.T) {
+	f := newCacheFixture(t, baseFile("gone.txt", "gone", 0o100644))
+	forget(t, f.fs, f.lookup(fuseops.RootInodeID, "gone.txt"))
+	f.switchTo()
+	ov := hookOverlay(f)
+	var created fuseops.InodeID
+	ov.afterList = func() {
+		op := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "gone.txt", Mode: 0o644}
+		if err := f.fs.CreateFile(f.ctx, op); err != nil {
+			t.Error(err)
+			return
+		}
+		_ = f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: op.Handle})
+		created = op.Entry.Child
+	}
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if created == 0 {
+		t.Fatal("the create did not run inside the switch pass")
+	}
+	if got := f.lookup(fuseops.RootInodeID, "gone.txt"); got != created {
+		t.Fatalf("lookup of gone.txt after the pass = inode %d, want %d, the number its create got", got, created)
+	}
+}
+
+// RmDir unmaps its path after the overlay removes it. A MkDir of the same name
+// must not land between the two steps, or the unmap drops the new directory's
+// number. The test runs the MkDir there whenever the lock RmDir holds lets it.
+func TestMkDirCannotLandInsideRmDir(t *testing.T) {
+	f := newCacheFixture(t)
+	ov := hookOverlay(f)
+	if err := f.fs.MkDir(f.ctx, &fuseops.MkDirOp{Parent: fuseops.RootInodeID, Name: "dir", Mode: os.ModeDir | 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	mkdir := func() fuseops.InodeID {
+		op := &fuseops.MkDirOp{Parent: fuseops.RootInodeID, Name: "dir", Mode: os.ModeDir | 0o755}
+		if err := f.fs.MkDir(f.ctx, op); err != nil {
+			t.Fatalf("MkDir: %v", err)
+		}
+		return op.Entry.Child
+	}
+	var made fuseops.InodeID
+	ov.afterRemove = func() {
+		if f.fs.handleOps.TryRLock() {
+			f.fs.handleOps.RUnlock()
+			made = mkdir()
+		}
+	}
+	if err := f.fs.RmDir(f.ctx, &fuseops.RmDirOp{Parent: fuseops.RootInodeID, Name: "dir"}); err != nil {
+		t.Fatalf("RmDir: %v", err)
+	}
+	if made == 0 {
+		made = mkdir()
+	}
+	if got := f.lookup(fuseops.RootInodeID, "dir"); got != made {
+		t.Fatalf("lookup of dir = inode %d, want %d, the number its MkDir got", got, made)
 	}
 }

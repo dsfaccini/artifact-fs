@@ -164,14 +164,15 @@ func BenchmarkSwitchGeneration20kOverlayEntries(b *testing.B) {
 	})
 }
 
-// inodeTableTree returns n files, 100 per directory, with their directories.
-// Each file path is 68 characters long, the mean length of the tracked files
-// of pydantic-ai; platform's is 78.
-func inodeTableTree(n int) []model.BaseNode {
-	nodes := make([]model.BaseNode, 0, n+n/100)
+// inodeTableTree returns n files, perDir per directory, with their
+// directories. A directory path is 44 characters long and a file path 69,
+// close to the 68 and 78 characters of the mean tracked file path of
+// pydantic-ai and platform, which hold about 11 and 12 files per directory.
+func inodeTableTree(n, perDir int) []model.BaseNode {
+	nodes := make([]model.BaseNode, 0, n+n/perDir+1)
 	for i := range n {
-		dir := fmt.Sprintf("packages/module-%04d/src/components/widgets", i/100)
-		if i%100 == 0 {
+		dir := fmt.Sprintf("packages/module-%05d/src/components/widgets", i/perDir)
+		if i%perDir == 0 {
 			nodes = append(nodes, model.BaseNode{Path: dir, Type: "dir", Mode: 0o40000, SizeState: "known"})
 		}
 		path := fmt.Sprintf("%s/component-file-%05d.tsx", dir, i%100000)
@@ -189,16 +190,18 @@ func heapInUse() uint64 {
 
 // BenchmarkInodeTable reports the heap the inode table holds per path the
 // kernel looked up once: held-B/path while the kernel holds every inode, and
-// dormant-B/path once it has forgotten them all. Each lookup allocates its
-// path and blob strings, as LookUpInode does.
+// dormant-B/path once it has forgotten them all. dormant-B/path includes the
+// capacity of the emptied inodes map, which Go never shrinks; table-B/path
+// leaves it out. Each lookup allocates its path and blob strings, as
+// LookUpInode does.
 func BenchmarkInodeTable(b *testing.B) {
 	for _, n := range []int{100_000, 300_000} {
 		b.Run(fmt.Sprint(n), func(b *testing.B) {
 			var paths, blobs []string
-			for _, node := range inodeTableTree(n) {
+			for _, node := range inodeTableTree(n, 100) {
 				paths, blobs = append(paths, node.Path), append(blobs, node.ObjectOID)
 			}
-			var held, dormant uint64
+			var held, dormant, table uint64
 			for range b.N {
 				before := heapInUse()
 				fs := NewArtifactFuse(model.RepoConfig{}, nil)
@@ -217,66 +220,107 @@ func BenchmarkInodeTable(b *testing.B) {
 				if len(fs.pathToInode) != len(paths)+1 {
 					b.Fatalf("table maps %d paths after FORGET, want %d", len(fs.pathToInode), len(paths)+1)
 				}
+				fs.inodes = map[fuseops.InodeID]*InodeRef{fuseops.RootInodeID: fs.inodes[fuseops.RootInodeID]}
+				table += heapInUse() - before - idsSize
 				runtime.KeepAlive(ids)
+				runtime.KeepAlive(fs)
 			}
 			perPath := float64(b.N * len(paths))
 			b.ReportMetric(float64(held)/perPath, "held-B/path")
 			b.ReportMetric(float64(dormant)/perPath, "dormant-B/path")
+			b.ReportMetric(float64(table)/perPath, "table-B/path")
 			b.ReportMetric(float64(dormant)/float64(b.N)/(1<<20), "dormant-MiB")
 		})
 	}
 }
 
 // BenchmarkSwitchPassForgottenPaths times the pass a generation switch runs
-// over a snapshot of n files that the kernel looked up once and forgot. The
-// pass lists each directory that holds one of their paths.
+// over paths the kernel looked up once and forgot, in the snapshot or in the
+// overlay. The pass reads the overlay once and lists the snapshot children of
+// each directory that holds one of the paths.
 func BenchmarkSwitchPassForgottenPaths(b *testing.B) {
-	ctx := context.Background()
-	for _, n := range []int{100_000, 300_000} {
-		b.Run(fmt.Sprint(n), func(b *testing.B) {
-			nodes := inodeTableTree(n)
-			snap, err := snapshot.New(ctx, filepath.Join(b.TempDir(), "snapshot.sqlite"))
-			if err != nil {
-				b.Fatal(err)
-			}
-			b.Cleanup(func() { _ = snap.Close() })
-			gen, err := snap.PublishGeneration(ctx, "head", "main", append([]model.BaseNode{{Path: ".", Type: "dir", Mode: 0o40000, SizeState: "known"}}, nodes...))
-			if err != nil {
-				b.Fatal(err)
-			}
-			dir := b.TempDir()
-			ov, err := overlaystore.New(ctx, model.RepoConfig{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
-			if err != nil {
-				b.Fatal(err)
-			}
-			b.Cleanup(func() { _ = ov.Close() })
-			r := &Resolver{Snapshot: snap, Overlay: ov}
-			r.SetGeneration(gen)
-			fs := NewArtifactFuse(model.RepoConfig{}, &Engine{Resolver: r, Overlay: ov})
-			ids := make([]fuseops.InodeID, len(nodes))
-			fs.mu.Lock()
-			for i, node := range nodes {
-				ids[i] = fs.allocInode(node.Path, Attrs{Type: node.Type, Mode: node.Mode, Gen: gen}).ID
-			}
-			fs.mu.Unlock()
-			for _, id := range ids {
-				_ = fs.ForgetInode(ctx, &fuseops.ForgetInodeOp{Inode: id, N: 1})
-			}
-			var cpu time.Duration
-			b.ResetTimer()
-			for range b.N {
-				start := cpuTime(b)
-				if err := fs.invalidateChanged(false); err != nil {
-					b.Fatal(err)
-				}
-				cpu += cpuTime(b) - start
-			}
-			b.StopTimer()
-			if len(fs.pathToInode) != len(nodes)+1 {
-				b.Fatalf("pass dropped mappings of paths that exist: %d left, want %d", len(fs.pathToInode), len(nodes)+1)
-			}
-			b.ReportMetric(float64(cpu.Nanoseconds())/float64(b.N), "cpu-ns/op")
-			b.ReportMetric(float64(cpu.Nanoseconds())/float64(b.N*len(nodes)), "cpu-ns/path")
+	overlayTree := func(format string) []string {
+		var files []string
+		for i := range 20_000 {
+			files = append(files, fmt.Sprintf(format, i%500, i))
+		}
+		return files
+	}
+	for _, layout := range []struct {
+		name    string
+		nodes   []model.BaseNode
+		overlay []string
+	}{
+		{name: "snapshot/100-per-dir/100k", nodes: inodeTableTree(100_000, 100)},
+		{name: "snapshot/100-per-dir/300k", nodes: inodeTableTree(300_000, 100)},
+		{name: "snapshot/10-per-dir/100k", nodes: inodeTableTree(100_000, 10)},
+		{name: "overlay/node_modules", overlay: overlayTree("node_modules/pkg%d/lib/f%d.js")},
+		{name: "overlay/venv", overlay: overlayTree(".venv/lib/python3.12/site-packages/pkg%d/sub/f%d.js")},
+	} {
+		b.Run(layout.name, func(b *testing.B) {
+			benchSwitchPass(b, layout.nodes, layout.overlay)
 		})
 	}
+}
+
+// benchSwitchPass publishes nodes, creates overlayFiles, and maps every one of
+// their paths and parent directories to an inode the kernel then forgets.
+// Then it times the pass and reports paths, cpu-ns/op and cpu-ns/path.
+func benchSwitchPass(b *testing.B, nodes []model.BaseNode, overlayFiles []string) {
+	ctx := context.Background()
+	snap, err := snapshot.New(ctx, filepath.Join(b.TempDir(), "snapshot.sqlite"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = snap.Close() })
+	gen, err := snap.PublishGeneration(ctx, "head", "main", append([]model.BaseNode{{Path: ".", Type: "dir", Mode: 0o40000, SizeState: "known"}}, nodes...))
+	if err != nil {
+		b.Fatal(err)
+	}
+	dir := b.TempDir()
+	ov, err := overlaystore.New(ctx, model.RepoConfig{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = ov.Close() })
+	paths := map[string]bool{}
+	for _, n := range nodes {
+		paths[n.Path] = true
+	}
+	for _, p := range overlayFiles {
+		if _, err := ov.CreateFile(ctx, p, 0o644); err != nil {
+			b.Fatal(err)
+		}
+		for q := p; q != "."; q = filepath.Dir(q) {
+			paths[q] = true
+		}
+	}
+	r := &Resolver{Snapshot: snap, Overlay: ov}
+	r.SetGeneration(gen)
+	fs := NewArtifactFuse(model.RepoConfig{}, &Engine{Resolver: r, Overlay: ov})
+	var ids []fuseops.InodeID
+	fs.mu.Lock()
+	for p := range paths {
+		ids = append(ids, fs.allocInode(p, Attrs{Type: "file", Mode: 0o644, Gen: gen}).ID)
+	}
+	fs.mu.Unlock()
+	for _, id := range ids {
+		_ = fs.ForgetInode(ctx, &fuseops.ForgetInodeOp{Inode: id, N: 1})
+	}
+	var cpu time.Duration
+	b.ResetTimer()
+	for range b.N {
+		start := cpuTime(b)
+		if err := fs.invalidateChanged(false); err != nil {
+			b.Fatal(err)
+		}
+		cpu += cpuTime(b) - start
+	}
+	b.StopTimer()
+	if len(fs.pathToInode) != len(paths)+1 {
+		b.Fatalf("pass dropped mappings of paths that exist: %d left, want %d", len(fs.pathToInode), len(paths)+1)
+	}
+	b.ReportMetric(float64(len(paths)), "paths")
+	b.ReportMetric(float64(cpu.Nanoseconds())/float64(b.N), "cpu-ns/op")
+	b.ReportMetric(float64(cpu.Nanoseconds())/float64(b.N*len(paths)), "cpu-ns/path")
 }

@@ -85,9 +85,9 @@ type ArtifactFuse struct {
 
 	mu sync.RWMutex
 	// handleOps keeps inode and handle bookkeeping consistent with the overlay:
-	// Unlink and Rename hold it exclusively, and every op that creates or uses
-	// inodes and handles holds it shared. Engine.Do releases it before it
-	// hydrates a blob.
+	// Unlink, RmDir and Rename hold it exclusively, and every op that creates
+	// or uses inodes and handles holds it shared. Engine.Do releases it before
+	// it hydrates a blob.
 	handleOps sync.RWMutex
 	// inodes holds each inode the kernel holds.
 	inodes map[fuseops.InodeID]*InodeRef
@@ -105,6 +105,10 @@ type ArtifactFuse struct {
 	// the time its record lapses.
 	negatives       map[kernelEntry]time.Time
 	negativeSweepAt int
+	// renameSeq is odd while a Rename op runs, and grows by two with each one.
+	// The switch pass unmaps nothing when a rename overlapped it, because a
+	// rename commits the overlay before it moves the mappings.
+	renameSeq uint64
 
 	// notifier is nil when nothing should reach the kernel. fs.mu guards it:
 	// the mount publishes it after ops may have started.
@@ -262,6 +266,18 @@ func (fs *ArtifactFuse) unmapPath(path string) {
 	fs.mu.Unlock()
 }
 
+// renaming marks a Rename op as running until done is called.
+func (fs *ArtifactFuse) renaming() (done func()) {
+	fs.mu.Lock()
+	fs.renameSeq++
+	fs.mu.Unlock()
+	return func() {
+		fs.mu.Lock()
+		fs.renameSeq++
+		fs.mu.Unlock()
+	}
+}
+
 // dropLookups drops n of id's lookups. An inode the kernel no longer holds
 // leaves inodes, and its path's mapping stays, dormant.
 func (fs *ArtifactFuse) dropLookups(id fuseops.InodeID, n uint64) {
@@ -322,7 +338,9 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // mapped path that no longer exists, so a path made there later gets a new
 // number. When send is true it also tells the kernel what changed. Every inode
 // the kernel holds at a path gets the check for a name that vanished or
-// changed type. An inode whose identity the kernel received from the base
+// changed type. An inode the kernel holds after its path stopped existing gets
+// only the identity comparison, because getattr and reads on it resolve the
+// path again. An inode whose identity the kernel received from the base
 // snapshot gets the identity comparison. One the kernel last saw from the
 // overlay is invalidated when it now resolves to a base blob, whose bytes can
 // differ from what was written. An overlay entry itself changes only through
@@ -339,11 +357,13 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		entry    kernelEntry
 		reported Identity
 		base     bool
+		mapped   bool
 	}
 	now := time.Now()
 	fs.mu.RLock()
 	notifier := fs.notifier
 	send = send && notifier != nil
+	renameSeq := fs.renameSeq
 	var inodes, negatives []known
 	// existenceOnly holds every other mapping: those that need only the check
 	// that their path exists.
@@ -358,7 +378,12 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			existenceOnly = append(existenceOnly, mapping{id, path})
 			continue
 		}
-		inodes = append(inodes, known{mapping: mapping{id, path}, entry: kernelEntry{parent, filepath.Base(path)}, reported: ref.identity(), base: ref.Gen != 0})
+		inodes = append(inodes, known{mapping: mapping{id, path}, entry: kernelEntry{parent, filepath.Base(path)}, reported: ref.identity(), base: ref.Gen != 0, mapped: true})
+	}
+	for id, ref := range fs.inodes {
+		if send && !ref.IsRoot && !ref.Stale && ref.Path != ".git" && fs.pathToInode[ref.Path] != id {
+			inodes = append(inodes, known{mapping: mapping{id, ref.Path}, reported: ref.identity(), base: ref.Gen != 0})
+		}
 	}
 	for e, lapses := range fs.negatives {
 		if parent := fs.inodes[e.parent]; parent != nil && !parent.Stale && lapses.After(now) {
@@ -382,44 +407,44 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			failed(err, "resolve "+k.path)
 			continue
 		}
-		if !exists {
-			vanished = append(vanished, k.mapping)
-		}
 		switch {
 		case !exists || current.Type != k.reported.Type:
-			entries = append(entries, k.entry)
+			// The name of an unmapped inode already left the kernel, through
+			// the op or the pass that unmapped it.
+			if k.mapped {
+				entries = append(entries, k.entry)
+			}
+			if k.mapped && !exists {
+				vanished = append(vanished, k.mapping)
+			}
 		case k.base && current != k.reported, !k.base && current.Blob != "":
 			changed = append(changed, k.id)
 		}
 	}
-	// Listing each directory once costs far less than resolving each of its
-	// children. A name its parent's listing lacks does not exist.
-	byDir := map[string][]mapping{}
+	paths := make([]string, len(existenceOnly))
+	for i, m := range existenceOnly {
+		paths[i] = m.path
+	}
+	missing, err := fs.engine.MissingPaths(context.Background(), paths)
+	failed(err, "list parents")
+	gone := make(map[string]bool, len(missing))
+	for _, p := range missing {
+		gone[p] = true
+	}
 	for _, m := range existenceOnly {
-		dir := model.CleanPath(filepath.Dir(m.path))
-		byDir[dir] = append(byDir[dir], m)
-	}
-	for dir, children := range byDir {
-		listed, _, _, err := fs.engine.ReadDir(context.Background(), dir)
-		if err != nil {
-			failed(err, "list "+dir)
-			continue
-		}
-		names := make(map[string]bool, len(listed))
-		for _, e := range listed {
-			names[e.Name] = true
-		}
-		for _, m := range children {
-			if !names[filepath.Base(m.path)] {
-				vanished = append(vanished, m)
-			}
+		if gone[m.path] {
+			vanished = append(vanished, m)
 		}
 	}
-	// An op may have mapped the path again since it was resolved.
+	// An op may have mapped the path again since it was resolved. A rename that
+	// overlapped the pass may not have moved its mappings yet, so the next
+	// pass retries.
 	fs.mu.Lock()
-	for _, m := range vanished {
-		if fs.pathToInode[m.path] == m.id {
-			delete(fs.pathToInode, m.path)
+	if fs.renameSeq == renameSeq && renameSeq%2 == 0 {
+		for _, m := range vanished {
+			if fs.pathToInode[m.path] == m.id {
+				delete(fs.pathToInode, m.path)
+			}
 		}
 	}
 	fs.mu.Unlock()
@@ -1294,7 +1319,7 @@ func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
 }
 
 func (fs *ArtifactFuse) RmDir(ctx context.Context, op *fuseops.RmDirOp) error {
-	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+	return fs.exclusive(ctx, func(ctx context.Context, _ *Blobs) error {
 		parent, childPath, err := fs.childPath(op.Parent, op.Name)
 		if err != nil {
 			return err
@@ -1330,6 +1355,7 @@ func (fs *ArtifactFuse) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error 
 
 func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error {
 	return fs.exclusive(ctx, func(ctx context.Context, b *Blobs) error {
+		defer fs.renaming()()
 		oldParent, err := fs.requireInode(op.OldParent, syscall.ENOENT)
 		if err != nil {
 			return err
