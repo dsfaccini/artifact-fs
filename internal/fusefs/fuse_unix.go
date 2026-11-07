@@ -141,9 +141,8 @@ type InodeRef struct {
 	// lookup's attributes for an inode it holds, so the pass checks Prior too.
 	// Its Type is empty when no reply replaced an identity.
 	Prior Identity
-	// Invalidated says the switch pass invalidated the inode or its entry and no
-	// reply has reached the kernel since, so the kernel holds nothing of an older
-	// identity.
+	// Invalidated says the switch pass invalidated the inode and no reply has
+	// been recorded since, so report keeps no Prior for the next reply.
 	Invalidated bool
 	// WrittenAt is the writeSeq of the last write through this inode.
 	WrittenAt uint64
@@ -418,19 +417,19 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // invalidateChanged implements MountedFS.InvalidateChanged. It unmaps each
 // mapped path that no longer exists, so a path made there later gets a new
 // number. When send is true it also tells the kernel what changed. Every inode
-// the kernel holds at a path gets the check for a name that vanished or
-// changed type. An inode the kernel holds after its path stopped existing gets
-// only the identity comparison, because getattr and reads on it resolve the
-// path again. An inode whose identity the kernel received from the base
-// snapshot gets the identity comparison. One the kernel last saw from the
-// overlay is invalidated when it now resolves to a base blob, whose bytes can
-// differ from what was written. An inode whose identity a reply replaced
-// since the last pass is invalidated too: the kernel can still cache pages of
-// the replaced identity, which report keeps in InodeRef.Prior. An overlay
-// entry itself changes only through the mount, which keeps the kernel's view
-// of it current. A dormant mapping
-// gets no invalidation: the kernel holds nothing for it. A failure skips only
-// what it concerns, and the first one is returned.
+// the kernel holds at a path gets the check for a name that vanished or changed
+// type, which invalidates both the name's entry and the inode. An inode the
+// kernel holds after its path stopped existing gets only the identity
+// comparison, because getattr and reads on it resolve the path again. An inode
+// whose identity the kernel received from the base snapshot gets the identity
+// comparison. One the kernel last saw from the overlay is invalidated when it
+// now resolves to a base blob, whose bytes can differ from what was written. An
+// inode whose identity a reply replaced since the last pass is invalidated too:
+// the kernel can still cache pages of the replaced identity, which report keeps
+// in InodeRef.Prior. An overlay entry itself changes only through the mount,
+// which keeps the kernel's view of it current. A dormant mapping gets no
+// invalidation: the kernel holds nothing for it. A failure skips only what it
+// concerns, and the first one is returned.
 func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	type known struct {
 		pathMapping
@@ -480,11 +479,11 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		}
 	}
 	var entries []kernelEntry
+	// changed holds each held inode the pass invalidates. An entry
+	// invalidation leaves the kernel's attributes and pages of the inode, so
+	// each inode whose entry the pass invalidates is in changed too.
 	var changed []fuseops.InodeID
 	var vanished []pathMapping
-	// dropped holds each inode whose entry or attributes the pass invalidates:
-	// the kernel then holds nothing of an identity older than the next reply.
-	var dropped []fuseops.InodeID
 	for _, k := range inodes {
 		current, exists, err := fs.engine.Identity(k.path)
 		if err != nil {
@@ -500,14 +499,13 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			// the op or the pass that unmapped it.
 			if k.mapped {
 				entries = append(entries, k.entry)
-				dropped = append(dropped, k.id)
+				changed = append(changed, k.id)
 			}
 			if k.mapped && !exists {
 				vanished = append(vanished, k.pathMapping)
 			}
 		case hidden, k.base && current != k.reported, !k.base && current.Blob != "":
 			changed = append(changed, k.id)
-			dropped = append(dropped, k.id)
 		}
 	}
 	paths := make([]string, len(existenceOnly))
@@ -526,7 +524,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		}
 	}
 	fs.mu.Lock()
-	for _, id := range dropped {
+	for _, id := range changed {
 		if ref := fs.inodes[id]; ref != nil {
 			ref.Invalidated, ref.Prior = true, Identity{}
 		}

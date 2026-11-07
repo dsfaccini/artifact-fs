@@ -192,8 +192,8 @@ func TestSwitchRetiresInodeNumbersOfVanishedPaths(t *testing.T) {
 	if err := f.mount.InvalidateChanged(); err != nil {
 		t.Fatal(err)
 	}
-	if inodes, entries := f.notifier.recorded(); len(inodes) != 0 || !slices.Equal(entries, []kernelEntry{{root, "held.txt"}}) {
-		t.Fatalf("invalidated inodes %v and entries %v, want only the entry of held.txt", inodes, entries)
+	if inodes, entries := f.notifier.recorded(); !slices.Equal(inodes, []fuseops.InodeID{held}) || !slices.Equal(entries, []kernelEntry{{root, "held.txt"}}) {
+		t.Fatalf("invalidated inodes %v and entries %v, want only the entry and inode of held.txt", inodes, entries)
 	}
 	forget(t, f.fs, held)
 
