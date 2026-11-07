@@ -503,11 +503,19 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 		return s.rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
 	}
 	if _, err := runGit(ctx, repo.GitDir, "symbolic-ref", "HEAD", refName); err != nil {
-		// The index goes first, so a ref restore that uses up the deadline
-		// cannot keep it from HEAD. The next preparation's read-tree would
-		// carry an index that differs from HEAD over as staged changes.
 		ctx, cancel := s.rollbackContext(ctx)
 		defer cancel()
+		// HEAD resolves to the fetched commit when it was on the branch
+		// already, or when symbolic-ref finished before a cancel stopped it.
+		// The git dir then holds the whole transition.
+		if headAt(ctx, repo.GitDir, oid) {
+			return err
+		}
+		// HEAD is not on the branch, so a branch ref left at the fetched
+		// commit is harmless, while an index that differs from HEAD reaches
+		// the next preparation's read-tree as staged changes. The index goes
+		// first, so a ref restore that uses up the deadline cannot keep it
+		// from HEAD.
 		indexErr := restoreIndex(ctx, repo.GitDir, oid, oldOID, err)
 		return errors.Join(indexErr, restoreRef(ctx, repo.GitDir, refName, oldBranchOID, oid))
 	}
@@ -527,10 +535,14 @@ func refOIDOrZero(ctx context.Context, gitDir string, refName string) (string, e
 
 // defaultRollbackTimeout bounds a rollback, all its steps together. A
 // rollback runs after its caller's context ended too: a canceled preparation
-// must still restore the index and refs it changed. It stays below the
-// daemon's drainTimeout, so a stop's drain outlasts the rollback of the
-// preparation it cancels.
+// must still restore the index and refs it changed.
 const defaultRollbackTimeout = 20 * time.Second
+
+// RollbackBound bounds how long PrepareFetchedBranch runs once its context
+// ends: the git command the cancel stops exits within gitCommandWaitDelay,
+// then the rollback ends at its deadline, plus gitCommandWaitDelay for the git
+// command that deadline stops. The daemon's drain must outlast it.
+const RollbackBound = defaultRollbackTimeout + 2*gitCommandWaitDelay
 
 // rollbackContext is the context of one rollback: it outlives ctx's
 // cancellation and ends after s.rollbackTimeout.
@@ -538,10 +550,22 @@ func (s *Store) rollbackContext(ctx context.Context) (context.Context, context.C
 	return context.WithTimeout(context.WithoutCancel(ctx), s.rollbackTimeout)
 }
 
+// rollbackIndexTransition restores the index from fromOID back to toOID after
+// a ref update failed, unless HEAD resolves to fromOID: the update landed after
+// all, as when a cancel arrives after git wrote the ref, and the index already
+// matches HEAD.
 func (s *Store) rollbackIndexTransition(ctx context.Context, gitDir string, fromOID string, toOID string, cause error) error {
 	ctx, cancel := s.rollbackContext(ctx)
 	defer cancel()
+	if headAt(ctx, gitDir, fromOID) {
+		return cause
+	}
 	return restoreIndex(ctx, gitDir, fromOID, toOID, cause)
+}
+
+func headAt(ctx context.Context, gitDir string, oid string) bool {
+	head, err := runGit(ctx, gitDir, "rev-parse", "--verify", "HEAD^{commit}")
+	return err == nil && strings.TrimSpace(head) == oid
 }
 
 func restoreIndex(ctx context.Context, gitDir string, fromOID string, toOID string, cause error) error {

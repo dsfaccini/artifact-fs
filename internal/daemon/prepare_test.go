@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 )
@@ -556,7 +558,7 @@ func TestCanceledPreparationRestoresTheIndex(t *testing.T) {
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, nil, func() bool {
+	waitFor(t, preparationsEnded(svc, "repo"), func() bool {
 		_, err := os.Stat(blocked)
 		return err == nil
 	})
@@ -574,6 +576,29 @@ func TestCanceledPreparationRestoresTheIndex(t *testing.T) {
 	}
 	if staged := runCmdOutput(t, realGit, "--git-dir", gitDir, "diff-index", "--cached", "--name-only", "HEAD"); staged != "" {
 		t.Fatalf("the index differs from HEAD in %q", staged)
+	}
+}
+
+// preparationsEnded reports name's prepare state once svc's async
+// preparations end, so a wait for a step inside one fails when it ends first.
+// Call it after the preparation started.
+func preparationsEnded(svc *Service, name string) <-chan error {
+	ended := make(chan error, 1)
+	go func() {
+		svc.prepareWorkers.Wait()
+		cfg, err := svc.registry.GetRepo(context.Background(), name)
+		if err == nil {
+			err = fmt.Errorf("the preparation ended %q with %q", cfg.PrepareState, cfg.PrepareError)
+		}
+		ended <- err
+	}()
+	return ended
+}
+
+// A stop's drain outlasts the rollback of the preparation it cancels.
+func TestDrainOutlastsTheRollbackOfACanceledPreparation(t *testing.T) {
+	if gitstore.RollbackBound >= drainTimeout {
+		t.Fatalf("gitstore.RollbackBound = %v, want below drainTimeout %v", gitstore.RollbackBound, drainTimeout)
 	}
 }
 
@@ -620,7 +645,7 @@ func TestCanceledReadTreeLeavesNoIndexLock(t *testing.T) {
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, nil, func() bool {
+	waitFor(t, preparationsEnded(svc, "repo"), func() bool {
 		_, err := os.Stat(blocked)
 		return err == nil
 	})

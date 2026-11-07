@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -108,11 +109,12 @@ func TestPrepareFetchedBranchConflictDoesNotMoveHEAD(t *testing.T) {
 	}
 }
 
-// A rollback that needs two steps ends at one deadline, so it cannot outlast
-// the daemon's drain of the preparation it rolls back.
-func TestPrepareFetchedBranchRollbackStepsShareOneDeadline(t *testing.T) {
-	tmp := t.TempDir()
-	repo := filepath.Join(tmp, "repo")
+// fetchedAheadRepo is a repository on main whose remoteRef, one commit ahead
+// of main, was fetched with no local branch at it. It returns the git dir and
+// both commits.
+func fetchedAheadRepo(t *testing.T, dir string, remoteRef string) (gitDir string, baseOID string, aheadOID string) {
+	t.Helper()
+	repo := filepath.Join(dir, "repo")
 	run(t, "git", "init", "--initial-branch", "main", repo)
 	run(t, "git", "-C", repo, "config", "user.name", "test")
 	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
@@ -121,52 +123,134 @@ func TestPrepareFetchedBranchRollbackStepsShareOneDeadline(t *testing.T) {
 	}
 	run(t, "git", "-C", repo, "add", "tracked.txt")
 	run(t, "git", "-C", repo, "commit", "-m", "base")
-	run(t, "git", "-C", repo, "checkout", "-b", "feature")
-	if err := os.WriteFile(filepath.Join(repo, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+	baseOID = strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	run(t, "git", "-C", repo, "checkout", "-b", "ahead")
+	if err := os.WriteFile(filepath.Join(repo, "ahead.txt"), []byte("ahead\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	run(t, "git", "-C", repo, "add", "feature.txt")
-	run(t, "git", "-C", repo, "commit", "-m", "feature")
-	featureOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	run(t, "git", "-C", repo, "add", "ahead.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "ahead")
+	aheadOID = strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
 	run(t, "git", "-C", repo, "checkout", "main")
-	run(t, "git", "-C", repo, "branch", "-D", "feature")
-	run(t, "git", "-C", repo, "update-ref", "refs/remotes/origin/feature", featureOID)
+	run(t, "git", "-C", repo, "branch", "-D", "ahead")
+	run(t, "git", "-C", repo, "update-ref", remoteRef, aheadOID)
+	return filepath.Join(repo, ".git"), baseOID, aheadOID
+}
 
+// wrapGit puts a git on PATH that runs script, which reaches the real git as
+// "$AFS_REAL_GIT", and returns the real git's path.
+func wrapGit(t *testing.T, dir string, script string) string {
+	t.Helper()
 	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatal(err)
 	}
-	bin := filepath.Join(tmp, "bin")
+	bin := filepath.Join(dir, "bin")
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Pointing HEAD at the branch fails, which takes a two-step rollback. Its
-	// first step hangs past the rollback's deadline, and a step that starts
-	// after it marks itself late.
-	failed := filepath.Join(tmp, "symbolic-ref-failed")
-	firstStep := filepath.Join(tmp, "first-step")
-	lateStep := filepath.Join(tmp, "late-step")
-	script := "#!/bin/sh\nif [ \"$1\" = symbolic-ref ] && [ \"$2\" = HEAD ] && [ \"$#\" = 3 ]; then\n  : > \"$AFS_FAILED\"\n  exit 1\nfi\nif [ -e \"$AFS_FAILED\" ]; then\n  if [ ! -e \"$AFS_FIRST_STEP\" ]; then\n    : > \"$AFS_FIRST_STEP\"\n    sleep 60\n    exit 1\n  fi\n  : > \"$AFS_LATE_STEP\"\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_REAL_GIT", realGit)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return realGit
+}
+
+// A rollback that needs two steps ends at one deadline, so it cannot outlast
+// the daemon's drain of the preparation it rolls back.
+func TestPrepareFetchedBranchRollbackStepsShareOneDeadline(t *testing.T) {
+	tmp := t.TempDir()
+	gitDir, _, _ := fetchedAheadRepo(t, tmp, "refs/remotes/origin/feature")
+	// Pointing HEAD at the branch fails, which takes a two-step rollback. The
+	// rollback's first git command hangs past its deadline, and a git command
+	// that starts after it marks itself late.
+	failed := filepath.Join(tmp, "symbolic-ref-failed")
+	firstStep := filepath.Join(tmp, "first-step")
+	lateStep := filepath.Join(tmp, "late-step")
+	wrapGit(t, tmp, "#!/bin/sh\nif [ \"$1\" = symbolic-ref ] && [ \"$2\" = HEAD ] && [ \"$#\" = 3 ]; then\n  : > \"$AFS_FAILED\"\n  exit 1\nfi\nif [ -e \"$AFS_FAILED\" ]; then\n  if [ ! -e \"$AFS_FIRST_STEP\" ]; then\n    : > \"$AFS_FIRST_STEP\"\n    sleep 60\n    exit 1\n  fi\n  : > \"$AFS_LATE_STEP\"\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n")
 	t.Setenv("AFS_FAILED", failed)
 	t.Setenv("AFS_FIRST_STEP", firstStep)
 	t.Setenv("AFS_LATE_STEP", lateStep)
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	store := New(nil)
 	store.rollbackTimeout = time.Second
-	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: filepath.Join(repo, ".git")}}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}}
 	if err := store.PrepareFetchedBranch(context.Background(), cfg, "feature"); err == nil {
 		t.Fatal("PrepareFetchedBranch succeeded although HEAD could not move")
 	}
 	if _, err := os.Stat(firstStep); err != nil {
-		t.Fatalf("the rollback's first step did not run: %v", err)
+		t.Fatalf("the rollback's first git command did not run: %v", err)
 	}
 	if _, err := os.Stat(lateStep); err == nil {
-		t.Fatal("a rollback step started after the rollback's deadline passed")
+		t.Fatal("a rollback git command started after the rollback's deadline passed")
+	}
+}
+
+// A rollback whose ref restore uses up its deadline has already restored the
+// index, so the index matches HEAD.
+func TestPrepareFetchedBranchRollbackRestoresTheIndexFirst(t *testing.T) {
+	tmp := t.TempDir()
+	gitDir, baseOID, _ := fetchedAheadRepo(t, tmp, "refs/remotes/origin/feature")
+	// Pointing HEAD at the branch fails, then the ref restore hangs past the
+	// rollback's deadline.
+	realGit := wrapGit(t, tmp, "#!/bin/sh\nif [ \"$1\" = symbolic-ref ] && [ \"$2\" = HEAD ] && [ \"$#\" = 3 ]; then\n  : > \"$AFS_FAILED\"\n  exit 1\nfi\nif [ \"$1\" = update-ref ] && [ -e \"$AFS_FAILED\" ]; then\n  sleep 60\n  exit 1\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n")
+	t.Setenv("AFS_FAILED", filepath.Join(tmp, "symbolic-ref-failed"))
+
+	store := New(nil)
+	store.rollbackTimeout = time.Second
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}}
+	if err := store.PrepareFetchedBranch(context.Background(), cfg, "feature"); err == nil {
+		t.Fatal("PrepareFetchedBranch succeeded although HEAD could not move")
+	}
+	if head := strings.TrimSpace(runOutput(t, realGit, "--git-dir", gitDir, "rev-parse", "HEAD")); head != baseOID {
+		t.Fatalf("HEAD = %s, want %s", head, baseOID)
+	}
+	if staged := runOutput(t, realGit, "--git-dir", gitDir, "diff-index", "--cached", "--name-only", "HEAD"); staged != "" {
+		t.Fatalf("the index differs from HEAD in %q", staged)
+	}
+}
+
+// A ref update that git completed before a cancel stopped it keeps the
+// transition: the index stays at the commit HEAD moved to.
+func TestPrepareFetchedBranchKeepsARefUpdateThatLanded(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		remoteRef string
+		fetchRef  string
+		// lands is the git command that completes before the cancel.
+		lands string
+	}{
+		{"branch HEAD is on", "refs/remotes/origin/main", "main", "update-ref"},
+		{"detached HEAD", fetchedFullRefRemoteTrackingRef, "refs/pull/10/head", "update-ref"},
+		{"HEAD onto the branch", "refs/remotes/origin/feature", "feature", "symbolic-ref"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			gitDir, _, aheadOID := fetchedAheadRepo(t, tmp, tt.remoteRef)
+			// The command completes, then hangs until the cancel stops it.
+			landed := filepath.Join(tmp, "landed")
+			realGit := wrapGit(t, tmp, "#!/bin/sh\nif [ \"$1\" = \"$AFS_LANDS\" ] && [ ! -e \"$AFS_LANDED\" ]; then\n  \"$AFS_REAL_GIT\" \"$@\" || exit\n  : > \"$AFS_LANDED\"\n  sleep 60\n  exit 0\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n")
+			t.Setenv("AFS_LANDS", tt.lands)
+			t.Setenv("AFS_LANDED", landed)
+
+			ctx, cancel := gittest.ExpireOnFile(context.Background(), landed)
+			defer cancel()
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}}
+			if err := New(nil).PrepareFetchedBranch(ctx, cfg, tt.fetchRef); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("PrepareFetchedBranch error = %v, want deadline exceeded", err)
+			}
+			head, err := exec.Command(realGit, "--git-dir", gitDir, "rev-parse", "--verify", "HEAD^{commit}").Output()
+			if err != nil {
+				t.Fatalf("HEAD does not resolve: %v", err)
+			}
+			if got := strings.TrimSpace(string(head)); got != aheadOID {
+				t.Fatalf("HEAD = %s, want %s", got, aheadOID)
+			}
+			if staged := runOutput(t, realGit, "--git-dir", gitDir, "diff-index", "--cached", "--name-only", "HEAD"); staged != "" {
+				t.Fatalf("the index differs from HEAD in %q", staged)
+			}
+		})
 	}
 }
 
