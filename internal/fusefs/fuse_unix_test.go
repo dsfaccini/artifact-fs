@@ -1640,8 +1640,7 @@ func newChmoddedFile(t *testing.T, fskit bool, mode os.FileMode) (fuseutil.FileS
 }
 
 // On an FSKit mount, a new open for writing or with O_TRUNC of a file
-// chmodded to 0444, and a truncate without a handle, fail with EACCES. Only
-// descriptors opened for writing before the chmod write.
+// chmodded to 0444, and a truncate without a handle, fail with EACCES.
 func TestReadOnlyFileRefusesNewWriter(t *testing.T) {
 	ctx := context.Background()
 	fs, ov, inode := newChmoddedFile(t, true, 0o444)
@@ -1712,6 +1711,84 @@ func TestCreateHandleTruncatesReadOnlyFile(t *testing.T) {
 	e, _ := ov.Get("ro.txt")
 	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "a" {
 		t.Fatalf("content = %q, %v; want a", data, err)
+	}
+}
+
+// createReleasedReadOnlyFile creates ro.txt with mode 0444 through fs, then
+// releases the create handle, as an FSKit mount's create sequence does.
+func createReleasedReadOnlyFile(t *testing.T, fs fuseutil.FileSystem) fuseops.InodeID {
+	t.Helper()
+	ctx := context.Background()
+	create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "ro.txt", Mode: 0o444, OpenFlags: syscall.O_RDWR | syscall.O_CREAT | syscall.O_EXCL}
+	if err := fs.CreateFile(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Handle: &create.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	return create.Entry.Child
+}
+
+// On an FSKit mount, the creator's descriptor can arrive as a write open after
+// the create releases its handle. That open succeeds whatever the create's
+// mode, and the next write open of the file is checked.
+func TestCreatorsOpenAfterCreateWritesReadOnlyFile(t *testing.T) {
+	ctx := context.Background()
+	fs, ov, _ := newChmoddedFile(t, true, 0o644)
+	inode := createReleasedReadOnlyFile(t, fs)
+	open := &fuseops.OpenFileOp{Inode: inode, OpenFlags: syscall.O_WRONLY}
+	if err := fs.OpenFile(ctx, open); err != nil {
+		t.Fatalf("the creator's write open = %v", err)
+	}
+	if err := fs.WriteFile(ctx, &fuseops.WriteFileOp{Inode: inode, Handle: open.Handle, Data: []byte("abc")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: open.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := ov.Get("ro.txt")
+	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "abc" {
+		t.Fatalf("content = %q, %v; want abc", data, err)
+	}
+	if got := kernelErrno(fs.OpenFile(ctx, &fuseops.OpenFileOp{Inode: inode, OpenFlags: syscall.O_WRONLY})); got != syscall.EACCES {
+		t.Errorf("a later write open = %v, want EACCES", got)
+	}
+}
+
+// On an FSKit mount, only the first open after a create skips the check,
+// whatever that open's flags.
+func TestFirstOpenAfterCreateUsesTheCreatorsAllowance(t *testing.T) {
+	ctx := context.Background()
+	fs, _, _ := newChmoddedFile(t, true, 0o644)
+	inode := createReleasedReadOnlyFile(t, fs)
+	if err := fs.OpenFile(ctx, &fuseops.OpenFileOp{Inode: inode, OpenFlags: syscall.O_RDONLY}); err != nil {
+		t.Fatalf("read open = %v", err)
+	}
+	if got := kernelErrno(fs.OpenFile(ctx, &fuseops.OpenFileOp{Inode: inode, OpenFlags: syscall.O_WRONLY})); got != syscall.EACCES {
+		t.Errorf("write open after a read open = %v, want EACCES", got)
+	}
+}
+
+// On an FSKit mount, a write through the create handle ends the creator's
+// allowance, so the next write open is checked.
+func TestWriteAfterCreateEndsTheCreatorsAllowance(t *testing.T) {
+	ctx := context.Background()
+	fs, _, _ := newChmoddedFile(t, true, 0o644)
+	create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "ro.txt", Mode: 0o444, OpenFlags: syscall.O_RDWR | syscall.O_CREAT | syscall.O_EXCL}
+	if err := fs.CreateFile(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.WriteFile(ctx, &fuseops.WriteFileOp{Inode: create.Entry.Child, Handle: create.Handle, Data: []byte("abc")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	if got := kernelErrno(fs.OpenFile(ctx, &fuseops.OpenFileOp{Inode: create.Entry.Child, OpenFlags: syscall.O_WRONLY})); got != syscall.EACCES {
+		t.Errorf("write open after a write = %v, want EACCES", got)
 	}
 }
 

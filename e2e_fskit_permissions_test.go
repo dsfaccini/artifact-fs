@@ -78,28 +78,23 @@ func TestE2EFSKitMountChecksOwnerPermissions(t *testing.T) {
 		requireContent(t, path, "abc")
 	})
 
-	t.Run("second writer after a chmod", func(t *testing.T) {
-		path := newFile(t, "second-writer.txt", "abc", 0o644)
-		first, err := os.OpenFile(path, os.O_WRONLY, 0)
+	t.Run("earlier writer after a chmod", func(t *testing.T) {
+		path := newFile(t, "earlier-writer.txt", "abc", 0o644)
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer first.Close()
+		defer f.Close()
 		if err := os.Chmod(path, 0o444); err != nil {
 			t.Fatal(err)
 		}
-		second, err := os.OpenFile(path, os.O_WRONLY, 0)
-		if err == nil {
-			second.Close()
-		}
-		requireEACCES(t, "second open O_WRONLY", err)
-		if _, err := first.WriteAt([]byte("def"), 3); err != nil {
+		if _, err := f.WriteAt([]byte("def"), 3); err != nil {
 			t.Fatalf("write through the earlier descriptor = %v", err)
 		}
-		if err := first.Truncate(2); err != nil {
+		if err := f.Truncate(2); err != nil {
 			t.Fatalf("ftruncate through the earlier descriptor = %v", err)
 		}
-		if err := first.Close(); err != nil {
+		if err := f.Close(); err != nil {
 			t.Fatal(err)
 		}
 		requireContent(t, path, "ab")

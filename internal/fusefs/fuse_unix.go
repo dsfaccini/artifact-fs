@@ -124,6 +124,12 @@ type InodeRef struct {
 	IsRoot   bool
 	Overlay  bool
 	Stale    bool
+	// CreateOpenPending says a CreateFile made the inode and no OpenFile or
+	// write has reached it since. The next OpenFile skips the permission
+	// check: on an FSKit mount the creator's descriptor can arrive as a
+	// separate open after the create, and a create grants its creator access
+	// whatever the mode.
+	CreateOpenPending bool
 }
 
 // report records attrs as what the kernel last received for ref. Reads then
@@ -516,6 +522,20 @@ func (fs *ArtifactFuse) fileHandle(handleID fuseops.HandleID) (*FileHandle, erro
 		return nil, syscall.EBADF
 	}
 	return fh, nil
+}
+
+// takeCreateOpenPending reports whether id's CreateOpenPending was set, and
+// clears it.
+func (fs *ArtifactFuse) takeCreateOpenPending(id fuseops.InodeID) bool {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	ref := fs.inodes[id]
+	if ref == nil {
+		return false
+	}
+	pending := ref.CreateOpenPending
+	ref.CreateOpenPending = false
+	return pending
 }
 
 // handleWritable says id names an open handle whose access mode allows
@@ -1092,6 +1112,7 @@ func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) er
 // entry's owner permission bits: read and write for the access mode, and
 // write for O_TRUNC.
 func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, checkPermissions bool) error {
+	created := fs.takeCreateOpenPending(op.Inode)
 	return fs.shared(ctx, func(ctx context.Context, b *Blobs) error {
 		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 		if err != nil {
@@ -1100,7 +1121,7 @@ func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, ch
 		fh := &FileHandle{inode: ref, path: ref.Path, writable: !op.OpenFlags.IsReadOnly()}
 		if ref.Path != ".git" {
 			var access uint32
-			if checkPermissions {
+			if checkPermissions && !created {
 				access = ownerRead | ownerWrite
 				if op.OpenFlags.IsReadOnly() {
 					access = ownerRead
@@ -1191,6 +1212,8 @@ func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) 
 		path := fh.path
 		fh.wrote = true
 		fh.mu.Unlock()
+		// The creator has its descriptor once a write arrives.
+		fs.takeCreateOpenPending(op.Inode)
 		n, err := fs.engine.Write(ctx, b, path, op.Offset, op.Data)
 		// A handle that cached the base content before the write promoted the
 		// path, or while another write promoted it, would keep serving the
@@ -1223,6 +1246,7 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 		}
 		fs.mu.Lock()
 		ref := fs.allocEntry(op.Parent, op.Name, childPath, Attrs{Type: "file", Mode: uint32(op.Mode)})
+		ref.CreateOpenPending = true
 		fh := &FileHandle{inode: ref, path: childPath, wrote: true, writable: !op.OpenFlags.IsReadOnly()}
 		handle := fs.nextHandleID
 		fs.nextHandleID++
