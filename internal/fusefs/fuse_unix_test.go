@@ -1492,7 +1492,7 @@ func TestReadDirPlusDropsLookupWhenEntryDoesNotFit(t *testing.T) {
 	if op.BytesRead != 0 {
 		t.Fatalf("BytesRead = %d, want 0", op.BytesRead)
 	}
-	if fs.pathToInode[".git"] != 0 {
+	if fs.inodes[fs.pathToInode[".git"]] != nil {
 		t.Fatal("inode lookup leaked for entry that did not fit")
 	}
 }

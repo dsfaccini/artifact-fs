@@ -481,6 +481,25 @@ it at a later HEAD change.
 | macFUSE kernel extension | The mount sends the same invalidations as on Linux. The extension mounts with `novncache`, so it caches no names and the mount caches no negative entries. It drops a file's cached attributes and pages on each `InvalidateInode`, and a getattr that reports a size other than the one it holds drops all the file's cached pages. A lookup leaves a held file's size alone. An open does not drop the pages, and `KeepPageCache` has no effect. So a lookup or getattr that races the switch can leave the old blob's pages beyond one open, until the next invalidation of that inode or a getattr that reports a different size. For up to 1 s, a reader can still see the old mtime of a file whose blob did not change, and of a directory. macFUSE 5's extension is closed source, so this row follows the open-source [osxfuse extension](https://github.com/osxfuse/kext/tree/534773bd3135f04b7f6fb801faa2f8991daf4a6b). |
 | FSKit | FSKit takes no invalidations, so the mount sends none and caches no negative entries. FSKit keeps what it cached until it asks again, which the mount cannot hasten. FSKit keeps its own attribute cache, and artifact-fs knows no bound for it. Until then, a reader can see the old commit's names, sizes and modes, and an inode reads the old generation while the daemon keeps it. After that, the inode reads the current content. The fuse library answers EIO to a read inside the size it last reported that the current content does not fill. A read that FSKit sends before a reply reporting a smaller size reaches it can still get a short reply without EIO. |
 
+### Inode numbers
+
+A path keeps its inode number while it exists, also after the kernel forgets
+the inode, so Git's stat data stays valid. A rename moves the numbers of the
+whole subtree. A path that stops existing retires its number: an unlink, rmdir
+or rename over it through the mount, or a HEAD change that removes it. A file or
+directory made there later gets a new number, even while the old inode is still
+open. A successful write through a file that is still open after a HEAD change
+removed its path recreates the path under the file's own number, unless another
+file took the path first. Numbers last for one mount: a remount or a daemon restart
+numbers paths again.
+
+The mount keeps one mapping per existing path the kernel has looked up. After
+each HEAD change, it finds the paths that vanished: it reads the overlay once
+and lists the snapshot children of each directory that holds such a path. When
+a rename overlapped that check, it checks the vanished paths again while no
+rename can run. On Linux and the macFUSE kernel extension, a path whose inode the kernel holds
+gets the per-path identity check that decides its invalidations instead.
+
 ### Subsystems
 
 | Package | Role |

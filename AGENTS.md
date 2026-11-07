@@ -64,9 +64,10 @@ Repository-specific guidance for `artifact-fs`.
 - Take the FUSE locks in this order: `handleOps`, `DirHandle.mu`, the resolver's `transition`, `ArtifactFuse.mu`, `FileHandle.mu`.
 - Release each FUSE lock with `defer`, or hold it only around code that cannot panic. The fuse library recovers a panic in an op and keeps serving, so a lock left held blocks every later op.
 - Wrap an operation error's cause with `%w`, and let `toErrno` map it for the kernel. Do not return `syscall.EIO` for a failure that carries an errno.
-- Switch a runtime's generation only through `Service.switchGeneration`. It sends the kernel the invalidations the switch needs through `MountedFS.InvalidateChanged`.
+- Switch a runtime's generation only through `Service.switchGeneration`. It sends the kernel the invalidations the switch needs through `MountedFS.InvalidateChanged`, which also unmaps each path the switch removed, on every backend.
 - Never wait on a kernel invalidation inside an op or while holding a lock an op takes. The kernel can hold a directory lock while it waits for that op's reply, and the invalidation waits for the same lock.
-- Record every entry reply with `allocEntry` and every attribute reply with `setReported`. `InvalidateChanged` compares what the kernel received with the merged view, and `allocEntry` drops the name's negative entry record. The exception is `GetInodeAttributes` for the root and the synthesized `.git` file: `InvalidateChanged` skips both.
+- Keep a path's inode number while the path exists. Git compares `st_ino`, so a new number marks a file changed. A FORGET leaves the path's `pathToInode` mapping in place, dormant, for the next lookup. Unmap a path only when it stops existing: an unlink, rmdir or rename over it through the mount, or a HEAD change that removes it.
+- Record every entry reply with `allocEntry`, or with `createEntry` for a path the op created, and every attribute reply with `setReported`. `InvalidateChanged` compares what the kernel received with the merged view, and `allocEntry` drops the name's negative entry record. The exception is `GetInodeAttributes` for the root and the synthesized `.git` file: `InvalidateChanged` skips both.
 - Prune snapshot generations only through `pruneGenerations` on the daemon's `core`. An inode reads the generation of its last reported attributes, so a retired generation stays readable for `defaultGenerationRetention`.
 
 ## Writing tests

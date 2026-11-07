@@ -293,6 +293,12 @@ func (e *Engine) ReadDir(ctx context.Context, path string) ([]ReaddirEntry, int6
 	return e.Resolver.ReaddirSnapshot(ctx, path)
 }
 
+// MissingPaths returns those of paths that the merged view lacks. It hydrates
+// nothing. See Resolver.MissingPaths.
+func (e *Engine) MissingPaths(ctx context.Context, paths []string) ([]string, error) {
+	return e.Resolver.MissingPaths(ctx, paths)
+}
+
 // ensureOverlay promotes a base file to the overlay (copy-on-write from its
 // blob in b). No-op if the path already has an overlay entry. The caller holds
 // the transition read lock.

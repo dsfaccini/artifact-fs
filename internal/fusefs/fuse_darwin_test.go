@@ -72,16 +72,21 @@ func TestPlatformMountReachesFSKit(t *testing.T) {
 	}
 }
 
-// FSKit takes no invalidations, so a mount through it sends none.
+// FSKit takes no invalidations, so a mount through it sends none. It still
+// retires the number of a path the switch removed.
 func TestInvalidateChangedSendsNothingOnFSKit(t *testing.T) {
 	f := newCacheFixtureOn(t, BackendFSKit, baseFile("file.txt", "old", 0o100644))
-	f.lookup(fuseops.RootInodeID, "file.txt")
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
 	f.switchTo()
 	if err := f.mount.InvalidateChanged(); err != nil {
 		t.Fatal(err)
 	}
 	if inodes, entries := f.notifier.recorded(); len(inodes) != 0 || len(entries) != 0 {
 		t.Fatalf("FSKit mount sent invalidations: inodes %v, entries %v", inodes, entries)
+	}
+	f.switchTo(baseFile("file.txt", "old", 0o100644))
+	if got := f.lookup(fuseops.RootInodeID, "file.txt"); got == held {
+		t.Fatalf("file.txt came back with inode %d, which it had before a switch removed it", got)
 	}
 }
 
