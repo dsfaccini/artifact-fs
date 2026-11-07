@@ -86,8 +86,9 @@ type ArtifactFuse struct {
 	mu sync.RWMutex
 	// handleOps keeps inode and handle bookkeeping consistent with the overlay:
 	// Unlink, RmDir and Rename hold it exclusively, and every op that creates
-	// or uses inodes and handles holds it shared. Engine.Do releases it before
-	// it hydrates a blob.
+	// or uses inodes and handles holds it shared. The switch pass's re-check,
+	// unmapStillMissing, holds it shared too. Engine.Do releases it before it
+	// hydrates a blob.
 	handleOps sync.RWMutex
 	// inodes holds each inode the kernel holds.
 	inodes map[fuseops.InodeID]*InodeRef
@@ -109,6 +110,10 @@ type ArtifactFuse struct {
 	// A rename commits the overlay before it moves the mappings, so a switch
 	// pass that a rename overlapped checks its vanished paths again.
 	renameSeq uint64
+	// writeSeq counts writes through the mount. A write through an open file
+	// recreates its path, so the switch pass leaves mapped the path of an
+	// inode written since the pass read the table.
+	writeSeq uint64
 
 	// notifier is nil when nothing should reach the kernel. fs.mu guards it:
 	// the mount publishes it after ops may have started.
@@ -131,10 +136,12 @@ type InodeRef struct {
 	// PageBlob is the base blob that the inode's last open served, while the
 	// kernel's cached pages can hold only that blob. It is empty otherwise.
 	PageBlob string
-	Refcnt   int64
-	IsRoot   bool
-	Overlay  bool
-	Stale    bool
+	// WrittenAt is the writeSeq of the last write through this inode.
+	WrittenAt uint64
+	Refcnt    int64
+	IsRoot    bool
+	Overlay   bool
+	Stale     bool
 }
 
 // report records attrs as what the kernel last received for ref. Reads then
@@ -272,11 +279,15 @@ type pathMapping struct {
 	path string
 }
 
-// unmapLocked unmaps each of ms whose path still maps to its number: an op may
-// have mapped the path again since the pass resolved it. Caller must hold
+// unmapLocked unmaps each of ms whose path still maps to its number, unless
+// its inode was written after writeSeq: an op may have mapped the path again,
+// or a write recreated it, since the pass read the table. Caller must hold
 // fs.mu write lock.
-func (fs *ArtifactFuse) unmapLocked(ms []pathMapping) {
+func (fs *ArtifactFuse) unmapLocked(ms []pathMapping, writeSeq uint64) {
 	for _, m := range ms {
+		if ref := fs.inodes[m.id]; ref != nil && ref.WrittenAt > writeSeq {
+			continue
+		}
 		if fs.pathToInode[m.path] == m.id {
 			delete(fs.pathToInode, m.path)
 		}
@@ -286,7 +297,7 @@ func (fs *ArtifactFuse) unmapLocked(ms []pathMapping) {
 // unmapStillMissing checks the paths of vanished again and unmaps each one
 // still missing. It holds handleOps meanwhile, which keeps every Rename op
 // out, so a switch pass that a rename overlapped still makes progress.
-func (fs *ArtifactFuse) unmapStillMissing(vanished []pathMapping) error {
+func (fs *ArtifactFuse) unmapStillMissing(vanished []pathMapping, writeSeq uint64) error {
 	fs.handleOps.RLock()
 	defer fs.handleOps.RUnlock()
 	paths := make([]string, len(vanished))
@@ -305,7 +316,7 @@ func (fs *ArtifactFuse) unmapStillMissing(vanished []pathMapping) error {
 		}
 	}
 	fs.mu.Lock()
-	fs.unmapLocked(still)
+	fs.unmapLocked(still, writeSeq)
 	fs.mu.Unlock()
 	return err
 }
@@ -403,7 +414,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	fs.mu.RLock()
 	notifier := fs.notifier
 	send = send && notifier != nil
-	renameSeq := fs.renameSeq
+	renameSeq, writeSeq := fs.renameSeq, fs.writeSeq
 	var inodes, negatives []known
 	// existenceOnly holds every other mapping: those that need only the check
 	// that their path exists.
@@ -479,11 +490,11 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	fs.mu.Lock()
 	overlapped := fs.renameSeq != renameSeq || renameSeq%2 != 0
 	if !overlapped {
-		fs.unmapLocked(vanished)
+		fs.unmapLocked(vanished, writeSeq)
 	}
 	fs.mu.Unlock()
 	if overlapped && len(vanished) > 0 {
-		failed(fs.unmapStillMissing(vanished), "check vanished paths again")
+		failed(fs.unmapStillMissing(vanished, writeSeq), "check vanished paths again")
 	}
 	if !send {
 		return firstErr
@@ -561,6 +572,8 @@ func (fs *ArtifactFuse) markWritten(id fuseops.InodeID, path string) {
 	fs.mu.Lock()
 	if ref := fs.inodes[id]; ref != nil {
 		ref.Gen, ref.PageBlob = 0, ""
+		fs.writeSeq++
+		ref.WrittenAt = fs.writeSeq
 		if _, mapped := fs.pathToInode[path]; !mapped && ref.Path == path && !ref.Stale {
 			fs.pathToInode[path] = id
 		}

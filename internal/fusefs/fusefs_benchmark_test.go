@@ -407,3 +407,42 @@ func BenchmarkMissingPathsHeap(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkMissingPathsOnePath times the switch pass's re-check, which holds
+// handleOps: MissingPaths of one vanished path over an overlay of n files.
+func BenchmarkMissingPathsOnePath(b *testing.B) {
+	ctx := context.Background()
+	for _, n := range []int{20_000, 60_000} {
+		b.Run(fmt.Sprint(n), func(b *testing.B) {
+			snap, err := snapshot.New(ctx, filepath.Join(b.TempDir(), "snapshot.sqlite"))
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { _ = snap.Close() })
+			gen, err := snap.PublishGeneration(ctx, "head", "main", []model.BaseNode{{Path: ".", Type: "dir", Mode: 0o40000, SizeState: "known"}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			dir := b.TempDir()
+			ov, err := overlaystore.New(ctx, model.RepoConfig{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { _ = ov.Close() })
+			for i := range n {
+				if _, err := ov.CreateFile(ctx, fmt.Sprintf(".venv/lib/python3.12/site-packages/pkg%d/sub/f%d.js", i%(n/40), i), 0o644); err != nil {
+					b.Fatal(err)
+				}
+			}
+			r := &Resolver{Snapshot: snap, Overlay: ov}
+			r.SetGeneration(gen)
+			b.ResetTimer()
+			for range b.N {
+				missing, err := r.MissingPaths(ctx, []string{"src/gone.txt"})
+				if err != nil || len(missing) != 1 {
+					b.Fatalf("MissingPaths = %v, %v; want src/gone.txt", missing, err)
+				}
+			}
+		})
+	}
+}

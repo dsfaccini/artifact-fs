@@ -509,6 +509,67 @@ func TestSwitchPassesUnmapUnderSteadyRenames(t *testing.T) {
 	}
 }
 
+// A rename away and back can straddle the switch pass's overlay read: the
+// pass sees src.txt missing, but by the time it would unmap, src.txt exists
+// again under its number. The pass's re-check keeps the mapping.
+func TestRenameAwayAndBackDuringSwitchPassKeepsNumber(t *testing.T) {
+	f := newCacheFixture(t)
+	ov := hookOverlay(f)
+	create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "src.txt", Mode: 0o644}
+	if err := f.fs.CreateFile(f.ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	forget(t, f.fs, create.Entry.Child)
+	f.switchTo()
+	rename := func(from, to string) {
+		if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: from, NewParent: fuseops.RootInodeID, NewName: to}); err != nil {
+			t.Error(err)
+		}
+	}
+	ov.beforeList = func() {
+		rename("src.txt", "tmp.txt")
+		ov.afterList = func() { rename("tmp.txt", "src.txt") }
+	}
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.lookup(fuseops.RootInodeID, "src.txt"); got != create.Entry.Child {
+		t.Fatalf("src.txt, renamed away and back during the pass, looks up as inode %d, want %d", got, create.Entry.Child)
+	}
+}
+
+// A write through a held inode can recreate its path after the switch pass
+// found the path missing and before the pass unmaps it. The path then still
+// maps to the writer's inode, and must keep that number.
+func TestWriteDuringSwitchPassKeepsHeldNumber(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644), baseFile("other.txt", "o", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	open := f.open(held)
+	forget(t, f.fs, f.lookup(fuseops.RootInodeID, "other.txt"))
+	f.switchTo(baseFile("other.txt", "o", 0o100644))
+	ov := hookOverlay(f)
+	wrote := false
+	ov.afterList = func() {
+		if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("new")}); err != nil {
+			t.Error(err)
+			return
+		}
+		wrote = true
+	}
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if !wrote {
+		t.Fatal("the write did not run inside the pass")
+	}
+	if got := f.lookup(fuseops.RootInodeID, "file.txt"); got != held {
+		t.Fatalf("file.txt, recreated by a write through inode %d during the pass, looks up as inode %d", held, got)
+	}
+}
+
 // A create can land after the switch pass read the mappings and the overlay.
 // The pass then finds the path missing, and must leave the created path's
 // mapping alone.
