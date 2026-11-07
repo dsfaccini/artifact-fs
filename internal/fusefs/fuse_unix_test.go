@@ -594,7 +594,7 @@ func TestWriteThroughOpenedBaseHandlePromotesAndWrites(t *testing.T) {
 	if err := fs.OpenFile(context.Background(), open); err != nil {
 		t.Fatal(err)
 	}
-	if err := fs.WriteFile(context.Background(), &fuseops.WriteFileOp{Handle: open.Handle, Data: []byte("local")}); err != nil {
+	if err := fs.WriteFile(context.Background(), &fuseops.WriteFileOp{Inode: lookup.Entry.Child, Handle: open.Handle, Data: []byte("local")}); err != nil {
 		t.Fatal(err)
 	}
 	if ov.writes != 1 || string(ov.data) != "local" {

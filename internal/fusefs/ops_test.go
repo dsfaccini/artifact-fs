@@ -261,8 +261,7 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": {Path: "file.txt", Type: "file", ObjectOID: "blob", Mode: 0o644}}}, overlay.fakeOverlay)
 	engine := &Engine{Repo: model.RepoPaths{ID: "repo"}, Resolver: resolver, Overlay: overlay, Hydrator: h}
 	fs := NewArtifactFuse(model.RepoPaths{ID: "repo"}, engine)
-	fh := &FileHandle{path: "file.txt"}
-	fs.fileHandles[1] = fh
+	fh := heldHandle(fs, "file.txt")
 	defer fh.closeCachedFile()
 
 	first, err := handleRead(context.Background(), engine, fh, 0, 0, make([]byte, 3))
@@ -275,7 +274,7 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 
 	writeDone := make(chan error, 1)
 	go func() {
-		writeDone <- fs.WriteFile(context.Background(), &fuseops.WriteFileOp{Handle: 1, Data: []byte("new")})
+		writeDone <- fs.WriteFile(context.Background(), &fuseops.WriteFileOp{Inode: fh.inode.ID, Handle: 1, Data: []byte("new")})
 	}()
 
 	<-overlay.beforeCopy
@@ -339,13 +338,12 @@ func TestFailedWriteThatPromotedClosesCachedBase(t *testing.T) {
 	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": {Path: "file.txt", Type: "file", ObjectOID: "blob", Mode: 0o644}}}, overlay.fakeOverlay)
 	engine := &Engine{Repo: model.RepoPaths{ID: "repo"}, Resolver: resolver, Overlay: overlay, Hydrator: &fakeBatchHydrator{path: baseCache}}
 	fs := NewArtifactFuse(model.RepoPaths{ID: "repo"}, engine)
-	fh := &FileHandle{path: "file.txt"}
-	fs.fileHandles[1] = fh
+	fh := heldHandle(fs, "file.txt")
 	defer fh.closeCachedFile()
 	if got, err := handleRead(context.Background(), engine, fh, 0, 0, make([]byte, 3)); err != nil || string(got) != "old" {
 		t.Fatalf("first read = %q, %v", got, err)
 	}
-	err := fs.WriteFile(context.Background(), &fuseops.WriteFileOp{Handle: 1, Data: []byte("new")})
+	err := fs.WriteFile(context.Background(), &fuseops.WriteFileOp{Inode: fh.inode.ID, Handle: 1, Data: []byte("new")})
 	if got := kernelErrno(err); got != syscall.ENOSPC {
 		t.Fatalf("write errno = %v, want ENOSPC", got)
 	}
@@ -954,6 +952,16 @@ func TestRenameDirectoryRejectsDestinationChildCreatedDuringHydration(t *testing
 
 // The helpers below run an Engine method through Engine.Do, as the adapter
 // does, without the adapter's namespace lock or open handles.
+
+// heldHandle registers handle 1 on path, as an open through the kernel
+// leaves it: the kernel holds the path's inode, and the path maps to it.
+func heldHandle(fs *ArtifactFuse, path string) *FileHandle {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fh := &FileHandle{inode: fs.allocInode(path, Attrs{Type: "file", Mode: 0o644}), path: path}
+	fs.fileHandles[1] = fh
+	return fh
+}
 
 func engineRename(ctx context.Context, e *Engine, oldPath, newPath string) error {
 	return e.Do(ctx, nil, func(ctx context.Context, b *Blobs) error {
