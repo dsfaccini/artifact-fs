@@ -505,9 +505,14 @@ whole subtree. A path that stops existing retires its number: an unlink, rmdir
 or rename over it through the mount, or a HEAD change that removes it. A file,
 directory or symlink made there later gets a new number, even while the kernel
 still holds the old inode. A successful write through a file that is still open after a HEAD change
-removed its path recreates the path under the file's own number, unless another
-file took the path first. Numbers last for one mount: a remount or a daemon restart
-numbers paths again.
+removed its path recreates the path under the file's own number, while no other
+file holds the path. A rename of a parent directory moves that path too. Once
+another file takes the path, through a create or a lookup that gives the path a
+new number, the open file is stale: `getattr` and `open` on it return `ESTALE`,
+and its handles never reach the path again. A handle reads the content it
+already holds. A write through it returns `ESTALE`, unless an unlink or rename
+through the mount gave the handle its own copy of the file. Numbers last for one
+mount: a remount or a daemon restart numbers paths again.
 
 The mount keeps one mapping for each existing path that the kernel has looked
 up or that an op made through the mount. After each HEAD change, it finds the
