@@ -23,6 +23,67 @@ var fullRepo = model.RepoConfig{ID: "repo", Name: "repo", MountRoot: "/mnt", Mou
 // fullRepoWithRequest is fullRepo with the mount request a migrated row can hold.
 var fullRepoWithRequest = func() model.RepoConfig { cfg := fullRepo; cfg.MountRequest = "request-1"; return cfg }()
 
+// fullRepoWithRequests is fullRepoWithRequest with the prepare request a
+// migrated row can hold.
+var fullRepoWithRequests = func() model.RepoConfig { cfg := fullRepoWithRequest; cfg.PrepareRequest = "prepare-1"; return cfg }()
+
+// reposTableV3 is the repos table after migration 3.
+const reposTableV3 = `CREATE TABLE IF NOT EXISTS repos (
+	  repo_id TEXT PRIMARY KEY,
+	  name TEXT NOT NULL UNIQUE,
+	  mount_root TEXT NOT NULL,
+	  mount_path TEXT NOT NULL,
+	  remote_url TEXT NOT NULL DEFAULT '',
+	  remote_url_redacted TEXT NOT NULL,
+	  branch TEXT NOT NULL,
+	  refresh_interval_seconds INTEGER NOT NULL,
+	  refresh_interval_ns INTEGER NOT NULL DEFAULT 0,
+	  git_dir TEXT NOT NULL,
+	  overlay_dir TEXT NOT NULL,
+	  blob_cache_dir TEXT NOT NULL,
+	  meta_db_path TEXT NOT NULL,
+	  overlay_db_path TEXT NOT NULL,
+	  enabled INTEGER NOT NULL DEFAULT 1,
+	  prepared_gitdir INTEGER NOT NULL DEFAULT 0,
+	  adopt_gitdir INTEGER NOT NULL DEFAULT 0,
+	  fetch_ref TEXT NOT NULL DEFAULT '',
+	  prepare_state TEXT NOT NULL DEFAULT '',
+	  prepare_error TEXT NOT NULL DEFAULT '',
+	  mount_error TEXT NOT NULL DEFAULT '',
+	  required_commit TEXT NOT NULL DEFAULT '',
+	  history_depth INTEGER NOT NULL DEFAULT 0,
+	  refresh_disabled INTEGER NOT NULL DEFAULT 0,
+	  acquired_ref TEXT NOT NULL DEFAULT '',
+	  acquired_commit TEXT NOT NULL DEFAULT '',
+	  acquired_at_ns INTEGER NOT NULL DEFAULT 0,
+	  config_version TEXT NOT NULL DEFAULT '',
+	  created_at_ns INTEGER NOT NULL,
+	  updated_at_ns INTEGER NOT NULL,
+	  mount_request TEXT NOT NULL DEFAULT ''
+	);`
+
+// repoRuntimeTableV3 is the repo_runtime table migration 3 creates.
+const repoRuntimeTableV3 = `CREATE TABLE repo_runtime (
+	  repo_id TEXT PRIMARY KEY,
+	  state TEXT NOT NULL DEFAULT '',
+	  phase TEXT NOT NULL DEFAULT '',
+	  last_error TEXT NOT NULL DEFAULT '',
+	  last_error_phase TEXT NOT NULL DEFAULT '',
+	  last_error_at_ns INTEGER NOT NULL DEFAULT 0,
+	  next_retry_at_ns INTEGER NOT NULL DEFAULT 0,
+	  attempts INTEGER NOT NULL DEFAULT 0,
+	  served_generation INTEGER NOT NULL DEFAULT 0,
+	  served_commit TEXT NOT NULL DEFAULT '',
+	  served_ref TEXT NOT NULL DEFAULT '',
+	  last_fetch_at_ns INTEGER NOT NULL DEFAULT 0,
+	  last_fetch_result TEXT NOT NULL DEFAULT '',
+	  ahead INTEGER NOT NULL DEFAULT 0,
+	  behind INTEGER NOT NULL DEFAULT 0,
+	  diverged INTEGER NOT NULL DEFAULT 0,
+	  mount_request TEXT NOT NULL DEFAULT '',
+	  updated_at_ns INTEGER NOT NULL DEFAULT 0
+	)`
+
 // legacyRegistries are databases that earlier builds created, named for the
 // commit that created them or for the user_version a migrated one records.
 // Keep each fixture as it is, and add one at the new user_version with each
@@ -56,7 +117,7 @@ var legacyRegistries = map[string]struct {
 			`INSERT INTO repos (repo_id, name, mount_root, mount_path, remote_url_redacted, remote_url_secret_ref, branch, refresh_interval_seconds, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, created_at_ns, updated_at_ns)
 			VALUES ('repo', 'repo', '/mnt', '/mnt/repo', 'https://example.com/repo.git', 'secret-ref', 'main', 45, '/git/repo', '/overlay/repo', '/cache/repo', '/meta/repo.sqlite', '/overlay/repo/meta.sqlite', 1, 1, 1)`,
 		},
-		want: model.RepoConfig{ID: "repo", Name: "repo", MountRoot: "/mnt", MountPath: "/mnt/repo", RemoteURLRedacted: "https://example.com/repo.git", Branch: "main", RefreshInterval: 45 * time.Second, GitDir: "/git/repo", OverlayDir: "/overlay/repo", BlobCacheDir: "/cache/repo", MetaDBPath: "/meta/repo.sqlite", OverlayDBPath: "/overlay/repo/meta.sqlite", Enabled: true},
+		want: model.RepoConfig{ID: "repo", Name: "repo", MountRoot: "/mnt", MountPath: "/mnt/repo", RemoteURLRedacted: "https://example.com/repo.git", Branch: "refs/heads/main", FetchRef: "refs/heads/main", RefreshInterval: 45 * time.Second, GitDir: "/git/repo", OverlayDir: "/overlay/repo", BlobCacheDir: "/cache/repo", MetaDBPath: "/meta/repo.sqlite", OverlayDBPath: "/overlay/repo/meta.sqlite", Enabled: true},
 	},
 	// main before migrations.
 	"25971f7": {
@@ -200,6 +261,64 @@ var legacyRegistries = map[string]struct {
 		},
 		want: fullRepoWithRequest,
 	},
+	// This schema, after migration 4.
+	"user_version 4": {
+		stmts: []string{
+			reposTableV3,
+			`ALTER TABLE repos ADD COLUMN prepare_request TEXT NOT NULL DEFAULT ''`,
+			repoRuntimeTableV3,
+			fullRepoRow,
+			`UPDATE repos SET mount_request = 'request-1', prepare_request = 'prepare-1'`,
+			`PRAGMA user_version = 4`,
+		},
+		want: fullRepoWithRequests,
+	},
+}
+
+// Migration 4 stores every ref of a repo that clones or fetches in full, with
+// the fetch ref defaulting to the source ref, as add-repo now does. It leaves
+// an adopted worktree's refs alone.
+func TestMigrationStoresRefsInFull(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "repos.sqlite")
+	row := func(name, branch, fetchRef, adopt string) string {
+		return `INSERT INTO repos (repo_id, name, mount_root, mount_path, remote_url_redacted, branch, refresh_interval_seconds, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, adopt_gitdir, fetch_ref, created_at_ns, updated_at_ns)
+			VALUES ('` + name + `', '` + name + `', '/mnt', '/mnt/r', '', '` + branch + `', 30, '/git', '/overlay', '/cache', '/meta', '/overlay/meta', ` + adopt + `, '` + fetchRef + `', 1, 1)`
+	}
+	metatest.Exec(t, path,
+		reposTableV3,
+		repoRuntimeTableV3,
+		row("bare", "main", "", "0"),
+		row("short", "refs/heads/main", "main", "0"),
+		row("origin", "refs/heads/main", "origin/dev", "0"),
+		row("tracking", "refs/heads/main", "refs/remotes/origin/dev", "0"),
+		row("tag", "refs/tags/v1", "refs/tags/v1", "0"),
+		row("spaced", "refs/heads/main", " dev ", "0"),
+		row("adopted", "HEAD", "", "1"),
+		`PRAGMA user_version = 3`,
+	)
+	store, err := New(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for name, want := range map[string][2]string{
+		"bare":     {"refs/heads/main", "refs/heads/main"},
+		"short":    {"refs/heads/main", "refs/heads/main"},
+		"origin":   {"refs/heads/main", "refs/heads/dev"},
+		"tracking": {"refs/heads/main", "refs/heads/dev"},
+		"tag":      {"refs/tags/v1", "refs/tags/v1"},
+		"spaced":   {"refs/heads/main", "refs/heads/dev"},
+		"adopted":  {"HEAD", ""},
+	} {
+		got, err := store.GetRepo(ctx, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Branch != want[0] || got.FetchRef != want[1] {
+			t.Errorf("%s: branch %q fetch ref %q, want %q %q", name, got.Branch, got.FetchRef, want[0], want[1])
+		}
+	}
 }
 
 func openRegistry(path string) func() (io.Closer, error) {

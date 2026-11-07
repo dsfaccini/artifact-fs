@@ -72,7 +72,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				&ucli.BoolFlag{Name: "prepared-gitdir", Usage: "use an existing git dir for async preparation"},
 				&ucli.StringFlag{Name: "git-dir", Usage: "explicit git dir path"},
 				&ucli.StringFlag{Name: "blob-cache-dir", Usage: "directory for hydrated blobs; may be shared between repositories"},
-				&ucli.StringFlag{Name: "fetch-ref", Usage: "ref to fetch during async preparation"},
+				&ucli.StringFlag{Name: "fetch-ref", Usage: "ref to fetch and serve; defaults to --ref"},
 			},
 			Action: withController(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Controller) error {
 				name := strings.TrimSpace(c.String("name"))
@@ -173,7 +173,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			fmt.Fprintf(w, "fetched %s\n", name)
 			return nil
 		}),
-		nameCommand("prepare", "retry async repository preparation", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Controller, name string, w io.Writer) error {
+		nameCommand("prepare", "prepare a repository again without unmounting it", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Controller, name string, w io.Writer) error {
 			if err := svc.Prepare(c, name); err != nil {
 				return err
 			}

@@ -191,6 +191,11 @@ func TestRemoveRepoStopsAdoptedFSMonitor(t *testing.T) {
 }
 
 func TestAdoptGitDirRejectsAcquisitionOptions(t *testing.T) {
+	ctl, err := NewController(t.Context(), t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctl.Close()
 	for _, cfg := range []model.RepoConfig{
 		{AdoptGitDir: true},
 		{AdoptGitDir: true, GitDir: "/git", RemoteURL: "https://example.invalid/repo"},
@@ -200,8 +205,12 @@ func TestAdoptGitDirRejectsAcquisitionOptions(t *testing.T) {
 		{AdoptGitDir: true, GitDir: "/git", HistoryDepth: 1},
 		{AdoptGitDir: true, GitDir: "/git", RequiredCommit: strings.Repeat("a", 40)},
 	} {
-		if err := normalizeSourceConfig(&cfg); err == nil {
+		cfg.Name = "adopted"
+		if err := ctl.AddRepo(t.Context(), cfg); err == nil {
 			t.Fatalf("accepted incompatible adoption config: %+v", cfg)
+		}
+		if _, err := ctl.registry.GetRepo(t.Context(), cfg.Name); err == nil {
+			t.Fatalf("registered incompatible adoption config: %+v", cfg)
 		}
 	}
 }

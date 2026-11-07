@@ -60,13 +60,7 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 			return fmt.Errorf("mktemp clone dir: %w", err)
 		}
 		sourceRef := strings.TrimSpace(cfg.Branch)
-		branch := sourceRef
-		if after, ok := strings.CutPrefix(sourceRef, "refs/heads/"); ok {
-			branch = after
-		} else if strings.HasPrefix(sourceRef, "refs/") {
-			branch = ""
-		}
-		if branch != "" {
+		if branch := model.BranchName(sourceRef); branch != "" {
 			args := []string{"clone", "--filter=blob:none"}
 			if cfg.HistoryDepth > 0 {
 				args = append(args, fmt.Sprintf("--depth=%d", cfg.HistoryDepth))
@@ -372,7 +366,7 @@ func (s *Store) FetchRefWithCredentials(ctx context.Context, repo model.RepoConf
 }
 
 func (s *Store) fetchRef(ctx context.Context, repo model.RepoConfig, ref string, env []string) error {
-	target, err := fetchRefTarget(repo, ref)
+	target, err := fetchRefTarget(ref)
 	if err != nil {
 		return err
 	}
@@ -474,7 +468,7 @@ func (s *Store) ValidateAmbientRemote(repo model.RepoConfig) error {
 }
 
 func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig, ref string) error {
-	target, err := fetchRefTarget(repo, ref)
+	target, err := fetchRefTarget(ref)
 	if err != nil {
 		return err
 	}
@@ -624,15 +618,12 @@ func (s *Store) ValidatePreparedGitDir(ctx context.Context, repo model.RepoConfi
 	return nil
 }
 
-func fetchRefTarget(repo model.RepoConfig, ref string) (fetchRefInfo, error) {
+func fetchRefTarget(ref string) (fetchRefInfo, error) {
 	ref = strings.TrimSpace(ref)
-	if ref == "" {
-		ref = strings.TrimSpace(repo.Branch)
-	}
 	if ref == "" {
 		return fetchRefInfo{}, errors.New("fetch ref is required")
 	}
-	if branch := branchName(ref); branch != "" {
+	if branch := model.BranchName(ref); branch != "" {
 		return fetchRefInfo{
 			sourceRef: "refs/heads/" + branch,
 			remoteRef: "refs/remotes/origin/" + branch,
@@ -643,21 +634,4 @@ func fetchRefTarget(repo model.RepoConfig, ref string) (fetchRefInfo, error) {
 		return fetchRefInfo{sourceRef: ref, remoteRef: fetchedFullRefRemoteTrackingRef}, nil
 	}
 	return fetchRefInfo{}, errors.New("fetch ref is required")
-}
-
-func branchName(ref string) string {
-	ref = strings.TrimSpace(ref)
-	if after, ok := strings.CutPrefix(ref, "refs/heads/"); ok {
-		return after
-	}
-	if after, ok := strings.CutPrefix(ref, "refs/remotes/origin/"); ok {
-		return after
-	}
-	if after, ok := strings.CutPrefix(ref, "origin/"); ok {
-		return after
-	}
-	if strings.HasPrefix(ref, "refs/") {
-		return ""
-	}
-	return ref
 }

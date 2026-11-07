@@ -307,9 +307,8 @@ func TestRemountClearsAConnectionFailure(t *testing.T) {
 	}
 }
 
-// A preparation that restarts a running repo records the failure to mount
-// its placeholder.
-func TestStatusReportsAFailedPlaceholderMountOnRePrepare(t *testing.T) {
+// An async repo whose placeholder fails to mount reports the failure.
+func TestStatusReportsAFailedPlaceholderMount(t *testing.T) {
 	ctx := context.Background()
 	svc, err := New(ctx, t.TempDir(), discardLogger())
 	if err != nil {
@@ -324,11 +323,6 @@ func TestStatusReportsAFailedPlaceholderMountOnRePrepare(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// An active runtime whose registry entry asks for another preparation.
-	rt := &repoRuntime{cfg: cfg, gate: fusefs.NewReadyGate(true), active: true, mount: mountServing, mfs: &fakeMountedFS{unmounted: make(chan struct{})}}
-	svc.mu.Lock()
-	svc.running[cfg.ID] = rt
-	svc.mu.Unlock()
 	// A snapshot store a newer build migrated fails the placeholder mount.
 	metatest.Exec(t, cfg.MetaDBPath, `PRAGMA user_version = 99`)
 	if err := svc.syncRepos(ctx); err != nil {

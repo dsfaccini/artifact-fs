@@ -234,7 +234,7 @@ The cache shards blobs by the first two hex characters of their object ID, `<blo
 
 ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the mode, source, attempt, phase, state, duration, and deadline. Clone and fetch operations retry known transient transport failures up to three total attempts. Preparation has a 30-minute timeout. Caller cancellation stops the active Git command and retry backoff; synchronous preparation records a redacted `prepare canceled` status, while daemon shutdown leaves async preparation queued for restart.
 
-Async existing-clone preparation reports remote configuration, fetch, and branch update as separate `configure_remote`, `fetch`, and `update_branch` phases.
+Existing-clone preparation reports remote configuration, fetch, and branch update as separate `configure_remote`, `fetch`, and `update_branch` phases.
 
 Each error the FUSE library reports becomes a `fuse error` record:
 
@@ -260,7 +260,7 @@ Stopping a repo, for `unmount`, `remove-repo` or a daemon shutdown, unmounts it 
 Successful `add-repo`:
 
 ```json
-{"time":"2026-07-16T12:00:00Z","level":"INFO","msg":"repo preparation started","repo":"workers-sdk","mode":"sync","source":"fresh_clone","attempt":1,"phase":"validate","state":"started","duration_ms":0,"branch":"refs/heads/main","fetch_ref":"main","deadline_set":true,"timeout_ms":1799999}
+{"time":"2026-07-16T12:00:00Z","level":"INFO","msg":"repo preparation started","repo":"workers-sdk","mode":"sync","source":"fresh_clone","attempt":1,"phase":"validate","state":"started","duration_ms":0,"branch":"refs/heads/main","fetch_ref":"refs/heads/main","deadline_set":true,"timeout_ms":1799999}
 {"time":"2026-07-16T12:00:04Z","level":"INFO","msg":"repo preparation completed","repo":"workers-sdk","mode":"sync","source":"fresh_clone","attempt":1,"phase":"complete","state":"completed","duration_ms":4217,"deadline_set":true,"timeout_ms":1799999,"head_oid":"d4c61587...","head_ref":"main","snapshot_generation":1}
 ```
 
@@ -305,6 +305,8 @@ The daemon mounts a placeholder immediately. Operations inside that repo mount, 
 ./artifact-fs prepare --name workers-sdk
 ```
 
+`prepare` never unmounts the repo. The daemon prepares an async repo again behind its gate, so operations wait as they did during the first preparation. For a repo `add-repo` prepared without `--async`, `prepare` fetches and prepares in the CLI while the daemon keeps serving the mount, which then moves to the prepared commit. An async repo that is ready and has no `--require-commit` has nothing to prepare. `set-refresh` never prepares a repo again.
+
 Async HTTPS remotes must use ambient credentials, such as a configured Git credential helper or repo-local Git config. Inline credentials in the remote URL are rejected for async repositories.
 
 For workflows that create the gitdir separately, `--prepared-gitdir` makes the async step fetch and prepare an existing gitdir instead of running `git clone`:
@@ -322,6 +324,8 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
   --git-dir /tmp/workers-sdk.git \
   --fetch-ref main
 ```
+
+`--ref` and `--fetch-ref` take a full ref name, a branch name, or `origin/<branch>`, and `add-repo` stores each as a full ref name. `--fetch-ref` defaults to `--ref`. Preparation fetches the fetch ref and serves it, also right after a fresh clone of `--ref`.
 
 ## Adopting linked Git worktrees
 

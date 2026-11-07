@@ -14,7 +14,6 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
-	"github.com/cloudflare/artifact-fs/internal/registry"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 )
 
@@ -60,70 +59,75 @@ func (s *Service) mountSucceeded(id model.RepoID) {
 	s.mu.Unlock()
 }
 
-// mountRepo prepares cfg's sync repo for the daemon and starts its runtime,
-// which mounts it.
+// mountRepo brings cfg's prepared repo's snapshot to its git dir's HEAD
+// through the prepare pipeline, then starts the runtime that serves it, which
+// mounts it. An async repo's runtime gets an open gate, which a later prepare
+// request closes while the repo prepares again.
 func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
-	prepareCtx, cancel := s.withPrepareTimeout(ctx)
-	defer cancel()
-	return s.withRepoPrepareLock(prepareCtx, cfg.Name, func() error {
-		latest, err := s.registry.GetRepo(prepareCtx, cfg.Name)
-		if err != nil {
-			return err
-		}
-		if latest.ConfigVersion != cfg.ConfigVersion {
-			return registry.ErrRepoChanged
-		}
-		cfg = latest
-		if cfg.PrepareState == model.PrepareStateSyncPreparing {
-			return fusefs.ErrRepoNotReady
-		}
-		if cfg.PrepareState == "" && cfg.PrepareError != "" {
-			return fmt.Errorf("repo prepare failed: %s", cfg.PrepareError)
-		}
-		snap, headOID, headRef, gen, err := s.ensurePreparedRepo(prepareCtx, cfg, true)
-		if err != nil {
-			return err
-		}
-		// attachMount checks this before each mount. Checking it here too
-		// keeps the index of a native worktree untouched.
-		if cfg.AdoptGitDir {
-			entries, err := os.ReadDir(cfg.MountPath)
-			if err != nil || len(entries) != 0 {
-				snap.Close()
-				if err != nil {
-					return err
-				}
-				return errors.New("adopted mountpoint must be empty; native working files are not imported")
-			}
-		}
-		if cfg.RequiredCommit == "" {
-			if err := s.git.EnsureIndexInitialized(prepareCtx, cfg); err != nil {
-				snap.Close()
-				return err
-			}
-		}
-		ov, err := overlay.New(prepareCtx, cfg)
-		if err != nil {
-			snap.Close()
-			return err
-		}
-		baseLookup := func(path string) (model.BaseNode, bool, error) {
-			return snap.LookupNode(prepareCtx, gen, path)
-		}
-		if err := ov.ReconcileChecked(prepareCtx, baseLookup, nil, nil); err != nil {
-			ov.Close()
-			snap.Close()
-			return err
-		}
-		if err := s.bootstrapCleanStatusIndex(prepareCtx, cfg, headOID, gen, snap, ov); err != nil {
-			ov.Close()
-			snap.Close()
-			return err
-		}
-		rt := s.startRuntime(ctx, cfg, snap, ov, servedHead{oid: headOID, ref: headRef, gen: gen}, nil)
-		s.startRepoBackground(rt)
-		return nil
+	if cfg.PrepareState == model.PrepareStateSyncPreparing {
+		return fusefs.ErrRepoNotReady
+	}
+	if cfg.PrepareState == "" && cfg.PrepareError != "" {
+		return fmt.Errorf("repo prepare failed: %s", cfg.PrepareError)
+	}
+	return s.prepare(ctx, cfg, preparation{
+		ambient:    true,
+		mountPoint: true,
+		complete: func(prepareCtx context.Context, res *prepared) error {
+			return s.startPreparedRuntime(ctx, prepareCtx, res)
+		},
 	})
+}
+
+// startPreparedRuntime starts the runtime that serves res, which mounts it.
+// ctx is the runtime's parent, and prepareCtx bounds the steps before it
+// starts.
+func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *prepared) error {
+	cfg, snap, gen := res.cfg, res.snap, res.gen
+	if err := s.withCurrentPrepare(prepareCtx, cfg, func() error {
+		return s.pruneGenerations(prepareCtx, nil, snap, gen)
+	}); err != nil {
+		return withPreparationPhase(preparePhaseCleanupSnapshot, err)
+	}
+	// attachMount checks this before each mount. Checking it here too
+	// keeps the index of a native worktree untouched.
+	if cfg.AdoptGitDir {
+		entries, err := os.ReadDir(cfg.MountPath)
+		if err != nil {
+			return err
+		}
+		if len(entries) != 0 {
+			return errors.New("adopted mountpoint must be empty; native working files are not imported")
+		}
+	}
+	if cfg.RequiredCommit == "" {
+		if err := s.git.EnsureIndexInitialized(prepareCtx, cfg); err != nil {
+			return err
+		}
+	}
+	ov, err := overlay.New(prepareCtx, cfg)
+	if err != nil {
+		return err
+	}
+	baseLookup := func(path string) (model.BaseNode, bool, error) {
+		return snap.LookupNode(prepareCtx, gen, path)
+	}
+	if err := ov.ReconcileChecked(prepareCtx, baseLookup, nil, nil); err != nil {
+		ov.Close()
+		return err
+	}
+	if err := s.bootstrapCleanStatusIndex(prepareCtx, cfg, res.source.Commit, gen, snap, ov); err != nil {
+		ov.Close()
+		return err
+	}
+	var gate *fusefs.ReadyGate
+	if isAsyncRepo(cfg) {
+		gate = fusefs.NewReadyGate(true)
+	}
+	res.kept = true
+	rt := s.startRuntime(ctx, cfg, snap, ov, servedHead{oid: res.source.Commit, ref: res.source.Ref, gen: gen}, gate)
+	s.startRepoBackground(rt)
+	return nil
 }
 
 // runHook runs a test hook of Service when a test set it.
@@ -136,7 +140,6 @@ func runHook(hook func()) {
 // mountAsyncRepo starts the runtime of cfg's async repo, which mounts it
 // behind a gate that holds FUSE ops until preparation ends.
 func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) error {
-	s.fillPaths(&cfg)
 	if err := os.MkdirAll(cfg.MountPath, 0o755); err != nil {
 		return err
 	}
