@@ -14,7 +14,7 @@ It exposes the tree quickly, then hydrates file contents on demand. That makes i
 
 In practice:
 
-* The operating system sees the full tree almost immediately, while the FUSE driver fetches file contents in the background. It prioritizes package manifests, dependency manifests, and source files ahead of large blobs.
+* The operating system sees the full tree almost immediately. The FUSE driver fetches a file's contents when the file is opened or its size is first needed, and opening a file for reading also prefetches the other files of its directory in the background. It prioritizes package manifests, dependency manifests, and source files ahead of images, archives, and videos.
 * ArtifactFS is part of [Cloudflare Artifacts](http://workers.cloudflare.com/product/artifacts), a versioned filesystem that speaks git, but it also works with any git repo.
 * ArtifactFS is optional. You can clone an Artifact repo directly, but larger repos still take time to clone. ArtifactFS lets you mount the repo and fetch blob contents as they are needed.
 
@@ -95,8 +95,10 @@ records the failure, and mounts the repo again only once the stalled mount has
 ended. macOS treats an FSKit mount as a network volume, so
 `umount <path>` returns `Operation not permitted` unless the terminal app has
 the Network Volumes permission (Privacy & Security → Files & Folders). The daemon
-unmounts its own FSKit mounts through `unmount(2)`, then through
-`diskutil unmount` when `unmount(2)` is refused. `diskutil unmount <path>`
+unmounts an FSKit mount it serves through `unmount(2)`, then through
+`diskutil unmount` when `unmount(2)` is refused. A mount it unmounts by its
+path, such as one an earlier daemon left or a late mount the fuse library could
+not unmount, gets no `diskutil` fallback. `diskutil unmount <path>`
 removes an FSKit mount that `umount` cannot.
 
 Quick start against a public repo:
@@ -115,6 +117,7 @@ MOUNT_ROOT="$HOME/artifact-fs-mnt"
 # Start the daemon (mounts each repo where add-repo registered it, blocks until killed)
 ./artifact-fs daemon &
 DAEMON_PID=$!
+for _ in $(seq 60); do ./artifact-fs status --name workers-sdk | grep -q ' state=mounted ' && break; sleep 1; done
 
 # Use the repo
 ls "$MOUNT_ROOT/workers-sdk/"
@@ -128,7 +131,8 @@ kill $DAEMON_PID
 ArtifactFS creates the state root and its subdirectories with mode `0700`, and
 narrows existing subdirectories to `0700`. It refuses a state root, or one of
 its subdirectories, that another user owns or that group or others can write:
-the state root holds each clone's fsmonitor hook, which Git runs on every
+the state root holds the hydrated blobs that reads serve, and the fsmonitor
+hook of each clone in its default git dir, which Git runs on every
 `git status`. A state root may be a symlink the current user owns. ArtifactFS
 resolves it at startup and builds the paths of repos it registers from the
 resolved path. Repos registered before that keep the paths they stored.
@@ -144,13 +148,13 @@ Check the state of a mounted repo with `status`:
 
 | Field | Meaning |
 |-------|---------|
-| `state` | `mounted`, `degraded` (the FUSE mount is down or the last remote refresh failed), `unmounted`, `preparing`, or `failed`. An async repo reports `preparing` or `failed` while its preparation is pending or has failed, also while its mount is down. Without a running daemon, `preparing` or `failed` while preparation is pending or has failed, and `unmounted` otherwise |
+| `state` | `mounted`, `degraded` (the FUSE mount is down or the last remote refresh failed), `unmounted`, `preparing`, or `failed`. A repo reports `preparing` while the CLI prepares it, for `add-repo` without `--async` or for `prepare`. An async repo reports `preparing` or `failed` while its preparation is pending or has failed, also while its mount is down. Without a running daemon, a repo reports these prepare states, and `unmounted` otherwise. Only an async repo reports `failed`. After a failed CLI preparation, a repo reports `unmounted`, or the state of the mount the daemon keeps serving, with the error in `prepare_error` |
 | `head` / `ref` | Backward-compatible aliases for the current base commit and Git HEAD ref |
-| `source_ref` | Canonical remote ref selected during acquisition |
+| `source_ref` | The source ref `add-repo` registered, as a full ref name (`--ref`, default `refs/heads/main`); `HEAD` for an adopted worktree |
 | `required_commit` | Required source commit, or `none` |
 | `acquisition` | Historical acquisition evidence: `not_required`, `pending`, or `verified` |
 | `base_commit` | The served commit while the daemon serves the repo, otherwise the published one |
-| `served_commit` / `served_generation` | Commit and snapshot generation the daemon's mount serves; `none`/`0` when no daemon serves the repo |
+| `served_commit` / `served_generation` | Commit and snapshot generation of the daemon's runtime for the repo, also while its FUSE mount is down and the daemon retries it; `none`/`0` when no daemon runs the repo |
 | `published_commit` / `published_generation` | Commit and generation the snapshot store last published. After a failed overlay transition they run ahead of the served ones until the daemon's retry succeeds |
 | `phase` | The step the daemon's runtime for the repo is in: `prepare` (async preparation), `mount` (including retries of a FUSE mount that failed), `serve` (a mount is served) or `unmount`; `none` when no daemon runs or before it records one |
 | `remote_refresh` | Whether daemon and manual remote refreshes are enabled |
@@ -160,8 +164,8 @@ Check the state of a mounted repo with `status`:
 | `last_error` / `last_error_phase` / `last_error_at` | Last redacted failure the daemon retries, the phase that failed (`mount`, `serve`, `unmount`, `head_reconcile`, `fetch` or `registry_sync`) and when. `serve` is a FUSE connection that failed or exited. A success of that phase clears it |
 | `next_retry` / `attempts` | When the daemon retries the failed phase, and how many times in a row it failed; `next_retry` is `none` when no daemon runs |
 | `hydrated_blobs` / `hydrated_bytes` | Blob count and bytes in the repo's blob cache, read from counters kept with the cache (see [Evicting the blob cache](#evicting-the-blob-cache)) |
-| `overlay_dirty` | `true` if the overlay contains created or modified files; delete-only overlays are not counted |
-| `last_fetch` / `result` | Time and result (`ok` or `failed`) of the daemon's last remote refresh, or of a later `fetch` command; otherwise `never` |
+| `overlay_dirty` | `true` if the overlay holds any entry other than a delete: a created, modified or renamed file, a symlink or a directory; delete-only overlays are not counted |
+| `last_fetch` / `result` | Result (`ok` or `failed`) of the daemon's last remote refresh, with the time of its last successful one; or `ok` with the time of a later successful fetch that wrote `FETCH_HEAD`, such as a `fetch` command; otherwise `never` |
 
 `status` reads what the daemon records in the registry, so it reports the same
 state from any process. Only one daemon runs per state root: it holds a lock on
@@ -180,11 +184,14 @@ the outcome. They exit non-zero when the daemon failed, when no daemon runs on
 the state root, when a later `unmount` or `remount` replaced the request, or
 after two minutes without an outcome. The daemon retries a failed unmount or
 mount; `status` shows the retry. The daemon runs each unmount on its own
-thread and waits at most 21 seconds for it, so an unmount that hangs, as one
-can on a dead FSKit volume, stalls only its repo. While that unmount has not
-returned, `unmount` and `remount` of the repo fail at once with `an earlier
-unmount of the repo has not returned`, and `status` shows the repo's mount
-waiting for it.
+thread. It waits at most 21 seconds for an unmount, and does not wait for the
+one it starts after a FUSE connection fails. An unmount that hangs, as one can
+on a dead FSKit volume, holds up the daemon's other repos for that one wait,
+then stalls only its own repo. While that unmount has not returned, `unmount`
+and `remount` of the repo fail at once with `an earlier unmount of the repo has
+not returned`, and `status` shows that error as `last_error`, with
+`last_error_phase` `unmount` while a stop waits for it and `mount` while a mount
+retry does.
 
 A request stays in the registry until the daemon carries it out, also after the
 command timed out or the daemon stopped. A later `unmount` or `remount` replaces
@@ -196,17 +203,18 @@ it.
 ```
 
 The commands wake the daemon through the owner-only socket
-`config/daemon.sock`, which carries no data. When the state root's path is too
-long for a Unix socket (104 bytes on macOS, 108 on Linux), the daemon opens no
-socket and acts at its next registry poll, within 3 seconds.
+`config/daemon.sock`, which carries no data. When the socket's path,
+`<state root>/config/daemon.sock`, does not fit a Unix socket address (at most
+103 bytes on macOS, 107 on Linux), the daemon opens no socket and acts at its
+next registry poll, within 3 seconds.
 
-Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The first read of a file in a directory also queues up to 256 of that directory's files for background hydration, ranking code and manifests (`package.json`, `go.mod`, `README.md`) ahead of binary files. Listing or walking directories queues nothing. A blobless clone knows a file's size only once its blob is local, so the first `stat` of a file hydrates that one file. A worker takes up to 256 queued blobs, all reads or all prefetches, and fetches the missing ones with one `git fetch` from the promisor remote, so a blobless clone pays one fetch per batch, not one per blob. Queued reads go ahead of queued prefetches, and a blob a prefetch has already downloaded is copied into the cache before more prefetches download. With more than one worker, one worker takes only reads and those copies, so a read never waits for an unrelated prefetch download, though it can wait for one copy of a blob already on disk. With a single worker, a read can wait for a running prefetch download. A read of a file whose own prefetch is downloading waits for that download.
+Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The first time a base file in a directory is opened for reading or read at a given snapshot generation, the mount also queues up to 256 of that directory's files, the opened one included, for background hydration, ranking code and manifests (`package.json`, `go.mod`, `README.md`) ahead of binary files. Listing or walking directories queues nothing. A blobless clone knows a file's size only once its blob is local, so the first `stat` of a file hydrates that one file. A worker takes up to 256 queued blobs, all reads or all prefetches, and fetches the missing ones with one `git fetch` from the promisor remote, so a blobless clone pays one fetch per batch, not one per blob. Queued reads go ahead of queued prefetches, and a blob a prefetch has already downloaded is copied into the cache before more prefetches download. With more than one worker, one worker takes only reads and those copies, so a read never waits for an unrelated prefetch download, though it can wait for one copy of a blob already on disk. With a single worker, a read can wait for a running prefetch download. A read of a file whose own prefetch is downloading waits for that download.
 
 For every repo, ArtifactFS reads blobs (`git cat-file --batch`) and trees (`git ls-tree`), and fetches queued blobs in batches (`git fetch --stdin`), without a controlling terminal, with `GIT_TERMINAL_PROMPT=0` and an empty `SSH_ASKPASS`. When a batch fetch runs, or a read lazily fetches a missing object, a remote that needs an interactive password or passphrase prompt makes the fetch fail instead of prompting. The repo's `core.sshCommand`, credential helpers, and any program set through `GIT_ASKPASS` or `core.askPass` still run. Git Credential Manager can still show its GUI prompt unless `GCM_INTERACTIVE=never` is set.
 
-When the Git index matches the published snapshot and the overlay is empty, startup marks snapshot entries valid for Git's filesystem monitor before opening the mount. This lets the first `git status` use the daemon's change list instead of reading every tracked blob, and each later `git status` receives only the paths the overlay changed since Git's previous query, plus each file whose writes are not yet flushed. Paths under `text=auto` are marked, and so are paths under `-text` or `binary` without `eol=lf`. Paths under `text`, `text=input` or `eol=lf` without `text=auto` stay unmarked, because Git's check-in turns CRLF into LF and a blob that holds CRLF then differs from its file; Git compares those paths itself. `-text eol=lf` stays unmarked too, because `git check-attr` prints it like the literal `text=unset`, which Git converts under `eol=lf`. A `git status` that runs while the worktree is unmounted sees the empty mountpoint, so Git's next query gets a rescan. When startup marks the baseline again, its own query takes that rescan, and the first `git status` after the mount receives only the overlay's changes. ArtifactFS skips this baseline when the index or a `.gitattributes` blob is uncertain, when `core.attributesFile` is configured or `core.autocrlf` is set to anything but false, when an `eol=crlf`, `crlf`, `filter`, `ident` or `working-tree-encoding` attribute applies, or when staged work or overlay changes exist; Git then performs its normal status scan.
+When the Git index matches the published snapshot and the overlay is empty, startup marks snapshot entries valid for Git's filesystem monitor before the mount serves the repo: before a prepared repo mounts, and before an async repo's gate opens. This lets the first `git status` use the daemon's change list instead of reading every tracked blob, and each later `git status` receives only the paths the overlay changed since Git's previous query, plus each file whose writes are not yet flushed. Paths with no `text` attribute, or under `text=auto`, `-text` or `binary`, are marked, unless `eol=lf` applies without `text=auto`. Paths under `text`, `text=input` or `eol=lf` without `text=auto` stay unmarked, because Git's check-in turns CRLF into LF and a blob that holds CRLF then differs from its file; Git compares those paths itself. `-text eol=lf` stays unmarked too, because `git check-attr` prints it like the literal `text=unset`, which Git converts under `eol=lf`. A `git status` that runs while the worktree is unmounted sees the empty mountpoint, so Git's next query gets a rescan. When startup marks the baseline again, its own query takes that rescan, and the first `git status` after the mount receives only the overlay's changes. ArtifactFS skips this baseline when the index or a `.gitattributes` blob is uncertain, when `core.attributesFile` is configured or `core.autocrlf` is set to anything but false, when an `eol=crlf`, `crlf`, `filter`, `ident` or `working-tree-encoding` attribute applies, or when staged work or overlay changes exist; Git then performs its normal status scan.
 
-Use `--hydration-concurrency` to control the number of parallel blob-fetch workers (default 4). Each worker maintains a persistent `git cat-file --batch` process that copies fetched blobs into the cache, so higher values trade memory for faster bulk hydration:
+Use `--hydration-concurrency` to set each repo's number of hydration workers (default 4). A repo's workers share a pool of up to that many persistent `git cat-file --batch` processes that copy fetched blobs into the cache, so higher values trade memory for faster bulk hydration:
 
 ```bash
 ./artifact-fs daemon --hydration-concurrency 8
@@ -230,7 +238,7 @@ Eviction follows the access times the filesystem records, so its order depends o
 - APFS on macOS: a read updates the access time only while it is not newer than the modification time, so only the first read after hydration counts, and eviction removes the blobs first read longest ago.
 - The kernel can serve repeated reads of a mounted file from its page cache without reading the blob file, and those reads leave its access time unchanged.
 
-The cache shards blobs by the first two hex characters of their object ID, `<blob-cache-dir>/<2 hex>/<oid>`. When a repo mounts, the daemon moves blobs of the earlier flat layout into their shards and recounts the cache. `evict-cache` does the same before it evicts, and `status` does it once for a cache that has no counters yet. While one of them recounts, hydration into the same cache waits, so mounting a repo stalls hydration for every repo that shares its `--blob-cache-dir` for one walk of the directory, about half a second per 100,000 blobs on an APFS laptop. Hydration and eviction update the counters `status` reports as they add and remove blobs, under a lock on the cache's `stats` file, so `status` never walks the cache. The recount corrects counters that a crash between a blob change and its counter update, or a change made by hand, left wrong.
+The cache shards blobs by the first two hex characters of their object ID, `<blob-cache-dir>/<2 hex>/<oid>`. When a repo mounts, the daemon moves blobs of the earlier flat layout into their shards and recounts the cache. `evict-cache` does the same before it evicts, and `status` does it once for a cache that has no counters yet. While one of them recounts, hydration into the same cache waits, so mounting a repo stalls hydration for every repo that shares its `--blob-cache-dir` for one walk of the directory, about half a second per 100,000 blobs on an APFS laptop. Hydration and eviction update the counters `status` reports as they add and remove blobs, under a lock on the cache's `stats` file, so `status` walks the cache only when it has no counters yet. The recount corrects counters that a crash between a blob change and its counter update, or a change made by hand, left wrong.
 
 ## Logging
 
@@ -262,8 +270,8 @@ Stopping a repo, for `unmount`, `remove-repo` or a daemon shutdown, unmounts it 
 Successful `add-repo`:
 
 ```json
-{"time":"2026-07-16T12:00:00Z","level":"INFO","msg":"repo preparation started","repo":"workers-sdk","mode":"sync","source":"fresh_clone","attempt":1,"phase":"validate","state":"started","duration_ms":0,"branch":"refs/heads/main","fetch_ref":"refs/heads/main","deadline_set":true,"timeout_ms":1799999}
-{"time":"2026-07-16T12:00:04Z","level":"INFO","msg":"repo preparation completed","repo":"workers-sdk","mode":"sync","source":"fresh_clone","attempt":1,"phase":"complete","state":"completed","duration_ms":4217,"deadline_set":true,"timeout_ms":1799999,"head_oid":"d4c61587...","head_ref":"main","snapshot_generation":1}
+{"time":"2026-07-16T12:00:00Z","level":"INFO","msg":"repo preparation started","repo":"workers-sdk","mode":"sync","attempt":1,"source":"fresh_clone","phase":"validate","state":"started","duration_ms":0,"branch":"refs/heads/main","fetch_ref":"refs/heads/main","deadline_set":true,"timeout_ms":1799999}
+{"time":"2026-07-16T12:00:04Z","level":"INFO","msg":"repo preparation completed","repo":"workers-sdk","mode":"sync","attempt":1,"source":"fresh_clone","phase":"complete","state":"completed","duration_ms":4217,"deadline_set":true,"timeout_ms":1799999,"head_oid":"d4c61587...","head_ref":"main","snapshot_generation":1}
 ```
 
 Transient network failure followed by recovery:
@@ -277,7 +285,7 @@ Transient network failure followed by recovery:
 Preparation timeout:
 
 ```json
-{"time":"2026-07-16T12:30:00Z","level":"ERROR","msg":"repo preparation failed","repo":"workers-sdk","mode":"sync","source":"fresh_clone","attempt":1,"phase":"clone","state":"failed","duration_ms":1800000,"deadline_set":true,"timeout_ms":1799999,"timed_out":true,"canceled":false,"error":"git clone failed after 1 attempt; caller context: context deadline exceeded"}
+{"time":"2026-07-16T12:30:00Z","level":"ERROR","msg":"repo preparation failed","repo":"workers-sdk","mode":"sync","attempt":1,"source":"fresh_clone","phase":"clone","state":"failed","duration_ms":1800000,"deadline_set":true,"timeout_ms":1799999,"timed_out":true,"canceled":false,"error":"git clone failed after 1 attempt; caller context: context deadline exceeded"}
 ```
 
 Diagnostics are bounded and redact credentials and complete remote references. To follow preparation and network activity:
@@ -300,14 +308,14 @@ By default, `add-repo` waits for the blobless clone and initial snapshot before 
   --async
 ```
 
-The daemon mounts a placeholder immediately. Operations inside that repo mount, such as `ls`, `less`, or `git -C /tmp/workers-sdk status`, wait until the clone/fetch and snapshot publish have completed. If preparation fails, those operations return an I/O error until preparation is retried:
+The running daemon mounts a placeholder at its next registry poll, within 3 seconds. Operations inside that repo mount, such as `ls`, `less`, or `git -C /tmp/workers-sdk status`, wait until the clone/fetch and snapshot publish have completed. If preparation fails, those operations return an I/O error until preparation is retried:
 
 ```bash
 ./artifact-fs status --name workers-sdk
 ./artifact-fs prepare --name workers-sdk
 ```
 
-`prepare` never unmounts the repo. The daemon prepares an async repo again behind its gate, so operations wait as they did during the first preparation. For a repo `add-repo` prepared without `--async`, `prepare` fetches and prepares in the CLI while the daemon keeps serving the previous commit, and `status` reports `preparing` meanwhile. The mount then moves to the prepared commit. When that `prepare` fails, the daemon keeps serving the repo. If the fetch already moved HEAD before a later step failed, the watcher moves the live mount to that HEAD, and a restarted daemon serves the git dir's HEAD. `status` shows the `prepare_error` with the commit the daemon serves. An async repo that is ready and has no `--require-commit` has nothing to prepare. `set-refresh` never prepares a repo again.
+`prepare` never unmounts the repo. The daemon prepares an async repo again behind its gate, so operations wait as they did during the first preparation. For a repo `add-repo` prepared without `--async`, `prepare` fetches and prepares in the CLI while the daemon keeps serving the repo, and `status` reports `preparing` meanwhile. Once the fetch moves HEAD, the watcher moves the live mount to that commit. When that `prepare` fails, the daemon keeps serving the repo, and a restarted daemon serves the git dir's HEAD. A repo whose `--remote` carried inline credentials stores no remote URL, so `prepare` fetches nothing for it and republishes the git dir's HEAD. `status` shows the `prepare_error` with the commit the daemon serves. An async repo that is ready and has no `--require-commit` has nothing to prepare. `set-refresh` never prepares a repo again.
 
 Async HTTPS remotes must use ambient credentials, such as a configured Git credential helper or repo-local Git config. Inline credentials in the remote URL are rejected for async repositories.
 
@@ -327,15 +335,16 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
   --fetch-ref main
 ```
 
-`--ref` and `--fetch-ref` take a full ref name, a branch name, or `origin/<branch>`, and `add-repo` stores each as a full ref name. `origin/X` names branch `X`, so a branch literally named `origin/X` needs `--ref refs/heads/origin/X`. `--fetch-ref` defaults to `--ref`. Preparation fetches the fetch ref and serves it, also right after a fresh clone of `--ref`.
+`--ref` and `--fetch-ref` take a full ref name, a branch name, or `origin/<branch>`, and `add-repo` stores each as a full ref name. `origin/X` and `refs/remotes/origin/X` name branch `X`, so a branch literally named `origin/X` needs `--ref refs/heads/origin/X`. `--fetch-ref` defaults to `--ref`. Preparation fetches the fetch ref and serves it, also right after a fresh clone of `--ref`. With `--require-commit`, preparation fetches and verifies `--ref` and ignores `--fetch-ref`.
 
 ## Adopting linked Git worktrees
 
 `--adopt-gitdir` registers an initialized linked worktree without cloning, fetching,
-changing refs or upstream tracking, or replacing its Git index. The GitDir must
+changing refs or upstream tracking, or resetting its Git index. The GitDir must
 already contain a valid HEAD and index, and its registered worktree path must
 match the mountpoint. Primary GitDirs, relocation and reftable ref storage are
-rejected before config writes. The mountpoint must be empty: adoption
+rejected before config writes. The daemon mounts the worktree only on an empty
+mountpoint, which `add-repo` does not check: adoption
 uses Git metadata and does not import native working files. This mode preserves normal linked
 worktree discovery, shared objects and refs, and private HEAD/index state:
 
@@ -360,7 +369,8 @@ watching remains active, including shared loose and packed branch refs, so
 commits and branch changes reconcile normally. Run ordinary Git fetch/push
 commands when needed; the worktree's original remote configuration is retained.
 If `origin` embeds credentials, adoption logs a warning that names no remote and proceeds:
-Git's lazy fetches of missing blobs and trees use that URL.
+fetches of missing blobs and trees, Git's lazy fetches and the hydrator's batch
+fetches, use the promisor remote, usually `origin`.
 
 ArtifactFS enables `extensions.worktreeConfig`, migrating shared `core.worktree`
 and `core.bare=true` settings into the primary worktree's config when necessary.
@@ -370,8 +380,8 @@ siblings retain their settings.
 
 Stop the owning daemon and wait for process exit and actual unmount before
 restoring the saved gitfile, unlocking metadata or removing the worktree.
-`remove-repo` only updates the registry and Git config when invoked outside the
-owning daemon; its return alone does not acknowledge that the live mount has stopped.
+`remove-repo` updates the registry and Git config and returns. The running daemon
+unmounts the repo at its next registry poll, so the return does not mean the live mount has stopped.
 It unsets the worktree's `core.fsmonitor` and keeps `extensions.worktreeConfig`,
 which sibling worktrees may rely on. Preserve a recovery ref before deleting a
 branch containing local commits.
@@ -399,7 +409,7 @@ A required source commit fixes the published base generation: ArtifactFS does no
 
 The remote must advertise Git partial-clone filtering for file contents to hydrate over the network on demand. If it does not, Git downloads the selected revision's blobs eagerly, but depth 1 still prevents historical commits and obsolete blob versions from being transferred.
 
-`--prepared-gitdir` is not supported with `--require-commit` because verified acquisition atomically installs a private Git directory.
+`--prepared-gitdir` is not supported with `--require-commit` because verified acquisition replaces the repo's Git directory with one it built and verified.
 
 ## Sandboxes and Containers
 
@@ -425,62 +435,66 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
                          │  ┌──────────┐                 ┌──────────────┐  │
                          │  │  Blob    │                 │   Resolver   │  │
                          │  │  Cache   │                 │              │  │
-                         │  │  (disk)  │◄────hydrate─────│ snap + ovl   │  │
+                         │  │  (disk)  │                 │ snap + ovl   │  │
                          │  └──────────┘                 │  merged view │  │
                          │       ▲                       └──────┬───────┘  │
                          │       │                              │          │
-                         │  ┌────┴─────┐   prefetch       ┌─────┴────────┐ │
+                         │  ┌────┴─────┐   hydrate,       ┌─────┴────────┐ │
                          │  │ Hydrator │◄─────────────────│    Engine    │ │
-                         │  │          │                  │              │ │
-                         │  │ priority │   ensureOverlay  │ read / write │ │
-                         │  │ queue    │   copy-on-write  │ create / rm  │ │
-                         │  └──────────┘                  └─────┬────────┘ │
-                         │                                      │          │
+                         │  │          │   prefetch       │              │ │
+                         │  │ priority │                  │ read / write │ │
+                         │  │ queue    │                  │ create / rm  │ │
+                         │  └──────────┘                  │              │ │
+                         │                                │ copy-on-     │ │
+                         │  ┌──────────┐   write ops      │ write        │ │
+                         │  │ Overlay  │◄─────────────────│              │ │
+                         │  │ (SQLite  │                  └─────┬────────┘ │
+                         │  │  + upper │                        │          │
+                         │  │  dir)    │                 ┌──────┴───────┐  │
+                         │  └──────────┘                 │  FUSE Layer  │  │
+                         │                               │  (macFUSE /  │  │
+                         │                               │   /dev/fuse) │  │
+                         │                               └──────┬───────┘  │
                          │  ┌──────────┐                 ┌──────┴───────┐  │
-                         │  │ Overlay  │◄────────────────│  FUSE Layer  │  │
-                         │  │ (SQLite  │  write ops      │  (macFUSE /  │  │
-                         │  │  + upper │                 │   /dev/fuse) │  │
-                         │  │  dir)    │                 └──────┬───────┘  │
-                         │  └──────────┘                        │          │
-                         │                                      │          │
-                         │  ┌──────────┐  HEAD poll       ┌─────┴────────┐ │
-                         │  │ Watcher  │─────────────────►│ Mount point  │ │
-                         │  │ (500ms)  │  re-index +      │ /tmp/myrepo  │ │
-                         │  └──────────┘  reconcile       └──────────────┘ │
+                         │  │ Watcher  │  polls gitdir   │ Mount point  │  │
+                         │  │ (500ms)  │  HEAD, then     │ /tmp/myrepo  │  │
+                         │  └──────────┘  re-indexes and └──────────────┘  │
+                         │                reconciles                       │
                          └─────────────────────────────────────────────────┘
 ```
 
 ### Data flow
 
-1. **Clone/fetch** -- `add-repo` runs a blobless clone or verified source acquisition. `--depth` controls transferred history independently. Verified acquisition fetches the canonical source ref into a private candidate ref and checks `--require-commit` before atomically installing the Git directory. When the remote advertises partial-clone filtering, only commits, trees, and refs are fetched initially; otherwise Git falls back to downloading blobs eagerly.
+1. **Clone/fetch** -- `add-repo` runs a blobless clone or verified source acquisition. `--depth` controls transferred history independently. Verified acquisition fetches the canonical source ref into a private candidate ref and checks `--require-commit` before it installs the Git directory. When the remote advertises partial-clone filtering, only commits, trees, and refs are fetched initially; otherwise Git falls back to downloading blobs eagerly.
 
 2. **Index** -- `git ls-tree -r -t -z <selected-commit>` enumerates every path in the selected tree. Sizes are resolved locally via `git cat-file --batch-check` with `GIT_NO_LAZY_FETCH=1` to avoid network round-trips. The result is bulk-inserted into a SQLite `base_nodes` table as a new generation.
 
 3. **Mount** -- The FUSE layer exposes the tree immediately. A synthesized `.git` gitfile points at the real gitdir so git commands work inside the mount.
 
-4. **Read** -- The Resolver merges the snapshot (base tree) with the overlay (local writes). For base files, reads block until the Hydrator fetches the blob and streams it to the blob cache through a persistent `git cat-file --batch` process. Blobs queued together are fetched with one `git fetch --stdin`; the first read in a directory queues its other files the same way.
+4. **Read** -- The Resolver merges the snapshot (base tree) with the overlay (local writes). For base files, reads block until the Hydrator fetches the blob and streams it to the blob cache through a persistent `git cat-file --batch` process. Two or more missing blobs queued together are fetched with one `git fetch --stdin`, up to 256 per fetch, and reads and prefetches never share a fetch. The first open for reading or read of a base file in a directory queues up to 256 of that directory's files, the opened one included, the same way.
 
-5. **Write** -- The Engine promotes base files to the overlay via copy-on-write (hydrate, then copy to the `upper/` directory). Subsequent reads come from the overlay. Deletes are recorded as whiteouts; deleting a file copies it first only while a handle on it is open. A write reaches the overlay file at once, and `stat` shows its size and mtime at once; the overlay database records them when a handle that wrote the file is flushed or closed, when the file is `fsync`ed, or when another change reaches the overlay. An `fsync` returns only after the file and the database reach stable storage. Between syncs, an OS crash can lose the database's latest changes; a daemon crash loses none of them. No FUSE operation holds a lock while a blob hydrates, so a slow fetch stalls neither a HEAD switch nor other operations. A failed operation returns the errno of its cause, such as `ENOSPC`, and an interrupted one returns `EINTR`.
+5. **Write** -- The Engine promotes base files to the overlay via copy-on-write (hydrate, then copy to the `upper/` directory). Subsequent reads come from the overlay. A delete is recorded as a delete entry in the overlay database; deleting a file copies it first only while a handle on it is open. A write reaches the overlay file at once, and `stat` shows its size and mtime at once. For a file whose overlay entry is already recorded, such as a base file promoted by copy-on-write, the overlay database records the first write after a flush at once. A file created through the mount is recorded at its create, and its writes are pending from then on. The database records the size and mtime of pending writes when a handle that wrote the file is flushed or closed, when the file is `fsync`ed, or when any overlay change other than a write reaches the overlay. An `fsync` returns only after the file and the database reach stable storage. Between syncs, an OS crash can lose the database's latest changes; a daemon crash loses none of them. No FUSE operation holds a lock while a blob hydrates, so a slow fetch stalls neither a HEAD switch nor other operations. A failed operation returns the errno of its cause, such as `ENOSPC`, and an interrupted one returns `EINTR`.
 
-6. **Background** -- For ordinary workspaces, a watcher polls HEAD/refs every 500ms and republishes HEAD changes. A HEAD change compares the overlay with the new generation while reads and writes continue; they wait only while the result is applied. Repositories with `--require-commit` do not run this watcher, so their verified base commit remains fixed. Remote polling is controlled separately by `--refresh`.
+6. **Background** -- For ordinary workspaces, a watcher polls HEAD and the ref it names every 500ms and republishes HEAD changes. A HEAD change compares the overlay with the new generation while reads and writes continue; they wait only while the result is applied. Repositories with `--require-commit` do not run this watcher, so their verified base commit remains fixed. Remote polling is controlled separately by `--refresh`.
 
 ### Kernel caches after a HEAD change
 
 A HEAD change switches the mount to a new snapshot generation. The kernel may
 still cache what the mount reported before: names, missing names, attributes
 and file pages. The mount reports entries, negative entries and attributes with
-a 1 s TTL. The synthesized `.git` file never changes. A base file's mtime is the
-time of its commit.
+a 1 s TTL. The synthesized `.git` file never changes, and the mount reports it
+with a 1 minute TTL. Every base file and directory reports the time of the HEAD
+commit the mount serves as its mtime.
 
 On every backend, an inode reads the generation of the attributes the kernel
 last received for it, so its reads match the size the kernel holds. The daemon
 keeps a generation readable for 2 s after the mount stops serving it, and prunes
-it at a later HEAD change.
+it at a later HEAD change or preparation.
 
 | Backend | After a HEAD change |
 |---------|---------------------|
-| Linux | The mount invalidates three things at once: the attributes and cached pages of each inode the kernel holds whose type, permission bits or blob changed; the entry of each name that vanished or changed type; and each negative entry whose name now exists. The mount caches a missing name as a negative entry for 1 s. A name made through the mount replaces its negative entry, and a write that recreates a vanished file invalidates it. The mount negotiates `FUSE_AUTO_INVAL_DATA` without writeback caching, so the kernel drops a file's cached pages when its size or mtime changes. The kernel keeps a base file's pages across opens only while its opens serve the same blob. For up to 1 s, a reader can still see attributes the mount does not invalidate, such as the old mtime of a file whose blob did not change, or of a directory. A lookup or getattr that races the switch can leave old names and sizes for up to 1 s, and old pages within one open. |
-| macFUSE kernel extension | The mount sends the same invalidations as on Linux. The extension mounts with `novncache`, so it caches no names and the mount caches no negative entries. It drops a file's cached attributes and pages on each `InvalidateInode`, and a getattr that reports a size other than the one it holds drops all the file's cached pages. A lookup leaves a held file's size alone. An open does not drop the pages, and `KeepPageCache` has no effect. So a lookup or getattr that races the switch can leave the old blob's pages beyond one open, until the next invalidation of that inode or a getattr that reports a different size. For up to 1 s, a reader can still see the old mtime of a file whose blob did not change, and of a directory. macFUSE 5's extension is closed source, so this row follows the open-source [osxfuse extension](https://github.com/osxfuse/kext/tree/534773bd3135f04b7f6fb801faa2f8991daf4a6b). |
+| Linux | The mount invalidates three things at once: the attributes and cached pages of each inode the kernel holds whose permission bits or blob changed, or that the kernel last saw from the overlay and that now resolves to a base blob; the entry of each name that vanished or changed type; and each negative entry whose name now exists. The mount caches a missing name as a negative entry for 1 s. A name made through the mount replaces its negative entry, and a write that recreates a vanished file invalidates it. The mount negotiates `FUSE_AUTO_INVAL_DATA` without writeback caching, so the kernel drops a file's cached pages when its size or mtime changes. The kernel keeps a base file's pages across opens only while its opens serve the same blob. For up to 1 s, a reader can still see attributes the mount does not invalidate, such as the old mtime of a file whose blob did not change, or of a directory. A lookup or getattr that races the switch can leave old names and sizes for up to 1 s, and old pages within one open. |
+| macFUSE kernel extension | The mount sends the inode and entry invalidations it sends on Linux. The extension mounts with `novncache`, so it caches no names and the mount caches no negative entries. It drops a file's cached attributes and pages on each `InvalidateInode`, and a getattr that reports a size other than the one it holds drops all the file's cached pages. A lookup leaves a held file's size alone. An open does not drop the pages, and `KeepPageCache` has no effect. So a lookup or getattr that races the switch can leave the old blob's pages beyond one open, until the next invalidation of that inode or a getattr that reports a different size. For up to 1 s, a reader can still see the old mtime of a file whose blob did not change, and of a directory. macFUSE 5's extension is closed source, so this row follows the open-source [osxfuse extension](https://github.com/osxfuse/kext/tree/534773bd3135f04b7f6fb801faa2f8991daf4a6b). |
 | FSKit | FSKit takes no invalidations, so the mount sends none and caches no negative entries. FSKit keeps what it cached until it asks again, which the mount cannot hasten. FSKit keeps its own attribute cache, and artifact-fs knows no bound for it. Until then, a reader can see the old commit's names, sizes and modes, and an inode reads the old generation while the daemon keeps it. After that, the inode reads the current content. The fuse library answers EIO to a read inside the size it last reported that the current content does not fill. A read that FSKit sends before a reply reporting a smaller size reaches it can still get a short reply without EIO. |
 
 ### Inode numbers
@@ -488,33 +502,36 @@ it at a later HEAD change.
 A path keeps its inode number while it exists, also after the kernel forgets
 the inode, so Git's stat data stays valid. A rename moves the numbers of the
 whole subtree. A path that stops existing retires its number: an unlink, rmdir
-or rename over it through the mount, or a HEAD change that removes it. A file or
-directory made there later gets a new number, even while the old inode is still
-open. A successful write through a file that is still open after a HEAD change
+or rename over it through the mount, or a HEAD change that removes it. A file,
+directory or symlink made there later gets a new number, even while the kernel
+still holds the old inode. A successful write through a file that is still open after a HEAD change
 removed its path recreates the path under the file's own number, unless another
 file took the path first. Numbers last for one mount: a remount or a daemon restart
 numbers paths again.
 
-The mount keeps one mapping per existing path the kernel has looked up. After
-each HEAD change, it finds the paths that vanished: it reads the overlay once
-and lists the snapshot children of each directory that holds such a path. When
-a rename overlapped that check, it checks the vanished paths again while no
-rename can run. On Linux and the macFUSE kernel extension, a path whose inode the kernel holds
-gets the per-path identity check that decides its invalidations instead.
+The mount keeps one mapping for each existing path that the kernel has looked
+up or that an op made through the mount. After each HEAD change, it finds the
+paths that vanished: it reads the overlay once and lists the snapshot children
+of each directory that holds a mapped path. When a rename overlapped that check,
+it checks the vanished paths again while no rename can run. On Linux and the
+macFUSE kernel extension, a mapped path whose inode the kernel holds is checked
+on its own instead: resolving it decides whether its number retires, and
+comparing its type, permission bits and blob with what the kernel last received
+decides which invalidations it gets.
 
 ### Subsystems
 
 | Package | Role |
 |---------|------|
-| `daemon` | Orchestrates repo lifecycle, refresh loop, watcher callbacks |
+| `daemon` | Repo lifecycle. `Controller` runs every CLI command except `daemon` and the `gc`, `doctor` and `prefetch` stubs. `Service` holds the daemon lock, syncs the registry, prepares, mounts and unmounts each repo, reconciles HEAD, runs the refresh loop, and writes `repo_runtime` |
 | `fusefs` | FUSE adapter (inode management, op dispatch), Resolver (merged view), Engine (the adapter's only API: one method per operation) |
 | `gitstore` | Git CLI wrapper: clone, fetch, ls-tree, batch pool for `cat-file --batch` |
 | `snapshot` | SQLite store for `base_nodes` keyed by `(generation, path)` |
-| `overlay` | SQLite metadata + `upper/` directory for local writes, whiteouts, reconciliation |
+| `overlay` | SQLite metadata + `upper/` directory for local writes, delete entries, reconciliation |
 | `blobcache` | Blob cache layout (sharded by object ID), its counters, and LRU eviction for `evict-cache` |
 | `hydrator` | Priority queue with deduped waiters; workers fetch queued blobs in batches. With more than one worker, a reserved worker takes only reads and copies of local blobs and blocks on `reservedReady`; the others block on `workReady` |
-| `watcher` | Polls gitdir mtimes (HEAD, index, refs) at 500ms intervals |
-| `registry` | SQLite-backed repo config persistence |
+| `watcher` | Polls the contents of `HEAD` and of the ref it names, loose or packed, at 500ms intervals |
+| `registry` | SQLite store of repo configs, prepare and mount requests, acquisition receipts, and the `repo_runtime` records the daemon writes and `status` reads |
 | `model` | Shared types and canonical interfaces (`Registry`, `GitStore`, `SnapshotStore`, `OverlayStore`, `Hydrator`) |
 
 ## Supported git operations
@@ -525,7 +542,7 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 
 | Operation | Status | Notes |
 |-----------|--------|-------|
-| `ls` (root and subdirectories) | Supported | Includes synthesized `.git` gitfile; hydrates nothing |
+| `ls` (root and subdirectories) | Supported | Includes synthesized `.git` gitfile; listing hydrates nothing |
 | `cat` / read file | Supported | Triggers on-demand hydration for unhydrated blobs |
 | `stat` (file size, mode) | Supported | Sizes resolved via `git cat-file --batch-check` when the blob is local; otherwise the first `stat` hydrates the file |
 | `mkdir` | Supported | Persisted in writable overlay |
@@ -533,7 +550,7 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 | Write / append to file | Supported | Copy-on-write for tracked files |
 | Rename file | Supported | Works for both overlay and tracked (snapshot-only) files |
 | Rename directory | Supported | Moves tracked and overlay-created directory trees |
-| Delete file (`rm`) | Supported | Whiteout recorded in overlay; fetches nothing unless the file is open |
+| Delete file (`rm`) | Supported | Delete entry recorded in overlay; fetches nothing unless the file is open |
 | `rmdir` | Supported | Checks directory is empty first |
 | Truncate | Supported | Hydrates blob before truncating |
 | `chmod` | Supported | Preserves executable-bit changes across commits |
@@ -549,7 +566,7 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 | `git branch` | Supported | |
 | `git rev-parse HEAD` | Supported | |
 | `git show` | Supported | |
-| `git remote -v` | Supported | Credentials stripped from output |
+| `git remote -v` | Supported | `add-repo` stores the remote URL without inline credentials; an adopted worktree keeps its own remotes |
 | `git stash` | Supported | Includes push/pop with untracked files |
 | `git status` | Supported | ~7s on 5800-entry repo |
 | `git diff` | Supported | Shows correct unified diff for modified files |
@@ -557,7 +574,7 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 | `git reset --hard` | Supported | Restores content, modes, and staged creates |
 | `git clean -fd` | Supported | Removes untracked files and directory trees |
 | `git commit` | Supported | Reconciles content, executable-bit, symlink, rename, and delete changes |
-| `git checkout` | Supported | Re-indexes tree, reconciles overlay, refreshes git index |
+| `git checkout` | Supported | Re-indexes tree and reconciles overlay; Git updates its own index |
 | `git merge --no-ff` | Supported | Publishes merge commits and reconciles the merged worktree |
 | `git rebase` | Supported | Reconciles rewritten commits and branch state |
 | `git fetch` | Supported | Background refresh loop fetches periodically |
@@ -587,12 +604,12 @@ By default, e2e tests create a local bare repo -- no network required. Set `AFS_
 
 ```bash
 # Run e2e tests (uses a local test repo by default)
-AFS_RUN_E2E_TESTS=1 go test -v -run TestE2E -count=1 -timeout 20m .
+AFS_RUN_E2E_TESTS=1 go test -v -run 'TestE2E|TestFUSEMountSmoke' -count=1 -timeout 20m .
 
 # Run against a specific remote repo
 AFS_RUN_E2E_TESTS=1 \
   AFS_E2E_REPO=https://github.com/cloudflare/workers-sdk.git \
-  go test -v -run TestE2E -count=1 -timeout 20m .
+  go test -v -run 'TestE2E|TestFUSEMountSmoke' -count=1 -timeout 20m .
 ```
 
 ### Environment variables
@@ -613,7 +630,7 @@ Contributions are welcome, but not all contributions will be accepted. As guidan
 
 AI/LLM submissions are welcome, but overall issue/PR quality is ultimately the responsibility of the submitter, and the codebase is the responsibility (and long term maintenance burden) of the maintainers.
 
-See [AGENTS.md](AGENTS.md) for build commands, architecture details, and conventions. Run `go test ./...` and `go vet ./...` before submitting changes.
+See [AGENTS.md](AGENTS.md) for build commands, architecture details, and conventions. Before submitting changes, run `go vet ./...` with `GOOS=linux` and with `GOOS=darwin`, then `go test -race ./...`.
 
 Enable the pre-commit checks with `git config core.hooksPath .githooks`. For staged Go changes they run `gofmt`, `go vet`, a CLI build, and the changed packages' unit tests. The hook skips the tests when the machine is under load; set `AFS_PRECOMMIT_TESTS` to `always` or `never` to override, or tune `AFS_PRECOMMIT_LOAD_PER_CPU` (default `1`).
 
