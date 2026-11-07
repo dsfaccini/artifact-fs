@@ -96,7 +96,7 @@ func (s *Controller) FSMonitorHook(ctx context.Context, name string, since strin
 	if !trusted {
 		sinceSeq = math.MaxInt64
 	}
-	changes, logged, err := overlay.ReadChangesSince(ctx, cfg, sinceSeq)
+	changes, logged, err := overlay.ReadChangesSince(ctx, cfg.RepoPaths, sinceSeq)
 	if err != nil {
 		return err
 	}

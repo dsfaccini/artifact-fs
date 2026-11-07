@@ -15,9 +15,9 @@ import (
 // files, which FSKit serves.
 func TestMountRepoKeepsAppleDoubleFilesVisible(t *testing.T) {
 	setMacFUSEKernelExtensionLoaded(t, true)
-	repo := model.RepoConfig{Name: "repo", MountPath: t.TempDir()}
+	repo := model.RepoPaths{Name: "repo", MountPath: t.TempDir()}
 	var kernel bool
-	for _, attempt := range mountRepoAttempts(t, repo, slog.New(slog.DiscardHandler)) {
+	for _, attempt := range mountRepoAttempts(t, repo, slog.New(slog.DiscardHandler), unredacted) {
 		if attempt.cfg.Backend != fuse.BackendFSKit {
 			kernel = true
 		}

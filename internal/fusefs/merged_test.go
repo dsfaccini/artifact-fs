@@ -59,7 +59,7 @@ func (f *fakeOverlay) ListByPrefix(_ context.Context, prefix string) ([]model.Ov
 	}
 	return out, nil
 }
-func (f *fakeOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoConfig, path string, base model.BaseNode) (model.OverlayEntry, error) {
+func (f *fakeOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoPaths, path string, base model.BaseNode) (model.OverlayEntry, error) {
 	if f.entries == nil {
 		f.entries = map[string]model.OverlayEntry{}
 	}
@@ -68,7 +68,7 @@ func (f *fakeOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoConfig, p
 	f.entries[e.Path] = e
 	return e, nil
 }
-func (f *fakeOverlay) EnsureCopyOnWriteFrom(ctx context.Context, repo model.RepoConfig, path string, base model.BaseNode, _ *os.File) (model.OverlayEntry, error) {
+func (f *fakeOverlay) EnsureCopyOnWriteFrom(ctx context.Context, repo model.RepoPaths, path string, base model.BaseNode, _ *os.File) (model.OverlayEntry, error) {
 	return f.EnsureCopyOnWrite(ctx, repo, path, base)
 }
 func (f *fakeOverlay) CreateFile(_ context.Context, _ string, _ uint32) (model.OverlayEntry, error) {
@@ -666,7 +666,7 @@ func (o *countingLookupOverlay) Lookup(ctx context.Context, path string) (model.
 func TestReaddirTypedDerivesOverlayChildrenFromOneListing(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
-	store, err := overlaystore.New(ctx, model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")})
+	store, err := overlaystore.New(ctx, model.RepoPaths{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

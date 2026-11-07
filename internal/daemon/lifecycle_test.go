@@ -55,11 +55,11 @@ func (m *hangingUnmountMount) InvalidateChanged() error { return nil }
 func TestHangingUnmountStallsOnlyItsRepo(t *testing.T) {
 	hanging := &hangingUnmountMount{fail: make(chan struct{}), release: make(chan struct{}), entered: make(chan struct{})}
 	var mounts atomic.Int32
-	d := startDaemonWithMount(t, func(ctx, opCtx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+	d := startDaemonWithMount(t, func(ctx, opCtx context.Context, cfg model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
 		if mounts.Add(1) == 1 {
 			return hanging, nil
 		}
-		return fakeMount(ctx, opCtx, cfg, engine, gate, logger)
+		return fakeMount(ctx, opCtx, cfg, engine, gate, logger, redact)
 	}, "")
 	// Runs before the daemon's cleanup, whose stop of the repo must not meet
 	// the unmount still running.
@@ -83,7 +83,7 @@ func TestHangingUnmountStallsOnlyItsRepo(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), errUnmountInProgress.Error()) {
 		t.Fatalf("Unmount = %v, want the daemon's report that the earlier unmount has not returned", err)
 	}
-	if err := d.svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "other", RemoteURL: d.workDir, Branch: "main", RefreshInterval: time.Hour, Enabled: true}); err != nil {
+	if err := d.svc.ctl().AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "other"}, RepoSpec: model.RepoSpec{RemoteURL: d.workDir, Branch: "main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Hour}, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, d.startErr, func() bool {
@@ -133,11 +133,11 @@ func (m *recordingMountTable) unmountPath(path string) error {
 	return nil
 }
 
-func (m *recordingMountTable) mount(ctx, opCtx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+func (m *recordingMountTable) mount(ctx, opCtx context.Context, cfg model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
 	m.mu.Lock()
 	m.calls = append(m.calls, "mount")
 	m.mu.Unlock()
-	return fakeMount(ctx, opCtx, cfg, engine, gate, logger)
+	return fakeMount(ctx, opCtx, cfg, engine, gate, logger, redact)
 }
 
 func (m *recordingMountTable) recorded() []string {
@@ -353,7 +353,7 @@ func TestFailedCloseKeepsTheLeftoverClaim(t *testing.T) {
 	busy := &exitingMount{exit: make(chan struct{}), err: errors.New("busy")}
 	t.Cleanup(func() { close(busy.exit) })
 	first.mountPointEntry = func(string) (mountEntry, bool) { return ownMountEntry("repo"), true }
-	first.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+	first.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return busy, nil
 	}
 	startCtx, cancel := context.WithCancel(ctx)
@@ -381,7 +381,7 @@ func TestCleanStopKeepsTheLastRefreshInStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ctl.SetRefresh(ctx, "repo", 20*time.Millisecond, false); err != nil {
+	if err := ctl.SetRefresh(ctx, "repo", model.RefreshPolicy{RefreshInterval: 20 * time.Millisecond}); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.RemoveAll(cfg.RemoteURL); err != nil {
@@ -461,7 +461,7 @@ func TestCleanStopClearsAnEarlierUnmountFailure(t *testing.T) {
 			return ownMountEntry("repo"), true
 		}
 	}
-	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
 	if err := svc.syncRepos(ctx); err != nil {
@@ -494,7 +494,7 @@ func TestStopReadsTheConfigUnderTheLock(t *testing.T) {
 	svc.mountPointEntry = heldMountPoint
 	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("busy")}
 	t.Cleanup(func() { close(mfs.exit) })
-	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
 	if err := svc.syncRepos(context.Background()); err != nil {
@@ -561,14 +561,14 @@ func TestSyncAbandonsAStalledMountAndWaitsForItToEnd(t *testing.T) {
 	svc.mountTimeout = time.Millisecond
 	abandoned := &fakeAbandonedMount{ended: make(chan struct{})}
 	var mounts atomic.Int32
-	svc.mount = func(ctx, opCtx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(ctx, opCtx context.Context, cfg model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
 		if mounts.Add(1) == 1 {
 			// The mount service stalls until the daemon stops waiting.
 			<-ctx.Done()
 			abandoned.ctxErr = ctx.Err()
 			return nil, abandoned
 		}
-		return fakeMount(ctx, opCtx, cfg, engine, gate, logger)
+		return fakeMount(ctx, opCtx, cfg, engine, gate, logger, redact)
 	}
 	ctx := context.Background()
 	if err := svc.syncRepos(ctx); err != nil {
@@ -600,9 +600,9 @@ func TestStopCancelsTheOpsOfItsMount(t *testing.T) {
 	svc, _ := newSyncedDaemon(t)
 	ctx := context.Background()
 	var opCtx context.Context
-	svc.mount = func(ctx, oc context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(ctx, oc context.Context, cfg model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
 		opCtx = oc
-		return fakeMount(ctx, oc, cfg, engine, gate, logger)
+		return fakeMount(ctx, oc, cfg, engine, gate, logger, redact)
 	}
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
@@ -645,9 +645,9 @@ func TestRemovedRepoLeavesNoBatchProcess(t *testing.T) {
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	var engine *fusefs.Engine
-	svc.mount = func(ctx, opCtx context.Context, cfg model.RepoConfig, e *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(ctx, opCtx context.Context, cfg model.RepoPaths, e *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
 		engine = e
-		return fakeMount(ctx, opCtx, cfg, e, gate, logger)
+		return fakeMount(ctx, opCtx, cfg, e, gate, logger, redact)
 	}
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
@@ -680,7 +680,7 @@ func TestMountRetryKeepsAFailedRefreshDegraded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ctl.SetRefresh(ctx, "repo", 20*time.Millisecond, false); err != nil {
+	if err := ctl.SetRefresh(ctx, "repo", model.RefreshPolicy{RefreshInterval: 20 * time.Millisecond}); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.RemoveAll(cfg.RemoteURL); err != nil {
@@ -688,11 +688,11 @@ func TestMountRetryKeepsAFailedRefreshDegraded(t *testing.T) {
 	}
 	first := &exitingMount{exit: make(chan struct{}), err: errors.New("connection lost")}
 	var mounts atomic.Int32
-	svc.mount = func(ctx, opCtx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(ctx, opCtx context.Context, cfg model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
 		if mounts.Add(1) == 1 {
 			return first, nil
 		}
-		return fakeMount(ctx, opCtx, cfg, engine, gate, logger)
+		return fakeMount(ctx, opCtx, cfg, engine, gate, logger, redact)
 	}
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
@@ -702,7 +702,7 @@ func TestMountRetryKeepsAFailedRefreshDegraded(t *testing.T) {
 		return err == nil && st.LastFetchResult == string(fetchFailed)
 	})
 	// No refresh runs after this one, so only the mount changes the state.
-	if err := ctl.SetRefresh(ctx, "repo", 0, true); err != nil {
+	if err := ctl.SetRefresh(ctx, "repo", model.RefreshPolicy{RemoteRefreshDisabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.syncRepos(ctx); err != nil {
@@ -740,12 +740,12 @@ func TestFailedPreparationStaysFailedWhenItsMountEnds(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = svc.Close() })
 	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("connection lost")}
-	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
 	ctl := svc.ctl()
 	missing := filepath.Join(tmp, "missing-remote")
-	if err := ctl.AddRepoWithOptions(ctx, model.RepoConfig{Name: "repo", RemoteURL: missing, Branch: "main", Enabled: true}, AddRepoOptions{Async: true}); err != nil {
+	if err := ctl.AddRepoWithOptions(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: missing, Branch: "main"}, Enabled: true}, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.syncRepos(ctx); err != nil {
@@ -796,16 +796,16 @@ func TestAdoptedMountRetryRefusesANonEmptyMountPoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = svc.Close() })
-	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "adopted", GitDir: gitDir, MountPath: worktree, AdoptGitDir: true, Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	first := &exitingMount{exit: make(chan struct{}), err: errors.New("connection lost")}
 	var mounts atomic.Int32
-	svc.mount = func(ctx, opCtx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(ctx, opCtx context.Context, cfg model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
 		if mounts.Add(1) == 1 {
 			return first, nil
 		}
-		return fakeMount(ctx, opCtx, cfg, engine, gate, logger)
+		return fakeMount(ctx, opCtx, cfg, engine, gate, logger, redact)
 	}
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
@@ -872,9 +872,9 @@ func TestAbandonedMountLeftInPlaceIsUnmountedBeforeTheNextMount(t *testing.T) {
 			svc.unmountPath = table.unmountPath
 			svc.mountTimeout = time.Millisecond
 			var mounts atomic.Int32
-			svc.mount = func(ctx, opCtx context.Context, c model.RepoConfig, e *fusefs.Engine, g *fusefs.ReadyGate, l *slog.Logger) (fusefs.MountedFS, error) {
+			svc.mount = func(ctx, opCtx context.Context, c model.RepoPaths, e *fusefs.Engine, g *fusefs.ReadyGate, l *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
 				if mounts.Add(1) > 1 {
-					return table.mount(ctx, opCtx, c, e, g, l)
+					return table.mount(ctx, opCtx, c, e, g, l, redact)
 				}
 				table.mu.Lock()
 				table.calls = append(table.calls, "mount")
@@ -922,7 +922,7 @@ func TestShutdownUnmountsBeforeCancellingOps(t *testing.T) {
 	svc, _ := newSyncedDaemon(t)
 	ctx := context.Background()
 	var mount atomic.Pointer[opCtxAtUnmount]
-	svc.mount = func(_, opCtx context.Context, _ model.RepoConfig, _ *fusefs.Engine, _ *fusefs.ReadyGate, _ *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(_, opCtx context.Context, _ model.RepoPaths, _ *fusefs.Engine, _ *fusefs.ReadyGate, _ *slog.Logger, _ func(string) string) (fusefs.MountedFS, error) {
 		m := &opCtxAtUnmount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, opCtx: opCtx}
 		mount.Store(m)
 		return m, nil
@@ -984,7 +984,7 @@ func TestStatusShowsAMountWaitingForAnUnmount(t *testing.T) {
 	ctx := context.Background()
 	hanging := &hangingUnmountMount{fail: make(chan struct{}), release: make(chan struct{}), entered: make(chan struct{})}
 	t.Cleanup(func() { close(hanging.release) })
-	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return hanging, nil
 	}
 	if err := svc.syncRepos(ctx); err != nil {
@@ -1026,7 +1026,7 @@ func TestStopFinishesAfterAnExternalUnmount(t *testing.T) {
 	ctx := context.Background()
 	joined := make(chan struct{}, 8)
 	svc.joinFinished = func() { joined <- struct{}{} }
-	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return &externallyUnmounted{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, joined: joined}, nil
 	}
 	if err := svc.syncRepos(ctx); err != nil {
@@ -1059,7 +1059,7 @@ func TestRuntimeStartResetsTheMountBackoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return nil, errors.New("refused")
 	}
 	// An overlay store a newer build migrated fails the mount before any

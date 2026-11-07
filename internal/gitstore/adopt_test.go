@@ -53,7 +53,7 @@ func TestAdoptedWorktreeConfigMigration(t *testing.T) {
 			}
 			store := New(nil)
 			defer store.Close()
-			cfg := model.RepoConfig{GitDir: gitDir, MountPath: worktree, AdoptGitDir: true}
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}}
 			beforeConfig, err := os.ReadFile(filepath.Join(common, "config"))
 			if err != nil {
 				t.Fatal(err)
@@ -148,7 +148,7 @@ func TestAdoptedWorktreeConfigMigrationFailureKeepsWorktreePaths(t *testing.T) {
 			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 			store := New(nil)
 			defer store.Close()
-			if err := store.ConfigureAdoptedWorktree(t.Context(), model.RepoConfig{GitDir: gitDir, MountPath: worktree, AdoptGitDir: true}); err == nil {
+			if err := store.ConfigureAdoptedWorktree(t.Context(), model.RepoConfig{RepoPaths: model.RepoPaths{GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}}); err == nil {
 				t.Fatal("adoption ignored a failed config write")
 			}
 			for _, checkout := range []string{source, worktree, side} {

@@ -372,7 +372,7 @@ func TestFSMonitorHookCLIAnswersGitToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	// "/" is always in the mount table, so it stands in for a live mount.
-	cfg := model.RepoConfig{Name: "repo", RemoteURL: "https://github.com/example/repo.git", MountPath: "/", Enabled: true}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", MountPath: "/"}, RepoSpec: model.RepoSpec{RemoteURL: "https://github.com/example/repo.git"}, Enabled: true}
 	if err := svc.AddRepoWithOptions(ctx, cfg, daemon.AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +380,7 @@ func TestFSMonitorHookCLIAnswersGitToken(t *testing.T) {
 	if closeErr := svc.Close(); err != nil || closeErr != nil || len(repos) != 1 {
 		t.Fatalf("list repos: %v, %v, %d", err, closeErr, len(repos))
 	}
-	ov, err := overlay.New(ctx, repos[0])
+	ov, err := overlay.New(ctx, repos[0].RepoPaths)
 	if err != nil {
 		t.Fatal(err)
 	}

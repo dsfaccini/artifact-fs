@@ -44,7 +44,7 @@ func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
 		read   func(ctx context.Context, store *Store, cfg model.RepoConfig, commit, blob string) error
 	}{
 		{"blob", "blob:none", func(ctx context.Context, store *Store, cfg model.RepoConfig, _, blob string) error {
-			_, err := store.BlobToCache(ctx, cfg, blob, filepath.Join(filepath.Dir(cfg.GitDir), "cache", blob))
+			_, err := store.BlobToCache(ctx, cfg.RepoPaths, blob, filepath.Join(filepath.Dir(cfg.GitDir), "cache", blob))
 			return err
 		}},
 		{"tree", "tree:0", func(ctx context.Context, store *Store, cfg model.RepoConfig, commit, _ string) error {
@@ -52,7 +52,7 @@ func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
 			return err
 		}},
 		{"batch blob fetch", "blob:none", func(ctx context.Context, store *Store, cfg model.RepoConfig, _, blob string) error {
-			return store.FetchMissingBlobs(ctx, cfg, []string{blob})
+			return store.FetchMissingBlobs(ctx, cfg.RepoPaths, []string{blob})
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -71,7 +71,7 @@ func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
-			err = tt.read(ctx, store, model.RepoConfig{ID: "x", GitDir: gitDir}, commit, blob)
+			err = tt.read(ctx, store, model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: gitDir}}, commit, blob)
 			store.Close()
 			if err == nil {
 				t.Fatal("read a missing object through an SSH command that fails")
@@ -171,7 +171,7 @@ func TestBlobToCacheCancellationClosesEscapedDescriptorPipes(t *testing.T) {
 		defer store.Close()
 		oid := strings.Repeat("a", 40)
 		dir := t.TempDir()
-		_, err := store.BlobToCache(ctx, model.RepoConfig{ID: "x", GitDir: dir}, oid, filepath.Join(dir, "cache", oid))
+		_, err := store.BlobToCache(ctx, model.RepoPaths{ID: "x", GitDir: dir}, oid, filepath.Join(dir, "cache", oid))
 		return err
 	})
 }
@@ -186,7 +186,7 @@ func TestBatchResolveSizesCancellationClosesEscapedDescriptorPipes(t *testing.T)
 	assertEscapedGitCancellationIsBounded(t, func(ctx context.Context) error {
 		return New(nil).batchResolveSizes(
 			ctx,
-			model.RepoConfig{ID: "repo", GitDir: t.TempDir()},
+			model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", GitDir: t.TempDir()}},
 			[]model.BaseNode{{ObjectOID: strings.Repeat("a", 40)}},
 			[]string{strings.Repeat("a", 40)},
 			map[string][]int{strings.Repeat("a", 40): {0}},

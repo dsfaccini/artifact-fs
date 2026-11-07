@@ -18,28 +18,34 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 	defer store.Close()
 
 	cfg := model.RepoConfig{
-		ID:                    "repo",
-		Name:                  "repo",
-		MountRoot:             "/mnt",
-		MountPath:             "/mnt/repo",
-		RemoteURL:             "https://github.com/example/repo.git",
-		RemoteURLRedacted:     "https://github.com/example/repo.git",
-		Branch:                "master",
-		RefreshInterval:       time.Minute,
-		GitDir:                "/git/repo",
-		OverlayDir:            "/overlay/repo",
-		BlobCacheDir:          "/cache/repo",
-		MetaDBPath:            "/meta/repo.sqlite",
-		OverlayDBPath:         "/overlay/repo/meta.sqlite",
-		Enabled:               true,
-		PreparedGitDir:        true,
-		AdoptGitDir:           true,
-		FetchRef:              "master",
-		PrepareState:          model.PrepareStatePreparing,
-		RequiredCommit:        "0123456789012345678901234567890123456789",
-		HistoryDepth:          1,
-		RemoteRefreshDisabled: true,
-		ConfigVersion:         "version-1",
+		RepoPaths: model.RepoPaths{
+			ID:            "repo",
+			Name:          "repo",
+			MountRoot:     "/mnt",
+			MountPath:     "/mnt/repo",
+			GitDir:        "/git/repo",
+			OverlayDir:    "/overlay/repo",
+			BlobCacheDir:  "/cache/repo",
+			MetaDBPath:    "/meta/repo.sqlite",
+			OverlayDBPath: "/overlay/repo/meta.sqlite",
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL:         "https://github.com/example/repo.git",
+			RemoteURLRedacted: "https://github.com/example/repo.git",
+			Branch:            "master",
+			PreparedGitDir:    true,
+			AdoptGitDir:       true,
+			FetchRef:          "master",
+			RequiredCommit:    "0123456789012345678901234567890123456789",
+			HistoryDepth:      1,
+		},
+		RefreshPolicy: model.RefreshPolicy{
+			RefreshInterval:       time.Minute,
+			RemoteRefreshDisabled: true,
+		},
+		Enabled:       true,
+		PrepareState:  model.PrepareStatePreparing,
+		ConfigVersion: "version-1",
 	}
 	if err := store.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
@@ -95,7 +101,7 @@ func TestPrepareStateUpdateRejectsOlderConfigOrRequest(t *testing.T) {
 	}
 	defer store.Close()
 
-	cfg := model.RepoConfig{ID: "repo", Name: "repo", Branch: "refs/heads/main", ConfigVersion: "version-1", PrepareRequest: "request-1"}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo"}, RepoSpec: model.RepoSpec{Branch: "refs/heads/main"}, ConfigVersion: "version-1", PrepareRequest: "request-1"}
 	if err := store.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +144,7 @@ func TestBeginPrepareRecordsRequestWithCompareAndSwap(t *testing.T) {
 	}
 	defer store.Close()
 
-	cfg := model.RepoConfig{ID: "repo", Name: "repo", Branch: "refs/heads/main", ConfigVersion: "version-1", PrepareRequest: "request-1"}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo"}, RepoSpec: model.RepoSpec{Branch: "refs/heads/main"}, ConfigVersion: "version-1", PrepareRequest: "request-1"}
 	if err := store.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -166,11 +172,11 @@ func TestSubsecondRefreshRoundTripsWithoutChangingPrepareState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	cfg := model.RepoConfig{ID: "repo", Name: "repo", Branch: "main", RefreshInterval: time.Second, PrepareState: model.PrepareStatePreparing}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo"}, RepoSpec: model.RepoSpec{Branch: "main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Second}, PrepareState: model.PrepareStatePreparing}
 	if err := store.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateRefresh(ctx, cfg.ID, 250*time.Millisecond, false); err != nil {
+	if err := store.UpdateRefresh(ctx, cfg.ID, model.RefreshPolicy{RefreshInterval: 250 * time.Millisecond}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.GetRepo(ctx, cfg.Name)

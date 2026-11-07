@@ -66,10 +66,14 @@ func TestCloneBloblessRetriesTransientTransportErrors(t *testing.T) {
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	store.gitRetryDelays = []time.Duration{0, 0}
 	cfg := model.RepoConfig{
-		Name:      "https://log-user:log-secret@example.com/openai-sites",
-		GitDir:    filepath.Join(tmp, "repo.git"),
-		RemoteURL: "https://user:super-secret@example.com/org/repo.git",
-		Branch:    "main",
+		RepoPaths: model.RepoPaths{
+			Name:   "https://log-user:log-secret@example.com/openai-sites",
+			GitDir: filepath.Join(tmp, "repo.git"),
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL: "https://user:super-secret@example.com/org/repo.git",
+			Branch:    "main",
+		},
 	}
 	if err := store.CloneBlobless(context.Background(), cfg); err != nil {
 		t.Fatalf("CloneBlobless: %v", err)
@@ -115,7 +119,7 @@ func TestCloneBloblessDoesNotRetryPermanentError(t *testing.T) {
 
 	store := New(nil)
 	store.gitRetryDelays = []time.Duration{0, 0}
-	err := store.CloneBlobless(context.Background(), model.RepoConfig{GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "https://credential-user:super-secret@example.com/org/repo.git", Branch: "main"})
+	err := store.CloneBlobless(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: "https://credential-user:super-secret@example.com/org/repo.git", Branch: "main"}})
 	var operationErr *GitOperationError
 	if !errors.As(err, &operationErr) {
 		t.Fatalf("error = %T %v, want GitOperationError", err, err)
@@ -161,7 +165,7 @@ func TestCloneBloblessPreservesTransportFailureAtCallerDeadline(t *testing.T) {
 	defer cancel()
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
-	err := store.CloneBlobless(ctx, model.RepoConfig{GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "https://example.com/org/repo.git", Branch: "main"})
+	err := store.CloneBlobless(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: "https://example.com/org/repo.git", Branch: "main"}})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want context deadline exceeded", err)
 	}
@@ -385,7 +389,7 @@ func TestFetchRefNonInteractiveRetriesTransientFailures(t *testing.T) {
 
 	store := New(nil)
 	store.gitRetryDelays = []time.Duration{0, 0}
-	repo := model.RepoConfig{Name: "prepared", GitDir: filepath.Join(tmp, "prepared.git"), Branch: "main"}
+	repo := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "prepared", GitDir: filepath.Join(tmp, "prepared.git")}, RepoSpec: model.RepoSpec{Branch: "main"}}
 	if err := store.FetchRefNonInteractive(context.Background(), repo, "main"); err != nil {
 		t.Fatalf("FetchRefNonInteractive: %v", err)
 	}

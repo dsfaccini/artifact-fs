@@ -166,14 +166,20 @@ func TestE2E(t *testing.T) {
 	ctl := newE2EController(t, root)
 
 	cfg := model.RepoConfig{
-		Name:              repoName,
-		ID:                model.RepoID(repoName),
-		RemoteURL:         remoteURL,
-		RemoteURLRedacted: auth.RedactRemoteURL(remoteURL),
-		Branch:            "main",
-		RefreshInterval:   5 * time.Minute,
-		MountRoot:         mountDir,
-		Enabled:           true,
+		RepoPaths: model.RepoPaths{
+			Name:      repoName,
+			ID:        model.RepoID(repoName),
+			MountRoot: mountDir,
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL:         remoteURL,
+			RemoteURLRedacted: auth.RedactRemoteURL(remoteURL),
+			Branch:            "main",
+		},
+		RefreshPolicy: model.RefreshPolicy{
+			RefreshInterval: 5 * time.Minute,
+		},
+		Enabled: true,
 	}
 	if err := ctl.AddRepo(ctx, cfg); err != nil {
 		t.Fatalf("add-repo: %v", err)
@@ -1107,17 +1113,23 @@ func TestE2EVerifiedSource(t *testing.T) {
 	mountDir := newE2EMountDir(t)
 	mountPath := filepath.Join(mountDir, repoName)
 	cfg := model.RepoConfig{
-		Name:                  repoName,
-		ID:                    model.RepoID(repoName),
-		RemoteURL:             remoteURL,
-		RemoteURLRedacted:     auth.RedactRemoteURL(remoteURL),
-		Branch:                "refs/heads/main",
-		RequiredCommit:        requiredCommit,
-		HistoryDepth:          1,
-		RefreshInterval:       100 * time.Millisecond,
-		RemoteRefreshDisabled: true,
-		MountRoot:             mountDir,
-		Enabled:               true,
+		RepoPaths: model.RepoPaths{
+			Name:      repoName,
+			ID:        model.RepoID(repoName),
+			MountRoot: mountDir,
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL:         remoteURL,
+			RemoteURLRedacted: auth.RedactRemoteURL(remoteURL),
+			Branch:            "refs/heads/main",
+			RequiredCommit:    requiredCommit,
+			HistoryDepth:      1,
+		},
+		RefreshPolicy: model.RefreshPolicy{
+			RefreshInterval:       100 * time.Millisecond,
+			RemoteRefreshDisabled: true,
+		},
+		Enabled: true,
 	}
 
 	firstCtx, firstCancel := context.WithCancel(context.Background())

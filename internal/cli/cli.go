@@ -123,21 +123,27 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					return err
 				}
 				cfg := model.RepoConfig{
-					Name:                  name,
-					ID:                    model.RepoID(name),
-					RemoteURL:             remote,
-					Branch:                ref,
-					RefreshInterval:       d,
-					RequiredCommit:        requiredCommit,
-					HistoryDepth:          c.Int("depth"),
-					RemoteRefreshDisabled: strings.EqualFold(refreshValue, "never"),
-					MountRoot:             c.String("mount-root"),
-					GitDir:                c.String("git-dir"),
-					BlobCacheDir:          c.String("blob-cache-dir"),
-					PreparedGitDir:        preparedGitDir,
-					AdoptGitDir:           adoptGitDir,
-					FetchRef:              c.String("fetch-ref"),
-					Enabled:               true,
+					RepoPaths: model.RepoPaths{
+						Name:         name,
+						ID:           model.RepoID(name),
+						MountRoot:    c.String("mount-root"),
+						GitDir:       c.String("git-dir"),
+						BlobCacheDir: c.String("blob-cache-dir"),
+					},
+					RepoSpec: model.RepoSpec{
+						RemoteURL:      remote,
+						Branch:         ref,
+						RequiredCommit: requiredCommit,
+						HistoryDepth:   c.Int("depth"),
+						PreparedGitDir: preparedGitDir,
+						AdoptGitDir:    adoptGitDir,
+						FetchRef:       c.String("fetch-ref"),
+					},
+					RefreshPolicy: model.RefreshPolicy{
+						RefreshInterval:       d,
+						RemoteRefreshDisabled: strings.EqualFold(refreshValue, "never"),
+					},
+					Enabled: true,
 				}
 				if err := svc.AddRepoWithOptions(ctx, cfg, daemon.AddRepoOptions{Async: async}); err != nil {
 					return err
@@ -243,7 +249,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					return err
 				}
 				disabled := strings.EqualFold(interval, "never")
-				if err := svc.SetRefresh(ctx, name, d, disabled); err != nil {
+				if err := svc.SetRefresh(ctx, name, model.RefreshPolicy{RefreshInterval: d, RemoteRefreshDisabled: disabled}); err != nil {
 					return err
 				}
 				if disabled {

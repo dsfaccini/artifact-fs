@@ -90,7 +90,7 @@ func newCacheFixtureOn(t *testing.T, backend string, nodes ...model.BaseNode) *c
 	t.Helper()
 	ctx := context.Background()
 	tmp := t.TempDir()
-	repo := model.RepoConfig{ID: "repo", Name: "repo", MountPath: t.TempDir(), OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	repo := model.RepoPaths{ID: "repo", Name: "repo", MountPath: t.TempDir(), OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
 	snap, err := snapshot.New(ctx, filepath.Join(tmp, "snapshot.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +111,7 @@ func newCacheFixtureOn(t *testing.T, backend string, nodes ...model.BaseNode) *c
 		return &fuse.MountedFileSystem{}, nil
 	}
 	t.Cleanup(func() { fuseMount = saved })
-	f.mount, err = MountRepoWithGate(context.Background(), context.Background(), repo, engine, nil, slog.New(slog.DiscardHandler))
+	f.mount, err = MountRepoWithGate(context.Background(), context.Background(), repo, engine, nil, slog.New(slog.DiscardHandler), unredacted)
 	if err != nil {
 		t.Fatal(err)
 	}

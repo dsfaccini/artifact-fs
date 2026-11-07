@@ -98,14 +98,20 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 	ctl := newE2EController(t, root)
 
 	cfg := model.RepoConfig{
-		Name:              repoName,
-		ID:                model.RepoID(repoName),
-		RemoteURL:         remoteURL,
-		RemoteURLRedacted: auth.RedactRemoteURL(remoteURL),
-		Branch:            "main",
-		RefreshInterval:   5 * time.Minute,
-		MountRoot:         mountDir,
-		Enabled:           true,
+		RepoPaths: model.RepoPaths{
+			Name:      repoName,
+			ID:        model.RepoID(repoName),
+			MountRoot: mountDir,
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL:         remoteURL,
+			RemoteURLRedacted: auth.RedactRemoteURL(remoteURL),
+			Branch:            "main",
+		},
+		RefreshPolicy: model.RefreshPolicy{
+			RefreshInterval: 5 * time.Minute,
+		},
+		Enabled: true,
 	}
 	if err := ctl.AddRepo(ctx, cfg); err != nil {
 		cancel()

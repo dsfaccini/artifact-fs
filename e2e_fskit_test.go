@@ -162,7 +162,7 @@ func TestSharedMountReadOnlyTestChangesMountHelper(t *testing.T) {
 	t.Cleanup(func() { _ = svc.Close() })
 	ctl := newE2EController(t, root)
 	// AddRepo clones and publishes the first snapshot without mounting.
-	if err := ctl.AddRepo(ctx, model.RepoConfig{Name: repoName, RemoteURL: remoteURL, Branch: "main", MountRoot: mountDir, Enabled: true}); err != nil {
+	if err := ctl.AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: repoName, MountRoot: mountDir}, RepoSpec: model.RepoSpec{RemoteURL: remoteURL, Branch: "main"}, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	st, err := ctl.Status(ctx, repoName)
@@ -183,7 +183,7 @@ func TestSharedMountReadOnlyTestChangesMountHelper(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			store, err := overlay.New(ctx, repos[0])
+			store, err := overlay.New(ctx, repos[0].RepoPaths)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -45,7 +45,7 @@ func (f *fakeBatchHydrator) EnqueueBatch(tasks []model.HydrationTask) {
 	f.tasks = append(f.tasks, tasks...)
 }
 
-func (f *fakeBatchHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfig, node model.BaseNode) (string, int64, error) {
+func (f *fakeBatchHydrator) EnsureHydrated(_ context.Context, _ model.RepoPaths, node model.BaseNode) (string, int64, error) {
 	f.calls++
 	if err := f.errorsByOID[node.ObjectOID]; err != nil {
 		return "", 0, err
@@ -56,7 +56,7 @@ func (f *fakeBatchHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfig
 	return f.path, 0, nil
 }
 
-func (f *fakeBatchHydrator) OpenHydrated(ctx context.Context, repo model.RepoConfig, node model.BaseNode) (*os.File, int64, error) {
+func (f *fakeBatchHydrator) OpenHydrated(ctx context.Context, repo model.RepoPaths, node model.BaseNode) (*os.File, int64, error) {
 	path, size, err := f.EnsureHydrated(ctx, repo, node)
 	if err != nil {
 		return nil, 0, err
@@ -65,11 +65,11 @@ func (f *fakeBatchHydrator) OpenHydrated(ctx context.Context, repo model.RepoCon
 	return file, size, err
 }
 
-func (f *fakeBatchHydrator) ReadBlob(context.Context, model.RepoConfig, model.BaseNode, int64) ([]byte, error) {
+func (f *fakeBatchHydrator) ReadBlob(context.Context, model.RepoPaths, model.BaseNode, int64) ([]byte, error) {
 	return nil, nil
 }
 
-func (h *blockingRenameHydrator) OpenHydrated(ctx context.Context, repo model.RepoConfig, node model.BaseNode) (*os.File, int64, error) {
+func (h *blockingRenameHydrator) OpenHydrated(ctx context.Context, repo model.RepoPaths, node model.BaseNode) (*os.File, int64, error) {
 	close(h.started)
 	select {
 	case <-h.proceed:
@@ -88,7 +88,7 @@ func (g *generationSnapshot) ListChildren(gen int64, path string) ([]model.BaseN
 	return g.kids[gen][path], nil
 }
 
-func (o *blockingCopyOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoConfig, path string, base model.BaseNode) (model.OverlayEntry, error) {
+func (o *blockingCopyOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoPaths, path string, base model.BaseNode) (model.OverlayEntry, error) {
 	close(o.beforeCopy)
 	<-o.continueCopy
 	now := time.Now().UnixNano()
@@ -97,7 +97,7 @@ func (o *blockingCopyOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoC
 	return e, nil
 }
 
-func (o *blockingCopyOverlay) EnsureCopyOnWriteFrom(ctx context.Context, repo model.RepoConfig, path string, base model.BaseNode, _ *os.File) (model.OverlayEntry, error) {
+func (o *blockingCopyOverlay) EnsureCopyOnWriteFrom(ctx context.Context, repo model.RepoPaths, path string, base model.BaseNode, _ *os.File) (model.OverlayEntry, error) {
 	return o.EnsureCopyOnWrite(ctx, repo, path, base)
 }
 
@@ -120,7 +120,7 @@ func (o *blockingCopyOverlay) WriteFile(_ context.Context, path string, off int6
 
 func TestPrefetchDirBatchesReaddirMetadata(t *testing.T) {
 	hydrator := &fakeBatchHydrator{}
-	engine := &Engine{Repo: model.RepoConfig{ID: "repo"}, Hydrator: hydrator}
+	engine := &Engine{Repo: model.RepoPaths{ID: "repo"}, Hydrator: hydrator}
 
 	engine.PrefetchDir("src", []ReaddirEntry{
 		{Name: "a.go", Type: "file", ObjectOID: "a", SizeState: "known", SizeBytes: 10},
@@ -142,7 +142,7 @@ func TestPrefetchDirBatchesReaddirMetadata(t *testing.T) {
 
 func TestPrefetchDirCapsAndPrioritizesTasks(t *testing.T) {
 	h := &fakeBatchHydrator{}
-	engine := &Engine{Repo: model.RepoConfig{ID: "repo"}, Hydrator: h}
+	engine := &Engine{Repo: model.RepoPaths{ID: "repo"}, Hydrator: h}
 	entries := make([]ReaddirEntry, 0, maxPrefetchTasksPerDir+2)
 	for i := range maxPrefetchTasksPerDir + 1 {
 		entries = append(entries, ReaddirEntry{Name: fmt.Sprintf("image-%03d.png", i), Type: "file", ObjectOID: fmt.Sprintf("png-%03d", i)})
@@ -177,7 +177,7 @@ func TestFileHandleCachesHydratedBaseFile(t *testing.T) {
 	h := &fakeBatchHydrator{path: cachePath}
 	overlay := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
 	engine := &Engine{
-		Repo:     model.RepoConfig{ID: "repo"},
+		Repo:     model.RepoPaths{ID: "repo"},
 		Resolver: newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": {Path: "file.txt", Type: "file", ObjectOID: "blob"}}}, overlay),
 		Overlay:  overlay,
 		Hydrator: h,
@@ -221,7 +221,7 @@ func TestFileHandleRehydratesAfterGenerationChange(t *testing.T) {
 		Overlay: overlay,
 	}
 	resolver.SetGeneration(1)
-	engine := &Engine{Repo: model.RepoConfig{ID: "repo"}, Resolver: resolver, Overlay: overlay, Hydrator: h}
+	engine := &Engine{Repo: model.RepoPaths{ID: "repo"}, Resolver: resolver, Overlay: overlay, Hydrator: h}
 	fh := &FileHandle{path: "file.txt"}
 	defer fh.closeCachedFile()
 
@@ -257,8 +257,8 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 		backingPath:  overlayBacking,
 	}
 	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": {Path: "file.txt", Type: "file", ObjectOID: "blob", Mode: 0o644}}}, overlay.fakeOverlay)
-	engine := &Engine{Repo: model.RepoConfig{ID: "repo"}, Resolver: resolver, Overlay: overlay, Hydrator: h}
-	fs := NewArtifactFuse(model.RepoConfig{ID: "repo"}, engine)
+	engine := &Engine{Repo: model.RepoPaths{ID: "repo"}, Resolver: resolver, Overlay: overlay, Hydrator: h}
+	fs := NewArtifactFuse(model.RepoPaths{ID: "repo"}, engine)
 	fh := &FileHandle{path: "file.txt"}
 	fs.fileHandles[1] = fh
 	defer fh.closeCachedFile()
@@ -305,7 +305,7 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 
 func TestRenameBaseDirectoryHydratesAndMovesContents(t *testing.T) {
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{
+	cfg := model.RepoPaths{
 		ID:            "repo",
 		OverlayDir:    filepath.Join(tmp, "overlay"),
 		OverlayDBPath: filepath.Join(tmp, "overlay.db"),
@@ -368,7 +368,7 @@ func TestRenameRecreatedTrackedEntryHidesSource(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			tmp := t.TempDir()
-			cfg := model.RepoConfig{
+			cfg := model.RepoPaths{
 				ID:            "repo",
 				OverlayDir:    filepath.Join(tmp, "overlay"),
 				OverlayDBPath: filepath.Join(tmp, "overlay.db"),
@@ -527,7 +527,7 @@ func TestRenameReplacedTrackedEntryHidesSource(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			tmp := t.TempDir()
-			cfg := model.RepoConfig{
+			cfg := model.RepoPaths{
 				ID:            "repo",
 				OverlayDir:    filepath.Join(tmp, "overlay"),
 				OverlayDBPath: filepath.Join(tmp, "overlay.db"),
@@ -626,7 +626,7 @@ func TestRenameChainHidesReplacedTrackedIntermediate(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			tmp := t.TempDir()
-			cfg := model.RepoConfig{
+			cfg := model.RepoPaths{
 				ID:            "repo",
 				OverlayDir:    filepath.Join(tmp, "overlay"),
 				OverlayDBPath: filepath.Join(tmp, "overlay.db"),
@@ -695,7 +695,7 @@ func TestRenameChainHidesReplacedTrackedIntermediate(t *testing.T) {
 
 func TestRenameBaseDirectoryHydratesBeforeMutatingOverlay(t *testing.T) {
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{
+	cfg := model.RepoPaths{
 		ID:            "repo",
 		OverlayDir:    filepath.Join(tmp, "overlay"),
 		OverlayDBPath: filepath.Join(tmp, "overlay.db"),
@@ -772,7 +772,7 @@ func TestRenameBaseDirectoryHydratesBeforeMutatingOverlay(t *testing.T) {
 
 func TestRenameBaseDirectoryDoesNotResurrectReplacedDestinationDescendants(t *testing.T) {
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{
+	cfg := model.RepoPaths{
 		ID:            "repo",
 		OverlayDir:    filepath.Join(tmp, "overlay"),
 		OverlayDBPath: filepath.Join(tmp, "overlay.db"),
@@ -832,7 +832,7 @@ func TestRenameBaseDirectoryDoesNotResurrectReplacedDestinationDescendants(t *te
 
 func TestRenameDirectoryRejectsDestinationChildCreatedDuringHydration(t *testing.T) {
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{
+	cfg := model.RepoPaths{
 		ID:            "repo",
 		OverlayDir:    filepath.Join(tmp, "overlay"),
 		OverlayDBPath: filepath.Join(tmp, "overlay.db"),
