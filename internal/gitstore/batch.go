@@ -119,21 +119,31 @@ func (s *Store) FetchMissingBlobs(ctx context.Context, repo model.RepoPaths, obj
 	return err
 }
 
-// promisorRemote returns the remote git's lazy fetch tries first, following
-// promisor_remote_config in git's promisor-remote.c. In config order, a remote
-// is a promisor when remote.<name>.promisor is true or
-// remote.<name>.partialclonefilter is set, and the remote that
-// extensions.partialClone names goes last. It returns "" when there is none.
+// promisorRemote returns the remote git's lazy fetch tries first, and "" when
+// there is none.
 func promisorRemote(ctx context.Context, gitDir string) (string, error) {
+	remotes, err := promisorRemotes(ctx, gitDir)
+	if err != nil || len(remotes) == 0 {
+		return "", err
+	}
+	return remotes[0], nil
+}
+
+// promisorRemotes returns the remotes git's lazy fetch tries, in order,
+// following promisor_remote_config in git's promisor-remote.c. In config
+// order, a remote is a promisor when remote.<name>.promisor is true or
+// remote.<name>.partialclonefilter is set, and the remote that
+// extensions.partialClone names goes last.
+func promisorRemotes(ctx context.Context, gitDir string) ([]string, error) {
 	entries, err := configEntries(ctx, gitDir, `^(remote\..+\.(promisor|partialclonefilter)|extensions\.partialclone)$`)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	// Git reads promisor as a boolean, so git parses it here too: an empty
 	// value is false and a nonzero number is true.
 	flags, err := configEntries(ctx, gitDir, `^remote\..+\.promisor$`, "--type=bool")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	var remotes []string
 	partialClone := ""
@@ -147,7 +157,7 @@ func promisorRemote(ctx context.Context, gitDir string) (string, error) {
 		name, subkey := rest[:dot], rest[dot+1:]
 		if subkey == "promisor" {
 			if len(flags) == 0 {
-				return "", errors.New("git config listed fewer promisor flags than promisor keys")
+				return nil, errors.New("git config listed fewer promisor flags than promisor keys")
 			}
 			promisor := flags[0].value == "true"
 			flags = flags[1:]
@@ -162,10 +172,7 @@ func promisorRemote(ctx context.Context, gitDir string) (string, error) {
 	if partialClone != "" {
 		remotes = append(slices.DeleteFunc(remotes, func(r string) bool { return r == partialClone }), partialClone)
 	}
-	if len(remotes) == 0 {
-		return "", nil
-	}
-	return remotes[0], nil
+	return remotes, nil
 }
 
 type configEntry struct {

@@ -366,6 +366,44 @@ func TestAddRepoSyncFreshCloneServesFetchRef(t *testing.T) {
 	}
 }
 
+// --depth bounds the history every preparation transfers, also when it
+// fetches a fetch ref other than the source ref.
+func TestSyncPreparationFetchRefKeepsHistoryDepth(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	newBranchedRemote(t, remote)
+	runCmd(t, "git", "-C", remote, "checkout", "feature")
+	commitFile(t, remote, "MORE.md", "more\n")
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	// Git ignores --depth for a clone from a local path.
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + remote, Branch: "main", FetchRef: "feature", HistoryDepth: 1}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commits := func() string {
+		return strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", cfg.GitDir, "rev-list", "--count", "HEAD"))
+	}
+	if got := commits(); got != "1" {
+		t.Fatalf("add-repo --depth 1 transferred %s commits of the fetch ref, want 1", got)
+	}
+	commitFile(t, remote, "AGAIN.md", "again\n")
+	commitFile(t, remote, "LAST.md", "last\n")
+	if err := svc.ctl().Prepare(ctx, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	if got := commits(); got != "1" {
+		t.Fatalf("prepare with --depth 1 left %s commits of the fetch ref, want 1", got)
+	}
+}
+
 // prepare cancels the async preparation it supersedes, so the next
 // preparation does not wait for a hung clone to end.
 func TestPrepareCancelsTheAsyncPreparationItSupersedes(t *testing.T) {

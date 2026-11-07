@@ -212,6 +212,8 @@ Hydration (blob downloading) is transparent: the file tree is visible immediatel
 
 For every repo, ArtifactFS reads blobs (`git cat-file --batch`) and trees (`git ls-tree`), and fetches queued blobs in batches (`git fetch --stdin`), without a controlling terminal, with `GIT_TERMINAL_PROMPT=0` and an empty `SSH_ASKPASS`. When a batch fetch runs, or a read lazily fetches a missing object, a remote that needs an interactive password or passphrase prompt makes the fetch fail instead of prompting. The repo's `core.sshCommand`, credential helpers, and any program set through `GIT_ASKPASS` or `core.askPass` still run. Git Credential Manager can still show its GUI prompt unless `GCM_INTERACTIVE=never` is set.
 
+The daemon's remote refresh (`git fetch origin`) runs the same way, so a remote that needs a prompt fails the refresh, and `status` reports the failure. The `fetch` command runs in your terminal and can prompt there.
+
 When the Git index matches the published snapshot and the overlay is empty, startup marks snapshot entries valid for Git's filesystem monitor before the mount serves the repo: before a prepared repo mounts, and before an async repo's gate opens. This lets the first `git status` use the daemon's change list instead of reading every tracked blob, and each later `git status` receives only the paths the overlay changed since Git's previous query, plus each file whose writes are not yet flushed. Paths with no `text` attribute, or under `text=auto`, `-text` or `binary`, are marked, unless `eol=lf` applies without `text=auto`. Paths under `text`, `text=input` or `eol=lf` without `text=auto` stay unmarked, because Git's check-in turns CRLF into LF and a blob that holds CRLF then differs from its file; Git compares those paths itself. `-text eol=lf` stays unmarked too, because `git check-attr` prints it like the literal `text=unset`, which Git converts under `eol=lf`. A `git status` that runs while the worktree is unmounted sees the empty mountpoint, so Git's next query gets a rescan. When startup marks the baseline again, its own query takes that rescan, and the first `git status` after the mount receives only the overlay's changes. ArtifactFS skips this baseline when the index or a `.gitattributes` blob is uncertain, when `core.attributesFile` is configured or `core.autocrlf` is set to anything but false, when an `eol=crlf`, `crlf`, `filter`, `ident` or `working-tree-encoding` attribute applies, or when staged work or overlay changes exist; Git then performs its normal status scan.
 
 Use `--hydration-concurrency` to set each repo's number of hydration workers (default 4). A repo's workers share a pool of up to that many persistent `git cat-file --batch` processes that copy fetched blobs into the cache, so higher values trade memory for faster bulk hydration:
@@ -368,9 +370,9 @@ Adoption disables remote refresh and rejects acquisition options (`--remote`,
 watching remains active, including shared loose and packed branch refs, so
 commits and branch changes reconcile normally. Run ordinary Git fetch/push
 commands when needed; the worktree's original remote configuration is retained.
-If `origin` embeds credentials, adoption logs a warning that names no remote and proceeds:
-fetches of missing blobs and trees, Git's lazy fetches and the hydrator's batch
-fetches, use the promisor remote, usually `origin`.
+If `origin` or a promisor remote embeds credentials, adoption logs a warning that names no
+remote and proceeds: fetches of missing blobs and trees, Git's lazy fetches and the
+hydrator's batch fetches, use the promisor remotes, usually `origin`.
 
 ArtifactFS enables `extensions.worktreeConfig`, migrating shared `core.worktree`
 and `core.bare=true` settings into the primary worktree's config when necessary.
@@ -382,8 +384,12 @@ Stop the owning daemon and wait for process exit and actual unmount before
 restoring the saved gitfile, unlocking metadata or removing the worktree.
 `remove-repo` updates the registry and Git config and returns. The running daemon
 unmounts the repo at its next registry poll, so the return does not mean the live mount has stopped.
-It unsets the worktree's `core.fsmonitor` and keeps `extensions.worktreeConfig`,
-which sibling worktrees may rely on. Preserve a recovery ref before deleting a
+It unsets what adoption pinned in the worktree's config for the mount
+(`core.fsmonitor`, `fsmonitor.allowRemote`, `core.filemode`, `core.ignorecase`
+and `core.symlinks`), so the worktree inherits its repository's settings again.
+A value the worktree's own config held before adoption does not come back. It
+keeps the worktree's path pins and `extensions.worktreeConfig`, which sibling
+worktrees may rely on. Preserve a recovery ref before deleting a
 branch containing local commits.
 
 ## Verified shallow sources

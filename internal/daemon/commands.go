@@ -155,7 +155,7 @@ func (s *Controller) RemoveRepo(ctx context.Context, name string) error {
 			return registry.ErrRepoChanged
 		}
 		if latest.AdoptGitDir {
-			if err := s.git.RemoveAdoptedFSMonitorHook(ctx, latest); err != nil {
+			if err := s.git.ReleaseAdoptedWorktree(ctx, latest); err != nil {
 				return err
 			}
 		}

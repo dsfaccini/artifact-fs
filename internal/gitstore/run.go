@@ -68,9 +68,22 @@ func setGitWorktreeDirectory(cmd *exec.Cmd, extraEnv []string) {
 	}
 }
 
+// runLazyFetchGit runs a Git command that fetches as a lazy fetch does: with
+// lazyFetchEnv, in its own session, so it cannot prompt.
+func runLazyFetchGit(ctx context.Context, gitDir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	configureCancelableCommand(cmd)
+	configureCommandSession(cmd)
+	return runGitCommand(ctx, cmd, gitDir, lazyFetchEnv(), true)
+}
+
 func runGitWithEnvCapture(ctx context.Context, gitDir string, extraEnv []string, captureOutput bool, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	configureCancelableCommand(cmd)
+	return runGitCommand(ctx, cmd, gitDir, extraEnv, captureOutput)
+}
+
+func runGitCommand(ctx context.Context, cmd *exec.Cmd, gitDir string, extraEnv []string, captureOutput bool) (string, error) {
 	setGitWorktreeDirectory(cmd, extraEnv)
 	env := os.Environ()
 	if gitDir != "" {

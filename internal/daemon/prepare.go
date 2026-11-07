@@ -232,7 +232,7 @@ func (s *core) acquireSource(ctx context.Context, cfg model.RepoConfig, p prepar
 			return model.PreparedSource{}, source, withPreparationPhase(preparePhaseClone, err)
 		}
 		// Adoption runs once per prepare and once per mount.
-		s.git.WarnAdoptedOriginCredentials(ctx, cfg)
+		s.git.WarnAdoptedRemoteCredentials(ctx, cfg)
 	case cfg.RequiredCommit != "":
 		prepared, err := s.git.PrepareSource(ctx, cfg, model.SourceRequirement{
 			Ref:            cfg.Branch,

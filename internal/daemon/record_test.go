@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -235,6 +237,47 @@ func TestStatusReportsAFailedRefresh(t *testing.T) {
 	})
 	if st := requireFailure(t, ctl, phaseFetch, "fetch"); st.LastFetchResult != string(fetchFailed) {
 		t.Fatalf("fetch result = %q, want %q", st.LastFetchResult, fetchFailed)
+	}
+}
+
+// The daemon refreshes in the background, so a remote that asks for
+// credentials fails the refresh instead of prompting.
+func TestRefreshDoesNotPrompt(t *testing.T) {
+	for _, key := range []string{"GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "SSH_ASKPASS_REQUIRE"} {
+		t.Setenv(key, "")
+		os.Unsetenv(key)
+	}
+	// Git falls back to SSH_ASKPASS for its own prompts.
+	askpassRuns := filepath.Join(t.TempDir(), "askpass-runs")
+	askpass := filepath.Join(t.TempDir(), "askpass")
+	if err := os.WriteFile(askpass, []byte("#!/bin/sh\necho \"$*\" >> '"+askpassRuns+"'\necho guessed\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SSH_ASKPASS", askpass)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="test"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(server.Close)
+
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "--git-dir", cfg.GitDir, "remote", "set-url", "origin", server.URL+"/repo.git")
+	if err := ctl.SetRefresh(ctx, "repo", model.RefreshPolicy{RefreshInterval: 20 * time.Millisecond}); err != nil {
+		t.Fatal(err)
+	}
+	done := startService(t, svc)
+	waitFor(t, done, func() bool {
+		st, err := ctl.Status(ctx, "repo")
+		return err == nil && st.LastErrorPhase == phaseFetch
+	})
+	requireFailure(t, ctl, phaseFetch, "terminal prompts disabled")
+	if data, err := os.ReadFile(askpassRuns); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the refresh ran SSH_ASKPASS: %q, %v", data, err)
 	}
 }
 

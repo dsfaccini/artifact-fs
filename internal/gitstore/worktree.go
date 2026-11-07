@@ -50,20 +50,29 @@ func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfi
 	return s.ReadTreeHEAD(ctx, repo)
 }
 
-// WarnAdoptedOriginCredentials logs a warning when an adopted worktree's origin
-// embeds credentials. The warning leaves the origin out: redaction is
-// heuristic, and this origin is known to hold credentials.
+// WarnAdoptedRemoteCredentials logs one warning when an adopted worktree's
+// origin or one of its promisor remotes embeds credentials. The warning leaves
+// the remote out: redaction is heuristic, and this remote is known to hold
+// credentials.
 //
 // add-repo never persists inline credentials: a sync clone uses them once
 // and stores the URL without them, and async and prepared repos reject them,
 // because the daemon would store the URL and fetch with it on its own
 // schedule. Adoption only warns. It stores no URL and never clones, fetches or
-// refreshes. Origin stays the user's existing Git config, which only Git's
-// lazy fetches of missing blobs and trees use, as any Git command in the
-// worktree would. ArtifactFS redacts all Git output it logs.
-func (s *Store) WarnAdoptedOriginCredentials(ctx context.Context, repo model.RepoConfig) {
-	if remote, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin"); err == nil && remoteHasInlineCredentials(remote) {
-		s.logger.WarnContext(ctx, "adopted worktree origin embeds credentials; Git's lazy fetches use them", "repo", repo.Name)
+// refreshes. The remotes stay the user's existing Git config. Git's lazy
+// fetches and the hydrator's batch fetches of missing blobs and trees use the
+// promisor remotes, as any Git command in the worktree would. ArtifactFS
+// redacts all Git output it logs.
+func (s *Store) WarnAdoptedRemoteCredentials(ctx context.Context, repo model.RepoConfig) {
+	names := []string{"origin"}
+	if promisors, err := promisorRemotes(ctx, repo.GitDir); err == nil {
+		names = append(names, promisors...)
+	}
+	for _, name := range names {
+		if remote, err := runGit(ctx, repo.GitDir, "remote", "get-url", "--", name); err == nil && remoteHasInlineCredentials(remote) {
+			s.logger.WarnContext(ctx, "adopted worktree remote embeds credentials; fetches of missing objects use them", "repo", repo.Name)
+			return
+		}
 	}
 }
 
@@ -261,19 +270,26 @@ func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfi
 	return nil
 }
 
-// RemoveAdoptedFSMonitorHook stops native Git from consulting ArtifactFS once
-// a worktree is released. extensions.worktreeConfig stays on because sibling
-// worktrees may now keep their own settings in config.worktree.
-func (s *Store) RemoveAdoptedFSMonitorHook(ctx context.Context, repo model.RepoConfig) error {
+// ReleaseAdoptedWorktree hands a worktree back to native Git once remove-repo
+// releases it. It unsets the FSMonitor hook and the filesystem settings that
+// ConfigureAdoptedWorktree pinned for the mount, so the worktree inherits its
+// repository's settings again. A value the worktree's own config held before
+// adoption does not come back, because adoption overwrote it. The core.worktree
+// and core.bare pins stay, because they match the registered worktree.
+// extensions.worktreeConfig stays on because sibling worktrees may now keep
+// their own settings in config.worktree.
+func (s *Store) ReleaseAdoptedWorktree(ctx context.Context, repo model.RepoConfig) error {
 	// --worktree resolves to this file, but fails once the extension is off.
 	worktreeConfig := filepath.Join(repo.GitDir, "config.worktree")
 	if _, err := os.Stat(worktreeConfig); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	if _, err := runGit(ctx, repo.GitDir, "config", "--file", worktreeConfig, "--unset-all", "core.fsmonitor"); err != nil {
-		var exitErr *gitCommandError
-		if !errors.As(err, &exitErr) || exitErr.exitCode != 5 {
-			return err
+	for _, key := range []string{"core.fsmonitor", "fsmonitor.allowRemote", "core.filemode", "core.ignorecase", "core.symlinks"} {
+		if _, err := runGit(ctx, repo.GitDir, "config", "--file", worktreeConfig, "--unset-all", key); err != nil {
+			var exitErr *gitCommandError
+			if !errors.As(err, &exitErr) || exitErr.exitCode != 5 {
+				return err
+			}
 		}
 	}
 	return nil
