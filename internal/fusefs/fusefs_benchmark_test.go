@@ -324,3 +324,86 @@ func benchSwitchPass(b *testing.B, nodes []model.BaseNode, overlayFiles []string
 	b.ReportMetric(float64(cpu.Nanoseconds())/float64(b.N), "cpu-ns/op")
 	b.ReportMetric(float64(cpu.Nanoseconds())/float64(b.N*len(paths)), "cpu-ns/path")
 }
+
+// listingHook runs onList before the snapshot's next listing.
+type listingHook struct {
+	model.SnapshotStore
+	onList func()
+}
+
+func (s *listingHook) ListChildren(gen int64, dir string) ([]model.BaseNode, error) {
+	fire(&s.onList)
+	return s.SnapshotStore.ListChildren(gen, dir)
+}
+
+// BenchmarkMissingPathsHeap reports the live heap MissingPaths holds over an
+// overlay of files, checking every overlay path and parent directory:
+// listall-MiB for the overlay read alone, and peak-MiB when the first snapshot
+// listing starts, after MissingPaths has read and grouped the overlay.
+func BenchmarkMissingPathsHeap(b *testing.B) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, format string
+		files, pkgs  int
+	}{
+		{"venv/20k", ".venv/lib/python3.12/site-packages/pkg%d/sub/f%d.js", 20_000, 500},
+		{"node_modules/20k", "node_modules/pkg%d/lib/f%d.js", 20_000, 500},
+		{"venv/60k", ".venv/lib/python3.12/site-packages/pkg%d/sub/f%d.js", 60_000, 1500},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			snap, err := snapshot.New(ctx, filepath.Join(b.TempDir(), "snapshot.sqlite"))
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { _ = snap.Close() })
+			gen, err := snap.PublishGeneration(ctx, "head", "main", []model.BaseNode{{Path: ".", Type: "dir", Mode: 0o40000, SizeState: "known"}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			dir := b.TempDir()
+			ov, err := overlaystore.New(ctx, model.RepoConfig{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { _ = ov.Close() })
+			set := map[string]bool{}
+			for i := range tc.files {
+				p := fmt.Sprintf(tc.format, i%tc.pkgs, i)
+				if _, err := ov.CreateFile(ctx, p, 0o644); err != nil {
+					b.Fatal(err)
+				}
+				for q := p; q != "."; q = filepath.Dir(q) {
+					set[q] = true
+				}
+			}
+			paths := make([]string, 0, len(set))
+			for p := range set {
+				paths = append(paths, p)
+			}
+			snapHook := &listingHook{SnapshotStore: snap}
+			r := &Resolver{Snapshot: snapHook, Overlay: ov}
+			r.SetGeneration(gen)
+			var listAll, peak uint64
+			b.ResetTimer()
+			for range b.N {
+				before := heapInUse()
+				all, err := ov.ListAll(ctx)
+				if err != nil {
+					b.Fatal(err)
+				}
+				listAll += heapInUse() - before
+				runtime.KeepAlive(all)
+				all = nil
+				before = heapInUse()
+				snapHook.onList = func() { peak += heapInUse() - before }
+				missing, err := r.MissingPaths(ctx, paths)
+				if err != nil || len(missing) != 0 {
+					b.Fatalf("MissingPaths = %d paths, %v; want none", len(missing), err)
+				}
+			}
+			b.ReportMetric(float64(len(paths)), "paths")
+			b.ReportMetric(float64(listAll)/float64(b.N)/(1<<20), "listall-MiB")
+			b.ReportMetric(float64(peak)/float64(b.N)/(1<<20), "peak-MiB")
+		})
+	}
+}

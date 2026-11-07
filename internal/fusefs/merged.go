@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -289,16 +290,18 @@ func (r *Resolver) MissingPaths(ctx context.Context, paths []string) ([]string, 
 	if err != nil {
 		return nil, err
 	}
-	below := map[string][]model.OverlayEntry{}
-	for _, e := range entries {
-		for dir := model.CleanPath(filepath.Dir(e.Path)); ; dir = model.CleanPath(filepath.Dir(dir)) {
-			if _, ok := byDir[dir]; ok {
-				below[dir] = append(below[dir], e)
-			}
-			if dir == "." {
-				break
-			}
+	// Sorted by path, the entries below a directory are one run, which below
+	// finds without copying them.
+	slices.SortFunc(entries, func(a, b model.OverlayEntry) int { return strings.Compare(a.Path, b.Path) })
+	below := func(dir string) []model.OverlayEntry {
+		if dir == "." {
+			return entries
 		}
+		from := func(prefix string) int {
+			return sort.Search(len(entries), func(i int) bool { return entries[i].Path >= prefix })
+		}
+		// '0' follows '/', so [dir/, dir0) holds exactly the paths below dir.
+		return entries[from(dir+"/"):from(dir+"0")]
 	}
 	var missing []string
 	var firstErr error
@@ -312,7 +315,7 @@ func (r *Resolver) MissingPaths(ctx context.Context, paths []string) ([]string, 
 			continue
 		}
 		names := map[string]bool{}
-		for _, e := range mergeChildren(dir, children, below[dir]) {
+		for _, e := range mergeChildren(dir, children, below(dir)) {
 			names[e.Name] = true
 		}
 		for _, p := range kids {

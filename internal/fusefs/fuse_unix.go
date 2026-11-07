@@ -106,8 +106,8 @@ type ArtifactFuse struct {
 	negatives       map[kernelEntry]time.Time
 	negativeSweepAt int
 	// renameSeq is odd while a Rename op runs, and grows by two with each one.
-	// The switch pass unmaps nothing when a rename overlapped it, because a
-	// rename commits the overlay before it moves the mappings.
+	// A rename commits the overlay before it moves the mappings, so a switch
+	// pass that a rename overlapped checks its vanished paths again.
 	renameSeq uint64
 
 	// notifier is nil when nothing should reach the kernel. fs.mu guards it:
@@ -266,6 +266,50 @@ func (fs *ArtifactFuse) unmapPath(path string) {
 	fs.mu.Unlock()
 }
 
+// pathMapping is a path and the inode number it maps to.
+type pathMapping struct {
+	id   fuseops.InodeID
+	path string
+}
+
+// unmapLocked unmaps each of ms whose path still maps to its number: an op may
+// have mapped the path again since the pass resolved it. Caller must hold
+// fs.mu write lock.
+func (fs *ArtifactFuse) unmapLocked(ms []pathMapping) {
+	for _, m := range ms {
+		if fs.pathToInode[m.path] == m.id {
+			delete(fs.pathToInode, m.path)
+		}
+	}
+}
+
+// unmapStillMissing checks the paths of vanished again and unmaps each one
+// still missing. It holds handleOps meanwhile, which keeps every Rename op
+// out, so a switch pass that a rename overlapped still makes progress.
+func (fs *ArtifactFuse) unmapStillMissing(vanished []pathMapping) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
+	paths := make([]string, len(vanished))
+	for i, m := range vanished {
+		paths[i] = m.path
+	}
+	missing, err := fs.engine.MissingPaths(context.Background(), paths)
+	gone := make(map[string]bool, len(missing))
+	for _, p := range missing {
+		gone[p] = true
+	}
+	var still []pathMapping
+	for _, m := range vanished {
+		if gone[m.path] {
+			still = append(still, m)
+		}
+	}
+	fs.mu.Lock()
+	fs.unmapLocked(still)
+	fs.mu.Unlock()
+	return err
+}
+
 // renaming marks a Rename op as running until done is called.
 func (fs *ArtifactFuse) renaming() (done func()) {
 	fs.mu.Lock()
@@ -348,12 +392,8 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // gets no invalidation: the kernel holds nothing for it. A failure skips only
 // what it concerns, and the first one is returned.
 func (fs *ArtifactFuse) invalidateChanged(send bool) error {
-	type mapping struct {
-		id   fuseops.InodeID
-		path string
-	}
 	type known struct {
-		mapping
+		pathMapping
 		entry    kernelEntry
 		reported Identity
 		base     bool
@@ -367,7 +407,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	var inodes, negatives []known
 	// existenceOnly holds every other mapping: those that need only the check
 	// that their path exists.
-	var existenceOnly []mapping
+	var existenceOnly []pathMapping
 	for path, id := range fs.pathToInode {
 		if path == "." || path == ".git" {
 			continue
@@ -375,19 +415,19 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		ref := fs.inodes[id]
 		parent, ok := fs.pathToInode[model.CleanPath(filepath.Dir(path))]
 		if !send || ref == nil || !ok {
-			existenceOnly = append(existenceOnly, mapping{id, path})
+			existenceOnly = append(existenceOnly, pathMapping{id, path})
 			continue
 		}
-		inodes = append(inodes, known{mapping: mapping{id, path}, entry: kernelEntry{parent, filepath.Base(path)}, reported: ref.identity(), base: ref.Gen != 0, mapped: true})
+		inodes = append(inodes, known{pathMapping: pathMapping{id, path}, entry: kernelEntry{parent, filepath.Base(path)}, reported: ref.identity(), base: ref.Gen != 0, mapped: true})
 	}
 	for id, ref := range fs.inodes {
 		if send && !ref.IsRoot && !ref.Stale && ref.Path != ".git" && fs.pathToInode[ref.Path] != id {
-			inodes = append(inodes, known{mapping: mapping{id, ref.Path}, reported: ref.identity(), base: ref.Gen != 0})
+			inodes = append(inodes, known{pathMapping: pathMapping{id, ref.Path}, reported: ref.identity(), base: ref.Gen != 0})
 		}
 	}
 	for e, lapses := range fs.negatives {
 		if parent := fs.inodes[e.parent]; parent != nil && !parent.Stale && lapses.After(now) {
-			negatives = append(negatives, known{mapping: mapping{path: cleanChildPath(parent.Path, e.name)}, entry: e})
+			negatives = append(negatives, known{pathMapping: pathMapping{path: cleanChildPath(parent.Path, e.name)}, entry: e})
 		}
 	}
 	fs.mu.RUnlock()
@@ -400,7 +440,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	}
 	var entries []kernelEntry
 	var changed []fuseops.InodeID
-	var vanished []mapping
+	var vanished []pathMapping
 	for _, k := range inodes {
 		current, exists, err := fs.engine.Identity(k.path)
 		if err != nil {
@@ -415,7 +455,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 				entries = append(entries, k.entry)
 			}
 			if k.mapped && !exists {
-				vanished = append(vanished, k.mapping)
+				vanished = append(vanished, k.pathMapping)
 			}
 		case k.base && current != k.reported, !k.base && current.Blob != "":
 			changed = append(changed, k.id)
@@ -436,18 +476,15 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			vanished = append(vanished, m)
 		}
 	}
-	// An op may have mapped the path again since it was resolved. A rename that
-	// overlapped the pass may not have moved its mappings yet, so the next
-	// pass retries.
 	fs.mu.Lock()
-	if fs.renameSeq == renameSeq && renameSeq%2 == 0 {
-		for _, m := range vanished {
-			if fs.pathToInode[m.path] == m.id {
-				delete(fs.pathToInode, m.path)
-			}
-		}
+	overlapped := fs.renameSeq != renameSeq || renameSeq%2 != 0
+	if !overlapped {
+		fs.unmapLocked(vanished)
 	}
 	fs.mu.Unlock()
+	if overlapped && len(vanished) > 0 {
+		failed(fs.unmapStillMissing(vanished), "check vanished paths again")
+	}
 	if !send {
 		return firstErr
 	}
@@ -516,12 +553,17 @@ func (fs *ArtifactFuse) inodeGeneration(id fuseops.InodeID) int64 {
 	return 0
 }
 
-// markWritten records a write through id. Reads then serve the overlay, and
-// the kernel's cached pages hold the written bytes, not any base blob.
-func (fs *ArtifactFuse) markWritten(id fuseops.InodeID) {
+// markWritten records a write through id at path. Reads then serve the
+// overlay, and the kernel's cached pages hold the written bytes, not any base
+// blob. A write that recreated the inode's vanished path maps the path back to
+// the inode, unless another inode took the path.
+func (fs *ArtifactFuse) markWritten(id fuseops.InodeID, path string) {
 	fs.mu.Lock()
 	if ref := fs.inodes[id]; ref != nil {
 		ref.Gen, ref.PageBlob = 0, ""
+		if _, mapped := fs.pathToInode[path]; !mapped && ref.Path == path && !ref.Stale {
+			fs.pathToInode[path] = id
+		}
 	}
 	fs.mu.Unlock()
 }
@@ -1236,7 +1278,7 @@ func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) 
 		if n != len(op.Data) {
 			return syscall.EIO
 		}
-		fs.markWritten(op.Inode)
+		fs.markWritten(op.Inode, path)
 		fs.closeCachedFilesForPath(path)
 		// A write recreates a path that vanished while the handle was open.
 		// No reply tells the kernel the name exists again.

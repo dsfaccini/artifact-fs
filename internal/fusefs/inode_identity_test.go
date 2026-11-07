@@ -4,8 +4,12 @@ package fusefs
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -254,30 +258,72 @@ func TestCreateBeforeTheSwitchPassGetsNewInodeNumber(t *testing.T) {
 // An inode the kernel still holds after a switch removed its path is
 // invalidated when a later switch brings the path back with another blob:
 // getattr and reads on the inode resolve the path again, so the kernel's
-// pages of the old blob must go.
+// pages of the old blob must go. Its name already left the kernel, so no
+// switch sends an entry invalidation for it once the path is unmapped.
 func TestSwitchInvalidatesHeldInodeWhosePathReturns(t *testing.T) {
 	f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
 	held := f.lookup(fuseops.RootInodeID, "file.txt")
 	f.open(held)
-	f.switchTo()
-	if err := f.mount.InvalidateChanged(); err != nil {
-		t.Fatal(err)
+	pass := func(nodes ...model.BaseNode) ([]fuseops.InodeID, []kernelEntry) {
+		t.Helper()
+		inodesBefore, entriesBefore := f.notifier.recorded()
+		f.switchTo(nodes...)
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
+		inodes, entries := f.notifier.recorded()
+		return inodes[len(inodesBefore):], entries[len(entriesBefore):]
 	}
-	before, _ := f.notifier.recorded()
-	f.switchTo(baseFile("file.txt", "blob-B", 0o100644))
-	if err := f.mount.InvalidateChanged(); err != nil {
-		t.Fatal(err)
+	if _, entries := pass(); !slices.Equal(entries, []kernelEntry{{fuseops.RootInodeID, "file.txt"}}) {
+		t.Fatalf("entries invalidated when file.txt vanished = %v, want file.txt", entries)
 	}
-	if after, _ := f.notifier.recorded(); !slices.Equal(after[len(before):], []fuseops.InodeID{held}) {
-		t.Fatalf("inodes invalidated when file.txt came back with blob-B = %v, want the held inode %d", after[len(before):], held)
+	if inodes, entries := pass(); len(inodes) != 0 || len(entries) != 0 {
+		t.Fatalf("a switch that keeps file.txt absent invalidated inodes %v and entries %v, want none", inodes, entries)
+	}
+	if inodes, entries := pass(baseFile("file.txt", "blob-B", 0o100644)); !slices.Equal(inodes, []fuseops.InodeID{held}) || len(entries) != 0 {
+		t.Fatalf("file.txt came back with blob-B and the switch invalidated inodes %v and entries %v, want only the held inode %d", inodes, entries, held)
 	}
 }
 
-// hookedOverlay runs each hook once: after a rename commits, after a listing,
-// or after a removal.
+// A write through an open file whose path a switch removed recreates the
+// path. The path maps back to the writer's inode, so one number names the
+// file, unless another inode already took the path.
+func TestWriteThroughHeldInodeRecreatesPathUnderItsNumber(t *testing.T) {
+	for _, recreated := range []bool{false, true} {
+		t.Run(fmt.Sprint("created first=", recreated), func(t *testing.T) {
+			f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
+			held := f.lookup(fuseops.RootInodeID, "file.txt")
+			open := f.open(held)
+			f.switchTo()
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			want := held
+			if recreated {
+				create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "file.txt", Mode: 0o644}
+				if err := f.fs.CreateFile(f.ctx, create); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+					t.Fatal(err)
+				}
+				want = create.Entry.Child
+			}
+			if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("new")}); err != nil {
+				t.Fatal(err)
+			}
+			if got := f.lookup(fuseops.RootInodeID, "file.txt"); got != want {
+				t.Fatalf("file.txt after a write through inode %d looks up as inode %d, want %d", held, got, want)
+			}
+		})
+	}
+}
+
+// hookedOverlay runs each hook once: after a rename commits, before or after
+// a listing, or after a removal.
 type hookedOverlay struct {
 	model.OverlayStore
-	afterRename, afterList, afterRemove func()
+	afterRename, beforeList, afterList, afterRemove func()
 }
 
 func fire(hook *func()) {
@@ -304,6 +350,7 @@ func (o *hookedOverlay) RenameTree(ctx context.Context, oldPath, newPath string,
 }
 
 func (o *hookedOverlay) ListByPrefix(ctx context.Context, prefix string) ([]model.OverlayEntry, error) {
+	fire(&o.beforeList)
 	out, err := o.OverlayStore.ListByPrefix(ctx, prefix)
 	fire(&o.afterList)
 	return out, err
@@ -324,12 +371,33 @@ func hookOverlay(f *cacheFixture) *hookedOverlay {
 	return ov
 }
 
-// A rename commits the overlay before it moves the mappings. A switch pass
-// that runs between the two sees the old names missing, and must not unmap
-// the numbers the rename is moving.
-func TestSwitchPassDuringRenameKeepsMovedNumbers(t *testing.T) {
-	f := newCacheFixture(t)
-	ov := hookOverlay(f)
+// waitRecheck returns once done is closed, or once a goroutine waits for the
+// handleOps read lock in unmapStillMissing: the switch pass's re-check, which
+// a Rename op holds off until it has moved its mappings.
+func waitRecheck(done <-chan struct{}) {
+	buf := make([]byte, 1<<20)
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		n := runtime.Stack(buf, true)
+		for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+			if strings.Contains(g, "[sync.RWMutex.RLock") && strings.Contains(g, "(*ArtifactFuse).unmapStillMissing") {
+				return
+			}
+		}
+		runtime.Gosched()
+	}
+}
+
+// newRenameFixture makes src/file.txt through the mount. The kernel holds
+// src and has forgotten file.txt.
+func newRenameFixture(t *testing.T) (f *cacheFixture, ov *hookedOverlay, src, file fuseops.InodeID) {
+	t.Helper()
+	f = newCacheFixture(t)
+	ov = hookOverlay(f)
 	mkdir := &fuseops.MkDirOp{Parent: fuseops.RootInodeID, Name: "src", Mode: os.ModeDir | 0o755}
 	if err := f.fs.MkDir(f.ctx, mkdir); err != nil {
 		t.Fatal(err)
@@ -342,29 +410,108 @@ func TestSwitchPassDuringRenameKeepsMovedNumbers(t *testing.T) {
 		t.Fatal(err)
 	}
 	forget(t, f.fs, create.Entry.Child)
-	ran := false
-	ov.afterRename = func() {
-		ran = true
-		if err := f.mount.InvalidateChanged(); err != nil {
-			t.Error(err)
-		}
-	}
-	if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "src", NewParent: fuseops.RootInodeID, NewName: "dst"}); err != nil {
-		t.Fatalf("Rename: %v", err)
-	}
-	if !ran {
-		t.Fatal("the switch pass did not run inside the rename")
-	}
+	return f, ov, mkdir.Entry.Child, create.Entry.Child
+}
+
+func renameSrcToDst(f *cacheFixture) error {
+	return f.fs.Rename(context.Background(), &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "src", NewParent: fuseops.RootInodeID, NewName: "dst"})
+}
+
+func assertMoved(t *testing.T, f *cacheFixture, src, file fuseops.InodeID) {
+	t.Helper()
 	dst := f.lookup(fuseops.RootInodeID, "dst")
-	file := f.lookup(dst, "file.txt")
-	if got, want := []fuseops.InodeID{dst, file}, []fuseops.InodeID{mkdir.Entry.Child, create.Entry.Child}; !slices.Equal(got, want) {
+	moved := f.lookup(dst, "file.txt")
+	if got, want := []fuseops.InodeID{dst, moved}, []fuseops.InodeID{src, file}; !slices.Equal(got, want) {
 		t.Fatalf("inodes of dst and dst/file.txt = %v, want the numbers they had under src: %v", got, want)
 	}
 }
 
-// A create can land while the switch pass lists the overlay, after the pass
-// read the mappings. The pass then finds the path missing, and must leave the
-// created path's mapping alone.
+// A rename commits the overlay before it moves the mappings. A switch pass
+// that starts between the two sees the old names missing, and must not unmap
+// the numbers the rename is moving.
+func TestSwitchPassDuringRenameKeepsMovedNumbers(t *testing.T) {
+	f, ov, src, file := newRenameFixture(t)
+	passed := make(chan struct{})
+	var passErr error
+	ov.afterRename = func() {
+		go func() {
+			defer close(passed)
+			passErr = f.mount.InvalidateChanged()
+		}()
+		waitRecheck(passed)
+	}
+	if err := renameSrcToDst(f); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	<-passed
+	if passErr != nil {
+		t.Fatal(passErr)
+	}
+	assertMoved(t, f, src, file)
+}
+
+// A rename can start after the switch pass read the table and commit before
+// the pass reads the overlay. It is still moving the mappings when the pass
+// would unmap.
+func TestSwitchPassWaitsForRenameStartedAfterItsSnapshot(t *testing.T) {
+	f, ov, src, file := newRenameFixture(t)
+	committed, release, renamed := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	ov.afterRename = func() {
+		close(committed)
+		<-release
+	}
+	ov.beforeList = func() {
+		go func() { renamed <- renameSrcToDst(f) }()
+		<-committed
+	}
+	passed := make(chan struct{})
+	go func() {
+		waitRecheck(passed)
+		close(release)
+	}()
+	passErr := f.mount.InvalidateChanged()
+	close(passed)
+	if err := <-renamed; err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if passErr != nil {
+		t.Fatal(passErr)
+	}
+	assertMoved(t, f, src, file)
+}
+
+// Under steady renames every switch pass overlaps one. A path the switches
+// removed still loses its number, so it comes back under a new one.
+func TestSwitchPassesUnmapUnderSteadyRenames(t *testing.T) {
+	f := newCacheFixture(t, baseFile("gone.txt", "blob-A", 0o100644))
+	ov := hookOverlay(f)
+	gone := f.lookup(fuseops.RootInodeID, "gone.txt")
+	forget(t, f.fs, gone)
+	if err := f.fs.MkDir(f.ctx, &fuseops.MkDirOp{Parent: fuseops.RootInodeID, Name: "a", Mode: os.ModeDir | 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	names := []string{"a", "b"}
+	for i := range 5 {
+		f.switchTo()
+		from, to := names[i%2], names[(i+1)%2]
+		ov.beforeList = func() {
+			if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: from, NewParent: fuseops.RootInodeID, NewName: to}); err != nil {
+				t.Error(err)
+			}
+		}
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.switchTo(baseFile("gone.txt", "blob-C", 0o100644))
+	if got := f.lookup(fuseops.RootInodeID, "gone.txt"); got == gone {
+		t.Fatalf("gone.txt came back with inode %d, which it had before 5 switches removed it", got)
+	}
+}
+
+// A create can land after the switch pass read the mappings and the overlay.
+// The pass then finds the path missing, and must leave the created path's
+// mapping alone.
 func TestCreateDuringSwitchPassKeepsItsNumber(t *testing.T) {
 	f := newCacheFixture(t, baseFile("gone.txt", "gone", 0o100644))
 	forget(t, f.fs, f.lookup(fuseops.RootInodeID, "gone.txt"))
@@ -422,5 +569,101 @@ func TestMkDirCannotLandInsideRmDir(t *testing.T) {
 	}
 	if got := f.lookup(fuseops.RootInodeID, "dir"); got != made {
 		t.Fatalf("lookup of dir = inode %d, want %d, the number its MkDir got", got, made)
+	}
+}
+
+// MissingPaths reads the overlay once for every directory. It must report the
+// same paths as a merged listing of each directory: over overlay deletes, a
+// renamed base directory and file, implicit directories at the root and below
+// it, a directory replaced by a file and a file replaced by a directory.
+func TestMissingPathsMatchesPerDirectoryListings(t *testing.T) {
+	gen1 := []model.BaseNode{
+		baseDir("a", "a1"), baseFile("a/x.txt", "x", 0o100644), baseDir("a/b", "ab1"), baseFile("a/b/y.txt", "y", 0o100644),
+		baseDir("c", "c1"), baseFile("c/z.txt", "z", 0o100644), baseDir("c/deep", "cd1"), baseFile("c/deep/q.txt", "q", 0o100644),
+		baseDir("d", "d1"), baseFile("d/w.txt", "w", 0o100644),
+		baseDir("e", "e1"), baseFile("e/v.txt", "v", 0o100644),
+		baseDir("f", "f1"), baseFile("f/u.txt", "u", 0o100644),
+		baseDir("g", "g1"), baseFile("g/s.txt", "s", 0o100644),
+		baseFile("k", "k", 0o100644), baseFile("top.txt", "top", 0o100644),
+		baseDir("m", "m1"), baseDir("m/n", "mn1"), baseFile("m/n/p.txt", "p", 0o100644),
+	}
+	f := newCacheFixture(t, gen1...)
+	ctx := f.ctx
+	var root fuseops.InodeID = fuseops.RootInodeID
+	ino := map[string]fuseops.InodeID{".": root}
+	for _, n := range gen1 {
+		ino[n.Path] = f.lookup(ino[filepath.Dir(n.Path)], filepath.Base(n.Path))
+	}
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	created := func(parent fuseops.InodeID, name string) {
+		t.Helper()
+		op := &fuseops.CreateFileOp{Parent: parent, Name: name, Mode: 0o644}
+		must(f.fs.CreateFile(ctx, op))
+		must(f.fs.ReleaseFileHandle(ctx, &fuseops.ReleaseFileHandleOp{Handle: op.Handle}))
+	}
+	must(f.fs.Unlink(ctx, &fuseops.UnlinkOp{Parent: ino["a"], Name: "x.txt"}))
+	must(f.fs.Rename(ctx, &fuseops.RenameOp{OldParent: root, OldName: "c", NewParent: root, NewName: "c2"}))
+	must(f.fs.Rename(ctx, &fuseops.RenameOp{OldParent: root, OldName: "top.txt", NewParent: root, NewName: "top2.txt"}))
+	created(ino["d"], "new.txt")
+	must(f.fs.Unlink(ctx, &fuseops.UnlinkOp{Parent: ino["f"], Name: "u.txt"}))
+	must(f.fs.RmDir(ctx, &fuseops.RmDirOp{Parent: root, Name: "f"}))
+	h := &fuseops.MkDirOp{Parent: root, Name: "h", Mode: os.ModeDir | 0o755}
+	must(f.fs.MkDir(ctx, h))
+	i := &fuseops.MkDirOp{Parent: h.Entry.Child, Name: "i", Mode: os.ModeDir | 0o755}
+	must(f.fs.MkDir(ctx, i))
+	created(i.Entry.Child, "j.txt")
+	must(f.fs.CreateSymlink(ctx, &fuseops.CreateSymlinkOp{Parent: root, Name: "link", Target: "a"}))
+	// g/t.txt and m/n/o.txt are untracked, and the switch removes g and m/n,
+	// so both become implicit directories.
+	created(ino["g"], "t.txt")
+	created(ino["m/n"], "o.txt")
+
+	f.switchTo(
+		baseDir("a", "a2"), baseFile("a/x.txt", "x", 0o100644), baseDir("a/b", "ab1"), baseFile("a/b/y.txt", "y2", 0o100644),
+		baseDir("c", "c1"), baseFile("c/z.txt", "z", 0o100644), baseDir("c/deep", "cd1"), baseFile("c/deep/q.txt", "q", 0o100644),
+		baseFile("e", "e-file", 0o100644),
+		baseDir("f", "f1"), baseFile("f/u.txt", "u", 0o100644),
+		baseDir("k", "k2"), baseFile("k/m.txt", "m", 0o100644),
+		baseFile("top.txt", "top", 0o100644), baseFile("n.txt", "n", 0o100644),
+		baseDir("m", "m2"),
+	)
+
+	set := map[string]bool{}
+	for _, n := range gen1 {
+		set[n.Path] = true
+	}
+	all, err := f.resolver.Overlay.ListByPrefix(ctx, ".")
+	must(err)
+	for _, e := range all {
+		set[e.Path] = true
+	}
+	for _, p := range []string{"d", "d/new.txt", "d/w.txt", "e", "e/v.txt", "k/m.txt", "n.txt", "c2/z.txt", "c2/deep/q.txt", "c2/deep", "h/i/j.txt", "zz/none", "a/b/nope", "g", "g/t.txt", "g/s.txt", "link", "top2.txt"} {
+		set[p] = true
+	}
+	delete(set, ".")
+	var paths []string
+	for p := range set {
+		paths = append(paths, p)
+	}
+	slices.Sort(paths)
+	got, err := f.fs.engine.MissingPaths(ctx, paths)
+	must(err)
+	slices.Sort(got)
+
+	var want []string
+	for _, p := range paths {
+		listed, _, _, err := f.fs.engine.ReadDir(ctx, filepath.Dir(p))
+		must(err)
+		if !slices.ContainsFunc(listed, func(e ReaddirEntry) bool { return e.Name == filepath.Base(p) }) {
+			want = append(want, p)
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("MissingPaths = %v, merged listings of each parent = %v", got, want)
 	}
 }
