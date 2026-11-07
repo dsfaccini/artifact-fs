@@ -383,7 +383,7 @@ func waitRecheck(done <-chan struct{}) {
 		default:
 		}
 		n := runtime.Stack(buf, true)
-		for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+		for g := range strings.SplitSeq(string(buf[:n]), "\n\n") {
 			if strings.Contains(g, "[sync.RWMutex.RLock") && strings.Contains(g, "(*ArtifactFuse).unmapStillMissing") {
 				return
 			}
