@@ -12,8 +12,9 @@ Repository-specific guidance for `artifact-fs`.
 - Add a blob cache file only with `blobcache.Stage` and `blobcache.Install`, and remove one only with `blobcache.Evict`. Each updates the counters `status` reads under the cache's `stats` flock. A direct write or unlink leaves the counters wrong until the next mount or `evict-cache` recounts them.
 - Normalize paths only with `model.CleanPath()`. Do not add local wrappers.
 - Use the canonical `model.*` interfaces for registry, git store, snapshot, overlay, and hydrator access. Do not add subset interfaces around them.
-- Assert each implementation with `var _ model.X = (*T)(nil)`. Add a method to an interface only when production code calls the method through the interface.
-- Only `internal/daemon` holds a concrete snapshot, overlay or hydrator type, because it opens and closes them.
+- In production code, assert each implementation of a `model.*` interface with `var _ model.X = (*T)(nil)`. Test fakes need no assertion.
+- Add a method to a `model.*` interface only when production code calls the method through the interface.
+- In production code, only `internal/daemon` holds a concrete snapshot, overlay or hydrator type, because it opens and closes them. Tests may build concrete stores.
 
 ## Architecture
 
