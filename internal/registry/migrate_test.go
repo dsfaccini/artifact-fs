@@ -281,6 +281,10 @@ var legacyRegistries = map[string]struct {
 func TestMigrationStoresRefsInFull(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "repos.sqlite")
+	verifiedRow := func(name, branch, fetchRef string) string {
+		return `INSERT INTO repos (repo_id, name, mount_root, mount_path, remote_url_redacted, branch, refresh_interval_seconds, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, fetch_ref, required_commit, acquired_ref, created_at_ns, updated_at_ns)
+			VALUES ('` + name + `', '` + name + `', '/mnt', '/mnt/r', '', '` + branch + `', 30, '/git', '/overlay', '/cache', '/meta', '/overlay/meta', '` + fetchRef + `', '0123456789012345678901234567890123456789', '` + branch + `', 1, 1)`
+	}
 	row := func(name, branch, fetchRef, adopt string) string {
 		return `INSERT INTO repos (repo_id, name, mount_root, mount_path, remote_url_redacted, branch, refresh_interval_seconds, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, adopt_gitdir, fetch_ref, created_at_ns, updated_at_ns)
 			VALUES ('` + name + `', '` + name + `', '/mnt', '/mnt/r', '', '` + branch + `', 30, '/git', '/overlay', '/cache', '/meta', '/overlay/meta', ` + adopt + `, '` + fetchRef + `', 1, 1)`
@@ -299,6 +303,8 @@ func TestMigrationStoresRefsInFull(t *testing.T) {
 		row("literal-origin", "refs/heads/origin/x", "origin/x", "0"),
 		row("short-origin", "origin/x", "", "0"),
 		row("adopted", "HEAD", "", "1"),
+		verifiedRow("verified-remotes", "refs/remotes/origin/x", "refs/remotes/origin/x"),
+		verifiedRow("verified-short", "refs/remotes/origin/x", "x"),
 		`PRAGMA user_version = 3`,
 	)
 	store, err := New(ctx, path)
@@ -322,6 +328,10 @@ func TestMigrationStoresRefsInFull(t *testing.T) {
 		// branch origin/x.
 		"short-origin": {"refs/heads/origin/x", "refs/heads/origin/x"},
 		"adopted":      {"HEAD", ""},
+		// A verified source keeps the ref an older build fetched and recorded
+		// in its acquisition receipt.
+		"verified-remotes": {"refs/remotes/origin/x", "refs/remotes/origin/x"},
+		"verified-short":   {"refs/remotes/origin/x", "refs/heads/x"},
 	} {
 		got, err := store.GetRepo(ctx, name)
 		if err != nil {

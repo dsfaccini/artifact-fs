@@ -140,7 +140,9 @@ func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *pre
 }
 
 // hasPublishedGeneration reports whether cfg's snapshot store holds a
-// generation, which only a preparation that succeeded publishes.
+// generation. A preparation publishes one before it records the acquisition
+// and its outcome, so a generation shows that a preparation got that far, not
+// that it succeeded.
 func hasPublishedGeneration(ctx context.Context, cfg model.RepoConfig) (bool, error) {
 	if _, err := os.Stat(cfg.MetaDBPath); errors.Is(err, fs.ErrNotExist) {
 		return false, nil

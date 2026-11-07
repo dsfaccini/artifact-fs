@@ -70,12 +70,14 @@ var migrations = []meta.Migration{
 	// changes only with the config. add-repo now stores every ref in full,
 	// with branch defaulting to refs/heads/main and fetch_ref to branch; this
 	// brings older rows to that. A short branch stays the branch an older
-	// build cloned, so origin/x becomes refs/heads/origin/x.
+	// build cloned, so origin/x becomes refs/heads/origin/x. A verified source
+	// keeps refs/remotes/origin/x: an older build fetched that ref from the
+	// remote and recorded it in the acquisition receipt.
 	meta.SQL(
 		`ALTER TABLE repos ADD COLUMN prepare_request TEXT NOT NULL DEFAULT ''`,
 		`UPDATE repos SET branch = CASE
 		    WHEN trim(branch) = '' THEN 'refs/heads/main'
-		    WHEN substr(trim(branch), 1, 20) = 'refs/remotes/origin/' THEN 'refs/heads/' || substr(trim(branch), 21)
+		    WHEN substr(trim(branch), 1, 20) = 'refs/remotes/origin/' AND required_commit = '' THEN 'refs/heads/' || substr(trim(branch), 21)
 		    WHEN substr(trim(branch), 1, 5) = 'refs/' THEN trim(branch)
 		    ELSE 'refs/heads/' || trim(branch)
 		  END
@@ -83,7 +85,7 @@ var migrations = []meta.Migration{
 		`UPDATE repos SET fetch_ref = CASE
 		    WHEN trim(fetch_ref) = '' THEN branch
 		    WHEN substr(trim(fetch_ref), 1, 11) = 'refs/heads/' THEN trim(fetch_ref)
-		    WHEN substr(trim(fetch_ref), 1, 20) = 'refs/remotes/origin/' THEN 'refs/heads/' || substr(trim(fetch_ref), 21)
+		    WHEN substr(trim(fetch_ref), 1, 20) = 'refs/remotes/origin/' AND required_commit = '' THEN 'refs/heads/' || substr(trim(fetch_ref), 21)
 		    WHEN substr(trim(fetch_ref), 1, 7) = 'origin/' THEN 'refs/heads/' || substr(trim(fetch_ref), 8)
 		    WHEN substr(trim(fetch_ref), 1, 5) = 'refs/' THEN trim(fetch_ref)
 		    ELSE 'refs/heads/' || trim(fetch_ref)

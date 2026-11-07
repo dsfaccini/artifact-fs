@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -533,7 +534,18 @@ func refOIDOrZero(ctx context.Context, gitDir string, refName string) (string, e
 	return zeroOIDForGitDir(ctx, gitDir)
 }
 
+// rollbackTimeout bounds a rollback, which runs after its caller's context
+// ended too: a canceled preparation must still restore the index and refs it
+// changed.
+const rollbackTimeout = 30 * time.Second
+
+func rollbackContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+}
+
 func rollbackIndexTransition(ctx context.Context, gitDir string, fromOID string, toOID string, cause error) error {
+	ctx, cancel := rollbackContext(ctx)
+	defer cancel()
 	if err := readTreeTransition(ctx, gitDir, fromOID, toOID); err != nil {
 		return errors.Join(cause, fmt.Errorf("restore index after ref update failure: %w", err))
 	}
@@ -541,6 +553,8 @@ func rollbackIndexTransition(ctx context.Context, gitDir string, fromOID string,
 }
 
 func restoreRef(ctx context.Context, gitDir string, refName string, oldOID string, newOID string) error {
+	ctx, cancel := rollbackContext(ctx)
+	defer cancel()
 	if _, err := runGit(ctx, gitDir, "update-ref", refName, oldOID, newOID); err != nil {
 		return fmt.Errorf("restore ref after HEAD update failure: %w", err)
 	}

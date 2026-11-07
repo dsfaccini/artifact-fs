@@ -469,3 +469,110 @@ func TestFailedSyncPrepareKeepsServingAcrossRestart(t *testing.T) {
 		t.Fatalf("status after a restart = state %q, prepare error %q, served %q; want mounted, the prepare error, %s", st.State, st.PrepareError, st.ServedHEADOID, served)
 	}
 }
+
+// A sync repo whose first preparation failed after its clone stays unmounted:
+// no preparation ever published a snapshot of it.
+func TestMountRefusesASyncRepoWhoseFirstPrepareFailed(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	runCmd(t, "git", "init", "--initial-branch", "main", remote)
+	commitFile(t, remote, "README.md", "main\n")
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	m := &recordingMount{}
+	svc.mount = m.mount
+	// The clone succeeds, then the fetch of a ref the remote lacks fails.
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", FetchRef: "missing", Enabled: true}); err == nil {
+		t.Fatal("add-repo with a missing fetch ref succeeded")
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	mounts := len(m.mounts)
+	m.mu.Unlock()
+	if mounts != 0 {
+		t.Fatalf("the daemon mounted a never-prepared repo %d times", mounts)
+	}
+	st, err := svc.ctl().Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LastErrorPhase != phaseMount || !strings.Contains(st.LastError, "repo prepare failed") {
+		t.Fatalf("status = %+v, want the refused mount", st)
+	}
+}
+
+// A preparation canceled after it moved the index restores the index to
+// HEAD, so the git dir stays consistent for the next preparation.
+func TestCanceledPreparationRestoresTheIndex(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	runCmd(t, "git", "init", "--initial-branch", "main", remote)
+	base := commitFile(t, remote, "README.md", "main\n")
+	clone := filepath.Join(tmp, "clone")
+	runCmd(t, "git", "clone", remote, clone)
+	commitFile(t, remote, "ADVANCED.md", "advanced\n")
+	gitDir := filepath.Join(clone, ".git")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The branch update after the index moved hangs until the preparation is
+	// canceled.
+	blocked := filepath.Join(tmp, "update-ref-blocked")
+	script := "#!/bin/sh\nif [ \"$1\" = update-ref ] && [ ! -e \"$AFS_BLOCKED\" ]; then\n  : > \"$AFS_BLOCKED\"\n  sleep 60\n  exit 1\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AFS_REAL_GIT", realGit)
+	t.Setenv("AFS_BLOCKED", blocked)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = svc.Close()
+		}
+	}()
+	svc.mount = (&recordingMount{}).mount
+	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{Name: "repo", RemoteURL: "file://" + remote, Branch: "main", GitDir: gitDir, Enabled: true}, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, nil, func() bool {
+		_, err := os.Stat(blocked)
+		return err == nil
+	})
+	// Stopping the daemon cancels the preparation.
+	closed = true
+	if err := svc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(gitDir, "index.lock")); err == nil {
+		t.Fatal("the canceled preparation left index.lock")
+	}
+	if head := strings.TrimSpace(runCmdOutput(t, realGit, "--git-dir", gitDir, "rev-parse", "HEAD")); head != base {
+		t.Fatalf("HEAD = %s, want %s", head, base)
+	}
+	if staged := runCmdOutput(t, realGit, "--git-dir", gitDir, "diff-index", "--cached", "--name-only", "HEAD"); staged != "" {
+		t.Fatalf("the index differs from HEAD in %q", staged)
+	}
+}
