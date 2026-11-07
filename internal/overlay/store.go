@@ -114,7 +114,7 @@ var _ model.OverlayStore = (*Store)(nil)
 
 type Store struct {
 	db       *sql.DB
-	repo     model.RepoConfig
+	repo     model.RepoPaths
 	upperDir string
 	mu       sync.Mutex
 	// pending holds the files written since their last commit. It changes
@@ -127,7 +127,7 @@ type Store struct {
 	reconcileMu sync.Mutex
 }
 
-func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
+func New(ctx context.Context, cfg model.RepoPaths) (*Store, error) {
 	db, err := meta.OpenDB(cfg.OverlayDBPath)
 	if err != nil {
 		return nil, err
@@ -246,7 +246,7 @@ func (s *Store) lookupCommitted(ctx context.Context, path string) (model.Overlay
 	return e, true, nil
 }
 
-func (s *Store) EnsureCopyOnWrite(ctx context.Context, repo model.RepoConfig, path string, base model.BaseNode) (model.OverlayEntry, error) {
+func (s *Store) EnsureCopyOnWrite(ctx context.Context, repo model.RepoPaths, path string, base model.BaseNode) (model.OverlayEntry, error) {
 	var src *os.File
 	if base.ObjectOID != "" {
 		var err error
@@ -259,7 +259,7 @@ func (s *Store) EnsureCopyOnWrite(ctx context.Context, repo model.RepoConfig, pa
 	return s.EnsureCopyOnWriteFrom(ctx, repo, path, base, src)
 }
 
-func (s *Store) EnsureCopyOnWriteFrom(ctx context.Context, _ model.RepoConfig, path string, base model.BaseNode, src *os.File) (model.OverlayEntry, error) {
+func (s *Store) EnsureCopyOnWriteFrom(ctx context.Context, _ model.RepoPaths, path string, base model.BaseNode, src *os.File) (model.OverlayEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.flushAllLocked(ctx); err != nil {
@@ -1560,7 +1560,7 @@ type Changes struct {
 // ReadChangesSince reads the change log of an existing overlay database
 // without the migrations that New runs, so it never takes the write lock. ok is false when the database, its change log or a trigger that
 // feeds the log is missing.
-func ReadChangesSince(ctx context.Context, cfg model.RepoConfig, since int64) (changes Changes, ok bool, err error) {
+func ReadChangesSince(ctx context.Context, cfg model.RepoPaths, since int64) (changes Changes, ok bool, err error) {
 	if _, err := os.Stat(cfg.OverlayDBPath); errors.Is(err, os.ErrNotExist) {
 		return Changes{}, false, nil
 	} else if err != nil {

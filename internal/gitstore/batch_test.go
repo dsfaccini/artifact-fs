@@ -31,7 +31,7 @@ func TestBlobToCacheBinarySafe(t *testing.T) {
 	run(t, "git", "-C", repo, "add", "file.txt")
 	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
 
-	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git"), BlobCacheDir: filepath.Join(tmp, "cache")}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git"), BlobCacheDir: filepath.Join(tmp, "cache")}}
 	store := New(nil)
 	ctx := context.Background()
 	oid, _, _ := store.ResolveHEAD(ctx, cfg)
@@ -46,7 +46,7 @@ func TestBlobToCacheBinarySafe(t *testing.T) {
 		t.Fatal("no blob OID found")
 	}
 	dst := filepath.Join(tmp, "cache", blobOID)
-	size, err := store.BlobToCache(ctx, cfg, blobOID, dst)
+	size, err := store.BlobToCache(ctx, cfg.RepoPaths, blobOID, dst)
 	if err != nil {
 		t.Fatalf("BlobToCache: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestFetchMissingBlobsRequestsOnlyMissingObjects(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
 	files := map[string]string{"a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n", "d.txt": "d\n"}
-	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: gittest.PartialCloneRemote(t, files), Branch: "main"}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: gittest.PartialCloneRemote(t, files), Branch: "main"}}
 	store := New(nil)
 	defer store.Close()
 	ctx := context.Background()
@@ -75,12 +75,12 @@ func TestFetchMissingBlobsRequestsOnlyMissingObjects(t *testing.T) {
 		oids = append(oids, strings.TrimSpace(runOutput(t, "git", "--git-dir", cfg.GitDir, "rev-parse", "HEAD:"+name)))
 	}
 	config := runOutput(t, "git", "--git-dir", cfg.GitDir, "config", "--list", "--local")
-	if err := store.FetchMissingBlobs(ctx, cfg, oids[:2]); err != nil {
+	if err := store.FetchMissingBlobs(ctx, cfg.RepoPaths, oids[:2]); err != nil {
 		t.Fatalf("FetchMissingBlobs(a, b): %v", err)
 	}
 	packed := packedObjects(t, cfg.GitDir)
 
-	if err := store.FetchMissingBlobs(ctx, cfg, oids); err != nil {
+	if err := store.FetchMissingBlobs(ctx, cfg.RepoPaths, oids); err != nil {
 		t.Fatalf("FetchMissingBlobs(a, b, c, d): %v", err)
 	}
 	// A fetch that also asked for a and b would download them again.
@@ -122,7 +122,7 @@ func TestFetchMissingBlobsLogsEveryFailureButACancel(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tmp := t.TempDir()
-			cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: gittest.PartialCloneRemote(t, map[string]string{"a.txt": "a\n", "b.txt": "b\n"}), Branch: "main"}
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: gittest.PartialCloneRemote(t, map[string]string{"a.txt": "a\n", "b.txt": "b\n"}), Branch: "main"}}
 			var logs bytes.Buffer
 			store := New(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
 			defer store.Close()
@@ -150,7 +150,7 @@ func TestFetchMissingBlobsLogsEveryFailureButACancel(t *testing.T) {
 			ctx, cancel := tt.context(marker)
 			defer cancel()
 
-			err := store.FetchMissingBlobs(ctx, cfg, oids)
+			err := store.FetchMissingBlobs(ctx, cfg.RepoPaths, oids)
 			if err == nil || tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
 				t.Fatalf("FetchMissingBlobs error = %v, want %v", err, tt.wantErr)
 			}
@@ -207,7 +207,7 @@ func failedFetchMissingBlobs(t *testing.T, stderrScript string) (string, error) 
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	defer store.Close()
-	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: filepath.Join(tmp, "repo.git")}
+	cfg := model.RepoPaths{ID: "x", Name: "x", GitDir: filepath.Join(tmp, "repo.git")}
 	err := store.FetchMissingBlobs(context.Background(), cfg, []string{strings.Repeat("a", 40), strings.Repeat("b", 40)})
 	if err == nil {
 		t.Fatal("FetchMissingBlobs succeeded against a fetch that fails")
@@ -247,7 +247,7 @@ func TestFetchMissingBlobsKeepsRemoteConfigWhenOriginIsNotThePromisor(t *testing
 	store := New(nil)
 	defer store.Close()
 
-	if err := store.FetchMissingBlobs(context.Background(), model.RepoConfig{ID: "x", Name: "x", GitDir: gitDir}, oids); err != nil {
+	if err := store.FetchMissingBlobs(context.Background(), model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}, oids); err != nil {
 		t.Fatalf("FetchMissingBlobs: %v", err)
 	}
 	// A filtered fetch from origin would record origin as a promisor.
@@ -334,7 +334,7 @@ func TestFetchMissingBlobsKeepsRemoteConfigWhenAnEarlierRemoteIsNotAPromisor(t *
 	store := New(nil)
 	defer store.Close()
 
-	if err := store.FetchMissingBlobs(context.Background(), model.RepoConfig{ID: "x", Name: "x", GitDir: gitDir}, oids); err != nil {
+	if err := store.FetchMissingBlobs(context.Background(), model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}, oids); err != nil {
 		t.Fatalf("FetchMissingBlobs: %v", err)
 	}
 	// A filtered fetch from a would record a as a promisor.
@@ -371,7 +371,7 @@ func TestVerifyBlobHashesWithoutGit(t *testing.T) {
 				t.Fatal(err)
 			}
 			oid := strings.TrimSpace(runOutput(t, "git", "-C", repo, "hash-object", "-w", "--no-filters", cachePath))
-			cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+			cfg := model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}
 			trace := filepath.Join(tmp, "git-trace")
 			t.Setenv("GIT_TRACE", trace)
 			store := New(nil)
@@ -404,7 +404,7 @@ func TestBlobToCacheHonorsCanceledContext(t *testing.T) {
 	run(t, "git", "-C", repo, "add", "file.txt")
 	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
 
-	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git"), BlobCacheDir: filepath.Join(tmp, "cache")}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git"), BlobCacheDir: filepath.Join(tmp, "cache")}}
 	store := New(nil)
 	oid, _, err := store.ResolveHEAD(context.Background(), cfg)
 	if err != nil {
@@ -426,7 +426,7 @@ func TestBlobToCacheHonorsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	dst := filepath.Join(tmp, "cache", blobOID)
-	_, err = store.BlobToCache(ctx, cfg, blobOID, dst)
+	_, err = store.BlobToCache(ctx, cfg.RepoPaths, blobOID, dst)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
@@ -444,7 +444,7 @@ func TestReadBlobRespectsMaxBytes(t *testing.T) {
 	run(t, "git", "-C", repo, "add", "file.txt")
 	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
 
-	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
 	store := New(nil)
 	ctx := context.Background()
 	oid, _, _ := store.ResolveHEAD(ctx, cfg)
@@ -459,18 +459,18 @@ func TestReadBlobRespectsMaxBytes(t *testing.T) {
 		t.Fatal("no blob OID found")
 	}
 
-	data, err := store.ReadBlob(ctx, cfg, blobOID, 5)
+	data, err := store.ReadBlob(ctx, cfg.RepoPaths, blobOID, 5)
 	if err != nil {
 		t.Fatalf("ReadBlob at limit: %v", err)
 	}
 	if string(data) != "line\n" {
 		t.Fatalf("data = %q, want line\\n", data)
 	}
-	_, err = store.ReadBlob(ctx, cfg, blobOID, 4)
+	_, err = store.ReadBlob(ctx, cfg.RepoPaths, blobOID, 4)
 	if !errors.Is(err, model.ErrBlobTooLarge) {
 		t.Fatalf("err = %v, want ErrBlobTooLarge", err)
 	}
-	data, err = store.ReadBlob(ctx, cfg, blobOID, 5)
+	data, err = store.ReadBlob(ctx, cfg.RepoPaths, blobOID, 5)
 	if err != nil {
 		t.Fatalf("ReadBlob after oversized read: %v", err)
 	}
@@ -517,7 +517,7 @@ func TestBlobToCacheLogsLazyFetchStderrWithoutPrompting(t *testing.T) {
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cfg := model.RepoConfig{ID: "x", GitDir: gitDir}
+	cfg := model.RepoPaths{ID: "x", GitDir: gitDir}
 	if _, err := store.BlobToCache(ctx, cfg, blobOID, filepath.Join(tmp, "cache", blobOID)); err == nil {
 		t.Fatal("BlobToCache fetched a blob the promisor remote refused")
 	}
@@ -536,7 +536,7 @@ func TestBuildTreeIndexLazyTreeFetchDoesNotPrompt(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_, err := New(nil).BuildTreeIndex(ctx, model.RepoConfig{ID: "x", GitDir: gitDir}, commit)
+	_, err := New(nil).BuildTreeIndex(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: gitDir}}, commit)
 	if err == nil || !strings.Contains(err.Error(), "terminal prompts disabled") {
 		t.Fatalf("BuildTreeIndex error = %v, want the lazy tree fetch's non-interactive failure", err)
 	}
@@ -546,7 +546,7 @@ func TestBuildTreeIndexLazyTreeFetchDoesNotPrompt(t *testing.T) {
 func TestCloneBloblessNonInteractiveSkipsSSHAskpass(t *testing.T) {
 	askpassRuns := isolateLazyFetchEnv(t)
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{Name: "repo", GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: unauthorizedRemote(t), Branch: "main"}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: unauthorizedRemote(t), Branch: "main"}}
 	err := New(slog.New(slog.NewTextHandler(io.Discard, nil))).CloneBloblessNonInteractive(context.Background(), cfg)
 	if err == nil || !strings.Contains(err.Error(), "terminal prompts disabled") {
 		t.Fatalf("CloneBloblessNonInteractive error = %v, want a non-interactive failure", err)
@@ -703,7 +703,7 @@ func batchStderrLogs(t *testing.T, stderrScript string) string {
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	oid := strings.Repeat("a", 40)
-	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(tmp, "repo.git")}
+	cfg := model.RepoPaths{ID: "x", GitDir: filepath.Join(tmp, "repo.git")}
 	if _, err := store.BlobToCache(context.Background(), cfg, oid, filepath.Join(tmp, "cache", oid)); err == nil {
 		t.Fatal("BlobToCache succeeded for a missing blob")
 	}
@@ -731,7 +731,7 @@ func TestBlobToCacheRemovesDstAfterAFailedWrite(t *testing.T) {
 	if err := os.WriteFile(dst, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(tmp, "repo.git")}
+	cfg := model.RepoPaths{ID: "x", GitDir: filepath.Join(tmp, "repo.git")}
 	if _, err := store.BlobToCache(context.Background(), cfg, strings.Repeat("a", 40), dst); err == nil {
 		t.Fatal("BlobToCache succeeded on a cut-short blob")
 	}

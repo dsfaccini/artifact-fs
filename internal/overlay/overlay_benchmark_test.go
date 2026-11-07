@@ -11,7 +11,7 @@ import (
 
 func benchStore(b *testing.B) *Store {
 	dir := b.TempDir()
-	s, err := New(context.Background(), model.RepoConfig{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
+	s, err := New(context.Background(), model.RepoPaths{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
 	if err != nil {
 		b.Fatal(err)
 	}

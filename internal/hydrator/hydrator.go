@@ -109,7 +109,7 @@ func (s *Service) signalWork() {
 // Start recounts repo's blob cache, moving blobs of the flat layout into
 // shards, then starts workers. A failed recount leaves the counters to the
 // next install or status, which recount them when they are missing.
-func (s *Service) Start(workers int, repo model.RepoConfig) {
+func (s *Service) Start(workers int, repo model.RepoPaths) {
 	s.mu.Lock()
 	if s.started || s.stopped {
 		s.mu.Unlock()
@@ -201,7 +201,7 @@ func (s *Service) enqueueLocked(task model.HydrationTask) bool {
 	return true
 }
 
-func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, node model.BaseNode) (cachePath string, size int64, err error) {
+func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoPaths, node model.BaseNode) (cachePath string, size int64, err error) {
 	cachePath = cachePathFor(repo, node.ObjectOID)
 	key := taskKey(repo.ID, node.ObjectOID)
 	s.mu.Lock()
@@ -290,7 +290,7 @@ func (s *Service) awaitHydration(ctx context.Context, key string, ch chan result
 	}
 }
 
-func (s *Service) OpenHydrated(ctx context.Context, repo model.RepoConfig, node model.BaseNode) (*os.File, int64, error) {
+func (s *Service) OpenHydrated(ctx context.Context, repo model.RepoPaths, node model.BaseNode) (*os.File, int64, error) {
 	key := taskKey(repo.ID, node.ObjectOID)
 	for {
 		cachePath, size, err := s.EnsureHydrated(ctx, repo, node)
@@ -324,7 +324,7 @@ func (s *Service) OpenHydrated(ctx context.Context, repo model.RepoConfig, node 
 	}
 }
 
-func (s *Service) ReadBlob(ctx context.Context, repo model.RepoConfig, node model.BaseNode, maxBytes int64) ([]byte, error) {
+func (s *Service) ReadBlob(ctx context.Context, repo model.RepoPaths, node model.BaseNode, maxBytes int64) ([]byte, error) {
 	if maxBytes < 0 {
 		return nil, fmt.Errorf("negative max bytes: %d", maxBytes)
 	}
@@ -397,7 +397,7 @@ func readCachedBlobFrom(f *os.File, size int64, maxBytes int64) ([]byte, error) 
 	return data, nil
 }
 
-func (s *Service) validateCachedBlob(ctx context.Context, repo model.RepoConfig, cachePath string, node model.BaseNode) (size int64, ok bool, err error) {
+func (s *Service) validateCachedBlob(ctx context.Context, repo model.RepoPaths, cachePath string, node model.BaseNode) (size int64, ok bool, err error) {
 	st, err := os.Stat(cachePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -557,7 +557,7 @@ func (s *Service) runVerification(key string, file os.FileInfo, cachePath string
 	notifyWaiters(waiters, r)
 }
 
-func (s *Service) worker(repo model.RepoConfig, reserved bool) {
+func (s *Service) worker(repo model.RepoPaths, reserved bool) {
 	ready := s.workReady
 	if reserved {
 		ready = s.reservedReady
@@ -584,7 +584,7 @@ func (s *Service) worker(repo model.RepoConfig, reserved bool) {
 // batch and fetches its missing blobs together. Returns true if it popped an
 // item, false if the queue was empty or, for the reserved worker, held only
 // prefetch work that downloads.
-func (s *Service) step(repo model.RepoConfig, reserved bool) bool {
+func (s *Service) step(repo model.RepoPaths, reserved bool) bool {
 	s.mu.Lock()
 	// Everything the reserved worker may take ranks above prefetch downloads,
 	// so the top of the queue decides.
@@ -637,7 +637,7 @@ func (s *Service) popBatchLocked() []model.HydrationTask {
 // fetchBatch finishes the batch's verified cache hits and handles the tasks
 // that need no fetch, then fetches the missing blobs with one fetch and
 // requeues them, so every worker can copy them in priority order.
-func (s *Service) fetchBatch(repo model.RepoConfig, batch []model.HydrationTask) {
+func (s *Service) fetchBatch(repo model.RepoPaths, batch []model.HydrationTask) {
 	var local, missing []model.HydrationTask
 	for _, task := range batch {
 		key := taskKey(task.RepoID, task.ObjectOID)
@@ -731,7 +731,7 @@ func (s *Service) takeQueued(key string) bool {
 
 // hydrate serves task from a valid cached blob, or else copies the blob into
 // the cache, fetching it if it is still missing.
-func (s *Service) hydrate(repo model.RepoConfig, task model.HydrationTask) {
+func (s *Service) hydrate(repo model.RepoPaths, task model.HydrationTask) {
 	key := taskKey(task.RepoID, task.ObjectOID)
 	cachePath := cachePathFor(repo, task.ObjectOID)
 	if size, ok, err := s.validateCachedBlob(context.Background(), repo, cachePath, taskBaseNode(task)); err != nil {
@@ -823,7 +823,7 @@ func taskKey(repoID model.RepoID, oid string) string {
 	return string(repoID) + ":" + oid
 }
 
-func cachePathFor(repo model.RepoConfig, oid string) string {
+func cachePathFor(repo model.RepoPaths, oid string) string {
 	return blobcache.Path(repo.BlobCacheDir, oid)
 }
 

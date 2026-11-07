@@ -196,15 +196,21 @@ func newAsyncPreparedE2ERepo(t *testing.T, preparedGitDir string, fetchRef strin
 	ctl := newE2EController(t, root)
 
 	cfg := model.RepoConfig{
-		Name:            repoName,
-		ID:              model.RepoID(repoName),
-		Branch:          "main",
-		RefreshInterval: 5 * time.Minute,
-		MountRoot:       mountDir,
-		GitDir:          preparedGitDir,
-		PreparedGitDir:  true,
-		FetchRef:        fetchRef,
-		Enabled:         true,
+		RepoPaths: model.RepoPaths{
+			Name:      repoName,
+			ID:        model.RepoID(repoName),
+			MountRoot: mountDir,
+			GitDir:    preparedGitDir,
+		},
+		RepoSpec: model.RepoSpec{
+			Branch:         "main",
+			PreparedGitDir: true,
+			FetchRef:       fetchRef,
+		},
+		RefreshPolicy: model.RefreshPolicy{
+			RefreshInterval: 5 * time.Minute,
+		},
+		Enabled: true,
 	}
 	if err := ctl.AddRepoWithOptions(ctx, cfg, daemon.AddRepoOptions{Async: true}); err != nil {
 		cancel()

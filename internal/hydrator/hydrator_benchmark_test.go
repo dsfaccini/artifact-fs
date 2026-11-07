@@ -37,7 +37,7 @@ func BenchmarkAsyncHydration(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: b.TempDir()}
+		cfg := model.RepoPaths{ID: "repo", BlobCacheDir: b.TempDir()}
 		fetcher := &fakeBlobFetcher{payload: payload}
 		h := New(fetcher)
 		h.Start(hydratorWorkers, cfg)
@@ -88,7 +88,7 @@ func BenchmarkAsyncHydrationDuplicateReads(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: b.TempDir()}
+		cfg := model.RepoPaths{ID: "repo", BlobCacheDir: b.TempDir()}
 		fetcher := &fakeBlobFetcher{payload: payload, fetchDelay: 100 * time.Microsecond}
 		h := New(fetcher)
 		h.Start(hydratorWorkers, cfg)
@@ -122,7 +122,7 @@ func BenchmarkQueuedDuplicatePrefetch(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: b.TempDir()}
+		cfg := model.RepoPaths{ID: "repo", BlobCacheDir: b.TempDir()}
 		fetcher := &fakeBlobFetcher{payload: payload}
 		h := New(fetcher)
 		for _, task := range tasks {
@@ -157,7 +157,7 @@ func BenchmarkQueuedCachedPrefetch(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: b.TempDir()}
+		cfg := model.RepoPaths{ID: "repo", BlobCacheDir: b.TempDir()}
 		if err := os.MkdirAll(cfg.BlobCacheDir, 0o755); err != nil {
 			b.Fatal(err)
 		}
@@ -200,7 +200,7 @@ func BenchmarkQueuedPrefetchWorkerRamp(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: b.TempDir()}
+		cfg := model.RepoPaths{ID: "repo", BlobCacheDir: b.TempDir()}
 		fetcher := &fakeBlobFetcher{payload: payload, fetchDelay: 10 * time.Millisecond}
 		h := New(fetcher)
 		for _, task := range tasks {
@@ -221,7 +221,7 @@ func BenchmarkAsyncHydrationGitStore(b *testing.B) {
 	)
 
 	workDir, gitDir := createBenchmarkGitRepo(b, objects)
-	cfg := model.RepoConfig{ID: "repo", GitDir: gitDir}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", GitDir: gitDir}}
 	git := gitstore.New(nil)
 	b.Cleanup(func() {
 		git.Close()
@@ -254,8 +254,8 @@ func BenchmarkAsyncHydrationGitStore(b *testing.B) {
 	for range b.N {
 		cfg.BlobCacheDir = b.TempDir()
 		h := New(git)
-		h.Start(hydratorWorkers, cfg)
-		hydrateBenchmarkNodes(b, h, cfg, targets, callerWorkers)
+		h.Start(hydratorWorkers, cfg.RepoPaths)
+		hydrateBenchmarkNodes(b, h, cfg.RepoPaths, targets, callerWorkers)
 		h.Stop()
 	}
 }
@@ -267,7 +267,7 @@ func BenchmarkAsyncHydrationGitStore(b *testing.B) {
 func BenchmarkSingleWorkerHydrationGitStore(b *testing.B) {
 	const objects = 2048
 	workDir, gitDir := createBenchmarkGitRepo(b, objects)
-	cfg := model.RepoConfig{ID: "repo", GitDir: gitDir}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", GitDir: gitDir}}
 	git := gitstore.New(nil)
 	b.Cleanup(func() {
 		git.Close()
@@ -299,14 +299,14 @@ func BenchmarkSingleWorkerHydrationGitStore(b *testing.B) {
 		b.StopTimer()
 		cfg.BlobCacheDir = b.TempDir()
 		h := New(git)
-		h.Start(1, cfg)
-		if _, _, err := h.EnsureHydrated(context.Background(), cfg, targets[0]); err != nil {
+		h.Start(1, cfg.RepoPaths)
+		if _, _, err := h.EnsureHydrated(context.Background(), cfg.RepoPaths, targets[0]); err != nil {
 			b.Fatal(err)
 		}
 		b.StartTimer()
 		start := time.Now()
 		for _, n := range targets[1:] {
-			if _, _, err := h.EnsureHydrated(context.Background(), cfg, n); err != nil {
+			if _, _, err := h.EnsureHydrated(context.Background(), cfg.RepoPaths, n); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -336,7 +336,7 @@ func BenchmarkPrefetchBloblessDir(b *testing.B) {
 		for i, n := range nodes {
 			tasks[i] = model.HydrationTask{RepoID: cfg.ID, Path: n.Path, ObjectOID: n.ObjectOID, SizeState: n.SizeState, Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()}
 		}
-		h.Start(4, cfg)
+		h.Start(4, cfg.RepoPaths)
 		b.StartTimer()
 		h.EnqueueBatch(tasks)
 		for range nodes {
@@ -364,9 +364,9 @@ func BenchmarkReadBloblessFiles(b *testing.B) {
 		git, cfg, nodes := cloneBenchmarkBlobless(b, remote)
 		packs := benchmarkPackCount(b, cfg.GitDir)
 		h := New(git)
-		h.Start(4, cfg)
+		h.Start(4, cfg.RepoPaths)
 		b.StartTimer()
-		hydrateBenchmarkNodes(b, h, cfg, nodes, callerWorkers)
+		hydrateBenchmarkNodes(b, h, cfg.RepoPaths, nodes, callerWorkers)
 		b.StopTimer()
 		h.Stop()
 		b.ReportMetric(float64(benchmarkPackCount(b, cfg.GitDir)-packs), "packs/op")
@@ -388,7 +388,7 @@ func createBenchmarkPartialCloneRemote(b *testing.B, blobs int) model.RepoConfig
 	bare := filepath.Join(b.TempDir(), "remote.git")
 	runBenchmarkGit(b, workDir, "clone", "-q", "--bare", workDir, bare)
 	runBenchmarkGit(b, bare, "config", "uploadpack.allowFilter", "true")
-	return model.RepoConfig{ID: "repo", Name: "repo", RemoteURL: "file://" + bare, Branch: strings.TrimSpace(string(branch))}
+	return model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + bare, Branch: strings.TrimSpace(string(branch))}}
 }
 
 func cloneBenchmarkBlobless(b *testing.B, remote model.RepoConfig) (*gitstore.Store, model.RepoConfig, []model.BaseNode) {
@@ -428,7 +428,7 @@ func benchmarkPackCount(b *testing.B, gitDir string) int {
 	return len(packs)
 }
 
-func hydrateBenchmarkNodes(b *testing.B, h *Service, cfg model.RepoConfig, nodes []model.BaseNode, callerWorkers int) {
+func hydrateBenchmarkNodes(b *testing.B, h *Service, cfg model.RepoPaths, nodes []model.BaseNode, callerWorkers int) {
 	b.Helper()
 	jobs := make(chan model.BaseNode)
 	var wg sync.WaitGroup

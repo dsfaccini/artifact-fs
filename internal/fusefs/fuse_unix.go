@@ -78,7 +78,6 @@ var _ AbandonedMount = (*fuse.AbandonedMountError)(nil)
 // is its only API to the merged view.
 type ArtifactFuse struct {
 	fuseutil.NotImplementedFileSystem
-	repo           model.RepoConfig
 	engine         *Engine
 	gitfileContent []byte    // synthesized .git gitfile, computed once
 	syntheticTime  time.Time // timestamps of synthesized entries; changing them can deadlock concurrent FSKit Git reads
@@ -218,9 +217,8 @@ func (e ReaddirEntry) direntType() fuseutil.DirentType {
 	}
 }
 
-func NewArtifactFuse(repo model.RepoConfig, engine *Engine) *ArtifactFuse {
+func NewArtifactFuse(repo model.RepoPaths, engine *Engine) *ArtifactFuse {
 	fs := &ArtifactFuse{
-		repo:           repo,
 		engine:         engine,
 		gitfileContent: fmt.Appendf(nil, "gitdir: %s\n", repo.GitDir),
 		syntheticTime:  time.Now(),
@@ -1668,15 +1666,15 @@ func (fs permissionCheckingFS) SetInodeAttributes(ctx context.Context, op *fuseo
 // Notifiers of two mount attempts apart.
 var newNotifier = fuse.NewNotifier
 
-// fuseErrorLog writes each line the fuse library logs to logger, with the
-// repo's remote redacted. A bug the library answered with EIO goes out as an
-// error. A short FSKit read the library answered with EIO goes out as a
-// warning. Any other op error, which the library logs for expected errnos such
-// as EEXIST too, goes out at Debug. Anything else, such as a failed reply,
-// goes out as a warning.
+// fuseErrorLog writes each line the fuse library logs to logger, redacted by
+// redact. A bug the library answered with EIO goes out as an error. A short
+// FSKit read the library answered with EIO goes out as a warning. Any other op
+// error, which the library logs for expected errnos such as EEXIST too, goes
+// out at Debug. Anything else, such as a failed reply, goes out as a warning.
 type fuseErrorLog struct {
 	logger *slog.Logger
-	repo   model.RepoConfig
+	repo   string
+	redact func(string) string
 }
 
 // fuseBugLine matches the op error lines the fuse library writes for a
@@ -1701,7 +1699,7 @@ func (l fuseErrorLog) Write(p []byte) (int, error) {
 	case strings.HasPrefix(msg, "Op "):
 		level = slog.LevelDebug
 	}
-	l.logger.Log(context.Background(), level, "fuse error", "repo", l.repo.Name, "error", auth.RedactLogString(msg, l.repo.RemoteURL))
+	l.logger.Log(context.Background(), level, "fuse error", "repo", l.repo, "error", l.redact(msg))
 	return len(p), nil
 }
 
@@ -1759,8 +1757,13 @@ func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileS
 // MountRepoWithGate mounts repo, gated by gate unless it is nil. ctx bounds
 // the wait for the mount: when it ends first, the error is an AbandonedMount.
 // opCtx is the parent of every op's context, so ending it cancels the ops in
-// flight.
-func MountRepoWithGate(ctx, opCtx context.Context, repo model.RepoConfig, engine *Engine, gate *ReadyGate, logger *slog.Logger) (MountedFS, error) {
+// flight. The fuse library's error lines go to logger, after redact removes
+// what a log must not show, such as the repo's remote. A nil redact
+// redacts only what auth.RedactLogString detects.
+func MountRepoWithGate(ctx, opCtx context.Context, repo model.RepoPaths, engine *Engine, gate *ReadyGate, logger *slog.Logger, redact func(string) string) (MountedFS, error) {
+	if redact == nil {
+		redact = func(msg string) string { return auth.RedactLogString(msg) }
+	}
 	backend, err := MountBackend()
 	if err != nil {
 		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
@@ -1771,7 +1774,7 @@ func MountRepoWithGate(ctx, opCtx context.Context, repo model.RepoConfig, engine
 		FSName:                  FSName(repo.Name),
 		Subtype:                 FSSubtype,
 		DisableWritebackCaching: true,
-		ErrorLogger:             log.New(fuseErrorLog{logger: logger, repo: repo}, "", 0),
+		ErrorLogger:             log.New(fuseErrorLog{logger: logger, repo: repo.Name, redact: redact}, "", 0),
 		OpContext:               opCtx,
 	}
 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.

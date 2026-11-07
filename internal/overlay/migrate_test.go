@@ -85,13 +85,13 @@ var legacyOverlays = map[string][]string{
 	"user_version 2": append(slices.Clone(overlayWithChangeLog), `CREATE TABLE IF NOT EXISTS overlay_pending (path TEXT PRIMARY KEY)`, `PRAGMA user_version = 2`),
 }
 
-func testConfig(t *testing.T) model.RepoConfig {
+func testConfig(t *testing.T) model.RepoPaths {
 	t.Helper()
 	dir := t.TempDir()
-	return model.RepoConfig{ID: "test", OverlayDir: filepath.Join(dir, "overlay"), OverlayDBPath: filepath.Join(dir, "overlay", "meta.sqlite")}
+	return model.RepoPaths{ID: "test", OverlayDir: filepath.Join(dir, "overlay"), OverlayDBPath: filepath.Join(dir, "overlay", "meta.sqlite")}
 }
 
-func openOverlay(cfg model.RepoConfig) func() (io.Closer, error) {
+func openOverlay(cfg model.RepoPaths) func() (io.Closer, error) {
 	return func() (io.Closer, error) { return New(context.Background(), cfg) }
 }
 

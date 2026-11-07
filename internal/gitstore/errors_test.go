@@ -48,7 +48,7 @@ func TestBuildTreeIndexDropsPartialTokenAtLazyFetchStderrBound(t *testing.T) {
 		"gcrypt::rsync://alice:s3cretpassword@example.invalid/repo.git",
 	} {
 		fakeGitStderrBoundInsidePassword(t, remote)
-		_, err := New(nil).BuildTreeIndex(context.Background(), model.RepoConfig{ID: "repo", GitDir: t.TempDir()}, strings.Repeat("a", 40))
+		_, err := New(nil).BuildTreeIndex(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", GitDir: t.TempDir()}}, strings.Repeat("a", 40))
 		if err == nil || strings.Contains(err.Error(), "s3cr") {
 			t.Errorf("BuildTreeIndex error for %s = ...%q, want a failure without the partial password", remote, errorTail(err))
 		}
@@ -57,7 +57,7 @@ func TestBuildTreeIndexDropsPartialTokenAtLazyFetchStderrBound(t *testing.T) {
 
 func TestResolveHEADDropsPartialTokenAtStderrBound(t *testing.T) {
 	fakeGitStderrBoundInsidePassword(t, "https://alice:s3cretpassword@example.invalid/repo.git")
-	_, _, err := New(nil).ResolveHEAD(context.Background(), model.RepoConfig{ID: "repo", GitDir: t.TempDir()})
+	_, _, err := New(nil).ResolveHEAD(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", GitDir: t.TempDir()}})
 	if err == nil || strings.Contains(err.Error(), "s3cr") {
 		t.Errorf("ResolveHEAD error = ...%q, want a failure without the partial password", errorTail(err))
 	}

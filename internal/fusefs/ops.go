@@ -33,7 +33,7 @@ const maxPrefetchTasksPerDir = 256
 // for the new blob.
 type Engine struct {
 	Resolver *Resolver
-	Repo     model.RepoConfig
+	Repo     model.RepoPaths
 	Overlay  model.OverlayStore
 	Hydrator model.Hydrator
 

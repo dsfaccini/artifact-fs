@@ -98,12 +98,14 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 	runCmd(t, "git", "-C", workDir, "update-ref", "refs/heads/main", oldOID)
 
 	cfg := model.RepoConfig{
-		ID:            "repro",
-		Name:          "repro",
-		GitDir:        filepath.Join(workDir, ".git"),
-		OverlayDir:    filepath.Join(root, "overlay"),
-		OverlayDBPath: filepath.Join(root, "overlay", "meta.sqlite"),
-		MetaDBPath:    filepath.Join(root, "snapshot.sqlite"),
+		RepoPaths: model.RepoPaths{
+			ID:            "repro",
+			Name:          "repro",
+			GitDir:        filepath.Join(workDir, ".git"),
+			OverlayDir:    filepath.Join(root, "overlay"),
+			OverlayDBPath: filepath.Join(root, "overlay", "meta.sqlite"),
+			MetaDBPath:    filepath.Join(root, "snapshot.sqlite"),
+		},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	logs := &lockedBuffer{}
@@ -125,7 +127,7 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 		_ = snap.Close()
 		t.Fatal(err)
 	}
-	ov, err := overlay.New(ctx, cfg)
+	ov, err := overlay.New(ctx, cfg.RepoPaths)
 	if err != nil {
 		cancel()
 		_ = snap.Close()
@@ -287,7 +289,7 @@ func TestHeadReconcileRetriesTransientOverlayFailureWithoutRepublishing(t *testi
 
 	f.signal()
 	f.waitForLog("overlay reconcile failed")
-	recovered, err := overlay.New(f.ctx, f.rt.cfg)
+	recovered, err := overlay.New(f.ctx, f.rt.cfg.RepoPaths)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +356,7 @@ func TestHeadReconcileRestoresPersistedStateWhenHEADReturnsAfterOverlayFailure(t
 		t.Fatalf("snapshot before rollback = %s/%d, want %s/%d", storedOID, storedGen, f.nextOID, f.oldGen+1)
 	}
 	f.waitForHead(f.oldOID, "main", f.oldGen)
-	recovered, err := overlay.New(f.ctx, f.rt.cfg)
+	recovered, err := overlay.New(f.ctx, f.rt.cfg.RepoPaths)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,9 +497,9 @@ func TestHeadReconcileServesReadsMatchingReportedSize(t *testing.T) {
 	repo := f.rt.cfg
 	repo.BlobCacheDir = t.TempDir()
 	h := hydrator.New(f.svc.git)
-	h.Start(1, repo)
+	h.Start(1, repo.RepoPaths)
 	t.Cleanup(h.Stop)
-	fs := fusefs.NewArtifactFuse(repo, &fusefs.Engine{Resolver: f.rt.resolver, Repo: repo, Overlay: f.rt.overlay, Hydrator: h})
+	fs := fusefs.NewArtifactFuse(repo.RepoPaths, &fusefs.Engine{Resolver: f.rt.resolver, Repo: repo.RepoPaths, Overlay: f.rt.overlay, Hydrator: h})
 	open := func(inode fuseops.InodeID) fuseops.HandleID {
 		t.Helper()
 		op := &fuseops.OpenFileOp{Inode: inode}
@@ -594,9 +596,9 @@ func TestHeadReconcileKeepsRetiredGenerationReadable(t *testing.T) {
 			repo := f.rt.cfg
 			repo.BlobCacheDir = t.TempDir()
 			h := hydrator.New(f.svc.git)
-			h.Start(1, repo)
+			h.Start(1, repo.RepoPaths)
 			t.Cleanup(h.Stop)
-			fs := fusefs.NewArtifactFuse(repo, &fusefs.Engine{Resolver: f.rt.resolver, Repo: repo, Overlay: f.rt.overlay, Hydrator: h})
+			fs := fusefs.NewArtifactFuse(repo.RepoPaths, &fusefs.Engine{Resolver: f.rt.resolver, Repo: repo.RepoPaths, Overlay: f.rt.overlay, Hydrator: h})
 			lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "README.md"}
 			if err := fs.LookUpInode(f.ctx, lookup); err != nil {
 				t.Fatalf("LookUpInode: %v", err)

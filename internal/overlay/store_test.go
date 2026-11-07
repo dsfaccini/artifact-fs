@@ -19,10 +19,10 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
-func testStore(t *testing.T) (*Store, model.RepoConfig) {
+func testStore(t *testing.T) (*Store, model.RepoPaths) {
 	t.Helper()
 	dir := t.TempDir()
-	cfg := model.RepoConfig{
+	cfg := model.RepoPaths{
 		ID:            "test",
 		Name:          "test",
 		OverlayDir:    filepath.Join(dir, "overlay"),
@@ -38,7 +38,7 @@ func testStore(t *testing.T) (*Store, model.RepoConfig) {
 	return s, cfg
 }
 
-func cacheTestBlob(t *testing.T, cfg model.RepoConfig, oid string) {
+func cacheTestBlob(t *testing.T, cfg model.RepoPaths, oid string) {
 	t.Helper()
 	if err := os.WriteFile(cachedBlobPath(t, cfg, oid), []byte("base"), 0o644); err != nil {
 		t.Fatal(err)
@@ -1491,7 +1491,7 @@ func TestSetMtime(t *testing.T) {
 	}
 }
 
-func changesSince(t *testing.T, cfg model.RepoConfig, since int64) Changes {
+func changesSince(t *testing.T, cfg model.RepoPaths, since int64) Changes {
 	t.Helper()
 	changes, ok, err := ReadChangesSince(context.Background(), cfg, since)
 	if err != nil || !ok {
@@ -2154,7 +2154,7 @@ func TestReadOnlyModeFileAcceptsWrites(t *testing.T) {
 }
 
 // cachedBlobPath returns oid's blob cache path, with its shard created.
-func cachedBlobPath(t *testing.T, cfg model.RepoConfig, oid string) string {
+func cachedBlobPath(t *testing.T, cfg model.RepoPaths, oid string) string {
 	t.Helper()
 	path := blobcache.Path(cfg.BlobCacheDir, oid)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

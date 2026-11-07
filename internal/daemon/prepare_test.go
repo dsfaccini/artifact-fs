@@ -24,7 +24,7 @@ type recordingMount struct {
 	gates  []*fusefs.ReadyGate
 }
 
-func (m *recordingMount) mount(_, _ context.Context, _ model.RepoConfig, _ *fusefs.Engine, gate *fusefs.ReadyGate, _ *slog.Logger) (fusefs.MountedFS, error) {
+func (m *recordingMount) mount(_, _ context.Context, _ model.RepoPaths, _ *fusefs.Engine, gate *fusefs.ReadyGate, _ *slog.Logger, _ func(string) string) (fusefs.MountedFS, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	mfs := &fakeMountedFS{unmounted: make(chan struct{})}
@@ -119,12 +119,12 @@ func TestSetRefreshDuringPrepareActivationOpensGate(t *testing.T) {
 	defer svc.Close()
 	m := &recordingMount{}
 	svc.mount = m.mount
-	cfg := model.RepoConfig{Name: "repo", Branch: "master", RefreshInterval: time.Minute, GitDir: gitDir, PreparedGitDir: true, FetchRef: "master", Enabled: true}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: gitDir}, RepoSpec: model.RepoSpec{Branch: "master", PreparedGitDir: true, FetchRef: "master"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Minute}, Enabled: true}
 	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	svc.readyRecorded = func() {
-		if err := svc.ctl().SetRefresh(ctx, cfg.Name, 0, true); err != nil {
+		if err := svc.ctl().SetRefresh(ctx, cfg.Name, model.RefreshPolicy{RemoteRefreshDisabled: true}); err != nil {
 			t.Errorf("set-refresh: %v", err)
 		}
 	}
@@ -181,7 +181,7 @@ func TestPrepareOnReadyVerifiedRepoKeepsItsMount(t *testing.T) {
 			defer func() { _ = svc.Close() }()
 			m := &recordingMount{}
 			svc.mount = m.mount
-			cfg := model.RepoConfig{Name: "verified", RemoteURL: "file://" + remote, Branch: "refs/heads/main", RequiredCommit: commit, HistoryDepth: 1, RefreshInterval: time.Hour, Enabled: true}
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "verified"}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + remote, Branch: "refs/heads/main", RequiredCommit: commit, HistoryDepth: 1}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Hour}, Enabled: true}
 			if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 				t.Fatal(err)
 			}
@@ -297,7 +297,7 @@ func TestAddRepoStoresAbsolutePaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ctl.Close()
-	cfg := model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/repo.git", MountRoot: "mnt", BlobCacheDir: "cache", GitDir: "git", Enabled: true}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", MountRoot: "mnt", BlobCacheDir: "cache", GitDir: "git"}, RepoSpec: model.RepoSpec{RemoteURL: "https://example.com/repo.git"}, Enabled: true}
 	if err := ctl.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +327,7 @@ func TestAddRepoReadsOriginPrefixedRefAsBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer svc.Close()
-	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "origin/feature", Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "origin/feature"}, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := svc.registry.GetRepo(ctx, "repo")
@@ -354,7 +354,7 @@ func TestAddRepoSyncFreshCloneServesFetchRef(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer svc.Close()
-	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", FetchRef: "feature", Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main", FetchRef: "feature"}, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := svc.registry.GetRepo(ctx, "repo")
@@ -403,7 +403,7 @@ func TestPrepareCancelsTheAsyncPreparationItSupersedes(t *testing.T) {
 	defer svc.Close()
 	m := &recordingMount{}
 	svc.mount = m.mount
-	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.invalid/repo.git", Branch: "main", Enabled: true}, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: "https://example.invalid/repo.git", Branch: "main"}, Enabled: true}, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.syncRepos(ctx); err != nil {
@@ -486,7 +486,7 @@ func TestMountRefusesASyncRepoWhoseFirstPrepareFailed(t *testing.T) {
 	m := &recordingMount{}
 	svc.mount = m.mount
 	// The clone succeeds, then the fetch of a ref the remote lacks fails.
-	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", FetchRef: "missing", Enabled: true}); err == nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main", FetchRef: "missing"}, Enabled: true}); err == nil {
 		t.Fatal("add-repo with a missing fetch ref succeeded")
 	}
 	if err := svc.syncRepos(ctx); err != nil {
@@ -550,7 +550,7 @@ func TestCanceledPreparationRestoresTheIndex(t *testing.T) {
 		}
 	}()
 	svc.mount = (&recordingMount{}).mount
-	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{Name: "repo", RemoteURL: "file://" + remote, Branch: "main", GitDir: gitDir, Enabled: true}, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: gitDir}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + remote, Branch: "main"}, Enabled: true}, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.syncRepos(ctx); err != nil {

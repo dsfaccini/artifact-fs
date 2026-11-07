@@ -19,8 +19,8 @@ import (
 
 // mountFunc mounts a repo's filesystem. ctx bounds the wait for the mount,
 // and opCtx is the parent of every op's context. A nil gate mounts it
-// ungated. The fuse library logs its errors to the logger.
-type mountFunc func(ctx, opCtx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error)
+// ungated. The fuse library logs its errors to the logger, redacted by redact.
+type mountFunc func(ctx, opCtx context.Context, repo model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error)
 
 // defaultMount is what New installs as Service.mount, and defaultUnmountPath
 // what it installs as Service.unmountPath. Package tests replace both so they
@@ -114,7 +114,7 @@ func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *pre
 			return err
 		}
 	}
-	ov, err := overlay.New(prepareCtx, cfg)
+	ov, err := overlay.New(prepareCtx, cfg.RepoPaths)
 	if err != nil {
 		return err
 	}
@@ -176,7 +176,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		return err
 	}
 	headOID, headRef, gen, _ := snap.ReadState(ctx)
-	ov, err := overlay.New(ctx, cfg)
+	ov, err := overlay.New(ctx, cfg.RepoPaths)
 	if err != nil {
 		snap.Close()
 		return err

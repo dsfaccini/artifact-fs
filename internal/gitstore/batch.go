@@ -49,7 +49,7 @@ func (s *Store) CloseBatchPool(gitDir string) {
 // blobcache.Stage reserved. A failed write removes dstPath. Uses a persistent
 // cat-file --batch process to amortize process spawn and remote connection
 // costs across multiple blob fetches.
-func (s *Store) BlobToCache(ctx context.Context, repo model.RepoConfig, objectOID string, dstPath string) (size int64, err error) {
+func (s *Store) BlobToCache(ctx context.Context, repo model.RepoPaths, objectOID string, dstPath string) (size int64, err error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -94,7 +94,7 @@ func (s *Store) BlobToCache(ctx context.Context, repo model.RepoConfig, objectOI
 // lacks in one fetch from the promisor remote. It runs the fetch that a lazy
 // fetch runs for one missing object, so N blobs cost one fetch and one pack
 // instead of N.
-func (s *Store) FetchMissingBlobs(ctx context.Context, repo model.RepoConfig, objectOIDs []string) error {
+func (s *Store) FetchMissingBlobs(ctx context.Context, repo model.RepoPaths, objectOIDs []string) error {
 	missing, err := missingObjects(ctx, repo.GitDir, objectOIDs)
 	if err != nil || len(missing) == 0 {
 		return err
@@ -226,7 +226,7 @@ func fetchBatchToFile(ctx context.Context, batch *batchCatFile, objectOID string
 	}
 }
 
-func (s *Store) ReadBlob(ctx context.Context, repo model.RepoConfig, objectOID string, maxBytes int64) ([]byte, error) {
+func (s *Store) ReadBlob(ctx context.Context, repo model.RepoPaths, objectOID string, maxBytes int64) ([]byte, error) {
 	if maxBytes < 0 {
 		return nil, fmt.Errorf("negative max bytes: %d", maxBytes)
 	}
@@ -283,7 +283,7 @@ func readBatchBlob(ctx context.Context, batch *batchCatFile, objectOID string, m
 
 // VerifyBlob hashes in process instead of spawning git: it runs on the first
 // read of every cached blob after a daemon start.
-func (s *Store) VerifyBlob(ctx context.Context, _ model.RepoConfig, objectOID string, cachePath string) (bool, error) {
+func (s *Store) VerifyBlob(ctx context.Context, _ model.RepoPaths, objectOID string, cachePath string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}

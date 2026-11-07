@@ -46,7 +46,7 @@ func TestPrepareFetchedBranchPreservesStagedEntries(t *testing.T) {
 	run(t, "git", "-C", repo, "add", "tracked.txt")
 	run(t, "git", "-C", repo, "add", "-N", "intent.txt")
 
-	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: filepath.Join(repo, ".git")}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: filepath.Join(repo, ".git")}}
 	if err := New(nil).PrepareFetchedBranch(context.Background(), cfg, "feature"); err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestPrepareFetchedBranchConflictDoesNotMoveHEAD(t *testing.T) {
 	}
 	run(t, "git", "-C", repo, "add", "tracked.txt")
 
-	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: filepath.Join(repo, ".git")}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: filepath.Join(repo, ".git")}}
 	err := New(nil).PrepareFetchedBranch(context.Background(), cfg, "feature")
 	if err == nil {
 		t.Fatal("expected staged conflict")
@@ -127,7 +127,7 @@ func TestFetchRefNonInteractiveAndPrepareFetchedBranch(t *testing.T) {
 	run(t, "git", "init", "--separate-git-dir", preparedGitDir, "--initial-branch", "master", preparedWorktree)
 	run(t, "git", "-C", preparedWorktree, "remote", "add", "origin", "file://"+bare)
 
-	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: preparedGitDir, Branch: "master"}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: preparedGitDir}, RepoSpec: model.RepoSpec{Branch: "master"}}
 	store := New(nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -189,7 +189,7 @@ func TestPrepareFetchedBranchRefusesPreparedGitDirRewind(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: preparedGitDir, Branch: "master", PreparedGitDir: true}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: preparedGitDir}, RepoSpec: model.RepoSpec{Branch: "master", PreparedGitDir: true}}
 	store := New(nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -287,7 +287,7 @@ func TestFetchedBranchReplacesExistingCloneBranch(t *testing.T) {
 	store := New(nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: gitDir, RemoteURL: "file://" + bare, Branch: "master", FetchRef: "master"}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + bare, Branch: "master", FetchRef: "master"}}
 	if err := store.CloneBloblessNonInteractive(ctx, cfg); err != nil {
 		t.Fatalf("CloneBloblessNonInteractive: %v", err)
 	}
@@ -355,14 +355,18 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	blobOID := strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD:README.md"))
 	gitDir := filepath.Join(tmp, "snapshot.git")
 	cfg := model.RepoConfig{
-		ID:             "verified",
-		Name:           "verified",
-		GitDir:         gitDir,
-		RemoteURL:      "file://" + bare,
-		Branch:         "refs/heads/main",
-		RequiredCommit: tip,
-		HistoryDepth:   1,
-		MountPath:      filepath.Join(tmp, "mounted"),
+		RepoPaths: model.RepoPaths{
+			ID:        "verified",
+			Name:      "verified",
+			GitDir:    gitDir,
+			MountPath: filepath.Join(tmp, "mounted"),
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL:      "file://" + bare,
+			Branch:         "refs/heads/main",
+			RequiredCommit: tip,
+			HistoryDepth:   1,
+		},
 	}
 	requirement := model.SourceRequirement{Ref: cfg.Branch, RequiredCommit: tip, Depth: 1}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -523,10 +527,14 @@ func TestPrepareSourceSupportsSHA256Remote(t *testing.T) {
 		t.Fatalf("SHA-256 commit length = %d, want 64", len(tip))
 	}
 	cfg := model.RepoConfig{
-		ID:        "sha256",
-		Name:      "sha256",
-		GitDir:    gitDir,
-		RemoteURL: "file://" + bare,
+		RepoPaths: model.RepoPaths{
+			ID:     "sha256",
+			Name:   "sha256",
+			GitDir: gitDir,
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL: "file://" + bare,
+		},
 	}
 	requirement := model.SourceRequirement{
 		Ref:            "refs/heads/main",
@@ -624,10 +632,14 @@ func TestPrepareSourceReacquiresMissingOrCorruptReceiptGitDir(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			gitDir := filepath.Join(tmp, test.name+".git")
 			cfg := model.RepoConfig{
-				ID:        model.RepoID(test.name),
-				Name:      test.name,
-				GitDir:    gitDir,
-				RemoteURL: "file://" + bare,
+				RepoPaths: model.RepoPaths{
+					ID:     model.RepoID(test.name),
+					Name:   test.name,
+					GitDir: gitDir,
+				},
+				RepoSpec: model.RepoSpec{
+					RemoteURL: "file://" + bare,
+				},
 			}
 			store := New(nil)
 			if _, err := store.PrepareSource(ctx, cfg, requirement); err != nil {
@@ -686,10 +698,14 @@ func TestPrepareSourceReceiptPreservesIndexAndRestoresHEAD(t *testing.T) {
 
 	requiredCommit := strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
 	cfg := model.RepoConfig{
-		ID:        "verified",
-		Name:      "verified",
-		GitDir:    gitDir,
-		RemoteURL: "file://" + bare,
+		RepoPaths: model.RepoPaths{
+			ID:     "verified",
+			Name:   "verified",
+			GitDir: gitDir,
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL: "file://" + bare,
+		},
 	}
 	requirement := model.SourceRequirement{
 		Ref:            "refs/heads/main",
@@ -784,12 +800,16 @@ func TestCloneBloblessUsesExactCanonicalTag(t *testing.T) {
 			run(t, "git", "-C", bare, "config", "uploadpack.allowFilter", "true")
 
 			cfg := model.RepoConfig{
-				ID:           "tag",
-				Name:         "tag",
-				GitDir:       gitDir,
-				RemoteURL:    "file://" + bare,
-				Branch:       "refs/tags/release",
-				HistoryDepth: 1,
+				RepoPaths: model.RepoPaths{
+					ID:     "tag",
+					Name:   "tag",
+					GitDir: gitDir,
+				},
+				RepoSpec: model.RepoSpec{
+					RemoteURL:    "file://" + bare,
+					Branch:       "refs/tags/release",
+					HistoryDepth: 1,
+				},
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -858,7 +878,7 @@ func TestCloneAndFetchRefSkipTags(t *testing.T) {
 	store := New(nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: gitDir, RemoteURL: "file://" + bare, Branch: "master", FetchRef: "master"}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + bare, Branch: "master", FetchRef: "master"}}
 	oldPool, err := store.getPool(gitDir)
 	if err != nil {
 		t.Fatal(err)
@@ -921,7 +941,7 @@ func TestFetchStartsBeforeRemoteLookupCompletes(t *testing.T) {
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	store.gitRetryDelays = nil
-	err := store.Fetch(context.Background(), model.RepoConfig{Name: "repo", GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "/private/configured/repo.git"})
+	err := store.Fetch(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: "/private/configured/repo.git"}})
 	if err == nil {
 		t.Fatal("Fetch error = nil, want transport failure")
 	}
@@ -944,7 +964,7 @@ func TestRemoteLookupIncludesConfiguredAndActualOrigin(t *testing.T) {
 	const configured = "https://example.com/old/repo.git"
 	actual := filepath.Join(tmp, "private", "repo.git")
 	run(t, "git", "--git-dir", gitDir, "remote", "add", "origin", actual)
-	remotesForLogging, cancel := New(nil).startRemotesForLogging(context.Background(), model.RepoConfig{GitDir: gitDir, RemoteURL: configured})
+	remotesForLogging, cancel := New(nil).startRemotesForLogging(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{GitDir: gitDir}, RepoSpec: model.RepoSpec{RemoteURL: configured}})
 	defer cancel()
 	for {
 		remotes, complete := remotesForLogging()
@@ -982,7 +1002,7 @@ func TestFetchRefNonInteractiveFullRefPreparesDetachedHEAD(t *testing.T) {
 	run(t, "git", "init", "--separate-git-dir", preparedGitDir, "--initial-branch", "master", preparedWorktree)
 	run(t, "git", "-C", preparedWorktree, "remote", "add", "origin", "file://"+bare)
 
-	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: preparedGitDir, Branch: "master"}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: preparedGitDir}, RepoSpec: model.RepoSpec{Branch: "master"}}
 	store := New(nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

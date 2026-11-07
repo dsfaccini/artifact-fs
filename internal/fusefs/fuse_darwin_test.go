@@ -27,8 +27,8 @@ func setMacFUSEKernelExtensionLoaded(t *testing.T, loaded bool) {
 // after a mount that failed past INIT.
 func TestMountRepoFallsBackWithANewServer(t *testing.T) {
 	setMacFUSEKernelExtensionLoaded(t, true)
-	repo := model.RepoConfig{Name: "repo", MountPath: t.TempDir()}
-	attempts := mountRepoAttempts(t, repo, slog.New(slog.DiscardHandler))
+	repo := model.RepoPaths{Name: "repo", MountPath: t.TempDir()}
+	attempts := mountRepoAttempts(t, repo, slog.New(slog.DiscardHandler), unredacted)
 	if len(attempts) != 2 {
 		t.Fatalf("got %d mount attempts, want FSKit, then the kernel extension", len(attempts))
 	}
@@ -117,7 +117,7 @@ func TestMountRepoInvalidatesThroughTheMountedAttemptsNotifier(t *testing.T) {
 	}
 	t.Cleanup(func() { fuseMount = savedMount })
 
-	m, err := MountRepoWithGate(context.Background(), context.Background(), model.RepoConfig{Name: "repo", MountPath: t.TempDir()}, nil, nil, slog.New(slog.DiscardHandler))
+	m, err := MountRepoWithGate(context.Background(), context.Background(), model.RepoPaths{Name: "repo", MountPath: t.TempDir()}, nil, nil, slog.New(slog.DiscardHandler), unredacted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestMountRepoChecksPermissionsOnlyThroughAnFSKitAttempt(t *testing.T) {
 	t.Setenv(backendEnv, BackendAuto)
 	ctx := context.Background()
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", Name: "repo", MountPath: t.TempDir(), OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	cfg := model.RepoPaths{ID: "repo", Name: "repo", MountPath: t.TempDir(), OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
 	ov, err := overlaystore.New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -173,7 +173,7 @@ func TestMountRepoChecksPermissionsOnlyThroughAnFSKitAttempt(t *testing.T) {
 		return &fuse.MountedFileSystem{}, nil
 	}
 	t.Cleanup(func() { fuseMount = savedMount })
-	if _, err := MountRepoWithGate(ctx, ctx, cfg, engine, nil, slog.New(slog.DiscardHandler)); err != nil {
+	if _, err := MountRepoWithGate(ctx, ctx, cfg, engine, nil, slog.New(slog.DiscardHandler), unredacted); err != nil {
 		t.Fatal(err)
 	}
 	if len(served) != 2 || len(throughFSKit) != 2 || !throughFSKit[0] || throughFSKit[1] {

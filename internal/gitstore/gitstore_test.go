@@ -20,7 +20,7 @@ func TestCommitTimestamp(t *testing.T) {
 	run(t, "git", "-C", repo, "add", ".")
 	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
 
-	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
 	store := New(nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

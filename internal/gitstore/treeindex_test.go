@@ -26,7 +26,7 @@ func TestResolveHEADAndBuildTreeIndex(t *testing.T) {
 	run(t, "git", "-C", repo, "add", "README.md")
 	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
 
-	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
 	store := New(nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -76,7 +76,7 @@ func TestBuildTreeIndexPropagatesBatchCancellation(t *testing.T) {
 	defer cancel()
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := store.BuildTreeIndex(ctx, model.RepoConfig{ID: "repo", GitDir: t.TempDir()}, oid)
+		_, err := store.BuildTreeIndex(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", GitDir: t.TempDir()}}, oid)
 		errCh <- err
 	}()
 	// Cancel only once size resolution runs, after ls-tree has finished.
@@ -128,7 +128,7 @@ done
 	}
 	err := New(nil).batchResolveSizes(
 		context.Background(),
-		model.RepoConfig{ID: "repo", GitDir: t.TempDir()},
+		model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", GitDir: t.TempDir()}},
 		nodes,
 		[]string{oid},
 		map[string][]int{oid: {0, 1}},
@@ -151,7 +151,7 @@ func TestBuildTreeIndexBoundsLazyFetchStderr(t *testing.T) {
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	_, err := New(nil).BuildTreeIndex(context.Background(), model.RepoConfig{ID: "repo", GitDir: t.TempDir()}, strings.Repeat("a", 40))
+	_, err := New(nil).BuildTreeIndex(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", GitDir: t.TempDir()}}, strings.Repeat("a", 40))
 	if err == nil || !strings.HasSuffix(err.Error(), gitErrorTruncatedLabel) || len(err.Error()) > maxGitErrorBytes+len("\n"+gitErrorTruncatedLabel) {
 		t.Fatalf("BuildTreeIndex error has %d bytes, want at most %d and the truncation label", len(fmt.Sprint(err)), maxGitErrorBytes)
 	}
@@ -170,7 +170,7 @@ func TestBuildTreeIndexPreservesGitlinkAsDirectory(t *testing.T) {
 	run(t, "git", "-C", repo, "update-index", "--add", "--cacheinfo", "160000,"+gitlinkOID+",vendor/dependency")
 	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "add gitlink")
 
-	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
 	store := New(nil)
 	headOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
 	nodes, err := store.BuildTreeIndex(context.Background(), cfg, headOID)
@@ -203,7 +203,7 @@ func TestBuildTreeIndexNonASCIIPaths(t *testing.T) {
 	run(t, "git", "-C", repo, "add", ".")
 	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "non-ascii files")
 
-	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
 	store := New(nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

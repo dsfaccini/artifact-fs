@@ -95,7 +95,7 @@ func BenchmarkSwitchGeneration20kOverlayEntries(b *testing.B) {
 	newOverlay := func(b *testing.B, path func(i int) string, write bool) *overlaystore.Store {
 		b.Helper()
 		dir := b.TempDir()
-		ov, err := overlaystore.New(ctx, model.RepoConfig{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
+		ov, err := overlaystore.New(ctx, model.RepoPaths{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -204,7 +204,7 @@ func BenchmarkInodeTable(b *testing.B) {
 			var held, dormant, table uint64
 			for range b.N {
 				before := heapInUse()
-				fs := NewArtifactFuse(model.RepoConfig{}, nil)
+				fs := NewArtifactFuse(model.RepoPaths{}, nil)
 				ids := make([]fuseops.InodeID, len(paths))
 				fs.mu.Lock()
 				for i, path := range paths {
@@ -278,7 +278,7 @@ func benchSwitchPass(b *testing.B, nodes []model.BaseNode, overlayFiles []string
 		b.Fatal(err)
 	}
 	dir := b.TempDir()
-	ov, err := overlaystore.New(ctx, model.RepoConfig{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
+	ov, err := overlaystore.New(ctx, model.RepoPaths{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func benchSwitchPass(b *testing.B, nodes []model.BaseNode, overlayFiles []string
 	}
 	r := &Resolver{Snapshot: snap, Overlay: ov}
 	r.SetGeneration(gen)
-	fs := NewArtifactFuse(model.RepoConfig{}, &Engine{Resolver: r, Overlay: ov})
+	fs := NewArtifactFuse(model.RepoPaths{}, &Engine{Resolver: r, Overlay: ov})
 	var ids []fuseops.InodeID
 	fs.mu.Lock()
 	for p := range paths {
@@ -361,7 +361,7 @@ func BenchmarkMissingPathsHeap(b *testing.B) {
 				b.Fatal(err)
 			}
 			dir := b.TempDir()
-			ov, err := overlaystore.New(ctx, model.RepoConfig{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
+			ov, err := overlaystore.New(ctx, model.RepoPaths{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -424,7 +424,7 @@ func BenchmarkMissingPathsOnePath(b *testing.B) {
 				b.Fatal(err)
 			}
 			dir := b.TempDir()
-			ov, err := overlaystore.New(ctx, model.RepoConfig{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
+			ov, err := overlaystore.New(ctx, model.RepoPaths{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
 			if err != nil {
 				b.Fatal(err)
 			}

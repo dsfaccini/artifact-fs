@@ -30,32 +30,20 @@ type PreparedSource struct {
 	Acquired bool // This call installed a new remote acquisition rather than reusing its receipt.
 }
 
+// RepoConfig is a registered repo: its paths, its source, its refresh policy,
+// and what the registry records about its requests and preparation. The
+// daemon's runtime holds the whole config. The hydrator, the overlay and the
+// FUSE layer take only its RepoPaths.
 type RepoConfig struct {
-	ID                    RepoID
-	Name                  string
-	MountRoot             string
-	MountPath             string
-	RemoteURL             string
-	RemoteURLRedacted     string
-	Branch                string
-	RefreshInterval       time.Duration
-	GitDir                string
-	OverlayDir            string
-	BlobCacheDir          string
-	MetaDBPath            string
-	OverlayDBPath         string
-	Enabled               bool
-	PreparedGitDir        bool
-	AdoptGitDir           bool
-	FetchRef              string
-	PrepareState          PrepareState
-	PrepareError          string
-	RequiredCommit        string
-	HistoryDepth          int
-	RemoteRefreshDisabled bool
-	AcquiredRef           string
-	AcquiredCommit        string
-	AcquiredAt            time.Time
+	RepoPaths
+	RepoSpec
+	RefreshPolicy
+	Enabled        bool
+	PrepareState   PrepareState
+	PrepareError   string
+	AcquiredRef    string
+	AcquiredCommit string
+	AcquiredAt     time.Time
 	// ConfigVersion identifies the registered config. A new registration
 	// changes it, and only a new registration does, so it is the one token
 	// that tells whether a config is still current.
@@ -65,6 +53,42 @@ type RepoConfig struct {
 	PrepareRequest string
 	// MountRequest identifies the latest unmount or remount the CLI asked for.
 	MountRequest string
+}
+
+// RepoPaths names a repo and locates its state on this machine.
+type RepoPaths struct {
+	ID            RepoID
+	Name          string
+	MountRoot     string
+	MountPath     string
+	GitDir        string
+	OverlayDir    string
+	BlobCacheDir  string
+	MetaDBPath    string
+	OverlayDBPath string
+}
+
+// RepoSpec is the source a repo's preparation acquires: the remote, the
+// refs, the required commit and history depth, and whether the git dir is
+// prepared or adopted.
+type RepoSpec struct {
+	// RemoteURL can carry credentials. Only the CLI, the registry, the
+	// daemon and gitstore read it.
+	RemoteURL         string
+	RemoteURLRedacted string
+	Branch            string
+	FetchRef          string
+	RequiredCommit    string
+	HistoryDepth      int
+	PreparedGitDir    bool
+	AdoptGitDir       bool
+}
+
+// RefreshPolicy is how the daemon refreshes a repo from its remote. It is not
+// part of the repo's prepare identity.
+type RefreshPolicy struct {
+	RefreshInterval       time.Duration
+	RemoteRefreshDisabled bool
 }
 
 // RepoRuntimeRecord is what the daemon last recorded about a repo. Only the
@@ -258,7 +282,7 @@ type Registry interface {
 	RemoveRepo(ctx context.Context, name string) error
 	GetRepo(ctx context.Context, name string) (RepoConfig, error)
 	ListRepos(ctx context.Context) ([]RepoConfig, error)
-	UpdateRefresh(ctx context.Context, repoID RepoID, interval time.Duration, disabled bool) error
+	UpdateRefresh(ctx context.Context, repoID RepoID, policy RefreshPolicy) error
 	BeginPrepare(ctx context.Context, cfg RepoConfig, state PrepareState, request string) error
 	UpdatePrepareStateForRequest(ctx context.Context, cfg RepoConfig, state PrepareState, prepareErr string) error
 	RecordAcquisition(ctx context.Context, cfg RepoConfig, source PreparedSource) error
@@ -295,10 +319,10 @@ type GitStore interface {
 	CommitTimestamp(ctx context.Context, repo RepoConfig, oid string) (int64, error)
 	ComputeAheadBehind(ctx context.Context, repo RepoConfig) (ahead int, behind int, diverged bool, err error)
 	BuildTreeIndex(ctx context.Context, repo RepoConfig, headOID string) ([]BaseNode, error)
-	BlobToCache(ctx context.Context, repo RepoConfig, objectOID string, dstPath string) (size int64, err error)
-	FetchMissingBlobs(ctx context.Context, repo RepoConfig, objectOIDs []string) error
-	ReadBlob(ctx context.Context, repo RepoConfig, objectOID string, maxBytes int64) ([]byte, error)
-	VerifyBlob(ctx context.Context, repo RepoConfig, objectOID string, cachePath string) (ok bool, err error)
+	BlobToCache(ctx context.Context, repo RepoPaths, objectOID string, dstPath string) (size int64, err error)
+	FetchMissingBlobs(ctx context.Context, repo RepoPaths, objectOIDs []string) error
+	ReadBlob(ctx context.Context, repo RepoPaths, objectOID string, maxBytes int64) ([]byte, error)
+	VerifyBlob(ctx context.Context, repo RepoPaths, objectOID string, cachePath string) (ok bool, err error)
 	SetBatchPoolSize(n int)
 	CloseBatchPool(gitDir string)
 	Close()
@@ -311,8 +335,8 @@ type SnapshotStore interface {
 
 type OverlayStore interface {
 	Lookup(ctx context.Context, path string) (OverlayEntry, bool, error)
-	EnsureCopyOnWrite(ctx context.Context, repo RepoConfig, path string, base BaseNode) (OverlayEntry, error)
-	EnsureCopyOnWriteFrom(ctx context.Context, repo RepoConfig, path string, base BaseNode, src *os.File) (OverlayEntry, error)
+	EnsureCopyOnWrite(ctx context.Context, repo RepoPaths, path string, base BaseNode) (OverlayEntry, error)
+	EnsureCopyOnWriteFrom(ctx context.Context, repo RepoPaths, path string, base BaseNode, src *os.File) (OverlayEntry, error)
 	CreateFile(ctx context.Context, path string, mode uint32) (OverlayEntry, error)
 	CreateSymlink(ctx context.Context, path string, target string) (OverlayEntry, error)
 	WriteFile(ctx context.Context, path string, off int64, data []byte) (int, error)
@@ -332,7 +356,7 @@ type OverlayStore interface {
 
 type Hydrator interface {
 	EnqueueBatch(tasks []HydrationTask)
-	EnsureHydrated(ctx context.Context, repo RepoConfig, node BaseNode) (cachePath string, size int64, err error)
-	OpenHydrated(ctx context.Context, repo RepoConfig, node BaseNode) (*os.File, int64, error)
-	ReadBlob(ctx context.Context, repo RepoConfig, node BaseNode, maxBytes int64) ([]byte, error)
+	EnsureHydrated(ctx context.Context, repo RepoPaths, node BaseNode) (cachePath string, size int64, err error)
+	OpenHydrated(ctx context.Context, repo RepoPaths, node BaseNode) (*os.File, int64, error)
+	ReadBlob(ctx context.Context, repo RepoPaths, node BaseNode, maxBytes int64) ([]byte, error)
 }

@@ -37,10 +37,14 @@ func TestExistingCloneCredentialOperationsKeepCredentialsOutOfArguments(t *testi
 
 	store := New(nil)
 	repo := model.RepoConfig{
-		Name:      "repo",
-		GitDir:    filepath.Join(tmp, "repo.git"),
-		RemoteURL: "https://alice:super-secret@example.com/org/repo.git",
-		Branch:    "main",
+		RepoPaths: model.RepoPaths{
+			Name:   "repo",
+			GitDir: filepath.Join(tmp, "repo.git"),
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL: "https://alice:super-secret@example.com/org/repo.git",
+			Branch:    "main",
+		},
 	}
 	if err := store.ConfigureRemoteWithCredentials(context.Background(), repo); err != nil {
 		t.Fatal(err)
@@ -76,7 +80,7 @@ func TestValidatePreparedGitDirRejectsCredentialedOrigin(t *testing.T) {
 	run(t, "git", "init", "--separate-git-dir", preparedGitDir, "--initial-branch", "master", preparedWorktree)
 	run(t, "git", "-C", preparedWorktree, "remote", "add", "origin", "https://ghp_secret@github.com/org/repo.git")
 
-	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: preparedGitDir, Branch: "master"}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: preparedGitDir}, RepoSpec: model.RepoSpec{Branch: "master"}}
 	store := New(nil)
 	err := store.ValidatePreparedGitDir(context.Background(), cfg)
 	if err == nil {
@@ -99,7 +103,7 @@ func TestValidatePreparedGitDirRejectsMalformedCredentialedOrigin(t *testing.T) 
 			run(t, "git", "init", "--separate-git-dir", preparedGitDir, "--initial-branch", "master", preparedWorktree)
 			run(t, "git", "-C", preparedWorktree, "remote", "add", "origin", remote)
 
-			cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: preparedGitDir, Branch: "master"}
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: preparedGitDir}, RepoSpec: model.RepoSpec{Branch: "master"}}
 			store := New(nil)
 			if err := store.ValidatePreparedGitDir(context.Background(), cfg); err == nil {
 				t.Fatal("expected malformed credentialed origin rejection")
@@ -116,7 +120,7 @@ func TestValidatePreparedGitDirAllowsAtInHTTPSOriginPath(t *testing.T) {
 	run(t, "git", "init", "--separate-git-dir", preparedGitDir, "--initial-branch", "master", preparedWorktree)
 	run(t, "git", "-C", preparedWorktree, "remote", "add", "origin", "https://git.example.com/team/repo@2026.git")
 
-	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: preparedGitDir, Branch: "master"}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: preparedGitDir}, RepoSpec: model.RepoSpec{Branch: "master"}}
 	store := New(nil)
 	if err := store.ValidatePreparedGitDir(context.Background(), cfg); err != nil {
 		t.Fatalf("ValidatePreparedGitDir: %v", err)
@@ -356,9 +360,13 @@ func TestCloneBloblessRejectsMalformedCredentialURLBeforeGit(t *testing.T) {
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	cfg := model.RepoConfig{
-		GitDir:    filepath.Join(tmp, "repo.git"),
-		RemoteURL: "https://user:bad%zz@example.com/org/repo.git",
-		Branch:    "main",
+		RepoPaths: model.RepoPaths{
+			GitDir: filepath.Join(tmp, "repo.git"),
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL: "https://user:bad%zz@example.com/org/repo.git",
+			Branch:    "main",
+		},
 	}
 	store := New(nil)
 	err := store.CloneBlobless(context.Background(), cfg)
@@ -392,9 +400,13 @@ func TestCloneBloblessRejectsOptionRemoteBeforeGit(t *testing.T) {
 	for _, branch := range []string{"main", "refs/tags/v1"} {
 		t.Run(branch, func(t *testing.T) {
 			cfg := model.RepoConfig{
-				GitDir:    filepath.Join(tmp, "repo.git"),
-				RemoteURL: "--upload-pack=a@b:c",
-				Branch:    branch,
+				RepoPaths: model.RepoPaths{
+					GitDir: filepath.Join(tmp, "repo.git"),
+				},
+				RepoSpec: model.RepoSpec{
+					RemoteURL: "--upload-pack=a@b:c",
+					Branch:    branch,
+				},
 			}
 			err := New(nil).CloneBlobless(context.Background(), cfg)
 			if err == nil || !strings.Contains(err.Error(), "must not start with '-'") {
@@ -422,9 +434,13 @@ func TestCloneBloblessRejectsMalformedHTTPSUserinfoBeforeGit(t *testing.T) {
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	cfg := model.RepoConfig{
-		GitDir:    filepath.Join(tmp, "repo.git"),
-		RemoteURL: "https:/user:ghp_secret@github.com/org/repo.git",
-		Branch:    "main",
+		RepoPaths: model.RepoPaths{
+			GitDir: filepath.Join(tmp, "repo.git"),
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL: "https:/user:ghp_secret@github.com/org/repo.git",
+			Branch:    "main",
+		},
 	}
 	store := New(nil)
 	err := store.CloneBlobless(context.Background(), cfg)
@@ -454,9 +470,13 @@ func TestCloneBloblessRejectsMalformedHTTPParseErrorBeforeGit(t *testing.T) {
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	cfg := model.RepoConfig{
-		GitDir:    filepath.Join(tmp, "repo.git"),
-		RemoteURL: "https//ghp_secret%zz@github.com/org/repo.git",
-		Branch:    "main",
+		RepoPaths: model.RepoPaths{
+			GitDir: filepath.Join(tmp, "repo.git"),
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL: "https//ghp_secret%zz@github.com/org/repo.git",
+			Branch:    "main",
+		},
 	}
 	store := New(nil)
 	err := store.CloneBlobless(context.Background(), cfg)
@@ -486,9 +506,13 @@ func TestCloneBloblessRejectsMalformedGitStyleCredentialBeforeGit(t *testing.T) 
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	cfg := model.RepoConfig{
-		GitDir:    filepath.Join(tmp, "repo.git"),
-		RemoteURL: "git:secret@github.com:org/repo.git",
-		Branch:    "main",
+		RepoPaths: model.RepoPaths{
+			GitDir: filepath.Join(tmp, "repo.git"),
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL: "git:secret@github.com:org/repo.git",
+			Branch:    "main",
+		},
 	}
 	store := New(nil)
 	err := store.CloneBlobless(context.Background(), cfg)
@@ -518,9 +542,13 @@ func TestCloneBloblessRejectsPathSplitHTTPCredentialsBeforeGit(t *testing.T) {
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	cfg := model.RepoConfig{
-		GitDir:    filepath.Join(tmp, "repo.git"),
-		RemoteURL: "https://user:123/ss@example.com/org/repo.git",
-		Branch:    "main",
+		RepoPaths: model.RepoPaths{
+			GitDir: filepath.Join(tmp, "repo.git"),
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL: "https://user:123/ss@example.com/org/repo.git",
+			Branch:    "main",
+		},
 	}
 	store := New(nil)
 	err := store.CloneBlobless(context.Background(), cfg)
@@ -698,7 +726,7 @@ func TestCloneBloblessAcceptsAtSignInPathAfterHostAndPort(t *testing.T) {
 		"ssh://[fe80::1%25en0]:22/org/repo@v1.git",
 	} {
 		gitDir := filepath.Join(t.TempDir(), "repo.git")
-		if err := New(nil).CloneBlobless(context.Background(), model.RepoConfig{Name: "repo", GitDir: gitDir, RemoteURL: remote, Branch: "main"}); err != nil {
+		if err := New(nil).CloneBlobless(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: gitDir}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main"}}); err != nil {
 			t.Fatalf("CloneBlobless(%q): %v", remote, err)
 		}
 		if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", "HEAD")); got != commit {
@@ -731,7 +759,7 @@ func TestCloneBloblessRejectsPasswordHoldingSlashBeforeGit(t *testing.T) {
 	// the "/", so "user:1234/secret" is userinfo.
 	const remote = "ssh://user:1234/secret@host/repo"
 	gitDir := filepath.Join(t.TempDir(), "repo.git")
-	if err := New(nil).CloneBlobless(context.Background(), model.RepoConfig{Name: "repo", GitDir: gitDir, RemoteURL: remote, Branch: "main"}); err == nil {
+	if err := New(nil).CloneBlobless(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: gitDir}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main"}}); err == nil {
 		t.Fatalf("CloneBlobless(%q) succeeded", remote)
 	}
 	if _, err := os.Stat(contacted); !errors.Is(err, os.ErrNotExist) {
@@ -783,7 +811,7 @@ func TestCloneBloblessReportsServerStderrWithCaseFoldingText(t *testing.T) {
 	}
 	t.Setenv("GIT_SSH_COMMAND", ssh)
 	t.Setenv("GIT_SSH_VARIANT", "ssh")
-	cfg := model.RepoConfig{Name: "repo", GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "ssh://host.example.com/org/repo.git", Branch: "main"}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: "ssh://host.example.com/org/repo.git", Branch: "main"}}
 	err := New(nil).CloneBlobless(context.Background(), cfg)
 	if err == nil || !strings.Contains(err.Error(), "denied") {
 		t.Fatalf("CloneBlobless error = %v, want the server's message", err)

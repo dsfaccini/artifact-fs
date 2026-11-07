@@ -45,7 +45,7 @@ func TestClassifyPriority(t *testing.T) {
 func TestEnsureHydratedRefetchesTruncatedKnownBlob(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "known", SizeBytes: 7}
 	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, []byte("bad"), 0o644); err != nil {
@@ -85,7 +85,7 @@ func TestEnsureHydratedUsesValidKnownBlobCacheHit(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
 	payload := []byte("content")
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "known", SizeBytes: int64(len(payload))}
 	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
@@ -116,7 +116,7 @@ func TestEnsureHydratedUsesValidUnknownSizeCacheHit(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
 	payload := []byte("content")
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
 	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
@@ -146,7 +146,7 @@ func TestEnsureHydratedUsesValidUnknownSizeCacheHit(t *testing.T) {
 func TestEnsureHydratedRefetchesUnknownSizeCacheHit(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
 	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, []byte("bad"), 0o644); err != nil {
@@ -176,7 +176,7 @@ func TestEnsureHydratedVerifiesUnknownCacheHitOnce(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
 	payload := []byte("content")
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
 	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
@@ -221,7 +221,7 @@ func TestVerifyBlobOnceReusesVerificationFinishedAfterCheck(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
 	payload := []byte("content")
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
 	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
@@ -262,7 +262,7 @@ func TestEnsureHydratedJoinsActiveFetch(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
 	payload := []byte("content")
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "known", SizeBytes: int64(len(payload))}
 	releaseFetch := make(chan struct{})
 	fetchStarted := make(chan struct{})
@@ -325,7 +325,7 @@ func TestQueuedHydrationUsesValidCacheHit(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
 	payload := []byte("content")
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	cachePath := cacheFile(t, tmp, "blob")
 	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
 		t.Fatal(err)
@@ -369,7 +369,7 @@ func TestQueuedHydrationUsesValidCacheHit(t *testing.T) {
 func TestQueuedHydrationWakesWorkersForBacklog(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	releaseFetch := make(chan struct{})
 	fetcher := &fakeBlobFetcher{payload: []byte("content"), fetchWait: releaseFetch}
 	h := New(fetcher)
@@ -402,11 +402,11 @@ func TestQueuedPrefetchFetchesBlobsInOnePack(t *testing.T) {
 
 	h := New(git)
 	h.EnqueueBatch(prefetchTasks(cfg.ID, nodes))
-	h.Start(4, cfg)
+	h.Start(4, cfg.RepoPaths)
 	defer h.Stop()
 	waitForHydratorIdle(t, h, cfg.ID)
 
-	assertCachedFiles(t, cfg, nodes, files)
+	assertCachedFiles(t, cfg.RepoPaths, nodes, files)
 	// A lazy fetch per blob would add one pack per blob.
 	if got := packCount(t, cfg.GitDir); got != packs+1 {
 		t.Fatalf("packs = %d after hydrating %d blobs, want %d", got, len(nodes), packs+1)
@@ -429,16 +429,16 @@ func TestQueuedPrefetchFetchesEachBlobWhenBatchFetchFails(t *testing.T) {
 
 	h := New(git)
 	h.EnqueueBatch(tasks)
-	h.Start(4, cfg)
+	h.Start(4, cfg.RepoPaths)
 	defer h.Stop()
 	waitForHydratorIdle(t, h, cfg.ID)
 
-	assertCachedFiles(t, cfg, nodes, files)
+	assertCachedFiles(t, cfg.RepoPaths, nodes, files)
 }
 
 func TestExplicitReadsDoNotShareBatchWithPrefetch(t *testing.T) {
 	t.Parallel()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 	fetcher := &fakeBlobFetcher{payload: []byte("content")}
 	h := New(fetcher)
 	var prefetch []model.HydrationTask
@@ -478,7 +478,7 @@ func TestExplicitReadsDoNotShareBatchWithPrefetch(t *testing.T) {
 
 func TestQueuedHydrationCapsFetchBatch(t *testing.T) {
 	t.Parallel()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 	fetcher := &fakeBlobFetcher{payload: []byte("content")}
 	h := New(fetcher)
 	start := time.Now()
@@ -508,7 +508,7 @@ func TestQueuedHydrationCapsFetchBatch(t *testing.T) {
 
 func TestQueuedHydrationBatchFetchesOnlyMissingBlobs(t *testing.T) {
 	t.Parallel()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 	payload := []byte("content")
 	fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true}
 	h := New(fetcher)
@@ -545,7 +545,7 @@ func TestQueuedHydrationBatchFetchesOnlyMissingBlobs(t *testing.T) {
 
 func TestQueuedHydrationVerifiesCachedBlobsInParallel(t *testing.T) {
 	t.Parallel()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 	payload := []byte("content")
 	releaseVerify := make(chan struct{})
 	fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true, verifyWait: releaseVerify}
@@ -573,7 +573,7 @@ func TestQueuedHydrationVerifiesCachedBlobsInParallel(t *testing.T) {
 
 func TestReadOfFetchingPrefetchBlobGoesAheadOfOtherPrefetch(t *testing.T) {
 	t.Parallel()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 	fetcher := &fakeBlobFetcher{payload: []byte("content")}
 	// The batch fails, so a-0 falls back to its own download and would rank
 	// with the other prefetch downloads.
@@ -611,7 +611,7 @@ func TestReadOfFetchingPrefetchBlobGoesAheadOfOtherPrefetch(t *testing.T) {
 
 func TestReadOfFetchedPrefetchBlobGoesAheadOfOtherPrefetch(t *testing.T) {
 	t.Parallel()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 	fetcher := &fakeBlobFetcher{payload: []byte("content")}
 	started, release := gateBatchFetchesFailingFirst(fetcher)
 	h := New(fetcher)
@@ -645,9 +645,9 @@ func TestReadOfFetchedPrefetchBlobGoesAheadOfOtherPrefetch(t *testing.T) {
 func TestReservedWorkerServesReadsDuringEveryKindOfPrefetchDownload(t *testing.T) {
 	tests := []struct {
 		name  string
-		setup func(t *testing.T, h *Service, fetcher *fakeBlobFetcher, cfg model.RepoConfig)
+		setup func(t *testing.T, h *Service, fetcher *fakeBlobFetcher, cfg model.RepoPaths)
 	}{
-		{name: "batch fetches", setup: func(t *testing.T, h *Service, fetcher *fakeBlobFetcher, cfg model.RepoConfig) {
+		{name: "batch fetches", setup: func(t *testing.T, h *Service, fetcher *fakeBlobFetcher, cfg model.RepoPaths) {
 			gateBatchFetches(fetcher)
 			oids := make([]string, 2*maxFetchBatch)
 			for i := range oids {
@@ -655,14 +655,14 @@ func TestReservedWorkerServesReadsDuringEveryKindOfPrefetchDownload(t *testing.T
 			}
 			h.EnqueueBatch(prefetchTasksFor(cfg.ID, PriorityLikelyText, oids...))
 		}},
-		{name: "single-blob downloads", setup: func(t *testing.T, h *Service, fetcher *fakeBlobFetcher, cfg model.RepoConfig) {
+		{name: "single-blob downloads", setup: func(t *testing.T, h *Service, fetcher *fakeBlobFetcher, cfg model.RepoPaths) {
 			// Each directory has one file left to prefetch.
 			for _, oid := range []string{"prefetch-dir1", "prefetch-dir2"} {
 				h.EnqueueBatch(prefetchTasksFor(cfg.ID, PriorityLikelyText, oid))
 				synctest.Wait()
 			}
 		}},
-		{name: "fallback downloads after a failed batch", setup: func(t *testing.T, h *Service, fetcher *fakeBlobFetcher, cfg model.RepoConfig) {
+		{name: "fallback downloads after a failed batch", setup: func(t *testing.T, h *Service, fetcher *fakeBlobFetcher, cfg model.RepoPaths) {
 			fetcher.fetchMissing = func(context.Context, []string) error { return errors.New("batch refused") }
 			h.EnqueueBatch(prefetchTasksFor(cfg.ID, PriorityLikelyText, "prefetch-0", "prefetch-1", "prefetch-2"))
 		}},
@@ -670,7 +670,7 @@ func TestReservedWorkerServesReadsDuringEveryKindOfPrefetchDownload(t *testing.T
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+				cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 				fetcher := &fakeBlobFetcher{payload: []byte("content")}
 				releaseDownloads := gatePrefetchDownloads(fetcher)
 				h := New(fetcher)
@@ -705,7 +705,7 @@ func TestReadOfAQueuedFallbackDownloadWakesTheReservedWorker(t *testing.T) {
 	for _, workers := range []int{2, 4} {
 		t.Run(fmt.Sprintf("%d workers", workers), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+				cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 				fetcher := &fakeBlobFetcher{payload: []byte("content")}
 				releaseDownloads := gatePrefetchDownloads(fetcher)
 				fetcher.fetchMissing = func(context.Context, []string) error { return errors.New("batch refused") }
@@ -748,7 +748,7 @@ func TestReadOfAQueuedFallbackDownloadWakesTheReservedWorker(t *testing.T) {
 
 func TestReadBatchServesBlobsNeedingNoFetchBeforeItsFetch(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+		cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 		payload := []byte("content")
 		fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true}
 		started, release := gateBatchFetches(fetcher)
@@ -782,7 +782,7 @@ func TestReadBatchServesBlobsNeedingNoFetchBeforeItsFetch(t *testing.T) {
 
 func TestReadBatchVerifiesCachedBlobsInParallelBeforeItsFetch(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+		cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 		payload := []byte("content")
 		releaseVerify := make(chan struct{})
 		fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true, verifyWait: releaseVerify}
@@ -841,7 +841,7 @@ func TestReadBatchVerifiesCachedBlobsInParallelBeforeItsFetch(t *testing.T) {
 
 func TestReadBatchWithoutAFetchCopiesInParallel(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+		cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 		payload := []byte("content")
 		fetcher := &fakeBlobFetcher{payload: payload}
 		releaseCopies := make(chan struct{})
@@ -875,7 +875,7 @@ func TestReadBatchWithoutAFetchCopiesInParallel(t *testing.T) {
 
 func TestReservedWorkerCopiesLocalPrefetchBlobsDuringADownload(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+		cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 		payload := []byte("content")
 		fetcher := &fakeBlobFetcher{payload: payload}
 		started, release := gateBatchFetches(fetcher)
@@ -906,7 +906,7 @@ func TestReservedWorkerCopiesLocalPrefetchBlobsDuringADownload(t *testing.T) {
 
 func TestDownloadedPrefetchBlobsCopyBeforeMoreDownload(t *testing.T) {
 	t.Parallel()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 	fetcher := &fakeBlobFetcher{payload: []byte("content")}
 	started, release := gateBatchFetches(fetcher)
 	h := New(fetcher)
@@ -927,7 +927,7 @@ func TestDownloadedPrefetchBlobsCopyBeforeMoreDownload(t *testing.T) {
 
 func TestReadOfVerifiedBlobDoesNotWaitForSiblingFetch(t *testing.T) {
 	t.Parallel()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 	payload := []byte("content")
 	fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true}
 	started, release := gateBatchFetches(fetcher)
@@ -959,7 +959,7 @@ func TestReadOfVerifiedBlobDoesNotWaitForSiblingFetch(t *testing.T) {
 
 func TestBlobsNeedingNoFetchDoNotWaitForTheirSiblingsFetch(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+		cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 		payload := []byte("content")
 		fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true}
 		started, release := gateBatchFetches(fetcher)
@@ -996,7 +996,7 @@ func TestBlobsNeedingNoFetchDoNotWaitForTheirSiblingsFetch(t *testing.T) {
 func TestOneWorkerStaysFreeForReadsDuringPrefetch(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const workers = 4
-		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+		cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 		fetcher := &fakeBlobFetcher{payload: []byte("content")}
 		started, release := gateBatchFetches(fetcher)
 		h := New(fetcher)
@@ -1024,7 +1024,7 @@ func TestOneWorkerStaysFreeForReadsDuringPrefetch(t *testing.T) {
 
 func TestStopCancelsBatchFetch(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+		cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 		fetcher := &fakeBlobFetcher{payload: []byte("content")}
 		started, _ := gateBatchFetches(fetcher)
 		h := New(fetcher)
@@ -1042,7 +1042,7 @@ func TestStopCancelsBatchFetch(t *testing.T) {
 
 func TestStopEndsAReadBatchsCopiesOfLocalBlobs(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+		cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 		payload := []byte("content")
 		fetcher := &fakeBlobFetcher{payload: payload}
 		// Each copy runs until Stop cancels it.
@@ -1069,7 +1069,7 @@ func TestStopEndsAReadBatchsCopiesOfLocalBlobs(t *testing.T) {
 
 func TestExplicitReadCopiesBeforeFetchedPrefetch(t *testing.T) {
 	t.Parallel()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 	copyStarted := make(chan struct{})
 	releaseCopy := make(chan struct{})
 	fetcher := &fakeBlobFetcher{payload: []byte("content"), fetchStarted: copyStarted, fetchWait: releaseCopy}
@@ -1106,7 +1106,7 @@ func TestEnsureHydratedVerificationIgnoresLeaderTimeout(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
 	payload := []byte("content")
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
 	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
@@ -1156,7 +1156,7 @@ func TestValidateCachedBlobKeepsFileOnVerifyError(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
 	payload := []byte("content")
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
 	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
@@ -1198,7 +1198,7 @@ func TestValidateCachedBlobKeepsFileOnVerifyError(t *testing.T) {
 
 func TestEnsureHydratedRevalidatesChangedCacheFile(t *testing.T) {
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "known", SizeBytes: 7}
 	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, []byte("content"), 0o644); err != nil {
@@ -1236,7 +1236,7 @@ func TestEnsureHydratedRevalidatesChangedCacheFile(t *testing.T) {
 
 func TestValidateCachedBlobRejectsReplacementDuringVerification(t *testing.T) {
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, ObjectOID: "blob", SizeState: "known", SizeBytes: 7}
 	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, []byte("content"), 0o644); err != nil {
@@ -1276,7 +1276,7 @@ func TestValidateCachedBlobRejectsReplacementDuringVerification(t *testing.T) {
 
 func TestOpenHydratedPinsVerifiedCacheFile(t *testing.T) {
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, ObjectOID: "blob", SizeState: "known", SizeBytes: 7}
 	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, []byte("content"), 0o644); err != nil {
@@ -1316,7 +1316,7 @@ func TestReadCachedBlobRejectsShortRead(t *testing.T) {
 
 func TestStopWaitsForWorkerAndRejectsLaterWork(t *testing.T) {
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
 	synctest.Test(t, func(t *testing.T) {
 		started := make(chan struct{})
@@ -1353,7 +1353,7 @@ func TestStopWaitsForWorkerAndRejectsLaterWork(t *testing.T) {
 func TestReadBlobRejectsKnownOversizedWithoutFetch(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "link", ObjectOID: "blob", SizeState: "known", SizeBytes: 6}
 	fetcher := &fakeBlobFetcher{payload: []byte("target")}
 	h := New(fetcher)
@@ -1373,7 +1373,7 @@ func TestReadBlobRejectsKnownOversizedWithoutFetch(t *testing.T) {
 func TestReadBlobUsesBoundedFetcherForUnknownSize(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "link", ObjectOID: "blob", SizeState: "unknown"}
 	fetcher := &fakeBlobFetcher{payload: []byte("target")}
 	h := New(fetcher)
@@ -1393,7 +1393,7 @@ func TestReadBlobUsesBoundedFetcherForUnknownSize(t *testing.T) {
 func TestReadBlobSkipsVerificationForOversizedCache(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "link", ObjectOID: "blob", SizeState: "unknown"}
 	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, []byte("oversized"), 0o644); err != nil {
@@ -1426,12 +1426,16 @@ func newBloblessRepo(t *testing.T, files map[string]string) (model.RepoConfig, *
 	t.Helper()
 	tmp := t.TempDir()
 	cfg := model.RepoConfig{
-		ID:           "repo",
-		Name:         "repo",
-		GitDir:       filepath.Join(tmp, "repo.git"),
-		RemoteURL:    gittest.PartialCloneRemote(t, files),
-		Branch:       "main",
-		BlobCacheDir: filepath.Join(tmp, "cache"),
+		RepoPaths: model.RepoPaths{
+			ID:           "repo",
+			Name:         "repo",
+			GitDir:       filepath.Join(tmp, "repo.git"),
+			BlobCacheDir: filepath.Join(tmp, "cache"),
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL: gittest.PartialCloneRemote(t, files),
+			Branch:    "main",
+		},
 	}
 	git := gitstore.New(nil)
 	t.Cleanup(git.Close)
@@ -1467,7 +1471,7 @@ func prefetchTasks(repoID model.RepoID, nodes []model.BaseNode) []model.Hydratio
 	return tasks
 }
 
-func assertCachedFiles(t *testing.T, cfg model.RepoConfig, nodes []model.BaseNode, files map[string]string) {
+func assertCachedFiles(t *testing.T, cfg model.RepoPaths, nodes []model.BaseNode, files map[string]string) {
 	t.Helper()
 	for _, n := range nodes {
 		data, err := os.ReadFile(cachePathFor(cfg, n.ObjectOID))
@@ -1571,7 +1575,7 @@ type fakeBlobFetcher struct {
 	failAfterWrite error
 }
 
-func (f *fakeBlobFetcher) BlobToCache(ctx context.Context, _ model.RepoConfig, objectOID string, dstPath string) (int64, error) {
+func (f *fakeBlobFetcher) BlobToCache(ctx context.Context, _ model.RepoPaths, objectOID string, dstPath string) (int64, error) {
 	f.mu.Lock()
 	f.calls++
 	f.copied = append(f.copied, objectOID)
@@ -1602,7 +1606,7 @@ func (f *fakeBlobFetcher) BlobToCache(ctx context.Context, _ model.RepoConfig, o
 	return int64(len(f.payload)), nil
 }
 
-func (f *fakeBlobFetcher) FetchMissingBlobs(ctx context.Context, _ model.RepoConfig, objectOIDs []string) error {
+func (f *fakeBlobFetcher) FetchMissingBlobs(ctx context.Context, _ model.RepoPaths, objectOIDs []string) error {
 	f.mu.Lock()
 	f.batches = append(f.batches, append([]string(nil), objectOIDs...))
 	f.mu.Unlock()
@@ -1700,7 +1704,7 @@ func (f *fakeBlobFetcher) Batches() [][]string {
 	return append([][]string(nil), f.batches...)
 }
 
-func (f *fakeBlobFetcher) ReadBlob(_ context.Context, _ model.RepoConfig, _ string, maxBytes int64) ([]byte, error) {
+func (f *fakeBlobFetcher) ReadBlob(_ context.Context, _ model.RepoPaths, _ string, maxBytes int64) ([]byte, error) {
 	f.mu.Lock()
 	f.readBlobCalls++
 	f.mu.Unlock()
@@ -1713,7 +1717,7 @@ func (f *fakeBlobFetcher) ReadBlob(_ context.Context, _ model.RepoConfig, _ stri
 	return f.payload, nil
 }
 
-func (f *fakeBlobFetcher) VerifyBlob(_ context.Context, _ model.RepoConfig, _ string, _ string) (bool, error) {
+func (f *fakeBlobFetcher) VerifyBlob(_ context.Context, _ model.RepoPaths, _ string, _ string) (bool, error) {
 	f.mu.Lock()
 	f.verifyCalls++
 	f.mu.Unlock()
@@ -1750,7 +1754,7 @@ func (f *fakeBlobFetcher) VerifyCalls() int {
 // cacheFile returns oid's cache path in dir, with its shard created.
 func cacheFile(t testing.TB, dir, oid string) string {
 	t.Helper()
-	path := cachePathFor(model.RepoConfig{BlobCacheDir: dir}, oid)
+	path := cachePathFor(model.RepoPaths{BlobCacheDir: dir}, oid)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}

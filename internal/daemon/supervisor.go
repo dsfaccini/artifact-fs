@@ -95,7 +95,7 @@ func (s *Service) syncRepos(ctx context.Context) error {
 		}
 		if running {
 			s.retryMount(rt)
-			s.updateRuntimeRefresh(rt, repo.RefreshInterval, repo.RemoteRefreshDisabled)
+			s.updateRuntimeRefresh(rt, repo.RefreshPolicy)
 			s.drivePrepare(ctx, repo, rt, alreadyPreparing)
 			continue
 		}
