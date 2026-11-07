@@ -121,6 +121,11 @@ func normalizeSource(cfg *model.RepoConfig, opts AddRepoOptions) error {
 			return errors.New("async repositories must use ambient credentials; remove credentials from --remote")
 		}
 	}
+	// A verified source serves the commit its source ref must resolve to,
+	// so a fetch ref would change nothing.
+	if strings.TrimSpace(cfg.RequiredCommit) != "" && strings.TrimSpace(cfg.FetchRef) != "" {
+		return errors.New("--fetch-ref cannot be combined with --require-commit")
+	}
 	cfg.Branch = model.CanonicalRef(cmp.Or(strings.TrimSpace(cfg.Branch), "refs/heads/main"))
 	cfg.FetchRef = model.CanonicalRef(cmp.Or(strings.TrimSpace(cfg.FetchRef), cfg.Branch))
 	if cfg.HistoryDepth < 0 {
@@ -233,15 +238,16 @@ func (s *Controller) FetchNow(ctx context.Context, name string) error {
 // Prepare asks for a new preparation of name. A sync repo prepares in the
 // CLI; the daemon prepares an async one. Either way the daemon keeps serving
 // the repo's mount, and only an async repo's gate holds FUSE ops meanwhile. An
-// async repo that is ready and follows its ref has nothing to prepare.
-func (s *Controller) Prepare(ctx context.Context, name string) error {
+// async repo that is ready and follows its ref has nothing to prepare, and
+// Prepare reports false for it.
+func (s *Controller) Prepare(ctx context.Context, name string) (bool, error) {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
-		return err
+		return false, err
 	}
 	async := isAsyncRepo(cfg)
 	if async && cfg.PrepareState == model.PrepareStateReady && cfg.RequiredCommit == "" {
-		return nil
+		return false, nil
 	}
 	request := rand.Text()
 	state := model.PrepareStateSyncPreparing
@@ -249,14 +255,14 @@ func (s *Controller) Prepare(ctx context.Context, name string) error {
 		state = model.PrepareStatePreparing
 	}
 	if err := s.registry.BeginPrepare(ctx, cfg, state, request); err != nil {
-		return err
+		return false, err
 	}
 	if async {
 		// The daemon prepares the repo again at its next registry sync.
-		return nil
+		return true, nil
 	}
 	cfg.PrepareRequest, cfg.PrepareState, cfg.PrepareError = request, state, ""
-	return s.prepareSync(ctx, cfg)
+	return true, s.prepareSync(ctx, cfg)
 }
 
 // mountRequestTimeout bounds how long Unmount and Remount wait for the

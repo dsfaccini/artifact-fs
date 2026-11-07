@@ -69,7 +69,7 @@ func TestAdoptGitDirPreservesGitStateAndScopesConfig(t *testing.T) {
 	if err := svc.mountRepo(ctx, stored); err == nil || !strings.Contains(err.Error(), "adopted mountpoint must be empty") {
 		t.Fatalf("adoption must not hide native working files: %v", err)
 	}
-	if err := svc.ctl().Prepare(ctx, cfg.Name); err != nil {
+	if _, err := svc.ctl().Prepare(ctx, cfg.Name); err != nil {
 		t.Fatal(err)
 	}
 	afterIndex, err := os.ReadFile(indexPath)

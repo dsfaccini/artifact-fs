@@ -317,7 +317,7 @@ The running daemon mounts a placeholder at its next registry poll, within 3 seco
 ./artifact-fs prepare --name workers-sdk
 ```
 
-`prepare` never unmounts the repo. The daemon prepares an async repo again behind its gate, so operations wait as they did during the first preparation. For a repo `add-repo` prepared without `--async`, `prepare` fetches and prepares in the CLI while the daemon keeps serving the repo, and `status` reports `preparing` meanwhile. Once the fetch moves HEAD, the watcher moves the live mount to that commit. When that `prepare` fails, the daemon keeps serving the repo, and a restarted daemon serves the git dir's HEAD. A repo whose `--remote` carried inline credentials stores no remote URL, so `prepare` fetches nothing for it and republishes the git dir's HEAD. `status` shows the `prepare_error` with the commit the daemon serves. An async repo that is ready and has no `--require-commit` has nothing to prepare. `set-refresh` never prepares a repo again.
+`prepare` never unmounts the repo. The daemon prepares an async repo again behind its gate, so operations wait as they did during the first preparation. For a repo `add-repo` prepared without `--async`, `prepare` fetches and prepares in the CLI while the daemon keeps serving the repo, and `status` reports `preparing` meanwhile. Once the fetch moves HEAD, the watcher moves the live mount to that commit. When that `prepare` fails, the daemon keeps serving the repo, and a restarted daemon serves the git dir's HEAD. A repo whose `--remote` carried inline credentials stores no remote URL, so `prepare` fetches nothing for it and republishes the git dir's HEAD. `status` shows the `prepare_error` with the commit the daemon serves. An async repo that is ready and has no `--require-commit` has nothing to prepare, and `prepare` says so. `set-refresh` never prepares a repo again.
 
 Async HTTPS remotes must use ambient credentials, such as a configured Git credential helper or repo-local Git config. Inline credentials in the remote URL are rejected for async repositories.
 
@@ -337,7 +337,7 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
   --fetch-ref main
 ```
 
-`--ref` and `--fetch-ref` take a full ref name, a branch name, or `origin/<branch>`, and `add-repo` stores each as a full ref name. `origin/X` and `refs/remotes/origin/X` name branch `X`, so a branch literally named `origin/X` needs `--ref refs/heads/origin/X`. `--fetch-ref` defaults to `--ref`. Preparation fetches the fetch ref and serves it, also right after a fresh clone of `--ref`. With `--require-commit`, preparation fetches and verifies `--ref` and ignores `--fetch-ref`.
+`--ref` and `--fetch-ref` take a full ref name, a branch name, or `origin/<branch>`, and `add-repo` stores each as a full ref name. `origin/X` and `refs/remotes/origin/X` name branch `X`, so a branch literally named `origin/X` needs `--ref refs/heads/origin/X`. `--fetch-ref` defaults to `--ref`. Preparation fetches the fetch ref and serves it, also right after a fresh clone of `--ref`. With `--require-commit`, preparation fetches and verifies `--ref`, and `add-repo` rejects `--fetch-ref`.
 
 With `--depth`, a fetch transfers at most that many commits of a fetch ref whose branch the git dir does not hold yet, or of a fetch ref that is not a branch. A fetch onto a branch the git dir holds transfers only the new commits. So `prepare` and the remote refresh make a `--prepared-gitdir` git dir shallow when it lacks the fetch ref's branch, or when the fetch ref is not a branch.
 
