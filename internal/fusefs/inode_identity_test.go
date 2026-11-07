@@ -363,6 +363,9 @@ func TestHeldInodeLosesItsPathToAnotherInode(t *testing.T) {
 		name string
 		// lose makes file.txt another file's and returns its content.
 		lose func(*cacheFixture) string
+		// writeFirst says the write, not the getattr, is the first op to
+		// find the path changed.
+		writeFirst bool
 	}{
 		{"create", func(f *cacheFixture) string {
 			create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "file.txt", Mode: 0o644}
@@ -376,23 +379,23 @@ func TestHeldInodeLosesItsPathToAnotherInode(t *testing.T) {
 				f.t.Fatal(err)
 			}
 			return "mine"
-		}},
+		}, false},
 		{"path returns changed", func(f *cacheFixture) string {
 			f.switchTo(baseFile("file.txt", "blob-B", 0o100644))
 			if err := f.mount.InvalidateChanged(); err != nil {
 				f.t.Fatal(err)
 			}
 			return "blob-B"
-		}},
+		}, false},
 		{"lookup before the pass", func(f *cacheFixture) string {
 			f.switchTo(baseFile("file.txt", "blob-B", 0o100644))
 			f.lookup(fuseops.RootInodeID, "file.txt")
 			return "blob-B"
-		}},
+		}, false},
 		{"write before the pass", func(f *cacheFixture) string {
 			f.switchTo(baseFile("file.txt", "blob-B", 0o100644))
 			return "blob-B"
-		}},
+		}, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
@@ -403,12 +406,18 @@ func TestHeldInodeLosesItsPathToAnotherInode(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := tt.lose(f)
-			if got := kernelErrno(f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("old")})); got != syscall.ESTALE {
-				t.Fatalf("write through the stale inode = errno %v, want ESTALE", got)
+			write := func() {
+				if got := kernelErrno(f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("old")})); got != syscall.ESTALE {
+					t.Fatalf("write through the stale inode = errno %v, want ESTALE", got)
+				}
+			}
+			if tt.writeFirst {
+				write()
 			}
 			if got := kernelErrno(f.fs.GetInodeAttributes(f.ctx, &fuseops.GetInodeAttributesOp{Inode: held})); got != syscall.ESTALE {
 				t.Fatalf("getattr of the stale inode = errno %v, want ESTALE", got)
 			}
+			write()
 			other := f.lookup(fuseops.RootInodeID, "file.txt")
 			if other == held {
 				t.Fatalf("file.txt went back to inode %d", held)
