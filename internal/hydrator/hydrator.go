@@ -15,19 +15,14 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
-type BlobFetcher interface {
-	BlobToCache(ctx context.Context, repo model.RepoConfig, objectOID string, dstPath string) (size int64, err error)
-	FetchMissingBlobs(ctx context.Context, repo model.RepoConfig, objectOIDs []string) error
-	ReadBlob(ctx context.Context, repo model.RepoConfig, objectOID string, maxBytes int64) ([]byte, error)
-	VerifyBlob(ctx context.Context, repo model.RepoConfig, objectOID string, cachePath string) (ok bool, err error)
-}
-
 // OnHydratedFunc is called after a blob is successfully fetched. Allows the
 // caller to update metadata (e.g., backfill file sizes in the snapshot).
 type OnHydratedFunc func(repoID model.RepoID, objectOID string, size int64)
 
+var _ model.Hydrator = (*Service)(nil)
+
 type Service struct {
-	fetcher    BlobFetcher
+	fetcher    model.GitStore
 	mu         sync.Mutex
 	pq         priorityQueue
 	queued     map[string]*taskItem
@@ -75,7 +70,7 @@ type verifyResult struct {
 	err error
 }
 
-func New(fetcher BlobFetcher) *Service {
+func New(fetcher model.GitStore) *Service {
 	return &Service{
 		fetcher:   fetcher,
 		queued:    map[string]*taskItem{},
@@ -560,18 +555,6 @@ func (s *Service) runVerification(key string, file os.FileInfo, cachePath string
 	s.mu.Unlock()
 
 	notifyWaiters(waiters, r)
-}
-
-func (s *Service) QueueDepth(repoID model.RepoID) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c := 0
-	for _, item := range s.pq {
-		if item.task.RepoID == repoID {
-			c++
-		}
-	}
-	return c
 }
 
 func (s *Service) worker(repo model.RepoConfig, reserved bool) {

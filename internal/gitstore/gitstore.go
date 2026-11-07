@@ -12,6 +12,8 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
+var _ model.GitStore = (*Store)(nil)
+
 type Store struct {
 	logger         *slog.Logger
 	mu             sync.Mutex

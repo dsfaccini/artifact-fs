@@ -23,8 +23,6 @@ type fakeSymlinkHydrator struct {
 	readBlobErr   error
 }
 
-func (f *fakeSymlinkHydrator) Enqueue(model.HydrationTask) {}
-
 func (f *fakeSymlinkHydrator) EnqueueBatch([]model.HydrationTask) {}
 
 func (f *fakeSymlinkHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfig, _ model.BaseNode) (string, int64, error) {
@@ -40,8 +38,6 @@ func (f *fakeSymlinkHydrator) ReadBlob(_ context.Context, _ model.RepoConfig, _ 
 	f.readBlobCalls++
 	return f.readBlobData, f.readBlobErr
 }
-
-func (f *fakeSymlinkHydrator) QueueDepth(model.RepoID) int { return 0 }
 
 func TestReadSymlinkRejectsKnownOversizedBlobBeforeHydration(t *testing.T) {
 	hydrator := &fakeSymlinkHydrator{}

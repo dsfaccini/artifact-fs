@@ -46,7 +46,6 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					return err
 				}
 				defer svc.Close()
-				svc.SetMountRoot(c.String("root"))
 				svc.SetHydrationConcurrency(c.Int("hydration-concurrency"))
 				err = svc.Start(ctx)
 				if err == context.Canceled {

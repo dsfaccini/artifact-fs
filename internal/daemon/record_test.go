@@ -55,7 +55,6 @@ func newDaemonWithRepo(t *testing.T, tmp string, opts AddRepoOptions) (*Service,
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = svc.Close() })
-	svc.SetMountRoot(filepath.Join(tmp, "mnt"))
 	svc.mount = fakeMount
 	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", RefreshInterval: time.Hour, Enabled: true}, opts); err != nil {
 		t.Fatal(err)

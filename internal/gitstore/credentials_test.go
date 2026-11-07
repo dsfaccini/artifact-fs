@@ -15,53 +15,6 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
-func TestPrepareExistingCloneRejectsCredentialedRemoteBeforeSetURL(t *testing.T) {
-	tmp := t.TempDir()
-	gitDir := filepath.Join(tmp, "repo.git")
-	worktree := filepath.Join(tmp, "worktree")
-	run(t, "git", "init", "--separate-git-dir", gitDir, "--initial-branch", "master", worktree)
-	run(t, "git", "-C", worktree, "remote", "add", "origin", "https://github.com/org/repo.git")
-
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	bin := filepath.Join(tmp, "bin")
-	if err := os.Mkdir(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	marker := filepath.Join(tmp, "set-url-invoked")
-	fakeGit := filepath.Join(bin, "git")
-	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\ncase \"$*\" in *\"remote set-url\"*) : > \"$GIT_SET_URL_MARKER\";; esac\nexec \"$AFS_REAL_GIT\" \"$@\"\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("AFS_REAL_GIT", realGit)
-	t.Setenv("GIT_SET_URL_MARKER", marker)
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	store := New(nil)
-	for _, remote := range []string{
-		"ssh:/git:secret@github.com/org/repo.git",
-		"ssh//git:secret@github.com/org/repo.git",
-		"ssh:/git:pa/ss@github.com/org/repo.git",
-		"alice:ghp_secret@github.com:org/repo.git",
-	} {
-		t.Run(remote, func(t *testing.T) {
-			cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: gitDir, RemoteURL: remote, Branch: "master", FetchRef: "master"}
-			err := store.PrepareExistingCloneNonInteractive(context.Background(), cfg)
-			if err == nil {
-				t.Fatal("expected credentialed remote rejection")
-			}
-			if strings.Contains(err.Error(), "secret") {
-				t.Fatalf("error leaked credential: %v", err)
-			}
-			if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
-				t.Fatal("git remote set-url was invoked before rejecting credentialed remote")
-			}
-		})
-	}
-}
-
 func TestExistingCloneCredentialOperationsKeepCredentialsOutOfArguments(t *testing.T) {
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "bin")

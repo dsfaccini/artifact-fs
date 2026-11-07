@@ -49,7 +49,6 @@ func TestE2EAdoptedWorktree(t *testing.T) {
 		cancel()
 		t.Fatal(err)
 	}
-	svc.SetMountRoot(mountDir)
 	ctl := newE2EController(t, root)
 	if err := ctl.AddRepo(ctx, model.RepoConfig{Name: repoName, AdoptGitDir: true, GitDir: gitDir, MountRoot: mountDir, Enabled: true}); err != nil {
 		cancel()

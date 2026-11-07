@@ -95,7 +95,6 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 		cancel()
 		t.Fatal(err)
 	}
-	svc.SetMountRoot(mountDir)
 	ctl := newE2EController(t, root)
 
 	cfg := model.RepoConfig{
@@ -190,7 +189,6 @@ func (r *mountedE2ERepo) restart(t *testing.T) {
 		cancel()
 		t.Fatal(err)
 	}
-	svc.SetMountRoot(r.mountDir)
 	errCh := startE2EDaemon(ctx, svc)
 	if err := waitForMount(r.ctl, r.mountPath, 60*time.Second); err != nil {
 		cancel()

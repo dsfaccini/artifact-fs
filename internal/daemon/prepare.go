@@ -406,11 +406,6 @@ func (s *Service) prepareAsync(ctx context.Context, cfg model.RepoConfig, attemp
 	})
 }
 
-// runPrepare runs one async preparation of cfg.
-func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
-	return s.prepareAsync(ctx, cfg, 1)
-}
-
 // activatePrepared persists res ready, then switches the runtime that waits
 // for it to res's generation and opens its gate.
 func (s *Service) activatePrepared(ctx context.Context, res *prepared) error {

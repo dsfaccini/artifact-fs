@@ -202,7 +202,6 @@ func runE2EBenchmarkOnce(t *testing.T, repo e2eBenchRepoSpec, iteration int, hyd
 		t.Fatal(err)
 	}
 	defer svc.Close()
-	svc.SetMountRoot(mountDir)
 	svc.SetHydrationConcurrency(hydratorWorkers)
 	ctl := newE2EController(t, root)
 

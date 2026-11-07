@@ -11,7 +11,9 @@ Repository-specific guidance for `artifact-fs`.
 - Run a Git command that can lazy-fetch missing objects with `lazyFetchEnv()` and `configureCommandSession`, never `nonInteractiveGitEnv()`. `nonInteractiveGitEnv()` sets `GIT_SSH_COMMAND`, which overrides the repo's `core.sshCommand`, and an adopted worktree keeps that setting.
 - Add a blob cache file only with `blobcache.Stage` and `blobcache.Install`, and remove one only with `blobcache.Evict`. Each updates the counters `status` reads under the cache's `stats` flock. A direct write or unlink leaves the counters wrong until the next mount or `evict-cache` recounts them.
 - Normalize paths only with `model.CleanPath()`. Do not add local wrappers.
-- Use the canonical `model.*` interfaces for snapshot, overlay, hydrator, and gitstore access. Do not add subset interfaces around them.
+- Use the canonical `model.*` interfaces for registry, git store, snapshot, overlay, and hydrator access. Do not add subset interfaces around them.
+- Assert each implementation with `var _ model.X = (*T)(nil)`. Add a method to an interface only when production code calls the method through the interface.
+- Only `internal/daemon` holds a concrete snapshot, overlay or hydrator type, because it opens and closes them.
 
 ## Architecture
 
@@ -46,7 +48,7 @@ Repository-specific guidance for `artifact-fs`.
 
 ## Code conventions
 
-- `Readdir()` stays thin; merged directory logic belongs in `ReaddirTyped()`.
+- Keep merged directory logic in `Resolver.readdirTypedAt`. `ReaddirSnapshot` and `ReaddirTyped` only choose the generation.
 - Run every preparation through `core.prepare`. Express a new caller's differences as a `preparation`, not as another pipeline.
 - Normalize a repo config only in `normalizeRepoConfig`, before the registry stores it. Readers trust the stored config: never re-default or re-resolve a field after reading it.
 - Parse a ref only with `model.BranchName` and `model.CanonicalRef`.

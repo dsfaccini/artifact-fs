@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -1085,15 +1086,14 @@ func TestFirstFileReadPrefetchesItsDirectoryAndListingPrefetchesNothing(t *testi
 	t.Cleanup(func() { _ = ov.Close() })
 	h := hydrator.New(git)
 	t.Cleanup(h.Stop)
+	queue := &enqueueCounter{Hydrator: h}
 	resolver := &Resolver{Snapshot: snap, Overlay: ov}
 	resolver.SetGeneration(gen)
-	fs := NewArtifactFuse(repo, &Engine{Resolver: resolver, Repo: repo, Overlay: ov, Hydrator: h})
+	fs := NewArtifactFuse(repo, &Engine{Resolver: resolver, Repo: repo, Overlay: ov, Hydrator: queue})
 	packs := packCount(t, repo.GitDir)
 
-	// The hydrator has not started, so anything a listing queued would still
-	// be queued.
 	walkListing(t, fs, fuseops.RootInodeID, ".")
-	if got := h.QueueDepth(repo.ID); got != 0 {
+	if got := queue.queued.Load(); got != 0 {
 		t.Fatalf("a listing-only walk queued %d blobs for hydration", got)
 	}
 
@@ -1502,8 +1502,6 @@ type fakeLookupHydrator struct {
 	data          []byte
 }
 
-func (f *fakeLookupHydrator) Enqueue(model.HydrationTask) {}
-
 func (f *fakeLookupHydrator) EnqueueBatch([]model.HydrationTask) {}
 
 func (f *fakeLookupHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfig, _ model.BaseNode) (string, int64, error) {
@@ -1530,8 +1528,6 @@ func (f *fakeLookupHydrator) ReadBlob(_ context.Context, _ model.RepoConfig, _ m
 	}
 	return f.data, nil
 }
-
-func (f *fakeLookupHydrator) QueueDepth(model.RepoID) int { return 0 }
 
 // Every backend lists a directory at the first ReadDir and again at each
 // ReadDir from offset 0: FSKit reuses a handle across enumerations, and
@@ -1601,4 +1597,16 @@ func TestCreateFileKeepsExistingEntry(t *testing.T) {
 	if err := f.fs.LookUpInode(ctx, attrs); err != nil || attrs.Entry.Attributes.Size != uint64(base.SizeBytes) {
 		t.Fatalf("base file after CreateFile = size %d, %v; want size %d", attrs.Entry.Attributes.Size, err, base.SizeBytes)
 	}
+}
+
+// enqueueCounter passes every call to its hydrator and counts the blobs queued
+// through it.
+type enqueueCounter struct {
+	model.Hydrator
+	queued atomic.Int64
+}
+
+func (c *enqueueCounter) EnqueueBatch(tasks []model.HydrationTask) {
+	c.queued.Add(int64(len(tasks)))
+	c.Hydrator.EnqueueBatch(tasks)
 }
