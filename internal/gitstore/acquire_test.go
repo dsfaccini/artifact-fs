@@ -173,8 +173,13 @@ func TestPrepareFetchedBranchRollbackStepsShareOneDeadline(t *testing.T) {
 	t.Setenv("AFS_FIRST_STEP", firstStep)
 	t.Setenv("AFS_LATE_STEP", lateStep)
 
+	// A deadline that expires on the first step's marker would expire at once
+	// in a step that made its own context, so it could not tell one deadline
+	// from one per step. A timer can.
 	store := New(nil)
-	store.rollbackTimeout = time.Second
+	store.rollbackContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+	}
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}}
 	if err := store.PrepareFetchedBranch(context.Background(), cfg, "feature"); err == nil {
 		t.Fatal("PrepareFetchedBranch succeeded although HEAD could not move")
@@ -192,13 +197,17 @@ func TestPrepareFetchedBranchRollbackStepsShareOneDeadline(t *testing.T) {
 func TestPrepareFetchedBranchRollbackRestoresTheIndexFirst(t *testing.T) {
 	tmp := t.TempDir()
 	gitDir, baseOID, _ := fetchedAheadRepo(t, tmp, "refs/remotes/origin/feature")
-	// Pointing HEAD at the branch fails, then the ref restore hangs past the
-	// rollback's deadline.
-	realGit := wrapGit(t, tmp, "#!/bin/sh\nif [ \"$1\" = symbolic-ref ] && [ \"$2\" = HEAD ] && [ \"$#\" = 3 ]; then\n  : > \"$AFS_FAILED\"\n  exit 1\nfi\nif [ \"$1\" = update-ref ] && [ -e \"$AFS_FAILED\" ]; then\n  sleep 60\n  exit 1\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n")
+	// Pointing HEAD at the branch fails, then the ref restore hangs until the
+	// rollback's deadline passes.
+	refRestore := filepath.Join(tmp, "ref-restore")
+	realGit := wrapGit(t, tmp, "#!/bin/sh\nif [ \"$1\" = symbolic-ref ] && [ \"$2\" = HEAD ] && [ \"$#\" = 3 ]; then\n  : > \"$AFS_FAILED\"\n  exit 1\nfi\nif [ \"$1\" = update-ref ] && [ -e \"$AFS_FAILED\" ]; then\n  : > \"$AFS_REF_RESTORE\"\n  sleep 60\n  exit 1\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n")
 	t.Setenv("AFS_FAILED", filepath.Join(tmp, "symbolic-ref-failed"))
+	t.Setenv("AFS_REF_RESTORE", refRestore)
 
 	store := New(nil)
-	store.rollbackTimeout = time.Second
+	store.rollbackContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		return gittest.ExpireOnFile(context.WithoutCancel(ctx), refRestore)
+	}
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}}
 	if err := store.PrepareFetchedBranch(context.Background(), cfg, "feature"); err == nil {
 		t.Fatal("PrepareFetchedBranch succeeded although HEAD could not move")
@@ -298,6 +307,91 @@ func TestPrepareFetchedBranchUndoesAReadTreeThatLanded(t *testing.T) {
 				t.Fatalf("the index differs from HEAD in %q, want %q", staged, wantStaged)
 			}
 		})
+	}
+}
+
+// A forward read-tree that failed before it wrote the index leaves a staged
+// change alone, also one that holds exactly the fetched content.
+func TestPrepareFetchedBranchKeepsAStagedChangeAFailedReadTreeLeft(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		// script fails the first read-tree, writing $AFS_MARKER.
+		script string
+		// cancel cancels the preparation once $AFS_MARKER exists.
+		cancel bool
+	}{
+		{"canceled", "#!/bin/sh\nif [ \"$1\" = read-tree ] && [ ! -e \"$AFS_MARKER\" ]; then\n  : > \"$AFS_MARKER\"\n  sleep 60\n  exit 1\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n", true},
+		{"failed on its own", "#!/bin/sh\nif [ \"$1\" = read-tree ] && [ ! -e \"$AFS_MARKER\" ]; then\n  : > \"$AFS_MARKER\"\n  echo \"fatal: Unable to create 'index.lock': File exists.\" >&2\n  exit 128\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			gitDir, baseOID, _ := fetchedAheadRepo(t, tmp, "refs/remotes/origin/main")
+			repo := filepath.Dir(gitDir)
+			if err := os.WriteFile(filepath.Join(repo, "ahead.txt"), []byte("ahead\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			run(t, "git", "-C", repo, "add", "ahead.txt")
+			marker := filepath.Join(tmp, "marker")
+			realGit := wrapGit(t, tmp, tt.script)
+			t.Setenv("AFS_MARKER", marker)
+
+			ctx := context.Background()
+			if tt.cancel {
+				var cancel context.CancelFunc
+				ctx, cancel = gittest.ExpireOnFile(ctx, marker)
+				defer cancel()
+			}
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}}
+			if err := New(nil).PrepareFetchedBranch(ctx, cfg, "main"); err == nil {
+				t.Fatal("PrepareFetchedBranch succeeded although read-tree failed")
+			}
+			if head := strings.TrimSpace(runOutput(t, realGit, "--git-dir", gitDir, "rev-parse", "HEAD")); head != baseOID {
+				t.Fatalf("HEAD = %s, want %s", head, baseOID)
+			}
+			if staged := runOutput(t, realGit, "--git-dir", gitDir, "diff-index", "--cached", "--name-only", "HEAD"); staged != "ahead.txt\n" {
+				t.Fatalf("the index differs from HEAD in %q, want the staged %q", staged, "ahead.txt\n")
+			}
+		})
+	}
+}
+
+// A forward read-tree that changed only a gitlink, which
+// submodule.<name>.ignore=all hides from diffs, is undone too.
+func TestPrepareFetchedBranchUndoesALandedReadTreeOfAnIgnoredGitlink(t *testing.T) {
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, "git", "init", "--initial-branch", "main", repo)
+	if err := os.WriteFile(filepath.Join(repo, ".gitmodules"), []byte("[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", ".gitmodules")
+	run(t, "git", "-C", repo, "update-index", "--add", "--cacheinfo", "160000,"+strings.Repeat("1", 40)+",sub")
+	baseTree := strings.TrimSpace(runOutput(t, "git", "-C", repo, "write-tree"))
+	baseOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@e", "commit-tree", baseTree, "-m", "base"))
+	run(t, "git", "-C", repo, "update-index", "--cacheinfo", "160000,"+strings.Repeat("2", 40)+",sub")
+	aheadTree := strings.TrimSpace(runOutput(t, "git", "-C", repo, "write-tree"))
+	aheadOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@e", "commit-tree", aheadTree, "-p", baseOID, "-m", "ahead"))
+	run(t, "git", "-C", repo, "update-ref", "refs/heads/main", baseOID)
+	run(t, "git", "-C", repo, "read-tree", baseOID)
+	run(t, "git", "-C", repo, "update-ref", "refs/remotes/origin/main", aheadOID)
+	run(t, "git", "-C", repo, "config", "submodule.sub.ignore", "all")
+	gitDir := filepath.Join(repo, ".git")
+	// The read-tree writes the index, then hangs until the cancel stops it.
+	landed := filepath.Join(tmp, "landed")
+	realGit := wrapGit(t, tmp, "#!/bin/sh\nif [ \"$1\" = read-tree ] && [ ! -e \"$AFS_LANDED\" ]; then\n  \"$AFS_REAL_GIT\" \"$@\" || exit\n  : > \"$AFS_LANDED\"\n  sleep 60\n  exit 0\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n")
+	t.Setenv("AFS_LANDED", landed)
+
+	ctx, cancel := gittest.ExpireOnFile(context.Background(), landed)
+	defer cancel()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}}
+	if err := New(nil).PrepareFetchedBranch(ctx, cfg, "main"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("PrepareFetchedBranch error = %v, want deadline exceeded", err)
+	}
+	if head := strings.TrimSpace(runOutput(t, realGit, "--git-dir", gitDir, "rev-parse", "HEAD")); head != baseOID {
+		t.Fatalf("HEAD = %s, want %s", head, baseOID)
+	}
+	if staged := runOutput(t, realGit, "--git-dir", gitDir, "diff-index", "--cached", "--name-only", "--ignore-submodules=none", "HEAD"); staged != "" {
+		t.Fatalf("the index differs from HEAD in %q", staged)
 	}
 }
 
