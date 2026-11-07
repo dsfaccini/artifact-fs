@@ -61,14 +61,23 @@ func (s *Service) mountSucceeded(id model.RepoID) {
 
 // mountRepo brings cfg's prepared repo's snapshot to its git dir's HEAD
 // through the prepare pipeline, then starts the runtime that serves it, which
-// mounts it. An async repo's runtime gets an open gate, which a later prepare
-// request closes while the repo prepares again.
+// mounts it. A repo whose last sync preparation failed mounts only when an
+// earlier preparation published a generation, so a failed prepare never
+// unmounts a repo, also across a daemon restart. An async repo's runtime gets
+// an open gate, which a later prepare request closes while the repo prepares
+// again.
 func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 	if cfg.PrepareState == model.PrepareStateSyncPreparing {
 		return fusefs.ErrRepoNotReady
 	}
 	if cfg.PrepareState == "" && cfg.PrepareError != "" {
-		return fmt.Errorf("repo prepare failed: %s", cfg.PrepareError)
+		published, err := hasPublishedGeneration(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		if !published {
+			return fmt.Errorf("repo prepare failed: %s", cfg.PrepareError)
+		}
 	}
 	return s.prepare(ctx, cfg, preparation{
 		ambient:    true,
@@ -128,6 +137,23 @@ func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *pre
 	rt := s.startRuntime(ctx, cfg, snap, ov, servedHead{oid: res.source.Commit, ref: res.source.Ref, gen: gen}, gate)
 	s.startRepoBackground(rt)
 	return nil
+}
+
+// hasPublishedGeneration reports whether cfg's snapshot store holds a
+// generation, which only a preparation that succeeded publishes.
+func hasPublishedGeneration(ctx context.Context, cfg model.RepoConfig) (bool, error) {
+	if _, err := os.Stat(cfg.MetaDBPath); errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
+	if err != nil {
+		return false, err
+	}
+	defer snap.Close()
+	_, _, gen, err := snap.ReadState(ctx)
+	return gen > 0, err
 }
 
 // runHook runs a test hook of Service when a test set it.

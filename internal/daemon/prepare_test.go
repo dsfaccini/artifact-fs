@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -208,6 +209,10 @@ func TestPrepareOnReadyVerifiedRepoKeepsItsMount(t *testing.T) {
 			if rt == nil || rt.reportedState() != repoStateMounted {
 				t.Fatalf("runtime before prepare = %+v, want mounted", rt)
 			}
+			before, err := svc.registry.GetRepo(ctx, cfg.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
 
 			if err := svc.ctl().Prepare(ctx, cfg.Name); err != nil {
 				t.Fatal(err)
@@ -228,6 +233,12 @@ func TestPrepareOnReadyVerifiedRepoKeepsItsMount(t *testing.T) {
 			}
 			if stored.PrepareState != model.PrepareStateReady {
 				t.Fatalf("prepare state = %q, want ready", stored.PrepareState)
+			}
+			svc.mu.Lock()
+			served := rt.cfg.PrepareRequest
+			svc.mu.Unlock()
+			if stored.PrepareRequest == before.PrepareRequest || served != stored.PrepareRequest {
+				t.Fatalf("prepare request before %q, stored %q, served %q; want a new request the runtime prepared", before.PrepareRequest, stored.PrepareRequest, served)
 			}
 			if rec, _, err := svc.registry.GetRuntime(ctx, id); err != nil || rec.State != repoStateMounted {
 				t.Fatalf("daemon state = %q, %v; want %s", rec.State, err, repoStateMounted)
@@ -352,5 +363,109 @@ func TestAddRepoSyncFreshCloneServesFetchRef(t *testing.T) {
 	}
 	if oid, ref := publishedHead(t, got); oid != feature || ref != "feature" {
 		t.Fatalf("published %s at %q, want feature %s", oid, ref, feature)
+	}
+}
+
+// prepare cancels the async preparation it supersedes, so the next
+// preparation does not wait for a hung clone to end.
+func TestPrepareCancelsTheAsyncPreparationItSupersedes(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(tmp, "bin")
+	markers := filepath.Join(tmp, "markers")
+	for _, dir := range []string{bin, markers} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A clone marks its start, hangs, then marks its end. A canceled clone
+	// never marks its end.
+	script := "#!/bin/sh\nif [ \"$1\" = clone ]; then\n  : > \"$AFS_MARKERS/start-$$\"\n  sleep 60\n  : > \"$AFS_MARKERS/end-$$\"\n  exit 1\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AFS_REAL_GIT", realGit)
+	t.Setenv("AFS_MARKERS", markers)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	clones := func(prefix string) int {
+		matches, _ := filepath.Glob(filepath.Join(markers, prefix+"-*"))
+		return len(matches)
+	}
+
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	m := &recordingMount{}
+	svc.mount = m.mount
+	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.invalid/repo.git", Branch: "main", Enabled: true}, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, nil, func() bool { return clones("start") == 1 })
+	if err := svc.ctl().Prepare(ctx, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, nil, func() bool { return clones("start") == 2 })
+	if clones("end") != 0 {
+		t.Fatal("the next preparation cloned only after the superseded clone ended")
+	}
+}
+
+// A failed prepare of a repo that was prepared before keeps the repo served,
+// also after the daemon restarts, and status shows the prepare error with the
+// commit the daemon serves.
+func TestFailedSyncPrepareKeepsServingAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	svc, ctl := newSyncedDaemonIn(t, tmp)
+	m := &recordingMount{}
+	svc.mount = m.mount
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	remote := filepath.Join(tmp, "remote")
+	served := strings.TrimSpace(runCmdOutput(t, "git", "-C", remote, "rev-parse", "HEAD"))
+	if err := os.Rename(remote, filepath.Join(tmp, "remote-gone")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctl.Prepare(ctx, "repo"); err == nil {
+		t.Fatal("prepare from a missing remote succeeded")
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m.only(t)
+	if err := svc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	m = &recordingMount{}
+	restarted.mount = m.mount
+	if err := restarted.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m.only(t)
+	st, err := ctl.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State != repoStateMounted || st.PrepareError == "" || st.ServedHEADOID != served {
+		t.Fatalf("status after a restart = state %q, prepare error %q, served %q; want mounted, the prepare error, %s", st.State, st.PrepareError, st.ServedHEADOID, served)
 	}
 }

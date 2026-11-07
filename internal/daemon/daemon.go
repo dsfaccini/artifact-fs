@@ -127,9 +127,10 @@ type Service struct {
 	headReconcileBackoff time.Duration
 	mu                   sync.Mutex
 	running              map[model.RepoID]*repoRuntime
-	preparing            map[model.RepoID]int64
-	prepareAttempts      map[model.RepoID]int64
-	prepareSeq           int64
+	// preparing holds each repo's async preparation worker.
+	preparing       map[model.RepoID]prepareWorker
+	prepareAttempts map[model.RepoID]int64
+	prepareSeq      int64
 	// leftovers holds the repos the daemon process before this one ran and
 	// whose mounts it may have left. Before the daemon mounts such a repo,
 	// it unmounts the mount at its mount point when ownsLeftover matches it.
@@ -175,7 +176,7 @@ func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error
 		unmountPath:     defaultUnmountPath,
 		mountPointEntry: mountPointEntry,
 		running:         map[model.RepoID]*repoRuntime{},
-		preparing:       map[model.RepoID]int64{},
+		preparing:       map[model.RepoID]prepareWorker{},
 		prepareAttempts: map[model.RepoID]int64{},
 		leftovers:       map[model.RepoID]bool{},
 		mountRetries:    map[model.RepoID]*mountRetry{},

@@ -294,6 +294,10 @@ func TestMigrationStoresRefsInFull(t *testing.T) {
 		row("tracking", "refs/heads/main", "refs/remotes/origin/dev", "0"),
 		row("tag", "refs/tags/v1", "refs/tags/v1", "0"),
 		row("spaced", "refs/heads/main", " dev ", "0"),
+		row("empty", "", "", "0"),
+		row("remotes", "refs/remotes/origin/x", "x", "0"),
+		row("literal-origin", "refs/heads/origin/x", "origin/x", "0"),
+		row("short-origin", "origin/x", "", "0"),
 		row("adopted", "HEAD", "", "1"),
 		`PRAGMA user_version = 3`,
 	)
@@ -309,7 +313,15 @@ func TestMigrationStoresRefsInFull(t *testing.T) {
 		"tracking": {"refs/heads/main", "refs/heads/dev"},
 		"tag":      {"refs/tags/v1", "refs/tags/v1"},
 		"spaced":   {"refs/heads/main", "refs/heads/dev"},
-		"adopted":  {"HEAD", ""},
+		// add-repo's default source ref.
+		"empty":   {"refs/heads/main", "refs/heads/main"},
+		"remotes": {"refs/heads/x", "refs/heads/x"},
+		// An older build cloned branch origin/x and fetched branch x.
+		"literal-origin": {"refs/heads/origin/x", "refs/heads/x"},
+		// A row from before add-repo stored full refs: the clone took
+		// branch origin/x.
+		"short-origin": {"refs/heads/origin/x", "refs/heads/origin/x"},
+		"adopted":      {"HEAD", ""},
 	} {
 		got, err := store.GetRepo(ctx, name)
 		if err != nil {

@@ -36,7 +36,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			Name:  "daemon",
 			Usage: "start the artifact-fs daemon",
 			Flags: []ucli.Flag{
-				&ucli.StringFlag{Name: "root", Value: filepath.Join(root, "mnt"), Usage: "mount root directory"},
+				&ucli.StringFlag{Name: "root", Value: filepath.Join(root, "mnt"), Usage: "accepted for compatibility; changes no registered repo, which mounts where add-repo --mount-root put it"},
 				&ucli.IntFlag{Name: "hydration-concurrency", Value: daemon.DefaultHydrationConcurrency, Usage: "number of concurrent blob hydration workers"},
 			},
 			Action: func(_ context.Context, c *ucli.Command) error {
@@ -62,7 +62,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				&ucli.StringFlag{Name: "name", Usage: "repo name (required)"},
 				&ucli.StringFlag{Name: "remote", Usage: "remote URL (required)"},
 				&ucli.StringFlag{Name: "branch", Usage: "deprecated alias for --ref refs/heads/<branch>"},
-				&ucli.StringFlag{Name: "ref", Value: "refs/heads/main", Usage: "canonical source ref"},
+				&ucli.StringFlag{Name: "ref", Value: "refs/heads/main", Usage: "source ref: a full ref name, a branch name, or origin/<branch>"},
 				&ucli.StringFlag{Name: "require-commit", Usage: "require the source ref to resolve to this exact commit"},
 				&ucli.IntFlag{Name: "depth", Usage: "history depth to transfer; 0 transfers complete history"},
 				&ucli.StringFlag{Name: "refresh", Value: "30s", Usage: "remote refresh interval or never"},

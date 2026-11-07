@@ -24,7 +24,7 @@ Repository-specific guidance for `artifact-fs`.
 
 ## Runtime contracts
 
-- `ARTIFACT_FS_ROOT` is the state root. `artifact-fs daemon --root` is the mount root. They are different things.
+- `ARTIFACT_FS_ROOT` is the state root. Each repo mounts at the path its registration stores: `add-repo --mount-root`, default `<state root>/mnt`, plus the repo name. `artifact-fs daemon --root` changes no registered repo's mount path.
 - `add-repo` is one-shot by default: register repo, clone blobless, build the initial snapshot, then exit. It does not mount FUSE or start background goroutines.
 - `add-repo --async` only registers prepare state. The daemon mounts a gated placeholder, prepares clone/fetch and snapshot in the background, then opens the gate and starts watcher/refresh.
 - `config_version` identifies a registered config, and only a new registration changes it. Use it as the only token that a config is still current.

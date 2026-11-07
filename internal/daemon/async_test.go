@@ -429,7 +429,7 @@ func TestSyncReposSkipsResetWhilePrepareWorkerInFlight(t *testing.T) {
 	}
 	svc.mu.Lock()
 	svc.running[cfg.ID] = rt
-	svc.preparing[cfg.ID] = 1
+	svc.preparing[cfg.ID] = prepareWorker{token: 1}
 	svc.mu.Unlock()
 
 	if err := svc.syncRepos(ctx); err != nil {

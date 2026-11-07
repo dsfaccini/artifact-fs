@@ -460,6 +460,12 @@ func (s *Service) persistAsyncFailure(ctx context.Context, cfg model.RepoConfig,
 	return prepareErr
 }
 
+// prepareWorker is a running async preparation. cancel ends it.
+type prepareWorker struct {
+	token  int64
+	cancel context.CancelFunc
+}
+
 func (s *Service) startPrepareWorker(ctx context.Context, cfg model.RepoConfig) {
 	s.mu.Lock()
 	if s.closing {
@@ -481,7 +487,8 @@ func (s *Service) startPrepareWorker(ctx context.Context, cfg model.RepoConfig) 
 		workerCtx = rt.ctx
 		rt.workers.Add(1)
 	}
-	s.preparing[cfg.ID] = token
+	workerCtx, cancel := context.WithCancel(workerCtx)
+	s.preparing[cfg.ID] = prepareWorker{token: token, cancel: cancel}
 	s.prepareWorkers.Add(1)
 	s.mu.Unlock()
 
@@ -490,9 +497,10 @@ func (s *Service) startPrepareWorker(ctx context.Context, cfg model.RepoConfig) 
 		if trackedRuntime {
 			defer rt.workers.Done()
 		}
+		defer cancel()
 		defer func() {
 			s.mu.Lock()
-			if s.preparing[cfg.ID] == token {
+			if s.preparing[cfg.ID].token == token {
 				delete(s.preparing, cfg.ID)
 			}
 			s.mu.Unlock()
@@ -501,10 +509,16 @@ func (s *Service) startPrepareWorker(ctx context.Context, cfg model.RepoConfig) 
 	}()
 }
 
+// supersedePrepare cancels id's running async preparation, which releases
+// the repo's prepare lock for the preparation that replaces it.
 func (s *Service) supersedePrepare(id model.RepoID) {
 	s.mu.Lock()
+	worker, ok := s.preparing[id]
 	delete(s.preparing, id)
 	s.mu.Unlock()
+	if ok && worker.cancel != nil {
+		worker.cancel()
+	}
 }
 
 func (s *core) withPrepareTimeout(ctx context.Context) (context.Context, context.CancelFunc) {

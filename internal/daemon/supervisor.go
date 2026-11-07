@@ -194,13 +194,16 @@ func (s *Service) stopRepo(repo model.RepoConfig, stopped string, logMsg string)
 	return true
 }
 
-// drivePrepare carries out repo's latest prepare request on rt, the runtime
-// that serves repo's current config, and never unmounts rt. An async repo
-// prepares again behind rt's gate, which holds FUSE ops meanwhile, unless a
-// worker already prepares that request or rt already finished it: repo can
-// be older than rt. The CLI prepares a sync repo while rt keeps serving; once
-// it is done, rt takes the request over and reconciles HEAD.
+// drivePrepare carries out an async repo's latest prepare request on rt, the
+// runtime that serves the repo's current config, and never unmounts rt. The
+// repo prepares again behind rt's gate, which holds FUSE ops meanwhile, unless
+// a worker already prepares that request or rt already finished it: repo can
+// be older than rt. The CLI prepares a sync repo, and rt's watcher moves the
+// mount to the HEAD that preparation leaves.
 func (s *Service) drivePrepare(ctx context.Context, repo model.RepoConfig, rt *repoRuntime, alreadyPreparing bool) {
+	if repo.PrepareState != model.PrepareStatePreparing {
+		return
+	}
 	s.mu.Lock()
 	if s.running[repo.ID] != rt {
 		s.mu.Unlock()
@@ -208,20 +211,12 @@ func (s *Service) drivePrepare(ctx context.Context, repo model.RepoConfig, rt *r
 	}
 	request, finished := rt.cfg.PrepareRequest, rt.prepare != model.PrepareStatePreparing
 	s.mu.Unlock()
-	switch {
-	case repo.PrepareState == model.PrepareStatePreparing:
-		if request == repo.PrepareRequest && (alreadyPreparing || finished) {
-			return
-		}
-		if !s.resetRunningPrepareState(repo) {
-			return
-		}
-		s.supersedePrepare(repo.ID)
-		s.startPrepareWorker(ctx, repo)
-	case repo.PrepareState != model.PrepareStateSyncPreparing && request != repo.PrepareRequest:
-		s.mu.Lock()
-		rt.cfg.PrepareRequest, rt.cfg.PrepareState, rt.cfg.PrepareError = repo.PrepareRequest, repo.PrepareState, repo.PrepareError
-		s.mu.Unlock()
-		s.signalHEADReconcile(rt)
+	if request == repo.PrepareRequest && (alreadyPreparing || finished) {
+		return
 	}
+	if !s.resetRunningPrepareState(repo) {
+		return
+	}
+	s.supersedePrepare(repo.ID)
+	s.startPrepareWorker(ctx, repo)
 }

@@ -68,11 +68,18 @@ var migrations = []meta.Migration{
 	),
 	// prepare_request carries the CLI's prepare requests, so config_version
 	// changes only with the config. add-repo now stores every ref in full,
-	// with fetch_ref defaulting to branch; this brings older rows to that.
+	// with branch defaulting to refs/heads/main and fetch_ref to branch; this
+	// brings older rows to that. A short branch stays the branch an older
+	// build cloned, so origin/x becomes refs/heads/origin/x.
 	meta.SQL(
 		`ALTER TABLE repos ADD COLUMN prepare_request TEXT NOT NULL DEFAULT ''`,
-		`UPDATE repos SET branch = 'refs/heads/' || trim(branch)
-		  WHERE adopt_gitdir = 0 AND substr(trim(branch), 1, 5) <> 'refs/'`,
+		`UPDATE repos SET branch = CASE
+		    WHEN trim(branch) = '' THEN 'refs/heads/main'
+		    WHEN substr(trim(branch), 1, 20) = 'refs/remotes/origin/' THEN 'refs/heads/' || substr(trim(branch), 21)
+		    WHEN substr(trim(branch), 1, 5) = 'refs/' THEN trim(branch)
+		    ELSE 'refs/heads/' || trim(branch)
+		  END
+		  WHERE adopt_gitdir = 0`,
 		`UPDATE repos SET fetch_ref = CASE
 		    WHEN trim(fetch_ref) = '' THEN branch
 		    WHEN substr(trim(fetch_ref), 1, 11) = 'refs/heads/' THEN trim(fetch_ref)

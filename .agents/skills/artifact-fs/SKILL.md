@@ -22,7 +22,7 @@ go build -o artifact-fs ./cmd/artifact-fs
 - **Prefer HTTPS remotes.** For private repos, use Git credential helpers or SSH auth. Do not embed tokens or passwords in the `--remote` URL because `--remote` is a CLI arg and can show up in process listings.
 - **`add-repo` does not mount.** It registers a blobless clone and exits. `daemon` mounts all registered repos and stays running.
 - **The mounted tree starts from committed Git state.** Remote commits, trees, and refs are the base view. Local edits live in an overlay and appear as dirty state until committed.
-- **One daemon can mount many repos.** Register each repo separately, then start one `daemon --root <mount-root>`. A second daemon on the same `ARTIFACT_FS_ROOT` exits with an error.
+- **One daemon can mount many repos.** Register each repo separately, then start one `daemon`. Each repo mounts at `<mount-root>/<name>` from its `add-repo --mount-root`; `daemon --root` changes no registered repo. A second daemon on the same `ARTIFACT_FS_ROOT` exits with an error.
 - **Unmount a stale mount with the OS's tool.** A stale mount is one no running daemon serves, so `unmount` cannot reach it. A daemon that starts on the same state root unmounts the stale mounts the stopped daemon left at its repos' mount points. Without a daemon, on macOS run `diskutil unmount <path>`, because `umount` fails on an FSKit mount unless the terminal app has the Network Volumes permission. On Linux run `fusermount3 -u <path>`, because `umount` needs root.
 
 ## Quick Reference
@@ -30,7 +30,7 @@ go build -o artifact-fs ./cmd/artifact-fs
 | Task | Command |
 |------|---------|
 | Register one repo | `./artifact-fs add-repo --name <name> --remote <url> --branch <branch> --mount-root <mount-root>` |
-| Mount all registered repos | `./artifact-fs daemon --root <mount-root>` |
+| Mount all registered repos | `./artifact-fs daemon` |
 | Check mount and overlay state | `./artifact-fs status --name <name>` |
 | List registered repos | `./artifact-fs list-repos` |
 | Unmount a repo until remount | `./artifact-fs unmount --name <name>`; waits for the running daemon and exits non-zero if it failed or no daemon runs |
@@ -50,7 +50,7 @@ MOUNT_ROOT="$HOME/artifact-fs-mnt"
   --branch main \
   --mount-root "$MOUNT_ROOT"
 
-./artifact-fs daemon --root "$MOUNT_ROOT" &
+./artifact-fs daemon &
 DAEMON_PID=$!
 
 git -C "$MOUNT_ROOT/workers-sdk" rev-parse HEAD
@@ -78,7 +78,7 @@ MOUNT_ROOT="$HOME/artifact-fs-mnt"
 ./artifact-fs add-repo --name repo-a --remote https://github.com/org/repo-a.git --branch main --mount-root "$MOUNT_ROOT"
 ./artifact-fs add-repo --name repo-b --remote https://github.com/org/repo-b.git --branch main --mount-root "$MOUNT_ROOT"
 
-./artifact-fs daemon --root "$MOUNT_ROOT" &
+./artifact-fs daemon &
 DAEMON_PID=$!
 
 ls "$MOUNT_ROOT/repo-a"

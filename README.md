@@ -110,8 +110,8 @@ MOUNT_ROOT="$HOME/artifact-fs-mnt"
   --ref refs/heads/main \
   --mount-root "$MOUNT_ROOT"
 
-# Start the daemon (mounts via FUSE, blocks until killed)
-./artifact-fs daemon --root "$MOUNT_ROOT" &
+# Start the daemon (mounts each repo where add-repo registered it, blocks until killed)
+./artifact-fs daemon &
 DAEMON_PID=$!
 
 # Use the repo
@@ -207,7 +207,7 @@ When the Git index matches the published snapshot and the overlay is empty, star
 Use `--hydration-concurrency` to control the number of parallel blob-fetch workers (default 4). Each worker maintains a persistent `git cat-file --batch` process that copies fetched blobs into the cache, so higher values trade memory for faster bulk hydration:
 
 ```bash
-./artifact-fs daemon --root /tmp --hydration-concurrency 8
+./artifact-fs daemon --hydration-concurrency 8
 ```
 
 ### Evicting the blob cache
@@ -281,7 +281,7 @@ Preparation timeout:
 Diagnostics are bounded and redact credentials and complete remote references. To follow preparation and network activity:
 
 ```bash
-./artifact-fs daemon --root /tmp 2>/tmp/daemon.log &
+./artifact-fs daemon 2>/tmp/daemon.log &
 tail -f /tmp/daemon.log | grep -Ei 'prepar|git operation'
 ```
 
@@ -305,7 +305,7 @@ The daemon mounts a placeholder immediately. Operations inside that repo mount, 
 ./artifact-fs prepare --name workers-sdk
 ```
 
-`prepare` never unmounts the repo. The daemon prepares an async repo again behind its gate, so operations wait as they did during the first preparation. For a repo `add-repo` prepared without `--async`, `prepare` fetches and prepares in the CLI while the daemon keeps serving the mount, which then moves to the prepared commit. An async repo that is ready and has no `--require-commit` has nothing to prepare. `set-refresh` never prepares a repo again.
+`prepare` never unmounts the repo. The daemon prepares an async repo again behind its gate, so operations wait as they did during the first preparation. For a repo `add-repo` prepared without `--async`, `prepare` fetches and prepares in the CLI while the daemon keeps serving the previous commit, and `status` reports `preparing` meanwhile. The mount then moves to the prepared commit. When that `prepare` fails, the daemon keeps serving the commit it served, also after a restart, and `status` shows the `prepare_error` with it. An async repo that is ready and has no `--require-commit` has nothing to prepare. `set-refresh` never prepares a repo again.
 
 Async HTTPS remotes must use ambient credentials, such as a configured Git credential helper or repo-local Git config. Inline credentials in the remote URL are rejected for async repositories.
 
@@ -325,7 +325,7 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
   --fetch-ref main
 ```
 
-`--ref` and `--fetch-ref` take a full ref name, a branch name, or `origin/<branch>`, and `add-repo` stores each as a full ref name. `--fetch-ref` defaults to `--ref`. Preparation fetches the fetch ref and serves it, also right after a fresh clone of `--ref`.
+`--ref` and `--fetch-ref` take a full ref name, a branch name, or `origin/<branch>`, and `add-repo` stores each as a full ref name. `origin/X` names branch `X`, so a branch literally named `origin/X` needs `--ref refs/heads/origin/X`. `--fetch-ref` defaults to `--ref`. Preparation fetches the fetch ref and serves it, also right after a fresh clone of `--ref`.
 
 ## Adopting linked Git worktrees
 
@@ -348,7 +348,7 @@ mv /path/to/mounts/topic/.git /path/to/topic.gitfile
 ARTIFACT_FS_ROOT=/path/to/topic-state artifact-fs add-repo \
   --name topic --adopt-gitdir --git-dir "$topic_gitdir" \
   --mount-root /path/to/mounts --blob-cache-dir /path/to/shared-blobs
-ARTIFACT_FS_ROOT=/path/to/topic-state artifact-fs daemon --root /path/to/mounts
+ARTIFACT_FS_ROOT=/path/to/topic-state artifact-fs daemon
 ```
 
 Adoption disables remote refresh and rejects acquisition options (`--remote`,
