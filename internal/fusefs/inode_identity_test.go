@@ -1495,3 +1495,132 @@ func TestRenameOntoHeldDirectoryPathRetiresIt(t *testing.T) {
 		t.Fatalf("d looks up as inode %d, want %d, the directory renamed there", got, e)
 	}
 }
+
+// A kernel that renames a name it cached, as FSKit can, sends no lookup
+// first. A rename of a path that came back unchanged for a held inode must
+// move that inode as a mapped one, with or without a getattr first, so the
+// next switch pass does not retire the inode the rename moved.
+func TestRenameOfReturnedPathWithoutLookupKeepsHeldInode(t *testing.T) {
+	for _, getattr := range []bool{true, false} {
+		t.Run(fmt.Sprint("getattr=", getattr), func(t *testing.T) {
+			f := newCacheFixtureOn(t, BackendFSKit, baseFile("file.txt", "blob-A", 0o100644))
+			held := f.lookup(fuseops.RootInodeID, "file.txt")
+			open := f.open(held)
+			f.switchTo()
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			f.switchTo(baseFile("file.txt", "blob-A", 0o100644))
+			if getattr {
+				f.getattr(held)
+			}
+			if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "file.txt", NewParent: fuseops.RootInodeID, NewName: "moved.txt"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.fs.GetInodeAttributes(f.ctx, &fuseops.GetInodeAttributesOp{Inode: held}); err != nil {
+				t.Fatalf("getattr of the inode the rename moved = %v", err)
+			}
+			if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("new")}); err != nil {
+				t.Fatalf("write through the inode the rename moved = %v", err)
+			}
+			if got := f.lookup(fuseops.RootInodeID, "moved.txt"); got != held {
+				t.Fatalf("moved.txt looks up as inode %d, want the held %d", got, held)
+			}
+		})
+	}
+}
+
+// An unlink of a path that came back unchanged for a held inode, with no
+// lookup first, retires that inode as an unlink of a mapped path does.
+func TestUnlinkOfReturnedPathWithoutLookupRetiresHeldInode(t *testing.T) {
+	f := newCacheFixtureOn(t, BackendFSKit, baseFile("file.txt", "blob-A", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	f.open(held)
+	f.switchTo()
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	f.switchTo(baseFile("file.txt", "blob-A", 0o100644))
+	if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := kernelErrno(f.fs.GetInodeAttributes(f.ctx, &fuseops.GetInodeAttributesOp{Inode: held})); got != syscall.ESTALE {
+		t.Fatalf("getattr of the inode whose path an unlink removed = errno %v, want ESTALE", got)
+	}
+}
+
+// failingRemoveOverlay fails every Remove.
+type failingRemoveOverlay struct{ model.OverlayStore }
+
+func (o *failingRemoveOverlay) Remove(context.Context, string) error {
+	return errors.New("remove failed")
+}
+
+// An unlink that fails after it pointed the open handles at the path's
+// overlay file leaves them unpinned: they hold no copy of their own. A later
+// retirement then makes a write through them return ESTALE, instead of
+// succeeding into a file that a commit removed.
+func TestFailedUnlinkLeavesHandleUnpinned(t *testing.T) {
+	other := baseFile("other.txt", "blob-O", 0o100644)
+	f := newCacheFixture(t, other)
+	create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "file.txt", Mode: 0o644}
+	if err := f.fs.CreateFile(f.ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	held := create.Entry.Child
+	if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: create.Handle, Data: []byte("data\n")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	open := f.open(held)
+	ov := f.resolver.Overlay
+	failing := &failingRemoveOverlay{ov}
+	f.resolver.Overlay, f.fs.engine.Overlay = failing, failing
+	if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"}); err == nil {
+		t.Fatal("unlink succeeded through an overlay whose Remove fails")
+	}
+	f.resolver.Overlay, f.fs.engine.Overlay = ov, ov
+	committed := baseFile("file.txt", blobOID("data\n"), 0o100644)
+	for _, nodes := range [][]model.BaseNode{{other, committed}, {other}, {other, committed}} {
+		f.switchTo(nodes...)
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := kernelErrno(f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("LOST")})); got != syscall.ESTALE {
+		t.Fatalf("write through the retired handle = errno %v, want ESTALE", got)
+	}
+}
+
+// A lookup of a held path while the path is missing runs holding handleOps
+// shared. A tool that polls the path on a backend that caches no negative
+// entries would otherwise make every lookup wait for all other ops.
+func TestLookupOfMissingHeldPathRunsShared(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	f.open(held)
+	f.switchTo()
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	f.fs.handleOps.RLock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = f.fs.LookUpInode(f.ctx, &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "file.txt"})
+	}()
+	waitDoneOrExclusive(f.fs, done)
+	select {
+	case <-done:
+		f.fs.handleOps.RUnlock()
+	default:
+		f.fs.handleOps.RUnlock()
+		<-done
+		t.Fatal("a lookup of the missing path file.txt waited for handleOps exclusively")
+	}
+}

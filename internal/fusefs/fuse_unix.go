@@ -302,14 +302,17 @@ func (fs *ArtifactFuse) createEntry(parent fuseops.InodeID, name, path string, a
 }
 
 // unmapPath retires the inode number of path, which an op through the mount
-// removed, and retires the inode the kernel still holds for it: that inode
-// never maps back, because its handles hold their own copy. The inode keeps
-// its number until its own FORGET.
+// removed, and retires the inode the kernel still holds for it, mapped or
+// unmapped: that inode never maps back, because its handles hold their own
+// copy. The inode keeps its number until its own FORGET.
 func (fs *ArtifactFuse) unmapPath(path string) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	if id, ok := fs.pathToInode[path]; ok {
 		delete(fs.pathToInode, path)
+		fs.retireLocked(id)
+	}
+	if id, ok := fs.unmapped[path]; ok {
 		fs.retireLocked(id)
 	}
 }
@@ -329,6 +332,49 @@ func (fs *ArtifactFuse) unmapPathLocked(id fuseops.InodeID, path string) {
 func (fs *ArtifactFuse) mapLocked(id fuseops.InodeID, path string) {
 	fs.pathToInode[path] = id
 	delete(fs.unmapped, path)
+}
+
+// settleLocked decides id, unmapped at path, now that path exists with
+// identity current. It maps id back when no other inode holds the path and
+// returnsAs accepts current, and retires id otherwise. It reports whether id
+// got the path back. Caller must hold fs.mu write lock.
+func (fs *ArtifactFuse) settleLocked(id fuseops.InodeID, path string, current Identity) bool {
+	if _, mapped := fs.pathToInode[path]; !mapped && fs.inodes[id].returnsAs(current) {
+		fs.mapLocked(id, path)
+		return true
+	}
+	fs.retireLocked(id)
+	return false
+}
+
+// settleUnmappedBelow decides each unmapped inode at or below path whose path
+// exists again, with settleLocked. A rename of path then moves such an inode
+// as a mapped one, or not at all. An unmapped inode whose path is still
+// missing moves with the rename. The caller holds handleOps exclusively.
+func (fs *ArtifactFuse) settleUnmappedBelow(path string) error {
+	fs.mu.RLock()
+	var held []pathMapping
+	for p, id := range fs.unmapped {
+		if samePathOrDescendant(p, path) {
+			held = append(held, pathMapping{id, p})
+		}
+	}
+	fs.mu.RUnlock()
+	for _, m := range held {
+		current, exists, err := fs.engine.Identity(m.path)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		fs.mu.Lock()
+		if fs.unmapped[m.path] == m.id {
+			fs.settleLocked(m.id, m.path, current)
+		}
+		fs.mu.Unlock()
+	}
+	return nil
 }
 
 // returnsAs reports whether a path that comes back with identity current is
@@ -726,12 +772,8 @@ func (fs *ArtifactFuse) setReported(id fuseops.InodeID, attrs Attrs) error {
 	if ref == nil {
 		return nil
 	}
-	if fs.unmapped[ref.Path] == id {
-		if _, mapped := fs.pathToInode[ref.Path]; mapped || !ref.returnsAs(attrs.identity()) {
-			fs.retireLocked(id)
-			return syscall.ESTALE
-		}
-		fs.mapLocked(id, ref.Path)
+	if fs.unmapped[ref.Path] == id && !fs.settleLocked(id, ref.Path, attrs.identity()) {
+		return syscall.ESTALE
 	}
 	ref.report(attrs)
 	return nil
@@ -895,8 +937,8 @@ func (fs *ArtifactFuse) hasOpenFile(path string) bool {
 	return false
 }
 
-// pinOpenFiles points the handles open on path at backingPath and marks them
-// pinned. A detached handle no longer names path, so it keeps its own file.
+// pinOpenFiles points the handles open on path at backingPath. A detached
+// handle no longer names path, so it keeps its own file.
 func (fs *ArtifactFuse) pinOpenFiles(path, backingPath string) error {
 	fs.mu.RLock()
 	var handles []*FileHandle
@@ -927,12 +969,25 @@ func (fs *ArtifactFuse) pinOpenFiles(path, backingPath string) error {
 				_ = old.Close()
 			}
 		}
-		if !fh.detached {
+		fh.mu.Unlock()
+	}
+	return nil
+}
+
+// markPinned marks pinned each handle open on path that holds the path's
+// overlay file, once an unlink or a rename over path committed. The handle
+// then holds its own copy, which pinOpenFiles pointed it at. A failed unlink
+// or rename leaves its handles unpinned.
+func (fs *ArtifactFuse) markPinned(path string) {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	for _, fh := range fs.fileHandles {
+		fh.mu.Lock()
+		if fh.path == path && !fh.detached && fh.cacheFile != nil && fh.cacheGeneration == -1 {
 			fh.pinned = true
 		}
 		fh.mu.Unlock()
 	}
-	return nil
 }
 
 func (fs *ArtifactFuse) detachOpenHandles(path string) {
@@ -969,10 +1024,6 @@ func (fs *ArtifactFuse) moveOpenHandles(oldPath, newPath string) {
 	for _, fh := range handles {
 		fh.mu.Lock()
 		fh.path = newPath + strings.TrimPrefix(fh.path, oldPath)
-		// A handle that moves with its file keeps no copy of its own.
-		if !fh.detached {
-			fh.pinned = false
-		}
 		fh.mu.Unlock()
 	}
 }
@@ -1123,9 +1174,10 @@ func isRequestCancellation(ctx context.Context, err error) bool {
 	return ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
 }
 
-// LookUpInode replies with the inode of a name. A lookup of a path that holds
-// an unmapped inode can retire it, so it holds handleOps exclusively: a write
-// through that inode then finishes recreating the path first.
+// LookUpInode replies with the inode of a name. A lookup that finds a path
+// holding an unmapped inode can retire it, so it holds handleOps exclusively:
+// a write through that inode then finishes recreating the path first. A
+// lookup of a missing path runs shared, so polling it stalls no other op.
 func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInodeOp) error {
 	return fs.sharedUnlessUnmapped(ctx, func(_ context.Context, b *Blobs, exclusive bool) error {
 		parent, err := fs.requireInode(op.Parent, syscall.ENOENT)
@@ -1134,9 +1186,6 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 		}
 
 		childPath := cleanChildPath(parent.Path, op.Name)
-		if _, unmapped := fs.heldAt(childPath); unmapped && !exclusive {
-			return errUnmappedPath
-		}
 
 		// Synthesize .git gitfile in root
 		if isGitfile(parent, op.Name) {
@@ -1159,6 +1208,9 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 		}
 		if err != nil {
 			return err
+		}
+		if _, unmapped := fs.heldAt(childPath); unmapped && !exclusive {
+			return errUnmappedPath
 		}
 
 		fs.mu.Lock()
@@ -1783,6 +1835,7 @@ func (fs *ArtifactFuse) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error 
 		if err := fs.engine.Unlink(ctx, b, childPath, fs); err != nil {
 			return err
 		}
+		fs.markPinned(childPath)
 		fs.unmapPath(childPath)
 		fs.detachOpenHandles(childPath)
 		return nil
@@ -1805,12 +1858,17 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 		}
 		oldPath := cleanChildPath(oldParent.Path, op.OldName)
 		newPath := cleanChildPath(newParent.Path, op.NewName)
+		// A kernel that renames a name it cached sends no lookup first.
+		if err := fs.settleUnmappedBelow(oldPath); err != nil {
+			return err
+		}
 		if err := fs.engine.Rename(ctx, b, oldPath, newPath, fs); err != nil {
 			return err
 		}
 		if oldPath == newPath {
 			return nil
 		}
+		fs.markPinned(newPath)
 		fs.mu.Lock()
 		// The kernel moves its dentry over any negative entry for the new name.
 		delete(fs.negatives, kernelEntry{op.NewParent, op.NewName})
