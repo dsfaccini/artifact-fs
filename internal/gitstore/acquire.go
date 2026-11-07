@@ -416,19 +416,6 @@ func (s *Store) startRemotesForLogging(ctx context.Context, repo model.RepoConfi
 	}, cancel
 }
 
-func (s *Store) PrepareExistingCloneNonInteractive(ctx context.Context, repo model.RepoConfig) error {
-	if err := s.ValidateAmbientRemote(repo); err != nil {
-		return err
-	}
-	if err := s.ConfigureRemoteNonInteractive(ctx, repo); err != nil {
-		return err
-	}
-	if err := s.FetchRefNonInteractive(ctx, repo, repo.FetchRef); err != nil {
-		return err
-	}
-	return s.PrepareFetchedBranch(ctx, repo, repo.FetchRef)
-}
-
 func (s *Store) ConfigureRemoteNonInteractive(ctx context.Context, repo model.RepoConfig) error {
 	return s.configureRemote(ctx, repo, repo.RemoteURL, nonInteractiveGitEnv())
 }

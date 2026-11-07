@@ -35,6 +35,8 @@ var migrations = []meta.Migration{meta.SQL(
 	`DROP TABLE IF EXISTS blob_cache_index;`,
 )}
 
+var _ model.SnapshotStore = (*Store)(nil)
+
 type Store struct {
 	db *sql.DB
 }
@@ -133,11 +135,6 @@ func (s *Store) UpdateHEADRef(ctx context.Context, ref string) error {
 	return err
 }
 
-func (s *Store) GetNode(generation int64, path string) (model.BaseNode, bool) {
-	n, ok, _ := s.LookupNode(context.Background(), generation, path)
-	return n, ok
-}
-
 func (s *Store) LookupNode(ctx context.Context, generation int64, path string) (model.BaseNode, bool, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT path, type, mode, object_oid, size_state, size_bytes FROM base_nodes WHERE generation=? AND path=?`, generation, path)
 	var n model.BaseNode
@@ -174,13 +171,8 @@ func (s *Store) ListChildren(generation int64, parentPath string) ([]model.BaseN
 	return out, rows.Err()
 }
 
-// UpdateSize sets the size for a blob after hydration. Updates all rows with
-// the given OID in the current generation so stat() returns the correct size
-// without waiting for a full re-index.
-func (s *Store) UpdateSize(generation int64, objectOID string, size int64) {
-	_ = s.UpdateSizes(context.Background(), generation, map[string]int64{objectOID: size})
-}
-
+// UpdateSizes sets the size of each blob in sizes on every row of generation
+// that holds it, so stat returns the size without a re-index.
 func (s *Store) UpdateSizes(ctx context.Context, generation int64, sizes map[string]int64) error {
 	if len(sizes) == 0 {
 		return nil

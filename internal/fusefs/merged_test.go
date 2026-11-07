@@ -22,16 +22,8 @@ type fakeSnapshot struct {
 	kids  map[string][]model.BaseNode
 }
 
-func (f *fakeSnapshot) PublishGeneration(_ context.Context, _ string, _ string, _ []model.BaseNode) (int64, error) {
-	return 0, nil
-}
-
-func (f *fakeSnapshot) GetNode(_ int64, path string) (model.BaseNode, bool) {
+func (f *fakeSnapshot) LookupNode(_ context.Context, _ int64, path string) (model.BaseNode, bool, error) {
 	n, ok := f.nodes[path]
-	return n, ok
-}
-func (f *fakeSnapshot) LookupNode(_ context.Context, generation int64, path string) (model.BaseNode, bool, error) {
-	n, ok := f.GetNode(generation, path)
 	return n, ok, nil
 }
 
@@ -50,12 +42,8 @@ type fakeOverlay struct {
 	data    []byte
 }
 
-func (f *fakeOverlay) Get(path string) (model.OverlayEntry, bool) {
-	v, ok := f.entries[path]
-	return v, ok
-}
 func (f *fakeOverlay) Lookup(_ context.Context, path string) (model.OverlayEntry, bool, error) {
-	e, ok := f.Get(path)
+	e, ok := f.entries[path]
 	return e, ok, nil
 }
 func (f *fakeOverlay) ListByPrefix(_ context.Context, prefix string) ([]model.OverlayEntry, error) {
@@ -176,9 +164,6 @@ func (f *fakeOverlay) SetMode(_ context.Context, path string, mode uint32) error
 	f.entries[model.CleanPath(path)] = e
 	return nil
 }
-func (f *fakeOverlay) Reconcile(_ context.Context, _ func(string) (model.BaseNode, bool)) error {
-	return nil
-}
 func (f *fakeOverlay) ReconcileChecked(_ context.Context, _ func(string) (model.BaseNode, bool, error), lock sync.Locker, switchBase func()) error {
 	if lock != nil {
 		lock.Lock()
@@ -189,7 +174,6 @@ func (f *fakeOverlay) ReconcileChecked(_ context.Context, _ func(string) (model.
 	}
 	return nil
 }
-func (f *fakeOverlay) DirtyCount(_ context.Context) (int64, error) { return 0, nil }
 
 func newResolver(snap *fakeSnapshot, ov *fakeOverlay) *Resolver {
 	r := &Resolver{Snapshot: snap, Overlay: ov}
@@ -578,10 +562,7 @@ func TestReaddirMergesSnapshotAndOverlay(t *testing.T) {
 			list:    []model.OverlayEntry{{Path: "c.txt", Kind: model.OverlayKindCreate}},
 		},
 	)
-	names, err := r.Readdir(context.Background(), ".")
-	if err != nil {
-		t.Fatal(err)
-	}
+	names := readdirNames(t, r, ".")
 	set := map[string]bool{}
 	for _, n := range names {
 		set[n] = true
@@ -600,10 +581,7 @@ func TestReaddirSkipsOverlayEntryForListedDirectory(t *testing.T) {
 		},
 	)
 
-	names, err := r.Readdir(context.Background(), ".")
-	if err != nil {
-		t.Fatal(err)
-	}
+	names := readdirNames(t, r, ".")
 	for _, name := range names {
 		if name == "." {
 			t.Fatal("root overlay entry should not appear as a child")
@@ -623,10 +601,7 @@ func TestReaddirWhiteoutRemovesEntry(t *testing.T) {
 			list:    []model.OverlayEntry{{Path: "del.txt", Kind: model.OverlayKindDelete}},
 		},
 	)
-	names, err := r.Readdir(context.Background(), ".")
-	if err != nil {
-		t.Fatal(err)
-	}
+	names := readdirNames(t, r, ".")
 	for _, n := range names {
 		if n == "del.txt" {
 			t.Fatal("del.txt should be removed by whiteout")
@@ -766,4 +741,19 @@ func TestChildName(t *testing.T) {
 				tt.parent, tt.entry, name, ok, tt.wantName, tt.wantOK)
 		}
 	}
+}
+
+// readdirNames lists path through ReaddirSnapshot, as the FUSE adapter does,
+// and returns the entry names.
+func readdirNames(t *testing.T, r *Resolver, path string) []string {
+	t.Helper()
+	entries, _, _, err := r.ReaddirSnapshot(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Name
+	}
+	return names
 }

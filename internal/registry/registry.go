@@ -148,6 +148,8 @@ var reposColumnsAddedBeforeV1 = []struct{ name, ddl string }{
 	{"mount_error", `TEXT NOT NULL DEFAULT ''`},
 }
 
+var _ model.Registry = (*Store)(nil)
+
 type Store struct {
 	db *sql.DB
 }
@@ -233,15 +235,6 @@ func (s *Store) UpdateRefresh(ctx context.Context, repoID model.RepoID, interval
 		return errors.New("repo not found")
 	}
 	return nil
-}
-
-func (s *Store) UpdatePrepareState(ctx context.Context, repoID model.RepoID, state model.PrepareState, prepareErr string) error {
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE repos
-		SET prepare_state=?, prepare_error=?, updated_at_ns=?
-		WHERE repo_id=?
-	`, string(state), prepareErr, time.Now().UnixNano(), string(repoID))
-	return err
 }
 
 // RequestMount records the CLI's unmount (enabled false) or remount (enabled

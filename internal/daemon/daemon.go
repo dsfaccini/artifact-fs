@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -80,13 +79,12 @@ const (
 // core is what the CLI controller and the daemon share: the state root, the
 // registry, the git store and the preparation pipeline.
 type core struct {
-	root      string
-	mountRoot string
+	root string
 	// prepareContext bounds one preparation attempt; nil means defaultPrepareTimeout.
 	prepareContext func(context.Context) (context.Context, context.CancelFunc)
 	logger         *slog.Logger
-	registry       *registry.Store
-	git            *gitstore.Store
+	registry       model.Registry
+	git            model.GitStore
 	// generationRetention is how long a retired generation stays readable;
 	// zero means defaultGenerationRetention.
 	generationRetention time.Duration
@@ -217,12 +215,6 @@ func (c *Controller) Close() error {
 	return c.registry.Close()
 }
 
-func (s *Service) SetMountRoot(root string) {
-	if strings.TrimSpace(root) != "" {
-		s.mountRoot = root
-	}
-}
-
 func (s *Service) SetHydrationConcurrency(n int) {
 	if n > 0 {
 		s.hydrationConcurrency = n
@@ -289,11 +281,7 @@ func (s *Service) Close() error {
 
 func (s *core) fillPaths(cfg *model.RepoConfig) {
 	if cfg.MountRoot == "" {
-		if s.mountRoot != "" {
-			cfg.MountRoot = s.mountRoot
-		} else {
-			cfg.MountRoot = filepath.Join(s.root, "mnt")
-		}
+		cfg.MountRoot = filepath.Join(s.root, "mnt")
 	}
 	if cfg.MountPath == "" {
 		cfg.MountPath = filepath.Join(cfg.MountRoot, cfg.Name)

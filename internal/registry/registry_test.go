@@ -44,7 +44,7 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 	if err := store.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdatePrepareState(ctx, cfg.ID, model.PrepareStateFailed, "clone failed"); err != nil {
+	if err := store.UpdatePrepareStateForRequest(ctx, cfg, model.PrepareStateFailed, "clone failed"); err != nil {
 		t.Fatal(err)
 	}
 

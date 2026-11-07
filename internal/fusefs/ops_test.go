@@ -41,10 +41,6 @@ type blockingRenameHydrator struct {
 	proceed chan struct{}
 }
 
-func (f *fakeBatchHydrator) Enqueue(task model.HydrationTask) {
-	f.tasks = append(f.tasks, task)
-}
-
 func (f *fakeBatchHydrator) EnqueueBatch(tasks []model.HydrationTask) {
 	f.tasks = append(f.tasks, tasks...)
 }
@@ -73,8 +69,6 @@ func (f *fakeBatchHydrator) ReadBlob(context.Context, model.RepoConfig, model.Ba
 	return nil, nil
 }
 
-func (f *fakeBatchHydrator) QueueDepth(model.RepoID) int { return len(f.tasks) }
-
 func (h *blockingRenameHydrator) OpenHydrated(ctx context.Context, repo model.RepoConfig, node model.BaseNode) (*os.File, int64, error) {
 	close(h.started)
 	select {
@@ -85,17 +79,8 @@ func (h *blockingRenameHydrator) OpenHydrated(ctx context.Context, repo model.Re
 	return h.fakeBatchHydrator.OpenHydrated(ctx, repo, node)
 }
 
-func (g *generationSnapshot) PublishGeneration(context.Context, string, string, []model.BaseNode) (int64, error) {
-	return 0, nil
-}
-
-func (g *generationSnapshot) GetNode(gen int64, path string) (model.BaseNode, bool) {
-	n, ok := g.nodes[gen][path]
-	return n, ok
-}
-
 func (g *generationSnapshot) LookupNode(_ context.Context, gen int64, path string) (model.BaseNode, bool, error) {
-	n, ok := g.GetNode(gen, path)
+	n, ok := g.nodes[gen][path]
 	return n, ok, nil
 }
 
@@ -455,7 +440,7 @@ func TestRenameRecreatedTrackedEntryHidesSource(t *testing.T) {
 			if _, err := resolver.ResolvePath("README.md"); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("source resolve error = %v, want not exist", err)
 			}
-			if err := ov.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+			if err := reconcileOverlay(ctx, ov, func(path string) (model.BaseNode, bool) {
 				node, ok := snapshot.nodes[path]
 				return node, ok
 			}); err != nil {
@@ -507,7 +492,7 @@ func TestRenameRecreatedTrackedEntryHidesSource(t *testing.T) {
 			snapshot.nodes = map[string]model.BaseNode{destination: committed}
 			snapshot.kids = map[string][]model.BaseNode{".": {committed}}
 			resolver.SetGeneration(2)
-			if err := ov.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+			if err := reconcileOverlay(ctx, ov, func(path string) (model.BaseNode, bool) {
 				node, ok := snapshot.nodes[path]
 				return node, ok
 			}); err != nil {
@@ -608,7 +593,7 @@ func TestRenameReplacedTrackedEntryHidesSource(t *testing.T) {
 			if n, err := resolver.ResolvePath("entry"); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("source after rename = (%+v, %v), want not exist", n, err)
 			}
-			if err := ov.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+			if err := reconcileOverlay(ctx, ov, func(path string) (model.BaseNode, bool) {
 				node, ok := snapshot.nodes[path]
 				return node, ok
 			}); err != nil {
@@ -678,7 +663,7 @@ func TestRenameChainHidesReplacedTrackedIntermediate(t *testing.T) {
 			if err := engineRename(ctx, engine, intermediate.Path, "final.txt"); err != nil {
 				t.Fatal(err)
 			}
-			if err := ov.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+			if err := reconcileOverlay(ctx, ov, func(path string) (model.BaseNode, bool) {
 				node, ok := snapshot.nodes[path]
 				return node, ok
 			}); err != nil {
@@ -960,4 +945,13 @@ func handleRead(ctx context.Context, e *Engine, fh *FileHandle, gen, off int64, 
 		return err
 	})
 	return data, err
+}
+
+// reconcileOverlay reconciles ov with the base lookup reads, with no readers
+// to exclude.
+func reconcileOverlay(ctx context.Context, ov model.OverlayStore, lookup func(string) (model.BaseNode, bool)) error {
+	return ov.ReconcileChecked(ctx, func(path string) (model.BaseNode, bool, error) {
+		n, ok := lookup(path)
+		return n, ok, nil
+	}, nil, nil)
 }

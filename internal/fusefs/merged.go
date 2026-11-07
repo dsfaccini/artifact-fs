@@ -102,16 +102,6 @@ func (r *Resolver) resolvePath(path string) (ResolvedNode, error) {
 	return ResolvedNode{}, fs.ErrNotExist
 }
 
-func (r *Resolver) Lookup(parent, name string) (ResolvedNode, error) {
-	r.transition.RLock()
-	defer r.transition.RUnlock()
-	if parent == "" {
-		parent = "."
-	}
-	p := model.CleanPath(filepath.Join(parent, name))
-	return r.resolvePath(p)
-}
-
 func (r *Resolver) Getattr(path string) (mode uint32, size int64, nodeType string, mtime time.Time, ctime time.Time, err error) {
 	r.transition.RLock()
 	defer r.transition.RUnlock()
@@ -149,18 +139,6 @@ func normalizeMode(mode uint32, typ string) uint32 {
 	return mode
 }
 
-func (r *Resolver) Readdir(ctx context.Context, path string) ([]string, error) {
-	entries, err := r.ReaddirTyped(ctx, path)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]string, len(entries))
-	for i, e := range entries {
-		out[i] = e.Name
-	}
-	return out, nil
-}
-
 // ReaddirTyped returns directory entries with name and type, so the FUSE
 // adapter doesn't need to call Getattr per child.
 func (r *Resolver) ReaddirTyped(ctx context.Context, path string) ([]ReaddirEntry, error) {
@@ -175,12 +153,6 @@ func (r *Resolver) ReaddirSnapshot(ctx context.Context, path string) ([]ReaddirE
 	gen := r.Generation()
 	entries, err := r.readdirTypedAt(ctx, path, gen)
 	return entries, gen, r.CommitTime(), err
-}
-
-func (r *Resolver) ReaddirTypedAt(ctx context.Context, path string, generation int64) ([]ReaddirEntry, error) {
-	r.transition.RLock()
-	defer r.transition.RUnlock()
-	return r.readdirTypedAt(ctx, path, generation)
 }
 
 func (r *Resolver) readdirTypedAt(ctx context.Context, path string, generation int64) ([]ReaddirEntry, error) {

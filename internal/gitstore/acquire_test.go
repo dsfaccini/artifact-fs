@@ -260,7 +260,9 @@ func TestZeroOIDForGitDirMatchesObjectFormat(t *testing.T) {
 	}
 }
 
-func TestPrepareExistingCloneNonInteractiveUpdatesBranch(t *testing.T) {
+// An existing clone moves to another branch the way the daemon refreshes it:
+// point origin at the remote, fetch the ref, then prepare the fetched branch.
+func TestFetchedBranchReplacesExistingCloneBranch(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
 	bare := filepath.Join(tmp, "origin.git")
@@ -292,8 +294,14 @@ func TestPrepareExistingCloneNonInteractiveUpdatesBranch(t *testing.T) {
 	assertArtifactWorktreeConfig(t, ctx, gitDir)
 	cfg.Branch = "dev"
 	cfg.FetchRef = "dev"
-	if err := store.PrepareExistingCloneNonInteractive(ctx, cfg); err != nil {
-		t.Fatalf("PrepareExistingCloneNonInteractive: %v", err)
+	if err := store.ConfigureRemoteNonInteractive(ctx, cfg); err != nil {
+		t.Fatalf("ConfigureRemoteNonInteractive: %v", err)
+	}
+	if err := store.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
+		t.Fatalf("FetchRefNonInteractive: %v", err)
+	}
+	if err := store.PrepareFetchedBranch(ctx, cfg, cfg.FetchRef); err != nil {
+		t.Fatalf("PrepareFetchedBranch: %v", err)
 	}
 	oid, ref, err := store.ResolveHEAD(ctx, cfg)
 	if err != nil {

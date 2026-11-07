@@ -739,7 +739,6 @@ func TestFailedPreparationStaysFailedWhenItsMountEnds(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = svc.Close() })
-	svc.SetMountRoot(filepath.Join(tmp, "mnt"))
 	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("connection lost")}
 	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
 		return mfs, nil

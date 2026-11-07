@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -323,7 +324,7 @@ func TestAddRepoAsyncRejectsInlineCredentials(t *testing.T) {
 	}
 }
 
-func TestRunPrepareRejectsPersistedInlineCredentialsBeforeClone(t *testing.T) {
+func TestPrepareAsyncRejectsPersistedInlineCredentialsBeforeClone(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -351,8 +352,8 @@ func TestRunPrepareRejectsPersistedInlineCredentialsBeforeClone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := svc.runPrepare(ctx, got); err == nil {
-		t.Fatal("expected runPrepare failure")
+	if err := svc.prepareAsync(ctx, got, 1); err == nil {
+		t.Fatal("expected prepareAsync failure")
 	}
 	if _, err := os.Stat(got.GitDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("git dir stat = %v, want not exist", err)
@@ -366,6 +367,88 @@ func TestRunPrepareRejectsPersistedInlineCredentialsBeforeClone(t *testing.T) {
 	}
 	if strings.Contains(got.PrepareError, "token") {
 		t.Fatalf("PrepareError was not redacted: %q", got.PrepareError)
+	}
+}
+
+// A preparation of an existing clone rejects a remote with inline credentials
+// before it points the clone's origin at the remote.
+func TestPrepareAsyncExistingCloneRejectsCredentialedRemoteBeforeSetURL(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	gitDir := filepath.Join(tmp, "repo.git")
+	worktree := filepath.Join(tmp, "worktree")
+	runCmd(t, "git", "init", "--separate-git-dir", gitDir, "--initial-branch", "master", worktree)
+	runCmd(t, "git", "-C", worktree, "remote", "add", "origin", "https://github.com/org/repo.git")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(tmp, "set-url-invoked")
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\ncase \"$*\" in *\"remote set-url\"*) : > \"$GIT_SET_URL_MARKER\";; esac\nexec \"$AFS_REAL_GIT\" \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AFS_REAL_GIT", realGit)
+	t.Setenv("GIT_SET_URL_MARKER", marker)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	for i, remote := range []string{
+		"ssh:/git:secret@github.com/org/repo.git",
+		"ssh//git:secret@github.com/org/repo.git",
+		"ssh:/git:pa/ss@github.com/org/repo.git",
+		"alice:ghp_secret@github.com:org/repo.git",
+	} {
+		t.Run(remote, func(t *testing.T) {
+			name := fmt.Sprintf("repo%d", i)
+			cfg := model.RepoConfig{
+				Name:            name,
+				ID:              model.RepoID(name),
+				GitDir:          gitDir,
+				RemoteURL:       remote,
+				Branch:          "master",
+				FetchRef:        "master",
+				PrepareState:    model.PrepareStatePreparing,
+				RefreshInterval: time.Minute,
+				Enabled:         true,
+			}
+			svc.fillPaths(&cfg)
+			if err := svc.registry.AddRepo(ctx, cfg); err != nil {
+				t.Fatal(err)
+			}
+			got, err := svc.registry.GetRepo(ctx, name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = svc.prepareAsync(ctx, got, 1)
+			if err == nil {
+				t.Fatal("expected credentialed remote rejection")
+			}
+			if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "pa/ss") {
+				t.Fatalf("error leaked credential: %v", err)
+			}
+			if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatal("git remote set-url was invoked before rejecting credentialed remote")
+			}
+			got, err = svc.registry.GetRepo(ctx, name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.PrepareState != model.PrepareStateFailed {
+				t.Fatalf("PrepareState = %q, want failed", got.PrepareState)
+			}
+			if strings.Contains(got.PrepareError, "secret") || strings.Contains(got.PrepareError, "pa/ss") {
+				t.Fatalf("PrepareError leaked credential: %q", got.PrepareError)
+			}
+		})
 	}
 }
 
@@ -471,7 +554,7 @@ func TestDrivePrepareSkipsStalePreparingSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.registry.UpdatePrepareState(ctx, latest.ID, model.PrepareStateReady, ""); err != nil {
+	if err := svc.registry.UpdatePrepareStateForRequest(ctx, latest, model.PrepareStateReady, ""); err != nil {
 		t.Fatal(err)
 	}
 	stale := latest
@@ -503,7 +586,7 @@ func TestDrivePrepareSkipsStalePreparingSnapshot(t *testing.T) {
 	}
 }
 
-func TestRunPrepareFailurePersistsRedactedError(t *testing.T) {
+func TestPrepareAsyncFailurePersistsRedactedError(t *testing.T) {
 	ctx := context.Background()
 	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -527,8 +610,8 @@ func TestRunPrepareFailurePersistsRedactedError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.runPrepare(ctx, got); err == nil {
-		t.Fatal("expected runPrepare failure")
+	if err := svc.prepareAsync(ctx, got, 1); err == nil {
+		t.Fatal("expected prepareAsync failure")
 	}
 	got, err = svc.registry.GetRepo(ctx, "repo")
 	if err != nil {
@@ -634,7 +717,6 @@ func TestMountRepoPreparationTimesOutAndReleasesLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	expirePrepareOnFile(svc, gitStarted)
-	svc.SetMountRoot(filepath.Join(tmp, "mnt"))
 	defer svc.Close()
 
 	cfg := model.RepoConfig{
@@ -918,7 +1000,7 @@ func TestSyncPrepareRetryPersistsCurrentFailure(t *testing.T) {
 	}
 }
 
-func TestRunPrepareReportsRemoteConfigurationPhase(t *testing.T) {
+func TestPrepareAsyncReportsRemoteConfigurationPhase(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "bin")
@@ -949,7 +1031,7 @@ func TestRunPrepareReportsRemoteConfigurationPhase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := svc.runPrepare(ctx, got); err == nil {
+	if err := svc.prepareAsync(ctx, got, 1); err == nil {
 		t.Fatal("expected remote setup failure")
 	}
 	if logOutput := logs.String(); !strings.Contains(logOutput, `"phase":"`+preparePhaseConfigureRemote+`"`) ||
@@ -1007,7 +1089,7 @@ func TestAddRepoSyncFailureDoesNotOverwriteNewerConfig(t *testing.T) {
 	}
 }
 
-func TestRunPreparePreparedGitDirPublishesSnapshotAndMarksReady(t *testing.T) {
+func TestPrepareAsyncPreparedGitDirPublishesSnapshotAndMarksReady(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
 	bare := filepath.Join(tmp, "origin.git")
@@ -1053,8 +1135,8 @@ func TestRunPreparePreparedGitDirPublishesSnapshotAndMarksReady(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.runPrepare(ctx, got); err != nil {
-		t.Fatalf("runPrepare: %v", err)
+	if err := svc.prepareAsync(ctx, got, 1); err != nil {
+		t.Fatalf("prepareAsync: %v", err)
 	}
 
 	got, err = svc.registry.GetRepo(ctx, "repo")
@@ -1082,7 +1164,7 @@ func TestRunPreparePreparedGitDirPublishesSnapshotAndMarksReady(t *testing.T) {
 	if gen == 0 {
 		t.Fatal("snapshot generation = 0, want published generation")
 	}
-	if _, ok := snap.GetNode(gen, "README.md"); !ok {
+	if _, ok := lookupNode(t, snap, gen, "README.md"); !ok {
 		t.Fatal("README.md not found in snapshot")
 	}
 	if logOutput := logs.String(); !strings.Contains(logOutput, `"msg":"`+logRepoPreparationCompleted+`"`) ||
@@ -1114,7 +1196,7 @@ func TestSyncPrepareRetainsPreviousGenerationForDaemonHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.runPrepare(ctx, got); err != nil {
+	if err := svc.prepareAsync(ctx, got, 1); err != nil {
 		t.Fatal(err)
 	}
 	got, err = svc.registry.GetRepo(ctx, cfg.Name)
@@ -1144,7 +1226,7 @@ func TestSyncPrepareRetainsPreviousGenerationForDaemonHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer snap.Close()
-	if _, ok := snap.GetNode(oldGen, "."); !ok {
+	if _, ok := lookupNode(t, snap, oldGen, "."); !ok {
 		t.Fatal("sync preparation pruned the generation that a daemon may still be serving")
 	}
 }
@@ -1174,14 +1256,14 @@ func TestSizeUpdateBatcherFlushesOnStop(t *testing.T) {
 	cancel()
 	batcher.Stop()
 
-	n, ok := snap.GetNode(gen, "a.txt")
+	n, ok := lookupNode(t, snap, gen, "a.txt")
 	if !ok {
 		t.Fatal("a.txt not found")
 	}
 	if n.SizeState != "known" || n.SizeBytes != 10 {
 		t.Fatalf("a.txt size = %s/%d, want known/10", n.SizeState, n.SizeBytes)
 	}
-	n, ok = snap.GetNode(gen, "b.txt")
+	n, ok = lookupNode(t, snap, gen, "b.txt")
 	if !ok {
 		t.Fatal("b.txt not found")
 	}
@@ -1190,7 +1272,7 @@ func TestSizeUpdateBatcherFlushesOnStop(t *testing.T) {
 	}
 }
 
-func TestRunPrepareFreshCloneSkipsSecondFetchForBranchFetchRef(t *testing.T) {
+func TestPrepareAsyncFreshCloneSkipsSecondFetchForBranchFetchRef(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
 	bare := filepath.Join(tmp, "origin.git")
@@ -1247,8 +1329,8 @@ func TestRunPrepareFreshCloneSkipsSecondFetchForBranchFetchRef(t *testing.T) {
 			t.Setenv("GIT_COMMAND_LOG", logPath)
 			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-			if err := svc.runPrepare(ctx, got); err != nil {
-				t.Fatalf("runPrepare: %v", err)
+			if err := svc.prepareAsync(ctx, got, 1); err != nil {
+				t.Fatalf("prepareAsync: %v", err)
 			}
 			logData, err := os.ReadFile(logPath)
 			if err != nil {
@@ -1271,7 +1353,7 @@ func TestRunPrepareFreshCloneSkipsSecondFetchForBranchFetchRef(t *testing.T) {
 	}
 }
 
-func TestRunPrepareDoesNotOpenGateWhenReadyPersistenceFails(t *testing.T) {
+func TestPrepareAsyncDoesNotOpenGateWhenReadyPersistenceFails(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
 	preparedGitDir := createPreparedGitDir(t, tmp)
@@ -1322,8 +1404,8 @@ func TestRunPrepareDoesNotOpenGateWhenReadyPersistenceFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := svc.runPrepare(ctx, got); err == nil || !strings.Contains(err.Error(), writeErr) {
-		t.Fatalf("runPrepare = %v, want the ready state write failure", err)
+	if err := svc.prepareAsync(ctx, got, 1); err == nil || !strings.Contains(err.Error(), writeErr) {
+		t.Fatalf("prepareAsync = %v, want the ready state write failure", err)
 	}
 	// Wait reports an open or failed gate before it checks the context, so a
 	// canceled context reads the gate's state without waiting.
@@ -1337,7 +1419,7 @@ func TestRunPrepareDoesNotOpenGateWhenReadyPersistenceFails(t *testing.T) {
 	}
 }
 
-func TestRunPrepareDoesNotMarkSupersededConfigReady(t *testing.T) {
+func TestPrepareAsyncDoesNotMarkSupersededConfigReady(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
 	firstGitDir := createPreparedGitDir(t, filepath.Join(tmp, "first"))
@@ -1371,9 +1453,9 @@ func TestRunPrepareDoesNotMarkSupersededConfigReady(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = svc.runPrepare(ctx, first)
+	err = svc.prepareAsync(ctx, first, 1)
 	if err == nil || !strings.Contains(err.Error(), "superseded") {
-		t.Fatalf("runPrepare error = %v, want superseded", err)
+		t.Fatalf("prepareAsync error = %v, want superseded", err)
 	}
 	got, err := svc.registry.GetRepo(ctx, "repo")
 	if err != nil {
@@ -1387,7 +1469,7 @@ func TestRunPrepareDoesNotMarkSupersededConfigReady(t *testing.T) {
 	}
 }
 
-func TestRunPrepareDoesNotMarkSupersededConfigFailed(t *testing.T) {
+func TestPrepareAsyncDoesNotMarkSupersededConfigFailed(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
 	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -1418,7 +1500,7 @@ func TestRunPrepareDoesNotMarkSupersededConfigFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := svc.runPrepare(ctx, first); err == nil {
+	if err := svc.prepareAsync(ctx, first, 1); err == nil {
 		t.Fatal("expected stale prepare failure")
 	}
 	got, err := svc.registry.GetRepo(ctx, "repo")
@@ -1473,8 +1555,8 @@ func TestPrepareRequeuesReadyVerifiedSourceForRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.runPrepare(ctx, cfg); err != nil {
-		t.Fatalf("initial runPrepare: %v", err)
+	if err := svc.prepareAsync(ctx, cfg, 1); err != nil {
+		t.Fatalf("initial prepareAsync: %v", err)
 	}
 	cfg, err = svc.registry.GetRepo(ctx, cfg.Name)
 	if err != nil {
@@ -1498,8 +1580,8 @@ func TestPrepareRequeuesReadyVerifiedSourceForRecovery(t *testing.T) {
 	if cfg.PrepareState != model.PrepareStatePreparing {
 		t.Fatalf("PrepareState = %q, want preparing", cfg.PrepareState)
 	}
-	if err := svc.runPrepare(ctx, cfg); err != nil {
-		t.Fatalf("recovery runPrepare: %v", err)
+	if err := svc.prepareAsync(ctx, cfg, 1); err != nil {
+		t.Fatalf("recovery prepareAsync: %v", err)
 	}
 	recovered, err := svc.registry.GetRepo(ctx, cfg.Name)
 	if err != nil {
@@ -1609,4 +1691,15 @@ func runCmdOutput(t *testing.T, name string, args ...string) string {
 		t.Fatalf("%s %v failed: %v\n%s", name, args, err, string(out))
 	}
 	return string(out)
+}
+
+// lookupNode looks path up in snap's generation and fails t on a database
+// error.
+func lookupNode(t *testing.T, snap *snapshot.Store, generation int64, path string) (model.BaseNode, bool) {
+	t.Helper()
+	n, ok, err := snap.LookupNode(context.Background(), generation, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n, ok
 }

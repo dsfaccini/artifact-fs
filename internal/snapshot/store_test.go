@@ -22,7 +22,7 @@ func testStore(t *testing.T) *Store {
 	return s
 }
 
-func TestPublishAndGetNode(t *testing.T) {
+func TestPublishAndLookupNode(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
 
@@ -40,7 +40,7 @@ func TestPublishAndGetNode(t *testing.T) {
 		t.Fatalf("expected gen 1, got %d", gen)
 	}
 
-	n, ok := s.GetNode(gen, "README.md")
+	n, ok := lookupNode(t, s, gen, "README.md")
 	if !ok {
 		t.Fatal("expected README.md")
 	}
@@ -48,7 +48,7 @@ func TestPublishAndGetNode(t *testing.T) {
 		t.Fatalf("wrong node: %+v", n)
 	}
 
-	_, ok = s.GetNode(gen, "nonexistent")
+	_, ok = lookupNode(t, s, gen, "nonexistent")
 	if ok {
 		t.Fatal("expected not found")
 	}
@@ -150,12 +150,12 @@ func TestGenerationCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Generation 1 should be cleaned up once the caller publishes the view.
-	_, ok := s.GetNode(1, "f.txt")
+	_, ok := lookupNode(t, s, 1, "f.txt")
 	if ok {
 		t.Fatal("gen 1 should be cleaned up")
 	}
 	// Generation 2 should still exist (gen-1)
-	_, ok = s.GetNode(2, "f.txt")
+	_, ok = lookupNode(t, s, 2, "f.txt")
 	if !ok {
 		t.Fatal("gen 2 should still exist")
 	}
@@ -206,20 +206,20 @@ func TestUpdateSizeUsesGenerationObjectOIDIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(detail, "idx_base_nodes_gen_oid") {
-		t.Fatalf("UpdateSize plan = %q, want idx_base_nodes_gen_oid", detail)
+		t.Fatalf("UpdateSizes plan = %q, want idx_base_nodes_gen_oid", detail)
 	}
 
 	if err := s.UpdateSizes(ctx, gen, map[string]int64{"shared": 42, "other": 7}); err != nil {
 		t.Fatal(err)
 	}
-	n, ok := s.GetNode(gen, "a.txt")
+	n, ok := lookupNode(t, s, gen, "a.txt")
 	if !ok {
 		t.Fatal("a.txt not found")
 	}
 	if n.SizeState != "known" || n.SizeBytes != 42 {
 		t.Fatalf("a.txt size = %s/%d, want known/42", n.SizeState, n.SizeBytes)
 	}
-	n, ok = s.GetNode(gen, "b.txt")
+	n, ok = lookupNode(t, s, gen, "b.txt")
 	if !ok {
 		t.Fatal("b.txt not found")
 	}
@@ -271,4 +271,14 @@ func TestNewDropsLegacyTables(t *testing.T) {
 
 	assertTableMissing("learned_path_stats")
 	assertTableMissing("blob_cache_index")
+}
+
+// lookupNode looks path up in generation and fails t on a database error.
+func lookupNode(t *testing.T, s *Store, generation int64, path string) (model.BaseNode, bool) {
+	t.Helper()
+	n, ok, err := s.LookupNode(context.Background(), generation, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n, ok
 }
