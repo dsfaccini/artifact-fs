@@ -3,8 +3,10 @@ package fusefs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -161,6 +163,18 @@ func (r *Resolver) readdirTypedAt(ctx context.Context, path string, generation i
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
+	ovEntries, err := r.Overlay.ListByPrefix(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	out := mergeChildren(path, children, ovEntries)
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// mergeChildren merges children, the snapshot children of the directory at
+// path, with ovEntries, the overlay entries below it.
+func mergeChildren(path string, children []model.BaseNode, ovEntries []model.OverlayEntry) []ReaddirEntry {
 	type entry struct {
 		name        string
 		typ         string
@@ -175,12 +189,8 @@ func (r *Resolver) readdirTypedAt(ctx context.Context, path string, generation i
 			set[name] = entry{name: name, typ: c.Type, base: c}
 		}
 	}
-	ovEntries, err := r.Overlay.ListByPrefix(ctx, path)
-	if err != nil {
-		return nil, err
-	}
-	// ListByPrefix returns every descendant, so a child's own entry, when it has
-	// one, is in the listing.
+	// ovEntries holds every entry below path, so a child's own entry, when it
+	// has one, is among them.
 	own := map[string]model.OverlayEntry{}
 	implicitDirs := map[string]bool{}
 	for _, e := range ovEntries {
@@ -228,6 +238,63 @@ func (r *Resolver) readdirTypedAt(ctx context.Context, path string, generation i
 		}
 		out = append(out, ReaddirEntry{Name: e.name, Type: e.typ, Mode: e.base.Mode, ObjectOID: e.base.ObjectOID, SizeState: e.base.SizeState, SizeBytes: e.base.SizeBytes})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
+	return out
+}
+
+// MissingPaths returns those of paths that the merged view lacks, as the
+// listing of each one's parent directory shows it. It reads the overlay once
+// and the snapshot children of each parent once, which costs far less than
+// resolving each path. A parent whose listing fails leaves its children out of
+// the result, and the first such error is returned.
+func (r *Resolver) MissingPaths(ctx context.Context, paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	byDir := map[string][]string{}
+	for _, p := range paths {
+		dir := model.CleanPath(filepath.Dir(p))
+		byDir[dir] = append(byDir[dir], p)
+	}
+	r.transition.RLock()
+	gen := r.Generation()
+	entries, err := r.Overlay.ListByPrefix(ctx, ".")
+	r.transition.RUnlock()
+	if err != nil {
+		return nil, err
+	}
+	// Sorted by path, the entries below a directory are one run, which below
+	// finds without copying them.
+	slices.SortFunc(entries, func(a, b model.OverlayEntry) int { return strings.Compare(a.Path, b.Path) })
+	below := func(dir string) []model.OverlayEntry {
+		if dir == "." {
+			return entries
+		}
+		from := func(prefix string) int {
+			return sort.Search(len(entries), func(i int) bool { return entries[i].Path >= prefix })
+		}
+		// '0' follows '/', so [dir/, dir0) holds exactly the paths below dir.
+		return entries[from(dir+"/"):from(dir+"0")]
+	}
+	var missing []string
+	var firstErr error
+	for dir, kids := range byDir {
+		// A published generation never changes, so its listing needs no lock.
+		children, err := r.Snapshot.ListChildren(gen, dir)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("list %s: %w", dir, err)
+			}
+			continue
+		}
+		names := map[string]bool{}
+		for _, e := range mergeChildren(dir, children, below(dir)) {
+			names[e.Name] = true
+		}
+		for _, p := range kids {
+			if !names[filepath.Base(p)] {
+				missing = append(missing, p)
+			}
+		}
+	}
+	return missing, firstErr
 }
