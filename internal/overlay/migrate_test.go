@@ -5,6 +5,7 @@ import (
 	"io"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/metatest"
@@ -80,6 +81,8 @@ var legacyOverlays = map[string][]string{
 	"25971f7": overlayWithChangeLog,
 	// This schema, after migration 1.
 	"user_version 1": append(slices.Clone(overlayWithChangeLog), `PRAGMA user_version = 1`),
+	// This schema, after migration 2.
+	"user_version 2": append(slices.Clone(overlayWithChangeLog), `CREATE TABLE IF NOT EXISTS overlay_pending (path TEXT PRIMARY KEY)`, `PRAGMA user_version = 2`),
 }
 
 func testConfig(t *testing.T) model.RepoPaths {
@@ -135,7 +138,7 @@ func TestNewMigratesEarlierSchemas(t *testing.T) {
 				t.Fatalf("a.txt = %+v, want %+v", got, wantRow)
 			}
 			changes := changesSince(t, cfg, 0)
-			if (name == "25971f7" || name == "user_version 1") && (changes.Instance != "instance" || !slices.Equal(changes.Paths, []string{"a.txt"})) {
+			if (name == "25971f7" || strings.HasPrefix(name, "user_version")) && (changes.Instance != "instance" || !slices.Equal(changes.Paths, []string{"a.txt"})) {
 				t.Fatalf("change log = %+v, want instance's log of a.txt", changes)
 			}
 		})
