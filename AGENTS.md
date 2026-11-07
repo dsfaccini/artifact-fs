@@ -6,11 +6,11 @@ Repository-specific guidance for `artifact-fs`.
 
 - Flag credentials in Git CLI arguments or unredacted logs. Pass credentials through the environment-based helper in `internal/gitstore/credentials.go`. Redact a log field with `auth.RedactLogString`, which replaces each remote it detects with `REDACTED_REMOTE`. Redact an error message with `auth.RedactString`, which replaces the credentials it detects with `REDACTED`. Detection is heuristic, so never log a value known to hold credentials.
 - In production code, flag a `model.RepoConfig` in the hydrator, the overlay or `internal/fusefs`. They take `model.RepoPaths`, so `RemoteURL`, which can carry credentials, reaches only the CLI, the registry, the daemon and gitstore.
-- Keep adoption's inline-credential check in `WarnAdoptedOriginCredentials` a warning that names no remote, not a rejection. Adoption stores no URL and never clones, fetches or refreshes. Only Git's lazy fetches of missing blobs and trees use the user's existing origin. Flag any other path that persists inline credentials or lets the daemon fetch with them.
+- Keep adoption's inline-credential check in `WarnAdoptedOriginCredentials` a warning that names no remote, not a rejection. Adoption stores no URL and never clones, fetches or refreshes. Only fetches of missing blobs and trees use the user's existing origin: Git's lazy fetches and the hydrator's batch fetches. Flag any other path that persists inline credentials or lets the daemon fetch with them.
 - Flag blob bytes converted to `string`. Keep `BlobToCache` binary-safe by streaming `git cat-file --batch` output to disk.
 - Keep `GIT_NO_LAZY_FETCH=1` on `git cat-file --batch-check` in `batchResolveSizes`. Removing it turns size resolution in blobless clones into network round-trips.
 - Run a Git command that can lazy-fetch missing objects with `lazyFetchEnv()` and `configureCommandSession`, never `nonInteractiveGitEnv()`. `nonInteractiveGitEnv()` sets `GIT_SSH_COMMAND`, which overrides the repo's `core.sshCommand`, and an adopted worktree keeps that setting.
-- Add a blob cache file only with `blobcache.Stage` and `blobcache.Install`, and remove one only with `blobcache.Evict`. Each updates the counters `status` reads under the cache's `stats` flock. A direct write or unlink leaves the counters wrong until the next mount or `evict-cache` recounts them.
+- Add a blob cache file only with `blobcache.Stage` and `blobcache.Install`, and remove one only with `blobcache.Evict`. `Install` and `Evict` update the counters `status` reads under the cache's `stats` flock. A direct write or unlink leaves the counters wrong until the next mount or `evict-cache` recounts them.
 - Normalize paths only with `model.CleanPath()`. Do not add local wrappers.
 - Use the canonical `model.*` interfaces for registry, git store, snapshot, overlay, and hydrator access. Do not add subset interfaces around them.
 - In production code, assert each implementation of a `model.*` interface with `var _ model.X = (*T)(nil)`. Test fakes need no assertion.
@@ -20,7 +20,7 @@ Repository-specific guidance for `artifact-fs`.
 ## Architecture
 
 - `cmd/artifact-fs` is the only binary entrypoint.
-- `internal/cli` runs the `daemon` command on `daemon.Service`, and every other command on `daemon.Controller`. Only `daemon.Service` mounts.
+- `internal/cli` runs the `daemon` command on `daemon.Service`, and every other command on `daemon.Controller`, except the `gc`, `doctor` and `prefetch` stubs. Only `daemon.Service` mounts.
 - `internal/daemon` owns repo lifecycle: registry sync, snapshot publish, overlay reconcile, FUSE mount, watcher, refresh loop.
 - `internal/fusefs` is the merged view and writable filesystem layer.
 - `internal/gitstore` is the performance-sensitive git wrapper; most easy-to-break invariants live there.
@@ -46,7 +46,7 @@ Repository-specific guidance for `artifact-fs`.
 - Mount with the runtime's op context. Only a stop cancels it, never the end of `Start`'s context. A stop unmounts first, then cancels the op context, which cancels the ops in flight, then closes the runtime's stores and its `git cat-file --batch` processes.
 - Unmount a mount the daemon did not make only when the daemon process before this one ran the repo and `ownsLeftover` matches the mount, or when it is an abandoned mount the fuse library failed to unmount. Leave every other mount alone. Record each repo a clean shutdown unmounted as stopped, unless the daemon still claims an earlier daemon's mount of it, so the next daemon claims none of its own mounts.
 - Back off a retried mount, HEAD reconcile or remote refresh with `retrier`. `status` shows each failure with its next attempt.
-- `git.CloneBlobless` already populates the git index with `read-tree HEAD`; be careful about extra index resets because they can discard staged state.
+- `gitstore.Store.CloneBlobless` already populates the git index with `read-tree HEAD`; be careful about extra index resets because they can discard staged state.
 
 ## Code conventions
 
@@ -54,7 +54,7 @@ Repository-specific guidance for `artifact-fs`.
 - Run every preparation through `core.prepare`. Express a new caller's differences as a `preparation`, not as another pipeline.
 - Normalize a repo config only in `normalizeRepoConfig`, before the registry stores it. Readers trust the stored config: never re-default or re-resolve a field after reading it.
 - Parse a ref only with `model.BranchName` and `model.CanonicalRef`.
-- The watcher polls `HEAD` plus the current HEAD ref path. If you change it, preserve branch-switch and packed-ref behavior covered by `internal/watcher/watcher_test.go`.
+- The watcher polls `HEAD` and the ref it names, loose or in `packed-refs`, in a linked worktree's common dir. If you change it, preserve the branch-switch, packed-ref and linked-worktree behavior covered by `internal/watcher/watcher_test.go` and `internal/watcher/linked_test.go`.
 - The overlay stores deletes as SQLite entries with `kind='delete'`; there is no on-disk whiteout file layer.
 - SQLite is `modernc.org/sqlite` in WAL mode via `internal/meta`.
 - Change a store's schema only by appending a migration to its `migrations` list. `meta.Migrate` records each applied migration in `PRAGMA user_version` and never reruns it. An edit to a shipped migration never reaches an existing database. With each new migration, add a fixture at its `user_version` to that store's `migrate_test.go`. That fixture fails the tests when a later edit changes a shipped migration.
@@ -75,7 +75,7 @@ Repository-specific guidance for `artifact-fs`.
 - Write a test to catch a regression, never to raise coverage. Do not add coverage targets.
 - Make every regression test fail on the code before the fix. Revert the fix and watch the test fail.
 - Drive behavior through the entry point real callers use, not an internal helper.
-- Use real Git repositories in `t.TempDir()`. Fake the `git` binary only to inject failures a local repository cannot produce, such as HTTP errors.
+- Use real Git repositories in `t.TempDir()`. Fake the `git` binary only for what a local repository cannot produce: an HTTP error, a hang, or a pause at one step.
 - Assert the observable outcome: what `git status` reports, the resolved entry, or the persisted state. A nil error or a log line is not an outcome.
 - Assert a result that only the code path under test produces. An unchanged index passes whichever check skips the bootstrap. `TestBootstrapCleanStatusIndexSkipsDeleteOnlyOverlay` therefore first bootstraps the same fixture without the overlay entry.
 - Call `gittest.IsolateConfig` from `TestMain` in every package whose tests run git. Prove it with a `TestGitIgnoresMachineConfig` that calls `gittest.RequireConfigIsolated`. The machine's global and system git config must not change a result. The root package keeps the machine config when `AFS_E2E_REPO` is set, so a real remote can authenticate through the ambient credential helper.
@@ -94,13 +94,13 @@ Repository-specific guidance for `artifact-fs`.
 ## Validation
 
 - Start with the narrowest relevant test: `go test ./internal/<pkg>` or `go test -run TestName ./internal/<pkg>`.
-- For non-trivial code changes, reproduce CI in order: `go build -o /dev/null ./cmd/artifact-fs`, `go vet ./...` with `GOOS=linux` and with `GOOS=darwin`, then `go test -race ./...`.
+- For non-trivial code changes, reproduce CI in order: `go run golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@v0.52.0 -fix ./...` with no resulting diff, `go build -o /dev/null ./cmd/artifact-fs`, `go vet ./...` with `GOOS=linux` and with `GOOS=darwin`, then `go test -race -count=1 ./...`.
 - Build only the CLI with `go build ./cmd/artifact-fs`.
 - Enable the pre-commit checks with `git config core.hooksPath .githooks`.
 - Benchmarks are opt-in: `AFS_RUN_BENCH=1 go test -run TestBenchRepos -v`.
-- FUSE e2e tests are opt-in. Run them with the same command on macOS and Linux: `AFS_RUN_E2E_TESTS=1 go test -run TestE2E -count=1 -timeout 20m -v .`. Keep `-timeout 20m`: the default 10m can expire mid-suite, and a timeout panic skips every unmount cleanup.
+- FUSE e2e tests are opt-in. Run them with the same command on macOS and Linux: `AFS_RUN_E2E_TESTS=1 go test -run 'TestE2E|TestFUSEMountSmoke' -count=1 -timeout 20m -v .`. Keep `-timeout 20m`: the default 10m can expire mid-suite, and a timeout panic skips every unmount cleanup.
 - On Linux, e2e tests need `/dev/fuse` plus either root or `fusermount3` from the `fuse3` package. Unmount a leftover mount with `fusermount3 -u <path>`, or `fusermount3 -uz <path>` when it hangs.
 - On macOS, e2e tests mount through FSKit. Set `ARTIFACT_FS_FUSE_BACKEND=kernel` only to test the macFUSE kernel extension; without a loaded kernel extension those tests skip. Unmount a leftover FSKit mount with `diskutil unmount <path>`. A deadlocked FSKit mount cannot be unmounted until reboot.
 - E2E tests use a local bare repository by default. Set `AFS_E2E_REPO` only when intentionally testing a real remote.
 - E2E benchmark coverage is separate: `AFS_RUN_E2E_BENCH=1 go test -run TestE2EBenchmarkRepos -v .`.
-- Package tests live beside the code. Benchmarks and `e2e*_test.go` live in the root package.
+- Package tests and `Benchmark*` functions live beside the code. `TestBenchRepos`, `TestE2EBenchmarkRepos` and every `e2e*_test.go` live in the root package.
