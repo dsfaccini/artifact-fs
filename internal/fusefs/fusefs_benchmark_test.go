@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 	overlaystore "github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
+	"github.com/dsfaccini/fuse/fuseops"
 )
 
 // lockTimer adds up how long reconciles hold the lock, which is how long
@@ -159,4 +162,121 @@ func BenchmarkSwitchGeneration20kOverlayEntries(b *testing.B) {
 		}
 		reportSwitch(b, cpu, timer)
 	})
+}
+
+// inodeTableTree returns n files, 100 per directory, with their directories.
+// Each file path is 68 characters long, the mean length of the tracked files
+// of pydantic-ai; platform's is 78.
+func inodeTableTree(n int) []model.BaseNode {
+	nodes := make([]model.BaseNode, 0, n+n/100)
+	for i := range n {
+		dir := fmt.Sprintf("packages/module-%04d/src/components/widgets", i/100)
+		if i%100 == 0 {
+			nodes = append(nodes, model.BaseNode{Path: dir, Type: "dir", Mode: 0o40000, SizeState: "known"})
+		}
+		path := fmt.Sprintf("%s/component-file-%05d.tsx", dir, i%100000)
+		nodes = append(nodes, model.BaseNode{Path: path, Type: "file", Mode: 0o100644, ObjectOID: fmt.Sprintf("%040x", i), SizeState: "known", SizeBytes: 10})
+	}
+	return nodes
+}
+
+func heapInUse() uint64 {
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.HeapAlloc
+}
+
+// BenchmarkInodeTable reports the heap the inode table holds per path the
+// kernel looked up once: held-B/path while the kernel holds every inode, and
+// dormant-B/path once it has forgotten them all. Each lookup allocates its
+// path and blob strings, as LookUpInode does.
+func BenchmarkInodeTable(b *testing.B) {
+	for _, n := range []int{100_000, 300_000} {
+		b.Run(fmt.Sprint(n), func(b *testing.B) {
+			var paths, blobs []string
+			for _, node := range inodeTableTree(n) {
+				paths, blobs = append(paths, node.Path), append(blobs, node.ObjectOID)
+			}
+			var held, dormant uint64
+			for range b.N {
+				before := heapInUse()
+				fs := NewArtifactFuse(model.RepoConfig{}, nil)
+				ids := make([]fuseops.InodeID, len(paths))
+				fs.mu.Lock()
+				for i, path := range paths {
+					ids[i] = fs.allocInode(strings.Clone(path), Attrs{Type: "file", Mode: 0o644, Gen: 1, Blob: strings.Clone(blobs[i])}).ID
+				}
+				fs.mu.Unlock()
+				idsSize := uint64(len(ids)) * 8
+				held += heapInUse() - before - idsSize
+				for _, id := range ids {
+					_ = fs.ForgetInode(context.Background(), &fuseops.ForgetInodeOp{Inode: id, N: 1})
+				}
+				dormant += heapInUse() - before - idsSize
+				if len(fs.pathToInode) != len(paths)+1 {
+					b.Fatalf("table maps %d paths after FORGET, want %d", len(fs.pathToInode), len(paths)+1)
+				}
+				runtime.KeepAlive(ids)
+			}
+			perPath := float64(b.N * len(paths))
+			b.ReportMetric(float64(held)/perPath, "held-B/path")
+			b.ReportMetric(float64(dormant)/perPath, "dormant-B/path")
+			b.ReportMetric(float64(dormant)/float64(b.N)/(1<<20), "dormant-MiB")
+		})
+	}
+}
+
+// BenchmarkSwitchPassForgottenPaths times the pass a generation switch runs
+// over a snapshot of n files that the kernel looked up once and forgot. The
+// pass lists each directory that holds one of their paths.
+func BenchmarkSwitchPassForgottenPaths(b *testing.B) {
+	ctx := context.Background()
+	for _, n := range []int{100_000, 300_000} {
+		b.Run(fmt.Sprint(n), func(b *testing.B) {
+			nodes := inodeTableTree(n)
+			snap, err := snapshot.New(ctx, filepath.Join(b.TempDir(), "snapshot.sqlite"))
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { _ = snap.Close() })
+			gen, err := snap.PublishGeneration(ctx, "head", "main", append([]model.BaseNode{{Path: ".", Type: "dir", Mode: 0o40000, SizeState: "known"}}, nodes...))
+			if err != nil {
+				b.Fatal(err)
+			}
+			dir := b.TempDir()
+			ov, err := overlaystore.New(ctx, model.RepoConfig{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { _ = ov.Close() })
+			r := &Resolver{Snapshot: snap, Overlay: ov}
+			r.SetGeneration(gen)
+			fs := NewArtifactFuse(model.RepoConfig{}, &Engine{Resolver: r, Overlay: ov})
+			ids := make([]fuseops.InodeID, len(nodes))
+			fs.mu.Lock()
+			for i, node := range nodes {
+				ids[i] = fs.allocInode(node.Path, Attrs{Type: node.Type, Mode: node.Mode, Gen: gen}).ID
+			}
+			fs.mu.Unlock()
+			for _, id := range ids {
+				_ = fs.ForgetInode(ctx, &fuseops.ForgetInodeOp{Inode: id, N: 1})
+			}
+			var cpu time.Duration
+			b.ResetTimer()
+			for range b.N {
+				start := cpuTime(b)
+				if err := fs.invalidateChanged(false); err != nil {
+					b.Fatal(err)
+				}
+				cpu += cpuTime(b) - start
+			}
+			b.StopTimer()
+			if len(fs.pathToInode) != len(nodes)+1 {
+				b.Fatalf("pass dropped mappings of paths that exist: %d left, want %d", len(fs.pathToInode), len(nodes)+1)
+			}
+			b.ReportMetric(float64(cpu.Nanoseconds())/float64(b.N), "cpu-ns/op")
+			b.ReportMetric(float64(cpu.Nanoseconds())/float64(b.N*len(nodes)), "cpu-ns/path")
+		})
+	}
 }
