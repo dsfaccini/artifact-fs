@@ -71,7 +71,7 @@ func (h *gatedHydrator) enter(ctx context.Context) error {
 
 func (h *gatedHydrator) EnqueueBatch([]model.HydrationTask) {}
 
-func (h *gatedHydrator) EnsureHydrated(ctx context.Context, _ model.RepoConfig, node model.BaseNode) (string, int64, error) {
+func (h *gatedHydrator) EnsureHydrated(ctx context.Context, _ model.RepoPaths, node model.BaseNode) (string, int64, error) {
 	if err := h.enter(ctx); err != nil {
 		return "", 0, err
 	}
@@ -83,7 +83,7 @@ func (h *gatedHydrator) EnsureHydrated(ctx context.Context, _ model.RepoConfig, 
 	return path, st.Size(), nil
 }
 
-func (h *gatedHydrator) OpenHydrated(ctx context.Context, _ model.RepoConfig, node model.BaseNode) (*os.File, int64, error) {
+func (h *gatedHydrator) OpenHydrated(ctx context.Context, _ model.RepoPaths, node model.BaseNode) (*os.File, int64, error) {
 	if err := h.enter(ctx); err != nil {
 		return nil, 0, err
 	}
@@ -99,7 +99,7 @@ func (h *gatedHydrator) OpenHydrated(ctx context.Context, _ model.RepoConfig, no
 	return f, st.Size(), nil
 }
 
-func (h *gatedHydrator) ReadBlob(ctx context.Context, _ model.RepoConfig, node model.BaseNode, _ int64) ([]byte, error) {
+func (h *gatedHydrator) ReadBlob(ctx context.Context, _ model.RepoPaths, node model.BaseNode, _ int64) ([]byte, error) {
 	if err := h.enter(ctx); err != nil {
 		return nil, err
 	}
@@ -122,7 +122,7 @@ func newTrackedFixture(t *testing.T) trackedFixture {
 	t.Helper()
 	ctx := context.Background()
 	tmp := t.TempDir()
-	repo := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	repo := model.RepoPaths{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
 	store, err := overlaystore.New(ctx, repo)
 	if err != nil {
 		t.Fatal(err)
@@ -651,7 +651,7 @@ func TestRenameCopiesReplacedDestinationOnlyForOpenHandles(t *testing.T) {
 func TestRenameLargeDirectoryUnderFDLimit(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
-	repo := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	repo := model.RepoPaths{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
 	store, err := overlaystore.New(ctx, repo)
 	if err != nil {
 		t.Fatal(err)
@@ -852,7 +852,7 @@ type replacingOverlay struct {
 	replace func()
 }
 
-func (o *replacingOverlay) EnsureCopyOnWriteFrom(ctx context.Context, repo model.RepoConfig, path string, base model.BaseNode, src *os.File) (model.OverlayEntry, error) {
+func (o *replacingOverlay) EnsureCopyOnWriteFrom(ctx context.Context, repo model.RepoPaths, path string, base model.BaseNode, src *os.File) (model.OverlayEntry, error) {
 	e, err := o.OverlayStore.EnsureCopyOnWriteFrom(ctx, repo, path, base, src)
 	o.once.Do(o.replace)
 	return e, err

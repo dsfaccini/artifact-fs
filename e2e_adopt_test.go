@@ -50,7 +50,7 @@ func TestE2EAdoptedWorktree(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctl := newE2EController(t, root)
-	if err := ctl.AddRepo(ctx, model.RepoConfig{Name: repoName, AdoptGitDir: true, GitDir: gitDir, MountRoot: mountDir, Enabled: true}); err != nil {
+	if err := ctl.AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: repoName, GitDir: gitDir, MountRoot: mountDir}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}); err != nil {
 		cancel()
 		_ = svc.Close()
 		t.Fatalf("adopt worktree: %v", err)

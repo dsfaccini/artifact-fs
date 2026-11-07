@@ -55,7 +55,7 @@ func TestAdoptGitDirPreservesGitStateAndScopesConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer svc.Close()
-	cfg := model.RepoConfig{Name: "adopted", GitDir: gitDir, MountPath: worktree, AdoptGitDir: true, Enabled: true}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
 	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestAdoptGitDirPreservesGitStateAndScopesConfig(t *testing.T) {
 	if got := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "config", "--get", "core.filemode")); got != "true" {
 		t.Fatalf("adopted filemode = %s", got)
 	}
-	if err := svc.ctl().SetRefresh(ctx, cfg.Name, time.Second, false); err == nil {
+	if err := svc.ctl().SetRefresh(ctx, cfg.Name, model.RefreshPolicy{RefreshInterval: time.Second}); err == nil {
 		t.Fatal("adoption allowed remote refresh to be enabled")
 	}
 	if err := svc.ctl().FetchNow(context.Background(), cfg.Name); err == nil {
@@ -136,7 +136,7 @@ func TestRemoveRepoStopsAdoptedFSMonitor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer svc.Close()
-	cfg := model.RepoConfig{Name: "adopted", GitDir: gitDir, MountPath: worktree, AdoptGitDir: true, Enabled: true}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
 	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -197,13 +197,13 @@ func TestAdoptGitDirRejectsAcquisitionOptions(t *testing.T) {
 	}
 	defer ctl.Close()
 	for _, cfg := range []model.RepoConfig{
-		{AdoptGitDir: true},
-		{AdoptGitDir: true, GitDir: "/git", RemoteURL: "https://example.invalid/repo"},
-		{AdoptGitDir: true, GitDir: "/git", PreparedGitDir: true},
-		{AdoptGitDir: true, GitDir: "/git", FetchRef: "main"},
-		{AdoptGitDir: true, GitDir: "/git", Branch: "refs/heads/main"},
-		{AdoptGitDir: true, GitDir: "/git", HistoryDepth: 1},
-		{AdoptGitDir: true, GitDir: "/git", RequiredCommit: strings.Repeat("a", 40)},
+		{RepoSpec: model.RepoSpec{AdoptGitDir: true}},
+		{RepoSpec: model.RepoSpec{AdoptGitDir: true, RemoteURL: "https://example.invalid/repo"}, RepoPaths: model.RepoPaths{GitDir: "/git"}},
+		{RepoSpec: model.RepoSpec{AdoptGitDir: true, PreparedGitDir: true}, RepoPaths: model.RepoPaths{GitDir: "/git"}},
+		{RepoSpec: model.RepoSpec{AdoptGitDir: true, FetchRef: "main"}, RepoPaths: model.RepoPaths{GitDir: "/git"}},
+		{RepoSpec: model.RepoSpec{AdoptGitDir: true, Branch: "refs/heads/main"}, RepoPaths: model.RepoPaths{GitDir: "/git"}},
+		{RepoSpec: model.RepoSpec{AdoptGitDir: true, HistoryDepth: 1}, RepoPaths: model.RepoPaths{GitDir: "/git"}},
+		{RepoSpec: model.RepoSpec{AdoptGitDir: true, RequiredCommit: strings.Repeat("a", 40)}, RepoPaths: model.RepoPaths{GitDir: "/git"}},
 	} {
 		cfg.Name = "adopted"
 		if err := ctl.AddRepo(t.Context(), cfg); err == nil {
@@ -248,7 +248,7 @@ func TestAdoptGitDirWarnsAboutCredentialedOriginOncePerPrepare(t *testing.T) {
 	}
 	defer svc.Close()
 	warnings := func() int { return strings.Count(logs.String(), "adopted worktree origin embeds credentials") }
-	cfg := model.RepoConfig{Name: "adopted", GitDir: gitDir, MountPath: worktree, AdoptGitDir: true, Enabled: true}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
 	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
 		t.Fatalf("adoption with a credentialed origin failed: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestAdoptedMountConfiguresWorktreeOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer svc.Close()
-	cfg := model.RepoConfig{Name: "adopted", GitDir: gitDir, MountPath: worktree, AdoptGitDir: true, Enabled: true}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
 	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}

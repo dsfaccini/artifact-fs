@@ -21,24 +21,31 @@ import (
 )
 
 // resolverMount mounts through next and keeps the resolver that the mount
-// would serve.
+// would serve and the redact it would log the fuse library's errors through.
 type resolverMount struct {
 	next     mountFunc
 	mu       sync.Mutex
 	resolved *fusefs.Resolver
+	redact   func(string) string
 }
 
-func (m *resolverMount) mount(ctx, opCtx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+func (m *resolverMount) mount(ctx, opCtx context.Context, cfg model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
 	m.mu.Lock()
-	m.resolved = engine.Resolver
+	m.resolved, m.redact = engine.Resolver, redact
 	m.mu.Unlock()
-	return m.next(ctx, opCtx, cfg, engine, gate, logger)
+	return m.next(ctx, opCtx, cfg, engine, gate, logger, redact)
 }
 
 func (m *resolverMount) resolver() *fusefs.Resolver {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.resolved
+}
+
+func (m *resolverMount) redactor() func(string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.redact
 }
 
 // startedDaemon is a daemon whose Start mounted one repo cloned from a local
@@ -82,7 +89,7 @@ func startDaemonWithMount(t *testing.T, mount mountFunc, mountPath string) *star
 	d.svc = svc
 	svc.mount = d.mounts.mount
 	// A remote refresh never runs during the test, so only the HEAD watcher can start a reconcile.
-	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: d.workDir, Branch: "main", MountPath: mountPath, RefreshInterval: time.Hour, Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", MountPath: mountPath}, RepoSpec: model.RepoSpec{RemoteURL: d.workDir, Branch: "main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Hour}, Enabled: true}); err != nil {
 		_ = svc.Close()
 		t.Fatal(err)
 	}
@@ -216,6 +223,9 @@ type connFailureMounts struct {
 	// abort makes the failed connection's Join return nil, as after an
 	// abort. Set it before closing fail.
 	abort bool
+	// remote is the repo's remote, which the failed connection's error names.
+	// Set it before closing fail.
+	remote string
 }
 
 // startConnFailureDaemon starts a daemon whose repo, mounted at mountPath,
@@ -224,6 +234,7 @@ func startConnFailureDaemon(t *testing.T, unmountFails int, mountPath string) (*
 	t.Helper()
 	m := &connFailureMounts{fail: make(chan struct{}), release: make(chan struct{}), unmountFails: unmountFails}
 	d := startDaemonWithMount(t, m.mount, mountPath)
+	m.remote = d.workDir
 	// Runs before the daemon's cleanup, which waits for a remount.
 	t.Cleanup(m.releaseRemount)
 	return d, m
@@ -231,16 +242,16 @@ func startConnFailureDaemon(t *testing.T, unmountFails int, mountPath string) (*
 
 func (m *connFailureMounts) releaseRemount() { m.releaseOnce.Do(func() { close(m.release) }) }
 
-func (m *connFailureMounts) mount(ctx, opCtx context.Context, cfg model.RepoConfig, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger) (fusefs.MountedFS, error) {
+func (m *connFailureMounts) mount(ctx, opCtx context.Context, cfg model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
 	m.mu.Lock()
 	remount := len(m.calls) > 0
 	m.calls = append(m.calls, "mount")
 	m.mu.Unlock()
 	if remount {
 		<-m.release
-		return fakeMount(ctx, opCtx, cfg, engine, gate, logger)
+		return fakeMount(ctx, opCtx, cfg, engine, gate, logger, redact)
 	}
-	return &failedConnectionMount{m: m, err: fmt.Errorf("readMessage: transport to %s failed", cfg.RemoteURL)}, nil
+	return &failedConnectionMount{m: m}, nil
 }
 
 func (m *connFailureMounts) recorded() []string {
@@ -250,8 +261,7 @@ func (m *connFailureMounts) recorded() []string {
 }
 
 type failedConnectionMount struct {
-	m   *connFailureMounts
-	err error
+	m *connFailureMounts
 }
 
 func (f *failedConnectionMount) Backend() string          { return "fake" }
@@ -263,7 +273,7 @@ func (f *failedConnectionMount) Join(ctx context.Context) error {
 		if f.m.abort {
 			return nil
 		}
-		return f.err
+		return fmt.Errorf("readMessage: transport to %s failed", f.m.remote)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -426,5 +436,16 @@ func TestMountPointHeld(t *testing.T) {
 		if got := mountPointHeld(tt.path); got != tt.want {
 			t.Errorf("%s: mountPointHeld(%q) = %t, want %t", tt.name, tt.path, got, tt.want)
 		}
+	}
+}
+
+// The daemon mounts with a redact that removes the repo's remote, so a fuse
+// library error line that names it, such as a failed lazy fetch's, never logs
+// it. The remote here is a local path, which only the remote itself matches.
+func TestStartMountRedactsTheRemoteFromFuseErrors(t *testing.T) {
+	d := startDaemonWithRepo(t)
+	line := fmt.Sprintf("Op 0x00000002 *fuseops.ReadFileOp] -> Error: %q", "fetch "+d.workDir+": exit status 128")
+	if got := d.mounts.redactor()(line); strings.Contains(got, d.workDir) || !strings.Contains(got, "REDACTED_REMOTE") {
+		t.Fatalf("redact(%q) = %q, want the remote redacted", line, got)
 	}
 }

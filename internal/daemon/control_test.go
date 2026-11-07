@@ -51,7 +51,7 @@ func TestStatusTrustsTheRecordOnlyWhileADaemonRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ctl.Close()
-	cfg := model.RepoConfig{ID: "repo", Name: "repo", Branch: "refs/heads/main", Enabled: true, ConfigVersion: "v1"}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo"}, RepoSpec: model.RepoSpec{Branch: "refs/heads/main"}, Enabled: true, ConfigVersion: "v1"}
 	ctl.fillPaths(&cfg)
 	if err := ctl.registry.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
@@ -201,7 +201,7 @@ func newRegisteredController(t *testing.T) *Controller {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ctl.Close() })
-	cfg := model.RepoConfig{ID: "repo", Name: "repo", Branch: "refs/heads/main", Enabled: true, ConfigVersion: "v1"}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo"}, RepoSpec: model.RepoSpec{Branch: "refs/heads/main"}, Enabled: true, ConfigVersion: "v1"}
 	ctl.fillPaths(&cfg)
 	if err := ctl.registry.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)

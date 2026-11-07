@@ -26,12 +26,16 @@ import (
 func TestVerifiedSourceStatusAndRefreshPolicy(t *testing.T) {
 	const requiredCommit = "0123456789012345678901234567890123456789"
 	cfg := model.RepoConfig{
-		Branch:                "refs/heads/main",
-		RequiredCommit:        requiredCommit,
-		AcquiredRef:           "refs/heads/main",
-		AcquiredCommit:        requiredCommit,
-		AcquiredAt:            time.Now(),
-		RemoteRefreshDisabled: true,
+		RepoSpec: model.RepoSpec{
+			Branch:         "refs/heads/main",
+			RequiredCommit: requiredCommit,
+		},
+		AcquiredRef:    "refs/heads/main",
+		AcquiredCommit: requiredCommit,
+		AcquiredAt:     time.Now(),
+		RefreshPolicy: model.RefreshPolicy{
+			RemoteRefreshDisabled: true,
+		},
 	}
 	st := model.RepoRuntimeState{CurrentHEADOID: requiredCommit}
 	applySourceStatus(&st, cfg)
@@ -96,7 +100,7 @@ func newBootstrapFixture(t *testing.T) *bootstrapFixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = svc.Close() })
-	cfg := model.RepoConfig{ID: "repo", Name: "repo", GitDir: filepath.Join(repoPath, ".git"), MountPath: repoPath}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", GitDir: filepath.Join(repoPath, ".git"), MountPath: repoPath}}
 	svc.fillPaths(&cfg)
 	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
 	if err != nil {
@@ -110,7 +114,7 @@ func newBootstrapFixture(t *testing.T) *bootstrapFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ov, err := overlay.New(ctx, cfg)
+	ov, err := overlay.New(ctx, cfg.RepoPaths)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +228,7 @@ exec "$AFS_REAL_GIT" "$@"
 func TestRequiredCommitIgnoresHEADWatcher(t *testing.T) {
 	const requiredCommit = "0123456789012345678901234567890123456789"
 	runtime := &repoRuntime{
-		cfg:  model.RepoConfig{ID: "verified", RequiredCommit: requiredCommit, GitDir: filepath.Join(t.TempDir(), "missing")},
+		cfg:  model.RepoConfig{RepoPaths: model.RepoPaths{ID: "verified", GitDir: filepath.Join(t.TempDir(), "missing")}, RepoSpec: model.RepoSpec{RequiredCommit: requiredCommit}},
 		head: servedHead{oid: requiredCommit, gen: 1},
 	}
 	service := &Service{running: map[model.RepoID]*repoRuntime{"verified": runtime}}
@@ -252,10 +256,14 @@ func TestPersistedVerifiedStatusDoesNotCountAcquisitionAsRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := model.RepoConfig{
-		ID:             "verified",
-		GitDir:         gitDir,
-		Branch:         "refs/heads/main",
-		RequiredCommit: strings.Repeat("a", 40),
+		RepoPaths: model.RepoPaths{
+			ID:     "verified",
+			GitDir: gitDir,
+		},
+		RepoSpec: model.RepoSpec{
+			Branch:         "refs/heads/main",
+			RequiredCommit: strings.Repeat("a", 40),
+		},
 		AcquiredRef:    "refs/heads/main",
 		AcquiredCommit: strings.Repeat("a", 40),
 		AcquiredAt:     acquiredAt,
@@ -296,7 +304,7 @@ func TestReadPersistedStatusIncludesHydrationStats(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st := persistedStatus(context.Background(), model.RepoConfig{ID: "repo", BlobCacheDir: cacheDir, GitDir: gitDir}, model.RepoRuntimeRecord{}, false)
+	st := persistedStatus(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", BlobCacheDir: cacheDir, GitDir: gitDir}}, model.RepoRuntimeRecord{}, false)
 
 	if st.LastFetchResult != "never" {
 		t.Fatalf("LastFetchResult = %q, want never", st.LastFetchResult)
@@ -331,10 +339,10 @@ func TestStatusReportsMountErrorUntilRetryMounts(t *testing.T) {
 	}
 	defer svc.Close()
 	mountErr := errors.New("fskit: file system extension requires approval")
-	svc.mount = func(context.Context, context.Context, model.RepoConfig, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger) (fusefs.MountedFS, error) {
+	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return nil, mountErr
 	}
-	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main"}, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -435,7 +443,7 @@ func TestStopRuntimeKeepsWorkersAliveWhenUnmountFails(t *testing.T) {
 		cancel: cancel,
 		mfs:    &blockingMountedFS{unmountErr: errors.New("busy")},
 		mount:  mountServing,
-		cfg:    model.RepoConfig{Name: "repo"},
+		cfg:    model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}},
 	}
 	if err := (&Service{unmounting: map[model.RepoID]*unmountOp{}, mountPointEntry: heldMountPoint}).stopRuntime(rt); err == nil {
 		t.Fatal("expected unmount failure")
@@ -455,7 +463,7 @@ func newHookService(t *testing.T, mountPath string) (*Service, model.RepoConfig)
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = svc.Close() })
-	cfg := model.RepoConfig{Name: "repo", ID: "repo", Branch: "main", RefreshInterval: time.Minute, Enabled: true, ConfigVersion: "v1", MountPath: mountPath}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", ID: "repo", MountPath: mountPath}, RepoSpec: model.RepoSpec{Branch: "main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Minute}, Enabled: true, ConfigVersion: "v1"}
 	svc.fillPaths(&cfg)
 	if err := svc.registry.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
@@ -501,7 +509,7 @@ func gitStatusWithAnswer(t *testing.T, repo string, answer []byte) (string, stri
 func TestFSMonitorHookReturnsPathsChangedSinceToken(t *testing.T) {
 	ctx := t.Context()
 	svc, cfg := newHookService(t, "/")
-	ov, err := overlay.New(ctx, cfg)
+	ov, err := overlay.New(ctx, cfg.RepoPaths)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,7 +560,7 @@ func TestFSMonitorHookReturnsPathsChangedSinceToken(t *testing.T) {
 func TestFSMonitorHookRescansForTokenFromRecreatedOverlay(t *testing.T) {
 	ctx := t.Context()
 	svc, cfg := newHookService(t, "/")
-	ov, err := overlay.New(ctx, cfg)
+	ov, err := overlay.New(ctx, cfg.RepoPaths)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +578,7 @@ func TestFSMonitorHookRescansForTokenFromRecreatedOverlay(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ov, err = overlay.New(ctx, cfg)
+	ov, err = overlay.New(ctx, cfg.RepoPaths)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -665,7 +673,7 @@ func TestFSMonitorHookKeepsGitUntrackedCacheAcrossDirectoryRenames(t *testing.T)
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
 			svc, cfg := newHookService(t, "/")
-			ov, err := overlay.New(ctx, cfg)
+			ov, err := overlay.New(ctx, cfg.RepoPaths)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -744,7 +752,7 @@ func TestFSMonitorHookRescansUnlessTokenAndMountAreCurrent(t *testing.T) {
 				return unmounted
 			}
 			svc, cfg := newHookService(t, mountPath(!tc.issuedUnmounted))
-			ov, err := overlay.New(ctx, cfg)
+			ov, err := overlay.New(ctx, cfg.RepoPaths)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -38,7 +38,7 @@ func newLocalOverlayFuseFixture(t *testing.T) localOverlayFuseFixture {
 	t.Helper()
 	ctx := context.Background()
 	tmp := t.TempDir()
-	repo := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	repo := model.RepoPaths{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
 	store, err := overlaystore.New(ctx, repo)
 	if err != nil {
 		t.Fatal(err)
@@ -287,7 +287,7 @@ func TestCanceledDuringRenameTreeKeepsNamespaceAndHandlesInSync(t *testing.T) {
 
 func TestCanceledHydrationInterruptsRenameBeforeMutation(t *testing.T) {
 	tmp := t.TempDir()
-	repo := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	repo := model.RepoPaths{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
 	store, err := overlaystore.New(context.Background(), repo)
 	if err != nil {
 		t.Fatal(err)
@@ -343,7 +343,7 @@ func TestCanceledHydrationInterruptsRenameBeforeMutation(t *testing.T) {
 
 func TestCanceledDestinationHydrationInterruptsRenameBeforeMutation(t *testing.T) {
 	tmp := t.TempDir()
-	repo := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	repo := model.RepoPaths{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
 	store, err := overlaystore.New(context.Background(), repo)
 	if err != nil {
 		t.Fatal(err)
@@ -403,7 +403,7 @@ func TestCanceledDestinationHydrationInterruptsRenameBeforeMutation(t *testing.T
 
 func TestCanceledHydrationInterruptsOpenFile(t *testing.T) {
 	tmp := t.TempDir()
-	repo := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	repo := model.RepoPaths{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
 	store, err := overlaystore.New(context.Background(), repo)
 	if err != nil {
 		t.Fatal(err)
@@ -482,7 +482,7 @@ func TestInodeAttrsPreservesExplicitZeroDirMode(t *testing.T) {
 }
 
 func TestGitFileAttrsUsesOneTimestamp(t *testing.T) {
-	fs := NewArtifactFuse(model.RepoConfig{GitDir: "/tmp/repo/.git"}, nil)
+	fs := NewArtifactFuse(model.RepoPaths{GitDir: "/tmp/repo/.git"}, nil)
 
 	attr := fs.gitFileAttrs()
 	if attr.Mtime.IsZero() || attr.Atime.IsZero() || attr.Ctime.IsZero() {
@@ -494,7 +494,7 @@ func TestGitFileAttrsUsesOneTimestamp(t *testing.T) {
 }
 
 func TestRootInodeAttributesDoNotRequireResolver(t *testing.T) {
-	fs := NewArtifactFuse(model.RepoConfig{Name: "repo", GitDir: "/tmp/repo.git"}, nil)
+	fs := NewArtifactFuse(model.RepoPaths{Name: "repo", GitDir: "/tmp/repo.git"}, nil)
 	op := &fuseops.GetInodeAttributesOp{Inode: fuseops.RootInodeID}
 
 	if err := fs.GetInodeAttributes(context.Background(), op); err != nil {
@@ -523,7 +523,7 @@ func TestSyntheticAttributesRemainStable(t *testing.T) {
 		t.Fatal("synthetic Git file attributes changed between lookup and stat")
 	}
 
-	fs := NewArtifactFuse(model.RepoConfig{Name: "repo", GitDir: "/tmp/repo.git"}, nil)
+	fs := NewArtifactFuse(model.RepoPaths{Name: "repo", GitDir: "/tmp/repo.git"}, nil)
 	statRoot := func() fuseops.InodeAttributes {
 		t.Helper()
 		op := &fuseops.GetInodeAttributesOp{Inode: fuseops.RootInodeID}
@@ -576,7 +576,7 @@ func TestWriteThroughOpenedBaseHandlePromotesAndWrites(t *testing.T) {
 	if err := os.WriteFile(cachePath, []byte("base"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	repo := model.RepoConfig{ID: "repo"}
+	repo := model.RepoPaths{ID: "repo"}
 	base := model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "file", Mode: 0o644, ObjectOID: "blob", SizeState: "known", SizeBytes: 4}
 	snap := &fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": base}}
 	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
@@ -605,7 +605,7 @@ func TestSetInodeAttributesAppliesExecutableBit(t *testing.T) {
 	if err := os.WriteFile(cachePath, []byte("base"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	repo := model.RepoConfig{ID: "repo"}
+	repo := model.RepoPaths{ID: "repo"}
 	base := model.BaseNode{RepoID: repo.ID, Path: "script.sh", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 4}
 	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
 	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{base.Path: base}}, ov)
@@ -630,7 +630,7 @@ func TestSetInodeAttributesAppliesExecutableBit(t *testing.T) {
 }
 
 func TestCreateAndReadOverlaySymlink(t *testing.T) {
-	repo := model.RepoConfig{ID: "repo"}
+	repo := model.RepoPaths{ID: "repo"}
 	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
 	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{}}, ov)
 	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: ov}
@@ -656,7 +656,7 @@ func TestCreateAndReadOverlaySymlink(t *testing.T) {
 }
 
 func TestMoveInodePathPreservesSourceIdentityAndStalesReplacement(t *testing.T) {
-	fs := NewArtifactFuse(model.RepoConfig{}, nil)
+	fs := NewArtifactFuse(model.RepoPaths{}, nil)
 	fs.mu.Lock()
 	source := fs.allocInode("source.txt", Attrs{Type: "file", Mode: 0o100644, Gen: 1})
 	replaced := fs.allocInode("destination.txt", Attrs{Type: "file", Mode: 0o100644, Gen: 1})
@@ -687,7 +687,7 @@ func TestMoveInodePathPreservesSourceIdentityAndStalesReplacement(t *testing.T) 
 }
 
 func TestMoveInodePathRewritesDirectoryDescendants(t *testing.T) {
-	fs := NewArtifactFuse(model.RepoConfig{}, nil)
+	fs := NewArtifactFuse(model.RepoPaths{}, nil)
 	fs.mu.Lock()
 	source := fs.allocInode("source", Attrs{Type: "dir", Mode: 0o755, Gen: 1})
 	child := fs.allocInode("source/nested/file.txt", Attrs{Type: "file", Mode: 0o100644, Gen: 1})
@@ -748,7 +748,7 @@ func TestRenameReturnsNativeErrorsBeforeMutatingOverlay(t *testing.T) {
 	overlay := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
 	resolver := newResolver(snapshot, overlay)
 	engine := &Engine{Resolver: resolver, Overlay: overlay}
-	fs := NewArtifactFuse(model.RepoConfig{ID: "repo"}, engine)
+	fs := NewArtifactFuse(model.RepoPaths{ID: "repo"}, engine)
 
 	for _, test := range []struct {
 		name string
@@ -858,7 +858,7 @@ func TestRootInodeAttributesUseStableResolverAttrsWhenReady(t *testing.T) {
 		}
 		resolver.SetGeneration(7)
 		resolver.SetCommitTime(1_700_000_000)
-		fs := NewArtifactFuse(model.RepoConfig{Name: "repo", GitDir: "/tmp/repo.git"}, &Engine{Resolver: resolver})
+		fs := NewArtifactFuse(model.RepoPaths{Name: "repo", GitDir: "/tmp/repo.git"}, &Engine{Resolver: resolver})
 
 		first := &fuseops.GetInodeAttributesOp{Inode: fuseops.RootInodeID}
 		if err := fs.GetInodeAttributes(context.Background(), first); err != nil {
@@ -881,7 +881,7 @@ func TestRootInodeAttributesUseStableResolverAttrsWhenReady(t *testing.T) {
 }
 
 func TestLookUpInodeHydratesUnknownSizeBaseFileAttributes(t *testing.T) {
-	repo := model.RepoConfig{ID: "repo"}
+	repo := model.RepoPaths{ID: "repo"}
 	base := model.BaseNode{
 		RepoID:    repo.ID,
 		Path:      "file.txt",
@@ -910,7 +910,7 @@ func TestLookUpInodeHydratesUnknownSizeBaseFileAttributes(t *testing.T) {
 }
 
 func TestGetInodeAttributesHydratesUnknownSizeBaseFileAttributes(t *testing.T) {
-	repo := model.RepoConfig{ID: "repo"}
+	repo := model.RepoPaths{ID: "repo"}
 	base := model.BaseNode{
 		RepoID:    repo.ID,
 		Path:      "file.txt",
@@ -944,7 +944,7 @@ func TestGetInodeAttributesHydratesUnknownSizeBaseFileAttributes(t *testing.T) {
 }
 
 func TestGetInodeAttributesHydrationFailureReturnsEIO(t *testing.T) {
-	repo := model.RepoConfig{ID: "repo"}
+	repo := model.RepoPaths{ID: "repo"}
 	base := model.BaseNode{
 		RepoID:    repo.ID,
 		Path:      "file.txt",
@@ -972,7 +972,7 @@ func TestGetInodeAttributesHydrationFailureReturnsEIO(t *testing.T) {
 }
 
 func TestLookUpInodeResolvesUnknownBaseAttributeSizes(t *testing.T) {
-	repo := model.RepoConfig{ID: "repo"}
+	repo := model.RepoPaths{ID: "repo"}
 	tests := []struct {
 		name              string
 		base              model.BaseNode
@@ -1044,14 +1044,18 @@ func TestFirstFileReadPrefetchesItsDirectoryAndListingPrefetchesNothing(t *testi
 	}
 	tmp := t.TempDir()
 	repo := model.RepoConfig{
-		ID:            "repo",
-		Name:          "repo",
-		GitDir:        filepath.Join(tmp, "repo.git"),
-		RemoteURL:     gittest.PartialCloneRemote(t, files),
-		Branch:        "main",
-		BlobCacheDir:  filepath.Join(tmp, "cache"),
-		OverlayDir:    filepath.Join(tmp, "overlay"),
-		OverlayDBPath: filepath.Join(tmp, "overlay.db"),
+		RepoPaths: model.RepoPaths{
+			ID:            "repo",
+			Name:          "repo",
+			GitDir:        filepath.Join(tmp, "repo.git"),
+			BlobCacheDir:  filepath.Join(tmp, "cache"),
+			OverlayDir:    filepath.Join(tmp, "overlay"),
+			OverlayDBPath: filepath.Join(tmp, "overlay.db"),
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL: gittest.PartialCloneRemote(t, files),
+			Branch:    "main",
+		},
 	}
 	git := gitstore.New(nil)
 	t.Cleanup(git.Close)
@@ -1079,7 +1083,7 @@ func TestFirstFileReadPrefetchesItsDirectoryAndListingPrefetchesNothing(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	ov, err := overlaystore.New(ctx, repo)
+	ov, err := overlaystore.New(ctx, repo.RepoPaths)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1089,7 +1093,7 @@ func TestFirstFileReadPrefetchesItsDirectoryAndListingPrefetchesNothing(t *testi
 	queue := &enqueueCounter{Hydrator: h}
 	resolver := &Resolver{Snapshot: snap, Overlay: ov}
 	resolver.SetGeneration(gen)
-	fs := NewArtifactFuse(repo, &Engine{Resolver: resolver, Repo: repo, Overlay: ov, Hydrator: queue})
+	fs := NewArtifactFuse(repo.RepoPaths, &Engine{Resolver: resolver, Repo: repo.RepoPaths, Overlay: ov, Hydrator: queue})
 	packs := packCount(t, repo.GitDir)
 
 	walkListing(t, fs, fuseops.RootInodeID, ".")
@@ -1097,13 +1101,13 @@ func TestFirstFileReadPrefetchesItsDirectoryAndListingPrefetchesNothing(t *testi
 		t.Fatalf("a listing-only walk queued %d blobs for hydration", got)
 	}
 
-	h.Start(4, repo)
+	h.Start(4, repo.RepoPaths)
 	src := lookUpInode(t, fs, fuseops.RootInodeID, "src")
 	if got := readWholeFile(t, fs, lookUpInode(t, fs, src, "a.go")); got != files["src/a.go"] {
 		t.Fatalf("src/a.go = %q, want %q", got, files["src/a.go"])
 	}
 	for _, path := range []string{"src/b.go", "src/c.go"} {
-		waitForCachedBlob(t, repo, oids[path])
+		waitForCachedBlob(t, repo.RepoPaths, oids[path])
 	}
 	// One fetch for a.go itself and one for its siblings.
 	if got := packCount(t, repo.GitDir); got != packs+2 {
@@ -1138,7 +1142,7 @@ func TestReadsPrefetchEachDirectoryOncePerGeneration(t *testing.T) {
 		kids:  map[string][]model.BaseNode{"src": {a, b}},
 	}, ov)
 	h := &fakeBatchHydrator{path: cachePath}
-	engine := &Engine{Resolver: r, Repo: model.RepoConfig{ID: "repo"}, Overlay: ov, Hydrator: h}
+	engine := &Engine{Resolver: r, Repo: model.RepoPaths{ID: "repo"}, Overlay: ov, Hydrator: h}
 	dst := make([]byte, 16)
 
 	for _, path := range []string{a.Path, b.Path} {
@@ -1176,7 +1180,7 @@ func newPrefetchFixture(t *testing.T) (*ArtifactFuse, *Engine, *fakeBatchHydrato
 		kids:  map[string][]model.BaseNode{".": {src}, "src": {a, b}},
 	}, ov)
 	h := &fakeBatchHydrator{path: cachePath}
-	repo := model.RepoConfig{ID: "repo"}
+	repo := model.RepoPaths{ID: "repo"}
 	engine := &Engine{Resolver: r, Repo: repo, Overlay: ov, Hydrator: h}
 	return NewArtifactFuse(repo, engine), engine, h
 }
@@ -1271,7 +1275,7 @@ type queuedAtOpenHydrator struct {
 	queuedAtOpen []int
 }
 
-func (h *queuedAtOpenHydrator) OpenHydrated(ctx context.Context, repo model.RepoConfig, node model.BaseNode) (*os.File, int64, error) {
+func (h *queuedAtOpenHydrator) OpenHydrated(ctx context.Context, repo model.RepoPaths, node model.BaseNode) (*os.File, int64, error) {
 	h.queuedAtOpen = append(h.queuedAtOpen, len(h.tasks))
 	return h.fakeBatchHydrator.OpenHydrated(ctx, repo, node)
 }
@@ -1346,7 +1350,7 @@ func readWholeFile(t *testing.T, fs *ArtifactFuse, inode fuseops.InodeID) string
 
 // waitForCachedBlob polls until oid's blob is in repo's cache; go test
 // -timeout is its only bound.
-func waitForCachedBlob(t *testing.T, repo model.RepoConfig, oid string) {
+func waitForCachedBlob(t *testing.T, repo model.RepoPaths, oid string) {
 	t.Helper()
 	for {
 		if _, err := os.Stat(blobcache.Path(repo.BlobCacheDir, oid)); err == nil {
@@ -1366,7 +1370,7 @@ func packCount(t *testing.T, gitDir string) int {
 }
 
 func TestReadDirPlusUsesReaddirMetadataWithoutHydration(t *testing.T) {
-	repo := model.RepoConfig{ID: "repo", GitDir: "/tmp/repo.git"}
+	repo := model.RepoPaths{ID: "repo", GitDir: "/tmp/repo.git"}
 	r := newResolver(
 		&fakeSnapshot{kids: map[string][]model.BaseNode{
 			".": {{Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 42}},
@@ -1397,7 +1401,7 @@ func TestReadDirPlusUsesReaddirMetadataWithoutHydration(t *testing.T) {
 }
 
 func TestReadDirPlusDoesNotHydrateUnknownSizeBaseFile(t *testing.T) {
-	repo := model.RepoConfig{ID: "repo", GitDir: "/tmp/repo.git"}
+	repo := model.RepoPaths{ID: "repo", GitDir: "/tmp/repo.git"}
 	r := newResolver(
 		&fakeSnapshot{kids: map[string][]model.BaseNode{
 			".": {{Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "unknown"}},
@@ -1426,7 +1430,7 @@ func TestReadDirPlusDoesNotHydrateUnknownSizeBaseFile(t *testing.T) {
 }
 
 func TestReadDirPlusContinuesInItsListingGeneration(t *testing.T) {
-	repo := model.RepoConfig{ID: "repo", GitDir: "/tmp/repo.git"}
+	repo := model.RepoPaths{ID: "repo", GitDir: "/tmp/repo.git"}
 	snap := &generationSnapshot{nodes: map[int64]map[string]model.BaseNode{}, kids: map[int64]map[string][]model.BaseNode{
 		1: {".": {
 			{Path: "a.txt", Type: "file", Mode: 0o100644, SizeState: "known", SizeBytes: 1},
@@ -1467,7 +1471,7 @@ func TestReadDirPlusContinuesInItsListingGeneration(t *testing.T) {
 }
 
 func TestReadDirPlusDropsLookupWhenEntryDoesNotFit(t *testing.T) {
-	repo := model.RepoConfig{ID: "repo", GitDir: "/tmp/repo.git"}
+	repo := model.RepoPaths{ID: "repo", GitDir: "/tmp/repo.git"}
 	r := newResolver(
 		&fakeSnapshot{kids: map[string][]model.BaseNode{
 			".": {{Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 42}},
@@ -1504,7 +1508,7 @@ type fakeLookupHydrator struct {
 
 func (f *fakeLookupHydrator) EnqueueBatch([]model.HydrationTask) {}
 
-func (f *fakeLookupHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfig, _ model.BaseNode) (string, int64, error) {
+func (f *fakeLookupHydrator) EnsureHydrated(_ context.Context, _ model.RepoPaths, _ model.BaseNode) (string, int64, error) {
 	f.calls++
 	if f.err != nil {
 		return "", 0, f.err
@@ -1512,7 +1516,7 @@ func (f *fakeLookupHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfi
 	return f.path, f.size, nil
 }
 
-func (f *fakeLookupHydrator) OpenHydrated(ctx context.Context, repo model.RepoConfig, node model.BaseNode) (*os.File, int64, error) {
+func (f *fakeLookupHydrator) OpenHydrated(ctx context.Context, repo model.RepoPaths, node model.BaseNode) (*os.File, int64, error) {
 	path, size, err := f.EnsureHydrated(ctx, repo, node)
 	if err != nil {
 		return nil, 0, err
@@ -1521,7 +1525,7 @@ func (f *fakeLookupHydrator) OpenHydrated(ctx context.Context, repo model.RepoCo
 	return file, size, err
 }
 
-func (f *fakeLookupHydrator) ReadBlob(_ context.Context, _ model.RepoConfig, _ model.BaseNode, _ int64) ([]byte, error) {
+func (f *fakeLookupHydrator) ReadBlob(_ context.Context, _ model.RepoPaths, _ model.BaseNode, _ int64) ([]byte, error) {
 	f.readBlobCalls++
 	if f.err != nil {
 		return nil, f.err

@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
@@ -27,7 +28,7 @@ type mountAttempt struct {
 // mountRepoAttempts runs MountRepoWithGate with fuse.Mount replaced and returns
 // each call it made. Every attempt fails, so nothing mounts. An FSKit attempt
 // fails as unavailable, which lets auto try the kernel extension.
-func mountRepoAttempts(t *testing.T, repo model.RepoConfig, logger *slog.Logger) []mountAttempt {
+func mountRepoAttempts(t *testing.T, repo model.RepoPaths, logger *slog.Logger, redact func(string) string) []mountAttempt {
 	t.Helper()
 	t.Setenv(backendEnv, "")
 	var attempts []mountAttempt
@@ -40,7 +41,7 @@ func mountRepoAttempts(t *testing.T, repo model.RepoConfig, logger *slog.Logger)
 		return nil, errors.New("package tests do not mount")
 	}
 	t.Cleanup(func() { fuseMount = saved })
-	if _, err := MountRepoWithGate(context.Background(), context.Background(), repo, nil, nil, logger); err == nil {
+	if _, err := MountRepoWithGate(context.Background(), context.Background(), repo, nil, nil, logger, redact); err == nil {
 		t.Fatal("MountRepoWithGate succeeded without a mount")
 	}
 	if len(attempts) == 0 {
@@ -49,16 +50,22 @@ func mountRepoAttempts(t *testing.T, repo model.RepoConfig, logger *slog.Logger)
 	return attempts
 }
 
+// unredacted is a mount's redact that keeps each line as it is.
+func unredacted(line string) string { return line }
+
 // The fuse library reports op errors and failed replies only to an
 // ErrorLogger. A bug it answered with EIO reaches the daemon log as an error,
 // and a short FSKit read it answered with EIO as a warning. Any other op error,
 // which the library also logs for expected errnos, goes out at Debug, and a
-// failed reply as a warning. Each carries the repo, with its remote redacted.
+// failed reply as a warning. Each carries the repo and goes through the
+// mount's redact.
 func TestMountRepoLogsFuseErrorsRedacted(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	repo := model.RepoConfig{Name: "repo", MountPath: t.TempDir(), RemoteURL: "https://git.example.com/private/repo.git"}
-	for _, attempt := range mountRepoAttempts(t, repo, logger) {
+	remote := "https://git.example.com/private/repo.git"
+	repo := model.RepoPaths{Name: "repo", MountPath: t.TempDir()}
+	redact := func(line string) string { return auth.RedactLogString(line, remote) }
+	for _, attempt := range mountRepoAttempts(t, repo, logger, redact) {
 		cfg := attempt.cfg
 		if cfg.ErrorLogger == nil {
 			t.Fatal("mount config has no ErrorLogger")
@@ -72,7 +79,7 @@ func TestMountRepoLogsFuseErrorsRedacted(t *testing.T) {
 		}{
 			{
 				log: func() {
-					cfg.ErrorLogger.Printf("Op 0x%08x %T] -> Error: %q", 2, &fuseops.ReadFileOp{}, "fetch "+repo.RemoteURL+": exit status 128")
+					cfg.ErrorLogger.Printf("Op 0x%08x %T] -> Error: %q", 2, &fuseops.ReadFileOp{}, "fetch "+remote+": exit status 128")
 				},
 				wantLevel: "DEBUG",
 				wantText:  "*fuseops.ReadFileOp",
@@ -80,7 +87,7 @@ func TestMountRepoLogsFuseErrorsRedacted(t *testing.T) {
 			},
 			{
 				log: func() {
-					cfg.ErrorLogger.Printf("Op 0x%08x %T] -> %s: panic: %v\n%s", 3, &fuseops.LookUpInodeOp{}, "Error", "fetch "+repo.RemoteURL+": nil map", "goroutine 7 [running]:\nruntime/debug.Stack()")
+					cfg.ErrorLogger.Printf("Op 0x%08x %T] -> %s: panic: %v\n%s", 3, &fuseops.LookUpInodeOp{}, "Error", "fetch "+remote+": nil map", "goroutine 7 [running]:\nruntime/debug.Stack()")
 				},
 				wantLevel: "ERROR",
 				wantText:  "panic: fetch",
@@ -88,7 +95,7 @@ func TestMountRepoLogsFuseErrorsRedacted(t *testing.T) {
 			},
 			{
 				log: func() {
-					cfg.ErrorLogger.Printf("Op 0x%08x %T] -> %s: panic: %v\n%s", 4, &fuseops.WriteFileOp{}, "Callback", "callback for "+repo.RemoteURL, "goroutine 8 [running]:")
+					cfg.ErrorLogger.Printf("Op 0x%08x %T] -> %s: panic: %v\n%s", 4, &fuseops.WriteFileOp{}, "Callback", "callback for "+remote, "goroutine 8 [running]:")
 				},
 				wantLevel: "ERROR",
 				wantText:  "Callback: panic",
@@ -153,8 +160,8 @@ func TestMountRepoBoundsTheMountAndParentsOpsOnOpContext(t *testing.T) {
 		mountCtx, gotOpCtx = c, cfg.OpContext
 		return nil, errors.New("package tests do not mount")
 	}
-	repo := model.RepoConfig{Name: "repo", MountPath: t.TempDir()}
-	if _, err := MountRepoWithGate(ctx, opCtx, repo, nil, nil, slog.New(slog.DiscardHandler)); err == nil {
+	repo := model.RepoPaths{Name: "repo", MountPath: t.TempDir()}
+	if _, err := MountRepoWithGate(ctx, opCtx, repo, nil, nil, slog.New(slog.DiscardHandler), unredacted); err == nil {
 		t.Fatal("MountRepoWithGate succeeded without a mount")
 	}
 	if mountCtx == nil || mountCtx.Value(key{}) != "mount" || gotOpCtx == nil || gotOpCtx.Value(key{}) != "ops" {

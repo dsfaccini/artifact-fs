@@ -215,15 +215,15 @@ func (s *Store) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
 
 // UpdateRefresh changes repoID's refresh policy. The policy is not part of
 // the config a preparation depends on, so it leaves config_version as it is.
-func (s *Store) UpdateRefresh(ctx context.Context, repoID model.RepoID, interval time.Duration, disabled bool) error {
-	if interval <= 0 && !disabled {
+func (s *Store) UpdateRefresh(ctx context.Context, repoID model.RepoID, policy model.RefreshPolicy) error {
+	if policy.RefreshInterval <= 0 && !policy.RemoteRefreshDisabled {
 		return errors.New("refresh interval must be positive")
 	}
 	res, err := s.db.ExecContext(ctx, `
 	UPDATE repos
 	SET refresh_interval_seconds=?, refresh_interval_ns=?, refresh_disabled=?, updated_at_ns=?
 	WHERE repo_id=?
-	`, int64(interval.Seconds()), int64(interval), boolToInt(disabled), time.Now().UnixNano(), string(repoID))
+	`, int64(policy.RefreshInterval.Seconds()), int64(policy.RefreshInterval), boolToInt(policy.RemoteRefreshDisabled), time.Now().UnixNano(), string(repoID))
 	if err != nil {
 		return err
 	}

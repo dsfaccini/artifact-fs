@@ -167,34 +167,32 @@ func (s *Controller) ListRepos(ctx context.Context) ([]model.RepoConfig, error) 
 	return s.registry.ListRepos(ctx)
 }
 
-func (s *Controller) SetRefresh(ctx context.Context, name string, interval time.Duration, disabled bool) error {
-	if interval <= 0 && !disabled {
+func (s *Controller) SetRefresh(ctx context.Context, name string, policy model.RefreshPolicy) error {
+	if policy.RefreshInterval <= 0 && !policy.RemoteRefreshDisabled {
 		return errors.New("refresh interval must be positive")
 	}
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
 		return err
 	}
-	if cfg.AdoptGitDir && !disabled {
+	if cfg.AdoptGitDir && !policy.RemoteRefreshDisabled {
 		return errors.New("remote refresh cannot be enabled for an adopted worktree")
 	}
-	cfg.RefreshInterval = interval
-	cfg.RemoteRefreshDisabled = disabled
-	// The daemon applies the new interval at its next registry sync.
-	return s.registry.UpdateRefresh(ctx, cfg.ID, interval, disabled)
+	// The daemon applies the new policy at its next registry sync.
+	return s.registry.UpdateRefresh(ctx, cfg.ID, policy)
 }
 
-func (s *Service) updateRuntimeRefresh(rt *repoRuntime, interval time.Duration, disabled bool) {
+func (s *Service) updateRuntimeRefresh(rt *repoRuntime, policy model.RefreshPolicy) {
 	if rt == nil {
 		return
 	}
 	s.mu.Lock()
-	if rt.cfg.RefreshInterval == interval && rt.cfg.RemoteRefreshDisabled == disabled {
+	if rt.cfg.RefreshPolicy == policy {
 		s.mu.Unlock()
 		return
 	}
-	rt.cfg.RefreshInterval = interval
-	rt.cfg.RemoteRefreshDisabled = disabled
+	rt.cfg.RefreshPolicy = policy
+	interval := policy.RefreshInterval
 	refresh := rt.refresh
 	s.mu.Unlock()
 	if refresh != nil && interval > 0 {

@@ -85,7 +85,7 @@ func newSharedE2ERepo(t *testing.T) *sharedE2ERepo {
 	// The shared daemon can outlive the 5-minute refresh interval. A
 	// background fetch would then move remote-tracking refs while a test or a
 	// restore runs.
-	if err := repo.ctl.SetRefresh(context.Background(), repoName, 24*time.Hour, false); err != nil {
+	if err := repo.ctl.SetRefresh(context.Background(), repoName, model.RefreshPolicy{RefreshInterval: 24 * time.Hour}); err != nil {
 		t.Fatal(err)
 	}
 	s := &sharedE2ERepo{repo: repo, gitDir: filepath.Join(repo.root, "repos", repoName, "git")}

@@ -17,7 +17,7 @@ func BenchmarkBuildTreeIndexSynthetic(b *testing.B) {
 	workDir, gitDir := createBuildTreeBenchmarkRepo(b, objects)
 	b.Cleanup(func() { _ = os.RemoveAll(workDir) })
 
-	cfg := model.RepoConfig{ID: "repo", Name: "repo", GitDir: gitDir}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", GitDir: gitDir}}
 	store := New(nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

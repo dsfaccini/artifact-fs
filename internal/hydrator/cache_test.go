@@ -14,7 +14,7 @@ import (
 )
 
 func TestOpenHydratedRehydratesBlobEvictedAfterValidation(t *testing.T) {
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "a.txt", ObjectOID: strings.Repeat("ab", 20), SizeState: "known", SizeBytes: 7}
 	fetcher := &fakeBlobFetcher{payload: []byte("content"), verifyOK: true}
 	h := New(fetcher)
@@ -63,7 +63,7 @@ func TestOpenHydratedRehydratesBlobEvictedAfterValidation(t *testing.T) {
 }
 
 func TestStartMovesFlatCacheBlobsIntoShards(t *testing.T) {
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "a.txt", ObjectOID: strings.Repeat("cd", 20), SizeState: "known", SizeBytes: 7}
 	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, node.ObjectOID), []byte("content"), 0o600); err != nil {
 		t.Fatal(err)
@@ -93,7 +93,7 @@ func TestStartMovesFlatCacheBlobsIntoShards(t *testing.T) {
 }
 
 func TestVerifiedCacheFilesStayBounded(t *testing.T) {
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 	h := New(&fakeBlobFetcher{payload: []byte("content"), verifyOK: true})
 	h.maxVerified = 2
 	h.Start(1, cfg)
@@ -113,7 +113,7 @@ func TestVerifiedCacheFilesStayBounded(t *testing.T) {
 }
 
 func TestFailedBlobWriteNeverReachesTheCachePath(t *testing.T) {
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 	node := model.BaseNode{RepoID: cfg.ID, Path: "a.txt", ObjectOID: strings.Repeat("ef", 20), SizeState: "known", SizeBytes: 7}
 	h := New(&fakeBlobFetcher{payload: []byte("partial"), failAfterWrite: errors.New("short read")})
 	h.Start(1, cfg)

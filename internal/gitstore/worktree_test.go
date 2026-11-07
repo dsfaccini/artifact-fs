@@ -32,7 +32,7 @@ func TestConfigureStatusOptimizationDoesNotWriteIndex(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cfg := model.RepoConfig{ID: "repo", Name: "repo", GitDir: gitDir, MountPath: repo}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", GitDir: gitDir, MountPath: repo}}
 	if err := New(nil).ConfigureStatusOptimization(ctx, cfg, tmp); err != nil {
 		t.Fatalf("ConfigureStatusOptimization: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestReadTreeHEAD(t *testing.T) {
 	run(t, "git", "-C", repo, "add", ".")
 	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
 
-	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
 	store := New(nil)
 	ctx := context.Background()
 	// Should not error on a clean repo.
@@ -100,7 +100,7 @@ func TestEnsureIndexInitializedPreservesStagedEntries(t *testing.T) {
 	run(t, "git", "-C", repo, "add", "tracked.txt")
 	run(t, "git", "-C", repo, "add", "-N", "intent.txt")
 
-	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
 	if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestEnsureIndexInitializedDoesNotReadTreeWhenIndexExists(t *testing.T) {
 	t.Setenv("AFS_REAL_GIT", realGit)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
 	if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestEnsureIndexInitializedDoesNotReadTreeWhenIndexExists(t *testing.T) {
 func TestEnsureIndexInitializedHonorsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := New(nil).EnsureIndexInitialized(ctx, model.RepoConfig{GitDir: t.TempDir()})
+	err := New(nil).EnsureIndexInitialized(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{GitDir: t.TempDir()}})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("EnsureIndexInitialized error = %v, want context canceled", err)
 	}
@@ -163,7 +163,7 @@ func TestEnsureIndexInitializedHonorsCanceledContext(t *testing.T) {
 
 func TestEnsureIndexInitializedRejectsEmptyAlternateIndexPath(t *testing.T) {
 	t.Setenv("GIT_INDEX_FILE", "")
-	err := New(nil).EnsureIndexInitialized(context.Background(), model.RepoConfig{GitDir: t.TempDir()})
+	err := New(nil).EnsureIndexInitialized(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{GitDir: t.TempDir()}})
 	if err == nil || !strings.Contains(err.Error(), "GIT_INDEX_FILE") {
 		t.Fatalf("EnsureIndexInitialized error = %v, want empty GIT_INDEX_FILE error", err)
 	}
@@ -185,7 +185,7 @@ func TestEnsureIndexInitializedCreatesMissingIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
 	if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func TestBootstrapCleanIndexForFSMonitorMarksSnapshotEntriesWithoutReadingBlobs(
 	t.Setenv("AFS_REAL_GIT", realGit)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: gitDir, MountPath: repo}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: gitDir, MountPath: repo}}
 	bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, oid, nil)
 	if err != nil || !bootstrapped {
 		t.Fatalf("BootstrapCleanIndexForFSMonitor = %v, %v; want true, nil", bootstrapped, err)
@@ -314,7 +314,7 @@ func TestBootstrapCleanIndexForFSMonitorSkipsStagedIndexAndExistingLock(t *testi
 	run(t, "git", "-C", repo, "add", "tracked.txt")
 	run(t, "git", "-C", repo, "commit", "-m", "base")
 	oid := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
-	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}}
 	indexPath := filepath.Join(cfg.GitDir, "index")
 	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("staged\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -386,7 +386,7 @@ func TestBootstrapCleanIndexForFSMonitorLeavesCRLFNormalizingPathsToGit(t *testi
 		t.Fatal(err)
 	}
 	run(t, "git", "-C", repo, "config", "core.fsmonitor", hook)
-	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}}
 	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, oid, nil); err != nil || !bootstrapped {
 		t.Fatalf("BootstrapCleanIndexForFSMonitor = %v, %v; want true, nil", bootstrapped, err)
 	}
@@ -419,7 +419,7 @@ func TestBootstrapCleanIndexForFSMonitorMarksItsHookQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	run(t, "git", "-C", repo, "config", "core.fsmonitor", hook)
-	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}}
 	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, oid, nil); err != nil || !bootstrapped {
 		t.Fatalf("BootstrapCleanIndexForFSMonitor = %v, %v; want true, nil", bootstrapped, err)
 	}
@@ -453,7 +453,7 @@ func TestBootstrapCleanIndexForFSMonitorSkipsConversionAttributes(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}}
 			if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, oid, nil); err != nil || bootstrapped {
 				t.Fatalf("conversion attribute bootstrap = %v, %v; want false, nil", bootstrapped, err)
 			}
@@ -482,7 +482,7 @@ func TestBootstrapCleanIndexForFSMonitorRequiresSnapshotToMatchHEAD(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}}
 	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, staleOID, nil); err != nil || bootstrapped {
 		t.Fatalf("stale snapshot bootstrap = %v, %v; want false, nil", bootstrapped, err)
 	}
@@ -509,7 +509,7 @@ func TestBootstrapCleanIndexForFSMonitorSkipsTrackedEmptyIntentToAdd(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}}
 	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); err != nil || bootstrapped {
 		t.Fatalf("tracked-empty ITA bootstrap = %v, %v; want false, nil", bootstrapped, err)
 	}
@@ -540,7 +540,7 @@ func TestBootstrapCleanIndexForFSMonitorSkipsConfiguredAttributesFile(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}}
 	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); err != nil || bootstrapped {
 		t.Fatalf("configured attributes file bootstrap = %v, %v; want false, nil", bootstrapped, err)
 	}
@@ -574,7 +574,7 @@ func TestBootstrapCleanIndexForFSMonitorSkipsIntentToAddAndUnmergedEntries(t *te
 		if err != nil {
 			t.Fatal(err)
 		}
-		cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+		cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}}
 		if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); err != nil || bootstrapped {
 			t.Fatalf("intent-to-add bootstrap = %v, %v; want false, nil", bootstrapped, err)
 		}
@@ -609,7 +609,7 @@ func TestBootstrapCleanIndexForFSMonitorSkipsIntentToAddAndUnmergedEntries(t *te
 		if err != nil {
 			t.Fatal(err)
 		}
-		cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+		cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}}
 		if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); err != nil || bootstrapped {
 			t.Fatalf("unmerged bootstrap = %v, %v; want false, nil", bootstrapped, err)
 		}
@@ -640,7 +640,7 @@ func TestBootstrapCleanIndexForFSMonitorSkipsAlternateIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("GIT_INDEX_FILE", alternate)
-	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}}
 	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); err != nil || bootstrapped {
 		t.Fatalf("alternate-index bootstrap = %v, %v; want false, nil", bootstrapped, err)
 	}
@@ -677,7 +677,7 @@ func TestBootstrapCleanIndexForFSMonitorSkipsMissingAttributesBlob(t *testing.T)
 	if err := os.Remove(objectPath); err != nil {
 		t.Fatal(err)
 	}
-	cfg := model.RepoConfig{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}}
 	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); err != nil || bootstrapped {
 		t.Fatalf("missing attributes blob bootstrap = %v, %v; want false, nil", bootstrapped, err)
 	}
@@ -728,7 +728,7 @@ func TestEnsureIndexInitializedPreservesAlternateIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := model.RepoConfig{ID: "x", GitDir: gitDir}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: gitDir}}
 	if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -753,7 +753,7 @@ func TestEnsureIndexInitializedCreatesMissingAlternateIndex(t *testing.T) {
 
 	alternateIndex := filepath.Join(t.TempDir(), "alternate.index")
 	t.Setenv("GIT_INDEX_FILE", alternateIndex)
-	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
 	if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -784,7 +784,7 @@ func TestEnsureIndexInitializedRejectsCorruptIndex(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			cfg := model.RepoConfig{ID: "x", GitDir: gitDir}
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: gitDir}}
 			if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err == nil {
 				t.Fatal("EnsureIndexInitialized accepted corrupt index")
 			}

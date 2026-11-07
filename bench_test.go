@@ -65,17 +65,21 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 	ctx := context.Background()
 
 	cfg := model.RepoConfig{
-		ID:            model.RepoID(repo.name),
-		Name:          repo.name,
-		RemoteURL:     repo.url,
-		Branch:        repo.branch,
-		GitDir:        filepath.Join(root, "git"),
-		MetaDBPath:    filepath.Join(root, "meta.sqlite"),
-		OverlayDir:    filepath.Join(root, "overlay"),
-		OverlayDBPath: filepath.Join(root, "overlay", "meta.sqlite"),
-		BlobCacheDir:  filepath.Join(root, "cache"),
-		MountPath:     filepath.Join(root, "mnt"),
-		MountRoot:     filepath.Join(root, "mnt"),
+		RepoPaths: model.RepoPaths{
+			ID:            model.RepoID(repo.name),
+			Name:          repo.name,
+			GitDir:        filepath.Join(root, "git"),
+			MetaDBPath:    filepath.Join(root, "meta.sqlite"),
+			OverlayDir:    filepath.Join(root, "overlay"),
+			OverlayDBPath: filepath.Join(root, "overlay", "meta.sqlite"),
+			BlobCacheDir:  filepath.Join(root, "cache"),
+			MountPath:     filepath.Join(root, "mnt"),
+			MountRoot:     filepath.Join(root, "mnt"),
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL: repo.url,
+			Branch:    repo.branch,
+		},
 	}
 
 	var results []timing
@@ -194,7 +198,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 	// -------------------------------------------------------
 	os.MkdirAll(cfg.OverlayDir, 0o755)
 	os.MkdirAll(cfg.BlobCacheDir, 0o755)
-	ov, err := overlay.New(ctx, cfg)
+	ov, err := overlay.New(ctx, cfg.RepoPaths)
 	if err != nil {
 		t.Fatalf("overlay.New: %v", err)
 	}
@@ -216,7 +220,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 	// Phase 7: Cold hydration -- read files that need blob fetch
 	// -------------------------------------------------------
 	h := hydrator.New(git)
-	h.Start(4, cfg) // 4 workers
+	h.Start(4, cfg.RepoPaths) // 4 workers
 	defer h.Stop()
 
 	// Pick a sample of files to hydrate (small text files first, up to 20)
@@ -229,7 +233,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 	var hydrateTotalBytes int64
 	for _, n := range sampleFiles {
 		start = time.Now()
-		_, size, err := h.EnsureHydrated(ctx, cfg, n)
+		_, size, err := h.EnsureHydrated(ctx, cfg.RepoPaths, n)
 		dur := time.Since(start)
 		if err != nil {
 			t.Logf("hydrate %s: %v", n.Path, err)
@@ -259,7 +263,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 	var warmDurs []time.Duration
 	for _, n := range sampleFiles {
 		start = time.Now()
-		_, _, err := h.EnsureHydrated(ctx, cfg, n)
+		_, _, err := h.EnsureHydrated(ctx, cfg.RepoPaths, n)
 		dur := time.Since(start)
 		if err != nil {
 			continue
@@ -297,7 +301,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 		results_ch := make(chan hydrateResult, len(freshBatch))
 		for _, n := range freshBatch {
 			go func() {
-				_, size, err := h.EnsureHydrated(ctx, cfg, n)
+				_, size, err := h.EnsureHydrated(ctx, cfg.RepoPaths, n)
 				results_ch <- hydrateResult{size, err}
 			}()
 		}

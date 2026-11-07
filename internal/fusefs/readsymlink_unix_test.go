@@ -25,16 +25,16 @@ type fakeSymlinkHydrator struct {
 
 func (f *fakeSymlinkHydrator) EnqueueBatch([]model.HydrationTask) {}
 
-func (f *fakeSymlinkHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfig, _ model.BaseNode) (string, int64, error) {
+func (f *fakeSymlinkHydrator) EnsureHydrated(_ context.Context, _ model.RepoPaths, _ model.BaseNode) (string, int64, error) {
 	f.calls++
 	return f.cachePath, f.size, f.err
 }
 
-func (f *fakeSymlinkHydrator) OpenHydrated(context.Context, model.RepoConfig, model.BaseNode) (*os.File, int64, error) {
+func (f *fakeSymlinkHydrator) OpenHydrated(context.Context, model.RepoPaths, model.BaseNode) (*os.File, int64, error) {
 	return nil, 0, f.err
 }
 
-func (f *fakeSymlinkHydrator) ReadBlob(_ context.Context, _ model.RepoConfig, _ model.BaseNode, _ int64) ([]byte, error) {
+func (f *fakeSymlinkHydrator) ReadBlob(_ context.Context, _ model.RepoPaths, _ model.BaseNode, _ int64) ([]byte, error) {
 	f.readBlobCalls++
 	return f.readBlobData, f.readBlobErr
 }
@@ -56,7 +56,7 @@ func TestReadSymlinkRejectsKnownOversizedBlobBeforeHydration(t *testing.T) {
 		}},
 		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
 	)
-	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, &Engine{Resolver: resolver, Repo: model.RepoConfig{ID: repoID}, Hydrator: hydrator})
+	fs := NewArtifactFuse(model.RepoPaths{ID: repoID}, &Engine{Resolver: resolver, Repo: model.RepoPaths{ID: repoID}, Hydrator: hydrator})
 
 	fs.mu.Lock()
 	ref := fs.allocInode("link", Attrs{Type: "symlink", Mode: 0o120000, Gen: fs.engine.Generation()})
@@ -95,7 +95,7 @@ func TestReadSymlinkRejectsNegativeKnownBlobBeforeHydration(t *testing.T) {
 		}},
 		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
 	)
-	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, &Engine{Resolver: resolver, Repo: model.RepoConfig{ID: repoID}, Hydrator: hydrator})
+	fs := NewArtifactFuse(model.RepoPaths{ID: repoID}, &Engine{Resolver: resolver, Repo: model.RepoPaths{ID: repoID}, Hydrator: hydrator})
 
 	fs.mu.Lock()
 	ref := fs.allocInode("link", Attrs{Type: "symlink", Mode: 0o120000, Gen: fs.engine.Generation()})
@@ -133,7 +133,7 @@ func TestReadSymlinkRejectsUnknownOversizedBlobWithoutHydration(t *testing.T) {
 		}},
 		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
 	)
-	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, &Engine{Resolver: resolver, Repo: model.RepoConfig{ID: repoID}, Hydrator: hydrator})
+	fs := NewArtifactFuse(model.RepoPaths{ID: repoID}, &Engine{Resolver: resolver, Repo: model.RepoPaths{ID: repoID}, Hydrator: hydrator})
 
 	fs.mu.Lock()
 	ref := fs.allocInode("link", Attrs{Type: "symlink", Mode: 0o120000, Gen: fs.engine.Generation()})
@@ -171,7 +171,7 @@ func TestReadSymlinkReadsUnknownBlobThroughBoundedRead(t *testing.T) {
 		}},
 		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
 	)
-	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, &Engine{Resolver: resolver, Repo: model.RepoConfig{ID: repoID}, Hydrator: hydrator})
+	fs := NewArtifactFuse(model.RepoPaths{ID: repoID}, &Engine{Resolver: resolver, Repo: model.RepoPaths{ID: repoID}, Hydrator: hydrator})
 
 	fs.mu.Lock()
 	ref := fs.allocInode("link", Attrs{Type: "symlink", Mode: 0o120000, Gen: fs.engine.Generation()})

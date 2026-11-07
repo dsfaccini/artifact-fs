@@ -164,20 +164,26 @@ func runE2EBenchmarkOnce(t *testing.T, repo e2eBenchRepoSpec, iteration int, hyd
 	git.SetBatchPoolSize(hydratorWorkers)
 
 	cfg := model.RepoConfig{
-		Name:              repoName,
-		ID:                model.RepoID(repoName),
-		RemoteURL:         repo.url,
-		RemoteURLRedacted: auth.RedactRemoteURL(repo.url),
-		Branch:            repo.branch,
-		RefreshInterval:   5 * time.Minute,
-		MountRoot:         mountDir,
-		Enabled:           true,
-		GitDir:            filepath.Join(root, "repos", repoName, "git"),
-		MetaDBPath:        filepath.Join(root, "repos", repoName, "meta.sqlite"),
-		OverlayDir:        filepath.Join(root, "repos", repoName, "overlay"),
-		OverlayDBPath:     filepath.Join(root, "repos", repoName, "overlay", "meta.sqlite"),
-		BlobCacheDir:      filepath.Join(root, "repos", repoName, "cache"),
-		MountPath:         mountPath,
+		RepoPaths: model.RepoPaths{
+			Name:          repoName,
+			ID:            model.RepoID(repoName),
+			MountRoot:     mountDir,
+			GitDir:        filepath.Join(root, "repos", repoName, "git"),
+			MetaDBPath:    filepath.Join(root, "repos", repoName, "meta.sqlite"),
+			OverlayDir:    filepath.Join(root, "repos", repoName, "overlay"),
+			OverlayDBPath: filepath.Join(root, "repos", repoName, "overlay", "meta.sqlite"),
+			BlobCacheDir:  filepath.Join(root, "repos", repoName, "cache"),
+			MountPath:     mountPath,
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL:         repo.url,
+			RemoteURLRedacted: auth.RedactRemoteURL(repo.url),
+			Branch:            repo.branch,
+		},
+		RefreshPolicy: model.RefreshPolicy{
+			RefreshInterval: 5 * time.Minute,
+		},
+		Enabled: true,
 	}
 
 	cloneStart := time.Now()
@@ -217,7 +223,7 @@ func runE2EBenchmarkOnce(t *testing.T, repo e2eBenchRepoSpec, iteration int, hyd
 	}
 	primeE2EMountPolling(t, mountPath)
 
-	hydrateDur, hydratedBytes, err := hydrateColdObjects(ctx, git, cfg, targets, hydratorWorkers, callerWorkers)
+	hydrateDur, hydratedBytes, err := hydrateColdObjects(ctx, git, cfg.RepoPaths, targets, hydratorWorkers, callerWorkers)
 	if err != nil {
 		cancel()
 		t.Fatalf("hydrateColdObjects: %v", err)
@@ -296,7 +302,7 @@ func countUnknownSizes(nodes []model.BaseNode) int {
 	return count
 }
 
-func hydrateColdObjects(ctx context.Context, git *gitstore.Store, cfg model.RepoConfig, targets []model.BaseNode, hydratorWorkers int, callerWorkers int) (time.Duration, int64, error) {
+func hydrateColdObjects(ctx context.Context, git *gitstore.Store, cfg model.RepoPaths, targets []model.BaseNode, hydratorWorkers int, callerWorkers int) (time.Duration, int64, error) {
 	if len(targets) == 0 {
 		return 0, 0, nil
 	}

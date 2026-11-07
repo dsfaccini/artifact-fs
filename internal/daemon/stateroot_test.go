@@ -33,7 +33,7 @@ func TestStateRootDirectoriesArePrivate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer svc.Close()
-	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", Enabled: true}); err != nil {
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main"}, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := svc.registry.GetRepo(ctx, "repo")
@@ -166,7 +166,7 @@ func TestNewKeepsResolvedStateRootAfterLinkRetarget(t *testing.T) {
 	if err := os.Symlink(attacker, link); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.invalid/repo.git", Enabled: true}, AddRepoOptions{Async: true}); err != nil {
+	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: "https://example.invalid/repo.git"}, Enabled: true}, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := svc.registry.GetRepo(ctx, "repo")

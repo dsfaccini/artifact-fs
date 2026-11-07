@@ -181,7 +181,7 @@ func (s *Service) startRuntime(ctx context.Context, cfg model.RepoConfig, snap *
 	h.SetOnHydrated(func(_ model.RepoID, objectOID string, size int64) {
 		sizes.Add(resolver.Generation(), objectOID, size)
 	})
-	h.Start(s.hydrationWorkers(), cfg)
+	h.Start(s.hydrationWorkers(), cfg.RepoPaths)
 	prepare := cfg.PrepareState
 	if gate != nil && prepare == "" {
 		prepare = model.PrepareStatePreparing
@@ -196,7 +196,7 @@ func (s *Service) startRuntime(ctx context.Context, cfg model.RepoConfig, snap *
 		hydrator:  h,
 		sizes:     sizes,
 		resolver:  resolver,
-		engine:    &fusefs.Engine{Resolver: resolver, Repo: cfg, Overlay: ov, Hydrator: h},
+		engine:    &fusefs.Engine{Resolver: resolver, Repo: cfg.RepoPaths, Overlay: ov, Hydrator: h},
 		gate:      gate,
 		refresh:   make(chan time.Duration, 1),
 		cfg:       cfg,
@@ -301,7 +301,7 @@ func (s *Service) attachMount(rt *repoRuntime) (bool, error) {
 	}
 	ctx, cancel := context.WithTimeout(rt.ctx, cmp.Or(s.mountTimeout, mountTimeout))
 	defer cancel()
-	mfs, err := s.mount(ctx, rt.opCtx, cfg, rt.engine, rt.gate, s.logger)
+	mfs, err := s.mount(ctx, rt.opCtx, cfg.RepoPaths, rt.engine, rt.gate, s.logger, func(msg string) string { return auth.RedactLogString(msg, cfg.RemoteURL) })
 	if err != nil {
 		if a, ok := errors.AsType[fusefs.AbandonedMount](err); ok {
 			s.mu.Lock()

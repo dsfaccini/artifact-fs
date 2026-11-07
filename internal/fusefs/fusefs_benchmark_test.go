@@ -92,7 +92,7 @@ func BenchmarkSwitchGeneration20kOverlayEntries(b *testing.B) {
 	newOverlay := func(b *testing.B, path func(i int) string, write bool) *overlaystore.Store {
 		b.Helper()
 		dir := b.TempDir()
-		ov, err := overlaystore.New(ctx, model.RepoConfig{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
+		ov, err := overlaystore.New(ctx, model.RepoPaths{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
 		if err != nil {
 			b.Fatal(err)
 		}

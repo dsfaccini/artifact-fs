@@ -23,8 +23,8 @@ func setMacFUSEKernelExtensionLoaded(t *testing.T, loaded bool) {
 // after a mount that failed past INIT.
 func TestMountRepoFallsBackWithANewServer(t *testing.T) {
 	setMacFUSEKernelExtensionLoaded(t, true)
-	repo := model.RepoConfig{Name: "repo", MountPath: t.TempDir()}
-	attempts := mountRepoAttempts(t, repo, slog.New(slog.DiscardHandler))
+	repo := model.RepoPaths{Name: "repo", MountPath: t.TempDir()}
+	attempts := mountRepoAttempts(t, repo, slog.New(slog.DiscardHandler), unredacted)
 	if len(attempts) != 2 {
 		t.Fatalf("got %d mount attempts, want FSKit, then the kernel extension", len(attempts))
 	}
@@ -108,7 +108,7 @@ func TestMountRepoInvalidatesThroughTheMountedAttemptsNotifier(t *testing.T) {
 	}
 	t.Cleanup(func() { fuseMount = savedMount })
 
-	m, err := MountRepoWithGate(context.Background(), context.Background(), model.RepoConfig{Name: "repo", MountPath: t.TempDir()}, nil, nil, slog.New(slog.DiscardHandler))
+	m, err := MountRepoWithGate(context.Background(), context.Background(), model.RepoPaths{Name: "repo", MountPath: t.TempDir()}, nil, nil, slog.New(slog.DiscardHandler), unredacted)
 	if err != nil {
 		t.Fatal(err)
 	}
