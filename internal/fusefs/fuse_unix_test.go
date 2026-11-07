@@ -551,7 +551,7 @@ func TestDetachedFileHandleRemainsReadableWritableAndSyncable(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	fh := &FileHandle{path: "file.txt", cacheFile: f, cacheGeneration: -1, detached: true}
+	fh := &FileHandle{path: "file.txt", cacheFile: f, cacheGeneration: -1, detached: true, pinned: true}
 	fs := &ArtifactFuse{fileHandles: map[fuseops.HandleID]*FileHandle{1: fh}}
 
 	write := &fuseops.WriteFileOp{Handle: 1, Offset: 0, Data: []byte("after!")}

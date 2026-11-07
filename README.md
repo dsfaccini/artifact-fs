@@ -509,10 +509,14 @@ still holds the old inode.
 A file or directory that the kernel still holds when a HEAD change removes its
 path gets the path back if a later HEAD change restores the path unchanged: a
 directory again, or a file or symlink with the same type, permission bits and
-blob. An open file and a shell's working directory therefore keep working
-across `git checkout other && git checkout -`. A successful write through such
-an open file recreates its path under the file's own number, while no other
-file holds the path. A rename of a parent directory moves that path too.
+blob. An open file and a shell's working directory therefore keep working across
+a HEAD change made outside the mount and later undone, such as with `git
+update-ref`, `git reset --soft`, or a ref moved from another worktree. A `git
+checkout` inside the mount instead unlinks and recreates through the mount each
+path it changes, which makes the file or directory held there stale. A
+successful write through such an open file recreates its path under the file's
+own number, while no other file holds the path. A rename of a parent directory
+moves that path too.
 
 The held file or directory becomes stale when its path comes back changed, when
 another file takes the path through a create, a lookup or a listing, or when an
@@ -520,9 +524,9 @@ unlink, rmdir or rename over it through the mount removes it. `getattr`,
 `setattr` and `open` on a stale file return `ESTALE`, and its handles never
 reach the path again. A handle reads the content it already holds, and returns
 `ESTALE` when it holds none. A write through it returns `ESTALE`, unless an
-unlink or rename through the mount gave the handle its own copy of the file. A
-lookup below a stale directory misses. Numbers last for one mount: a remount or
-a daemon restart numbers paths again.
+unlink of its path or a rename over it through the mount gave the handle its own
+copy of the file. A lookup below a stale directory misses. Numbers last for one
+mount: a remount or a daemon restart numbers paths again.
 
 The mount keeps one mapping for each existing path that the kernel has looked
 up or that an op made through the mount. After each HEAD change, it finds the
