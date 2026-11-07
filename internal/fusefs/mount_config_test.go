@@ -58,11 +58,11 @@ func unredacted(line string) string { return line }
 // and a short FSKit read it answered with EIO as a warning. Any other op error,
 // which the library also logs for expected errnos, goes out at Debug, and a
 // failed reply as a warning. Each carries the repo and goes through the
-// mount's redact.
+// mount's redact. The remote is a local path, which only that redact removes.
 func TestMountRepoLogsFuseErrorsRedacted(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	remote := "https://git.example.com/private/repo.git"
+	remote := "/srv/git/private/repo.git"
 	repo := model.RepoPaths{Name: "repo", MountPath: t.TempDir()}
 	redact := func(line string) string { return auth.RedactLogString(line, remote) }
 	for _, attempt := range mountRepoAttempts(t, repo, logger, redact) {
@@ -139,9 +139,27 @@ func TestMountRepoLogsFuseErrorsRedacted(t *testing.T) {
 			if rec.Level != line.wantLevel || rec.Repo != repo.Name || !strings.Contains(rec.Error, line.wantText) {
 				t.Fatalf("log record = %+v, want level %s for repo %q containing %q", rec, line.wantLevel, repo.Name, line.wantText)
 			}
-			if strings.Contains(buf.String(), "git.example.com") || line.remote && !strings.Contains(rec.Error, "REDACTED_REMOTE") {
+			if strings.Contains(rec.Error, remote) || line.remote && !strings.Contains(rec.Error, "REDACTED_REMOTE") {
 				t.Fatalf("log output %q does not redact the remote", buf.String())
 			}
+		}
+	}
+}
+
+// A mount without a redact still removes the remotes auth.RedactLogString
+// detects from the fuse library's error lines.
+func TestMountRepoWithoutRedactRedactsDetectedRemotes(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	for _, attempt := range mountRepoAttempts(t, model.RepoPaths{Name: "repo", MountPath: t.TempDir()}, logger, nil) {
+		buf.Reset()
+		attempt.cfg.ErrorLogger.Print("writeMessage: fetch https://git.example.com/private/repo.git failed")
+		var rec struct{ Error string }
+		if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+			t.Fatalf("log output %q is not one JSON record: %v", buf.String(), err)
+		}
+		if strings.Contains(rec.Error, "git.example.com") || !strings.Contains(rec.Error, "REDACTED_REMOTE") {
+			t.Fatalf("log error %q does not redact the remote", rec.Error)
 		}
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
@@ -1640,8 +1641,12 @@ func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileS
 // the wait for the mount: when it ends first, the error is an AbandonedMount.
 // opCtx is the parent of every op's context, so ending it cancels the ops in
 // flight. The fuse library's error lines go to logger, after redact removes
-// what a log must not show, such as the repo's remote.
+// what a log must not show, such as the repo's remote. A nil redact
+// redacts only what auth.RedactLogString detects.
 func MountRepoWithGate(ctx, opCtx context.Context, repo model.RepoPaths, engine *Engine, gate *ReadyGate, logger *slog.Logger, redact func(string) string) (MountedFS, error) {
+	if redact == nil {
+		redact = func(msg string) string { return auth.RedactLogString(msg) }
+	}
 	backend, err := MountBackend()
 	if err != nil {
 		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
