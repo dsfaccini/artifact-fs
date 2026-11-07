@@ -316,6 +316,7 @@ type OverlayStore interface {
 	CreateFile(ctx context.Context, path string, mode uint32) (OverlayEntry, error)
 	CreateSymlink(ctx context.Context, path string, target string) (OverlayEntry, error)
 	WriteFile(ctx context.Context, path string, off int64, data []byte) (int, error)
+	FlushFile(ctx context.Context, path string) error
 	SyncFile(ctx context.Context, path string) error
 	Truncate(ctx context.Context, path string, size int64) error
 	Remove(ctx context.Context, path string) error

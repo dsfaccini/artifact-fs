@@ -4,11 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
+	overlaystore "github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
+	"github.com/dsfaccini/fuse/fuseutil"
 )
 
 func setMacFUSEKernelExtensionLoaded(t *testing.T, loaded bool) {
@@ -125,5 +129,65 @@ func TestMountRepoInvalidatesThroughTheMountedAttemptsNotifier(t *testing.T) {
 	}
 	if fs := m.(*mountedFSWrapper).fs; fs.notifier != created[1] {
 		t.Fatal("the mount invalidates through a Notifier other than the kernel extension attempt's")
+	}
+}
+
+// An FSKit attempt's server checks permissions itself, and a kernel
+// extension attempt's server does not, even when both attempts run.
+func TestMountRepoChecksPermissionsOnlyThroughAnFSKitAttempt(t *testing.T) {
+	setMacFUSEKernelExtensionLoaded(t, true)
+	t.Setenv(backendEnv, BackendAuto)
+	ctx := context.Background()
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{ID: "repo", Name: "repo", MountPath: t.TempDir(), OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
+	ov, err := overlaystore.New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ov.Close() })
+	if _, err := ov.CreateFile(ctx, "ro.txt", 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := ov.FlushFile(ctx, "ro.txt"); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{}}, Overlay: ov}
+	resolver.SetGeneration(1)
+	engine := &Engine{Repo: cfg, Resolver: resolver, Overlay: ov}
+
+	// Each attempt builds its server, then mounts it.
+	var served []fuseutil.FileSystem
+	var throughFSKit []bool
+	savedServer := newFileSystemServer
+	newFileSystemServer = func(fs fuseutil.FileSystem) fuse.Server {
+		served = append(served, fs)
+		return savedServer(fs)
+	}
+	t.Cleanup(func() { newFileSystemServer = savedServer })
+	savedMount := fuseMount
+	fuseMount = func(_ context.Context, _ string, _ fuse.Server, cfg *fuse.MountConfig) (*fuse.MountedFileSystem, error) {
+		throughFSKit = append(throughFSKit, cfg.Backend == fuse.BackendFSKit)
+		if cfg.Backend == fuse.BackendFSKit {
+			return nil, fuse.ErrFSKitUnavailable
+		}
+		return &fuse.MountedFileSystem{}, nil
+	}
+	t.Cleanup(func() { fuseMount = savedMount })
+	if _, err := MountRepoWithGate(ctx, ctx, cfg, engine, nil, slog.New(slog.DiscardHandler)); err != nil {
+		t.Fatal(err)
+	}
+	if len(served) != 2 || len(throughFSKit) != 2 || !throughFSKit[0] || throughFSKit[1] {
+		t.Fatalf("attempts through FSKit %v served %d file systems, want an FSKit attempt, then a kernel extension attempt", throughFSKit, len(served))
+	}
+	for i, fs := range served {
+		fskit := throughFSKit[i]
+		lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "ro.txt"}
+		if err := fs.LookUpInode(ctx, lookup); err != nil {
+			t.Fatal(err)
+		}
+		got := kernelErrno(fs.OpenFile(ctx, &fuseops.OpenFileOp{Inode: lookup.Entry.Child, OpenFlags: syscall.O_WRONLY}))
+		if want := map[bool]syscall.Errno{true: syscall.EACCES, false: 0}[fskit]; got != want {
+			t.Errorf("FSKit attempt %t: write open of a 0444 file = %v, want %v", fskit, got, want)
+		}
 	}
 }
