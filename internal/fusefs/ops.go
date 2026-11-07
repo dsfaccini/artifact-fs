@@ -341,7 +341,7 @@ const (
 )
 
 // checkOwnerAccess refuses access when mode lacks any of its owner permission
-// bits. The mount serves one user, so the owner's bits decide. A base file's
+// bits. The check applies the owner's bits to every caller. A base file's
 // mode from Git, 644 or 755, grants the owner both bits.
 func checkOwnerAccess(mode, access uint32) error {
 	if access&^mode != 0 {
