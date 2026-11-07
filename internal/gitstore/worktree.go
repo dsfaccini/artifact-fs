@@ -19,19 +19,28 @@ func (s *Store) ReadTreeHEAD(ctx context.Context, repo model.RepoConfig) error {
 	return err
 }
 
+// gitIndexPath is the index file git reads for gitDir: GIT_INDEX_FILE when it is
+// set.
+func gitIndexPath(gitDir string) (string, error) {
+	if alternateIndex, ok := os.LookupEnv("GIT_INDEX_FILE"); ok {
+		if alternateIndex == "" {
+			return "", errors.New("GIT_INDEX_FILE is empty")
+		}
+		return alternateIndex, nil
+	}
+	return filepath.Join(gitDir, "index"), nil
+}
+
 // EnsureIndexInitialized creates a missing index without replacing staged work.
 func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfig) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	indexPath := filepath.Join(repo.GitDir, "index")
-	if alternateIndex, ok := os.LookupEnv("GIT_INDEX_FILE"); ok {
-		if alternateIndex == "" {
-			return errors.New("GIT_INDEX_FILE is empty")
-		}
-		indexPath = alternateIndex
+	path, err := gitIndexPath(repo.GitDir)
+	if err != nil {
+		return err
 	}
-	if _, err := os.Stat(indexPath); err == nil {
+	if _, err := os.Stat(path); err == nil {
 		// Validate the effective index without refreshing it. Unlike read-tree,
 		// ls-files does not replace staged state or resolve missing blobs.
 		return runGitDiscardOutputWithEnv(
