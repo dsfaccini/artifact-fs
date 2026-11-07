@@ -1693,6 +1693,28 @@ func TestHandleOpenedForWriteBeforeChmodKeepsWriting(t *testing.T) {
 	}
 }
 
+// On an FSKit mount, the handle that created a 0444 file for writing still
+// writes and truncates it through ftruncate(2).
+func TestCreateHandleTruncatesReadOnlyFile(t *testing.T) {
+	ctx := context.Background()
+	fs, ov, _ := newChmoddedFile(t, true, 0o644)
+	create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "ro.txt", Mode: 0o444, OpenFlags: syscall.O_WRONLY}
+	if err := fs.CreateFile(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.WriteFile(ctx, &fuseops.WriteFileOp{Inode: create.Entry.Child, Handle: create.Handle, Data: []byte("abc")}); err != nil {
+		t.Fatal(err)
+	}
+	one := uint64(1)
+	if err := fs.SetInodeAttributes(ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Handle: &create.Handle, Size: &one}); err != nil {
+		t.Fatalf("ftruncate through the create handle = %v", err)
+	}
+	e, _ := ov.Get("ro.txt")
+	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "a" {
+		t.Fatalf("content = %q, %v; want a", data, err)
+	}
+}
+
 // On an FSKit mount, ftruncate(2) through a read-only handle of a 0444 file
 // fails with EACCES.
 func TestReadOnlyHandleCannotTruncateReadOnlyFile(t *testing.T) {
