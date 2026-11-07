@@ -52,7 +52,7 @@ Repository-specific guidance for `artifact-fs`.
 
 - Keep merged directory logic in `Resolver.readdirTypedAt`. `ReaddirSnapshot` and `ReaddirTyped` only choose the generation.
 - Resolve a path as its parent's listing shows it. `Resolver.resolvePath` resolves a directory that only overlay entries below it imply, as `mergeChildren` lists it.
-- Check every `Engine` method that makes a name with `requireAbsent`. The kernel can send CREATE, MKDIR or SYMLINK for a name that appeared after its lookup missed, such as after a HEAD change.
+- Call `requireAbsent` in `Engine.Create`, `Engine.Mkdir` and `Engine.Symlink` before they make the name. The kernel can send CREATE, MKDIR or SYMLINK for a name that appeared after its lookup missed, such as after a HEAD change. `Engine.Rename` replaces its target, so it does not call `requireAbsent`.
 - Run every preparation through `core.prepare`. Express a new caller's differences as a `preparation`, not as another pipeline.
 - Normalize a repo config only in `normalizeRepoConfig`, before the registry stores it. Readers trust the stored config: never re-default or re-resolve a field after reading it.
 - Parse a ref only with `model.BranchName` and `model.CanonicalRef`.
