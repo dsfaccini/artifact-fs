@@ -14,7 +14,7 @@ It exposes the tree quickly, then hydrates file contents on demand. That makes i
 
 In practice:
 
-* The operating system sees the full tree almost immediately. The FUSE driver fetches a file's contents when the file is read, and then prefetches the other files of its directory in the background. It prioritizes package manifests, dependency manifests, and source files ahead of images, archives, and videos.
+* The operating system sees the full tree almost immediately. The FUSE driver fetches a file's contents when the file is opened or its size is first needed, and opening a file for reading also prefetches the other files of its directory in the background. It prioritizes package manifests, dependency manifests, and source files ahead of images, archives, and videos.
 * ArtifactFS is part of [Cloudflare Artifacts](http://workers.cloudflare.com/product/artifacts), a versioned filesystem that speaks git, but it also works with any git repo.
 * ArtifactFS is optional. You can clone an Artifact repo directly, but larger repos still take time to clone. ArtifactFS lets you mount the repo and fetch blob contents as they are needed.
 
@@ -184,7 +184,8 @@ the outcome. They exit non-zero when the daemon failed, when no daemon runs on
 the state root, when a later `unmount` or `remount` replaced the request, or
 after two minutes without an outcome. The daemon retries a failed unmount or
 mount; `status` shows the retry. The daemon runs each unmount on its own
-thread and waits at most 21 seconds for it. An unmount that hangs, as one can
+thread. It waits at most 21 seconds for an unmount, and does not wait for the
+one it starts after a FUSE connection fails. An unmount that hangs, as one can
 on a dead FSKit volume, holds up the daemon's other repos for that one wait,
 then stalls only its own repo. While that unmount has not returned, `unmount`
 and `remount` of the repo fail at once with `an earlier unmount of the repo has
@@ -207,7 +208,7 @@ The commands wake the daemon through the owner-only socket
 103 bytes on macOS, 107 on Linux), the daemon opens no socket and acts at its
 next registry poll, within 3 seconds.
 
-Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The first time a file in a directory is opened for reading or read at a given HEAD, the mount also queues up to 256 of that directory's files for background hydration, ranking code and manifests (`package.json`, `go.mod`, `README.md`) ahead of binary files. Listing or walking directories queues nothing. A blobless clone knows a file's size only once its blob is local, so the first `stat` of a file hydrates that one file. A worker takes up to 256 queued blobs, all reads or all prefetches, and fetches the missing ones with one `git fetch` from the promisor remote, so a blobless clone pays one fetch per batch, not one per blob. Queued reads go ahead of queued prefetches, and a blob a prefetch has already downloaded is copied into the cache before more prefetches download. With more than one worker, one worker takes only reads and those copies, so a read never waits for an unrelated prefetch download, though it can wait for one copy of a blob already on disk. With a single worker, a read can wait for a running prefetch download. A read of a file whose own prefetch is downloading waits for that download.
+Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The first time a base file in a directory is opened for reading or read at a given snapshot generation, the mount also queues up to 256 of that directory's files, the opened one included, for background hydration, ranking code and manifests (`package.json`, `go.mod`, `README.md`) ahead of binary files. Listing or walking directories queues nothing. A blobless clone knows a file's size only once its blob is local, so the first `stat` of a file hydrates that one file. A worker takes up to 256 queued blobs, all reads or all prefetches, and fetches the missing ones with one `git fetch` from the promisor remote, so a blobless clone pays one fetch per batch, not one per blob. Queued reads go ahead of queued prefetches, and a blob a prefetch has already downloaded is copied into the cache before more prefetches download. With more than one worker, one worker takes only reads and those copies, so a read never waits for an unrelated prefetch download, though it can wait for one copy of a blob already on disk. With a single worker, a read can wait for a running prefetch download. A read of a file whose own prefetch is downloading waits for that download.
 
 For every repo, ArtifactFS reads blobs (`git cat-file --batch`) and trees (`git ls-tree`), and fetches queued blobs in batches (`git fetch --stdin`), without a controlling terminal, with `GIT_TERMINAL_PROMPT=0` and an empty `SSH_ASKPASS`. When a batch fetch runs, or a read lazily fetches a missing object, a remote that needs an interactive password or passphrase prompt makes the fetch fail instead of prompting. The repo's `core.sshCommand`, credential helpers, and any program set through `GIT_ASKPASS` or `core.askPass` still run. Git Credential Manager can still show its GUI prompt unless `GCM_INTERACTIVE=never` is set.
 
@@ -470,9 +471,9 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 
 3. **Mount** -- The FUSE layer exposes the tree immediately. A synthesized `.git` gitfile points at the real gitdir so git commands work inside the mount.
 
-4. **Read** -- The Resolver merges the snapshot (base tree) with the overlay (local writes). For base files, reads block until the Hydrator fetches the blob and streams it to the blob cache through a persistent `git cat-file --batch` process. Two or more missing blobs queued together are fetched with one `git fetch --stdin`, up to 256 per fetch, and reads and prefetches never share a fetch. The first open for reading or read of a base file in a directory queues up to 256 of its other files the same way.
+4. **Read** -- The Resolver merges the snapshot (base tree) with the overlay (local writes). For base files, reads block until the Hydrator fetches the blob and streams it to the blob cache through a persistent `git cat-file --batch` process. Two or more missing blobs queued together are fetched with one `git fetch --stdin`, up to 256 per fetch, and reads and prefetches never share a fetch. The first open for reading or read of a base file in a directory queues up to 256 of that directory's files, the opened one included, the same way.
 
-5. **Write** -- The Engine promotes base files to the overlay via copy-on-write (hydrate, then copy to the `upper/` directory). Subsequent reads come from the overlay. A delete is recorded as a delete entry in the overlay database; deleting a file copies it first only while a handle on it is open. A write reaches the overlay file at once, and `stat` shows its size and mtime at once. The overlay database records a file's first write after a flush at once, and the size and mtime of later writes when a handle that wrote the file is flushed or closed, when the file is `fsync`ed, or when any overlay change other than a write reaches the overlay. An `fsync` returns only after the file and the database reach stable storage. Between syncs, an OS crash can lose the database's latest changes; a daemon crash loses none of them. No FUSE operation holds a lock while a blob hydrates, so a slow fetch stalls neither a HEAD switch nor other operations. A failed operation returns the errno of its cause, such as `ENOSPC`, and an interrupted one returns `EINTR`.
+5. **Write** -- The Engine promotes base files to the overlay via copy-on-write (hydrate, then copy to the `upper/` directory). Subsequent reads come from the overlay. A delete is recorded as a delete entry in the overlay database; deleting a file copies it first only while a handle on it is open. A write reaches the overlay file at once, and `stat` shows its size and mtime at once. For a file whose overlay entry is already recorded, such as a base file promoted by copy-on-write, the overlay database records the first write after a flush at once. A file created through the mount is recorded at its create, and its writes are pending from then on. The database records the size and mtime of pending writes when a handle that wrote the file is flushed or closed, when the file is `fsync`ed, or when any overlay change other than a write reaches the overlay. An `fsync` returns only after the file and the database reach stable storage. Between syncs, an OS crash can lose the database's latest changes; a daemon crash loses none of them. No FUSE operation holds a lock while a blob hydrates, so a slow fetch stalls neither a HEAD switch nor other operations. A failed operation returns the errno of its cause, such as `ENOSPC`, and an interrupted one returns `EINTR`.
 
 6. **Background** -- For ordinary workspaces, a watcher polls HEAD and the ref it names every 500ms and republishes HEAD changes. A HEAD change compares the overlay with the new generation while reads and writes continue; they wait only while the result is applied. Repositories with `--require-commit` do not run this watcher, so their verified base commit remains fixed. Remote polling is controlled separately by `--refresh`.
 
@@ -514,15 +515,15 @@ paths that vanished: it reads the overlay once and lists the snapshot children
 of each directory that holds a mapped path. When a rename overlapped that check,
 it checks the vanished paths again while no rename can run. On Linux and the
 macFUSE kernel extension, a mapped path whose inode the kernel holds is checked
-on its own instead: comparing its type, permission bits and blob with what the
-kernel last received decides whether its number retires and which invalidations
-it gets.
+on its own instead: resolving it decides whether its number retires, and
+comparing its type, permission bits and blob with what the kernel last received
+decides which invalidations it gets.
 
 ### Subsystems
 
 | Package | Role |
 |---------|------|
-| `daemon` | Repo lifecycle. `Controller` runs every CLI command except `daemon`. `Service` holds the daemon lock, syncs the registry, prepares, mounts and unmounts each repo, reconciles HEAD, runs the refresh loop, and writes `repo_runtime` |
+| `daemon` | Repo lifecycle. `Controller` runs every CLI command except `daemon` and the `gc`, `doctor` and `prefetch` stubs. `Service` holds the daemon lock, syncs the registry, prepares, mounts and unmounts each repo, reconciles HEAD, runs the refresh loop, and writes `repo_runtime` |
 | `fusefs` | FUSE adapter (inode management, op dispatch), Resolver (merged view), Engine (the adapter's only API: one method per operation) |
 | `gitstore` | Git CLI wrapper: clone, fetch, ls-tree, batch pool for `cat-file --batch` |
 | `snapshot` | SQLite store for `base_nodes` keyed by `(generation, path)` |
