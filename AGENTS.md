@@ -32,7 +32,7 @@ Repository-specific guidance for `artifact-fs`.
 - `add-repo` is one-shot by default: register repo, clone blobless, build the initial snapshot, then exit. It does not mount FUSE or start background goroutines.
 - `add-repo --async` only registers prepare state. The daemon mounts a gated placeholder, prepares clone/fetch and snapshot in the background, then opens the gate and starts watcher/refresh.
 - `config_version` identifies a registered config, and only a new registration changes it. Use it as the only token that a config is still current.
-- `prepare_request` identifies the latest prepare request, from `add-repo` or `prepare`. Write a preparation's outcome only while its `config_version` and its `prepare_request` are both current.
+- `prepare_request` identifies the latest prepare request, from `add-repo` or `prepare`. Write a preparation's outcome only while its `config_version` and its `prepare_request` are both current. Write the acquisition receipt while its `config_version` is current; the receipt belongs to the config, not to the request.
 - A prepare request never unmounts a repo. The daemon prepares an async repo again behind its runtime's gate. The CLI prepares a sync repo while the daemon keeps serving it.
 - Refresh settings are not part of a repo's prepare identity. `set-refresh` changes neither token.
 - `daemon` is long-running: it mounts registered repos and starts watcher, refresh, and hydrator workers.
@@ -55,7 +55,7 @@ Repository-specific guidance for `artifact-fs`.
 - Call `requireAbsent` in `Engine.Create`, `Engine.Mkdir` and `Engine.Symlink` before they make the name. The kernel can send CREATE, MKDIR or SYMLINK for a name that appeared after its lookup missed, such as after a HEAD change. `Engine.Rename` replaces its target, so it does not call `requireAbsent`.
 - Run every preparation through `core.prepare`. Express a new caller's differences as a `preparation`, not as another pipeline.
 - Normalize a repo config only in `normalizeRepoConfig`, before the registry stores it. Readers trust the stored config: never re-default or re-resolve a field after reading it.
-- Parse a ref only with `model.BranchName` and `model.CanonicalRef`.
+- Parse a ref only with `model.BranchName` and `model.CanonicalRef`. Keep two hand parses in `internal/cli`, because those helpers would change their meaning. Keep the deprecated `add-repo --branch` alias dropping one leading `refs/heads/` and storing the rest under `refs/heads/`. `--branch x` and `--branch refs/heads/x` both store `refs/heads/x`, and `--branch origin/x` stores `refs/heads/origin/x`. Keep `list-repos` shortening only a `refs/heads/` ref and showing every other stored ref in full.
 - Keep the watcher polling `HEAD` and the ref it names, loose or in `packed-refs`. Read a linked worktree's `refs/bisect/`, `refs/worktree/` and `refs/rewritten/` refs from its own git dir. Read every other ref from the common dir. Preserve the branch-switch, packed-ref and linked-worktree behavior that `internal/watcher/watcher_test.go` and `internal/watcher/linked_test.go` cover.
 - The overlay stores deletes as SQLite entries with `kind='delete'`; there is no on-disk whiteout file layer.
 - SQLite is `modernc.org/sqlite` in WAL mode via `internal/meta`.
