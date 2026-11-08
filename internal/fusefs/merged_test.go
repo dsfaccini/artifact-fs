@@ -122,7 +122,7 @@ func TestSetMtimePromotesBaseFileWithSeparateCtime(t *testing.T) {
 	engine := &Engine{Resolver: r, Overlay: ov}
 	target := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
 
-	if err := engineSetMtime(context.Background(), engine, "b.txt", target); err != nil {
+	if err := engineSetMtime(context.Background(), engine, "b.txt", "file", target); err != nil {
 		t.Fatal(err)
 	}
 	got, ok := lookupOverlay(t, ov, "b.txt")
@@ -149,13 +149,13 @@ func TestSetMtimeRejectsRootAndBaseSymlink(t *testing.T) {
 	engine := &Engine{Resolver: r, Overlay: ov}
 	target := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
 
-	if err := engineSetMtime(context.Background(), engine, ".", target); !errors.Is(err, iofs.ErrInvalid) {
+	if err := engineSetMtime(context.Background(), engine, ".", "dir", target); !errors.Is(err, iofs.ErrInvalid) {
 		t.Fatalf("root SetMtime err = %v, want ErrInvalid", err)
 	}
 	if _, ok := lookupOverlay(t, ov, "."); ok {
 		t.Fatal("root SetMtime should not create an overlay entry")
 	}
-	if err := engineSetMtime(context.Background(), engine, "link", target); !errors.Is(err, iofs.ErrInvalid) {
+	if err := engineSetMtime(context.Background(), engine, "link", "symlink", target); !errors.Is(err, iofs.ErrInvalid) {
 		t.Fatalf("symlink SetMtime err = %v, want ErrInvalid", err)
 	}
 }

@@ -72,6 +72,14 @@ type ResolvedNode struct {
 	Overlay     model.OverlayEntry
 }
 
+// nodeType returns n's type: file, dir or symlink.
+func (n ResolvedNode) nodeType() string {
+	if n.FromOverlay {
+		return n.Overlay.NodeType()
+	}
+	return n.Base.Type
+}
+
 func (r *Resolver) ResolvePath(path string) (ResolvedNode, error) {
 	r.transition.RLock()
 	defer r.transition.RUnlock()

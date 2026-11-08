@@ -537,12 +537,18 @@ content, and an open of a file whose path a HEAD change removed fails with
 
 ### Inode numbers
 
-A path keeps its inode number while it exists, also after the kernel forgets
-the inode, so Git's stat data stays valid. A rename moves the numbers of the
-whole subtree. A path that stops existing retires its number: an unlink, rmdir
-or rename over it through the mount, or a HEAD change that removes it. A file,
-directory or symlink made there later gets a new number, even while the kernel
-still holds the old inode.
+A path keeps its inode number while it exists and keeps its type, also after
+the kernel forgets the inode, so Git's stat data stays valid. A rename moves the
+numbers of the whole subtree. A path that stops existing retires its number: an
+unlink, rmdir or rename over it through the mount, or a HEAD change that removes
+it. A file, directory or symlink made there later gets a new number, even while
+the kernel still holds the old inode. When a HEAD change changes the type of a
+path whose inode the kernel holds, such as a file that becomes a directory or a
+symlink, the path gets a new number too, and the held inode becomes stale.
+Linux and the macFUSE kernel extension fail every operation on an inode whose
+type changes, so the mount never changes an inode's type. A file held open on
+that path keeps reading what it opened. A write or `setattr` through it returns
+`ESTALE` from the HEAD change on and changes nothing.
 
 A file or directory that the kernel still holds when a HEAD change removes its
 path gets the path back if a later HEAD change restores the path unchanged: a
@@ -556,9 +562,10 @@ successful write through such an open file recreates its path under the file's
 own number, while no other file holds the path. A rename of a parent directory
 moves that path too.
 
-The held file or directory becomes stale when its path comes back changed, when
-another file takes the path through a create, a lookup or a listing, or when an
-unlink, rmdir or rename over it through the mount removes it. `open` on a stale
+The held file or directory becomes stale when its path comes back changed or
+changes type, when another file takes the path through a create, a lookup or a
+listing, or when an unlink, rmdir or rename over it through the mount removes
+it. `open` on a stale
 file returns `ESTALE`, and its handles never reach the path again. A handle
 reads the content it already holds, and returns `ESTALE` when it holds none.
 `getattr` on a stale file, or on a held file whose path is away, answers with

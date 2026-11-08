@@ -41,13 +41,16 @@ type MountedFS interface {
 	// and the merged view no longer matches: the attributes and pages of an
 	// inode whose type, permission bits or blob changed, the entry of a name
 	// that vanished or changed type, and a negative entry whose name now
-	// exists. It also retires the inode number of each path that vanished,
-	// and closes each overlay file that a handle that is not detached holds
-	// and the overlay no longer names for the handle's path. It moves the read
-	// generation of each inode whose path kept its identity to the current
-	// one. Call it after a generation switch, holding no lock an op takes.
-	// FSKit takes no invalidations, so it only retires numbers, closes files
-	// and moves read generations there.
+	// exists. It also retires the inode number of each path that vanished and
+	// the inode of each path that changed type, and closes each overlay file
+	// that a handle that is not detached holds and the overlay no longer
+	// names for the handle's path. It moves the read generation of each inode
+	// whose path kept its identity to the current one. Call it after a
+	// generation switch, holding no lock an op takes. FSKit takes no
+	// invalidations, so there it only retires numbers, closes files and moves
+	// read generations. Of the inodes whose paths changed type, it retires
+	// every one that an open file is on there, and a lookup or getattr
+	// retires the others.
 	InvalidateChanged() error
 	// OpenFileGenerations returns the snapshot generations that open files
 	// read. A prune keeps them.
@@ -121,6 +124,11 @@ type ArtifactFuse struct {
 	// the time its record lapses.
 	negatives       map[kernelEntry]time.Time
 	negativeSweepAt int
+	// retypedNames holds the name of each inode that setReported retired
+	// because its path changed type, with the inode, until the next switch
+	// pass invalidates both. The kernel can still bind the name to the inode,
+	// and no mapping leads the pass to it.
+	retypedNames map[kernelEntry]fuseops.InodeID
 	// renameSeq is odd while a Rename op runs, and grows by two with each one.
 	// A rename commits the overlay before it moves the mappings, so a switch
 	// pass that a rename overlapped checks its vanished paths again.
@@ -293,6 +301,7 @@ func NewArtifactFuse(repo model.RepoPaths, engine *Engine) *ArtifactFuse {
 		fileHandles:    make(map[fuseops.HandleID]*FileHandle),
 		nextHandleID:   1,
 		negatives:      make(map[kernelEntry]time.Time),
+		retypedNames:   make(map[kernelEntry]fuseops.InodeID),
 		openPins:       make(map[int64]int),
 	}
 	root := &InodeRef{ID: fuseops.RootInodeID, Path: ".", Type: "dir", Mode: 0o755, Refcnt: 1, IsRoot: true}
@@ -305,7 +314,9 @@ func NewArtifactFuse(repo model.RepoPaths, engine *Engine) *ArtifactFuse {
 // as what the kernel last received for it. A path with a dormant mapping gets
 // its number back. An unmapped inode whose path came back with its identity
 // maps back to the path; one whose path came back as something else is
-// retired. Caller must hold fs.mu write lock.
+// retired. A path whose type changed gets a new number, and the inode the
+// kernel holds for it is retired: the kernel fails every op on an inode whose
+// type changes. Caller must hold fs.mu write lock.
 func (fs *ArtifactFuse) allocInode(path string, attrs Attrs) *InodeRef {
 	id, ok := fs.pathToInode[path]
 	if held, found := fs.unmapped[path]; !ok && found {
@@ -318,9 +329,13 @@ func (fs *ArtifactFuse) allocInode(path string, attrs Attrs) *InodeRef {
 		}
 	}
 	if ref := fs.inodes[id]; ok && ref != nil {
-		ref.Refcnt++
-		ref.report(attrs)
-		return ref
+		if ref.Type == attrs.Type {
+			ref.Refcnt++
+			ref.report(attrs)
+			return ref
+		}
+		fs.retireRetypedLocked(id, path)
+		ok = false
 	}
 	if !ok {
 		id = fs.nextInodeID
@@ -380,6 +395,17 @@ func (fs *ArtifactFuse) unmapPathLocked(id fuseops.InodeID, path string) {
 	if fs.inodes[id] != nil {
 		fs.unmapped[path] = id
 	}
+}
+
+// retireRetypedLocked retires id, whose path now has another type than the
+// one the kernel holds for id, and unmaps the path from it, so the path gets
+// a new number. id's handles keep reading the content they opened. Caller
+// must hold fs.mu write lock.
+func (fs *ArtifactFuse) retireRetypedLocked(id fuseops.InodeID, path string) {
+	if fs.pathToInode[path] == id {
+		delete(fs.pathToInode, path)
+	}
+	fs.retireLocked(id)
 }
 
 // mapLocked maps path back to id, an unmapped inode whose path came back.
@@ -640,7 +666,8 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // removed. When send is true it also tells the kernel what changed. Every inode
 // the kernel holds at a path gets the check for a name that vanished or
 // changed type. A name that changed type gets its entry and its inode
-// invalidated, and a vanished name only its entry. An unmapped inode whose
+// invalidated, and its inode retired, so the name gets a new number. A
+// vanished name gets only its entry invalidated. An unmapped inode whose
 // path came back maps back to the path when the path has its identity, and
 // is retired and invalidated otherwise. An inode whose identity the kernel
 // received from the base snapshot gets the identity comparison. One the
@@ -656,8 +683,9 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // An inode whose base identity the current generation still has reads that
 // generation from then on, so a prune need not keep the one it read. The
 // pass advances InodeRef.ReadGen for each inode it compares and finds
-// unchanged with no Prior. With send false it compares no inode, so it
-// checks the inodes that open file handles are on for that alone.
+// unchanged with no Prior. With send false it compares no other inode: it
+// checks every inode an open file handle is on for a type change, and each
+// one that reads base content for the advance too.
 func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	type known struct {
 		pathMapping
@@ -697,18 +725,19 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		}
 		inodes = append(inodes, known{pathMapping: pathMapping{id, path}, entry: kernelEntry{parent, filepath.Base(path)}, reported: ref.identity(), prior: ref.Prior, base: ref.Gen != 0, gen: ref.Gen, readGen: ref.ReadGen})
 	}
-	// opened holds, with send false, each inode an open file handle is on
-	// that may read an older generation than gen.
+	// opened holds, with send false, each inode an open file handle is on,
+	// except one whose base identity was reported at gen: its path still has
+	// that type.
 	var opened []known
 	if !send {
 		seen := map[fuseops.InodeID]bool{}
 		for _, fh := range fs.fileHandles {
 			ref := fs.inodes[fh.inode.ID]
-			if ref == nil || seen[ref.ID] || ref.Stale || ref.Gen == 0 || ref.ReadGen == gen || ref.Prior.Type != "" || ref.Path == ".git" {
+			if ref == nil || seen[ref.ID] || ref.Stale || ref.Gen != 0 && ref.ReadGen == gen || ref.Path == ".git" {
 				continue
 			}
 			seen[ref.ID] = true
-			opened = append(opened, known{pathMapping: pathMapping{ref.ID, ref.Path}, reported: ref.identity(), base: true, gen: ref.Gen, readGen: ref.ReadGen})
+			opened = append(opened, known{pathMapping: pathMapping{ref.ID, ref.Path}, reported: ref.identity(), prior: ref.Prior, base: ref.Gen != 0, gen: ref.Gen, readGen: ref.ReadGen})
 		}
 	}
 	var returning []unmappedInode
@@ -740,7 +769,8 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// a getattr when its path comes back, createEntry when a create takes
 	// the path, and settleUnmappedBelow before an unlink or a rename.
 	var changed []fuseops.InodeID
-	var vanished []pathMapping
+	// retyped holds each held inode whose path changed type, to retire.
+	var vanished, retyped []pathMapping
 	// unchanged holds each inode whose base identity the path still has, to
 	// read gen from then on.
 	var unchanged []known
@@ -754,12 +784,13 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		// the switch and this pass replaced it.
 		hidden := k.prior.Type != ""
 		switch {
-		case !exists || current.Type != k.reported.Type || hidden && current.Type != k.prior.Type:
+		case !exists || current.Type != k.reported.Type:
 			entries = append(entries, k.entry)
 			if !exists {
 				vanished = append(vanished, k.pathMapping)
 			} else {
 				changed = append(changed, k.id)
+				retyped = append(retyped, k.pathMapping)
 			}
 		case hidden, k.base && current != k.reported, !k.base && current.Blob != "":
 			changed = append(changed, k.id)
@@ -773,7 +804,10 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			failed(err, "resolve "+k.path)
 			continue
 		}
-		if exists && current == k.reported {
+		switch {
+		case exists && current.Type != k.reported.Type:
+			retyped = append(retyped, k.pathMapping)
+		case exists && k.base && k.prior.Type == "" && current == k.reported:
 			unchanged = append(unchanged, k)
 		}
 	}
@@ -812,6 +846,11 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		}
 	}
 	fs.mu.Lock()
+	for e, id := range fs.retypedNames {
+		entries = append(entries, e)
+		changed = append(changed, id)
+	}
+	clear(fs.retypedNames)
 	// An op may have taken, moved or recreated a path since the check, which
 	// removes it from unmapped.
 	for _, m := range remap {
@@ -832,6 +871,11 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// A reply or an op since the check can have changed what the kernel holds,
 	// and a switch since the check what the identities were resolved against.
 	if fs.engine.Generation() == gen {
+		for _, m := range retyped {
+			if fs.pathToInode[m.path] == m.id {
+				fs.retireRetypedLocked(m.id, m.path)
+			}
+		}
 		for _, k := range unchanged {
 			if ref := fs.inodes[k.id]; ref != nil && !ref.Stale && ref.Prior.Type == "" && ref.identity() == k.reported && ref.Gen == k.gen && ref.ReadGen == k.readGen {
 				ref.ReadGen = gen
@@ -1051,7 +1095,9 @@ func (fs *ArtifactFuse) heldAttrs(id fuseops.InodeID) (Attrs, bool) {
 // the switch pass does: it maps id back to the path, or retires id and
 // returns ESTALE when the path changed or another inode holds it. Recording a
 // changed identity on an unmapped inode would let the pass map the path back
-// to it.
+// to it. When attrs give id's path another type, setReported retires id and
+// returns ESTALE, as allocInode does, and leaves the name's entry and id for
+// the next switch pass to invalidate.
 func (fs *ArtifactFuse) setReported(id fuseops.InodeID, attrs Attrs) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -1060,6 +1106,13 @@ func (fs *ArtifactFuse) setReported(id fuseops.InodeID, attrs Attrs) error {
 		return nil
 	}
 	if fs.unmapped[ref.Path] == id && !fs.settleLocked(id, ref.Path, attrs.identity()) {
+		return syscall.ESTALE
+	}
+	if ref.Type != attrs.Type {
+		if parent, ok := fs.pathToInode[model.CleanPath(filepath.Dir(ref.Path))]; ok && fs.pathToInode[ref.Path] == id {
+			fs.retypedNames[kernelEntry{parent, filepath.Base(ref.Path)}] = id
+		}
+		fs.retireRetypedLocked(id, ref.Path)
 		return syscall.ESTALE
 	}
 	ref.report(attrs)
@@ -1621,16 +1674,14 @@ func (fs *ArtifactFuse) setInodeAttributes(ctx context.Context, op *fuseops.SetI
 			m := uint32(op.Mode.Perm())
 			mode = &m
 		}
-		changesContent := op.Size != nil || op.Mtime != nil
-		if changesContent {
-			fs.closeCachedFilesForPath(ref.Path)
-		}
 		var sizeAccess uint32
 		if op.Size != nil && checkPermissions && !fs.handleWritable(op.Handle) {
 			sizeAccess = ownerWrite
 		}
-		attrs, err := fs.engine.SetAttributes(ctx, b, ref.Path, size, sizeAccess, mode, op.Mtime)
-		if changesContent {
+		attrs, err := fs.engine.SetAttributes(ctx, b, ref.Path, ref.Type, size, sizeAccess, mode, op.Mtime, fs)
+		// A refused change changed nothing, so the handles keep what they
+		// cached.
+		if (op.Size != nil || op.Mtime != nil) && !errors.Is(err, errTypeChanged) {
 			fs.closeCachedFilesForPath(ref.Path)
 		}
 		if err != nil {
@@ -2195,6 +2246,10 @@ func (fs *ArtifactFuse) writeFile(ctx context.Context, b *Blobs, op *fuseops.Wri
 	// The creator has its descriptor once a write arrives.
 	fs.takeCreateOpenPending(op.Inode)
 	n, err := fs.engine.Write(ctx, b, path, op.Offset, op.Data)
+	if errors.Is(err, errTypeChanged) {
+		// The write changed nothing, so the handles keep what they cached.
+		return err
+	}
 	// A handle that cached the base content before the write promoted the
 	// path, or while another write promoted it, would keep serving the
 	// base. Close those caches before the write returns, failed or not.
