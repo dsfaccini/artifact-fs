@@ -144,14 +144,16 @@ func TestStatusReportsAnExitedFUSEServer(t *testing.T) {
 	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
+	// The join records the serve failure, then the runtime's state in a
+	// second write, so the test reads status once the join ended.
+	joined := make(chan struct{})
+	var joinOnce sync.Once
+	svc.joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
 	if err := svc.syncRepos(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	close(mfs.exit)
-	waitFor(t, nil, func() bool {
-		st, err := ctl.Status(context.Background(), "repo")
-		return err == nil && st.LastErrorPhase == phaseServe
-	})
+	<-joined
 	if st := requireFailure(t, ctl, phaseServe, "lost"); st.State != repoStateDegraded {
 		t.Fatalf("state = %q, want degraded", st.State)
 	}

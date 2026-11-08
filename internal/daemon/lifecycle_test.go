@@ -1237,6 +1237,12 @@ func TestFailedPreparationStaysFailedWhenItsMountEnds(t *testing.T) {
 	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
+	// The join records the serve failure, then the runtime's state in a
+	// second write. A status between the two shows the failure with the
+	// phase before it, so the test reads status once the join ended.
+	joined := make(chan struct{})
+	var joinOnce sync.Once
+	svc.joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
 	ctl := svc.ctl()
 	missing := filepath.Join(tmp, "missing-remote")
 	if err := ctl.AddRepoWithOptions(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: missing, Branch: "main"}, Enabled: true}, AddRepoOptions{Async: true}); err != nil {
@@ -1251,15 +1257,12 @@ func TestFailedPreparationStaysFailedWhenItsMountEnds(t *testing.T) {
 		return err == nil && st.State == string(model.PrepareStateFailed)
 	})
 	close(mfs.exit)
-	waitFor(t, nil, func() bool {
-		st, err := ctl.Status(ctx, "repo")
-		return err == nil && st.LastErrorPhase == phaseServe
-	})
+	<-joined
 	st, err := ctl.Status(ctx, "repo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.State != string(model.PrepareStateFailed) || st.Phase != phaseMount {
+	if st.State != string(model.PrepareStateFailed) || st.Phase != phaseMount || st.LastErrorPhase != phaseServe {
 		t.Fatalf("status after the failed preparation's mount ended = %+v, want failed in the mount phase", st)
 	}
 }
