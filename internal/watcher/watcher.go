@@ -5,40 +5,50 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
 type Poller struct {
-	interval        time.Duration
+	// mu serializes polls and Rebase.
+	mu              sync.Mutex
 	prev            map[string]string
 	firstSeenChange map[string]struct{}
 }
 
-func New(interval time.Duration) *Poller {
-	if interval <= 0 {
-		interval = 500 * time.Millisecond
-	}
-	return &Poller{interval: interval, prev: map[string]string{}, firstSeenChange: map[string]struct{}{}}
+func New() *Poller {
+	return &Poller{prev: map[string]string{}, firstSeenChange: map[string]struct{}{}}
 }
 
-func (p *Poller) Watch(ctx context.Context, gitDir string, fn func()) {
+// Watch polls gitDir's HEAD and the ref it names on each tick, and calls fn
+// when either changed since the last poll or Rebase.
+func (p *Poller) Watch(ctx context.Context, gitDir string, ticks <-chan time.Time, fn func()) {
 	headPath := filepath.Join(gitDir, "HEAD")
 	// Prime first, then reconcile. A change during reconciliation is observed by
 	// the next poll instead of falling into the startup baseline window.
-	_ = p.headChanged(headPath)
+	p.Rebase(gitDir)
 	fn()
-	t := time.NewTicker(p.interval)
-	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			if p.headChanged(headPath) {
+		case <-ticks:
+			p.mu.Lock()
+			changed := p.headChanged(headPath)
+			p.mu.Unlock()
+			if changed {
 				fn()
 			}
 		}
 	}
+}
+
+// Rebase makes gitDir's HEAD and the ref it names, as they are now, the state
+// the next poll compares with.
+func (p *Poller) Rebase(gitDir string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_ = p.headChanged(filepath.Join(gitDir, "HEAD"))
 }
 
 func (p *Poller) headChanged(headPath string) bool {

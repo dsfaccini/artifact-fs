@@ -29,6 +29,7 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 		s.logger.Error("HEAD resolve failed", "repo", cfg.Name, "error", err)
 		return err
 	}
+	s.logger.Debug("HEAD resolved", "repo", cfg.Name, "oid", oid, "ref", ref)
 	s.mu.Lock()
 	prev := rt.head
 	s.mu.Unlock()
@@ -168,6 +169,24 @@ func (s *Service) signalHEADReconcile(rt *repoRuntime) {
 	}
 }
 
+// servesHEAD rebases rt's watcher on HEAD as it is now, then reports whether
+// rt serves HEAD, or no longer follows it. A reconcile reads HEAD after the
+// poll that signaled it, so HEAD can move to a state no poll saw, which the
+// reconcile serves, and back to the polled state, which no poll signals. The
+// rebase follows the reconcile's read: one before it leaves that hole.
+func (s *Service) servesHEAD(rt *repoRuntime) bool {
+	s.mu.Lock()
+	cfg, served, w := rt.cfg, rt.head, rt.watcher
+	following := s.running[cfg.ID] == rt && !rt.stopping && cfg.RequiredCommit == ""
+	s.mu.Unlock()
+	if !following {
+		return true
+	}
+	w.Rebase(cfg.GitDir)
+	oid, ref, err := s.git.ResolveHEAD(rt.ctx, cfg)
+	return err == nil && oid == served.oid && ref == served.ref
+}
+
 func (s *Service) headReconcileLoop(rt *repoRuntime) {
 	retry := newRetrier(phaseHEADReconcile, cmp.Or(s.headReconcileBackoff, headReconcileMinBackoff), headReconcileMaxBackoff)
 	for {
@@ -181,7 +200,10 @@ func (s *Service) headReconcileLoop(rt *repoRuntime) {
 			err := s.reconcileHEAD(rt.ctx, rt)
 			if err == nil {
 				retry.succeed()
-				break
+				if s.servesHEAD(rt) {
+					break
+				}
+				continue
 			}
 			if rt.ctx.Err() != nil {
 				return

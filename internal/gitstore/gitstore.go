@@ -36,6 +36,9 @@ type Store struct {
 	// testHookBeforeHookRename, when set, runs in replaceExecutable between
 	// writing the new file and renaming it over path.
 	testHookBeforeHookRename func(path string)
+	// testHookBetweenHEADReads, when set, runs in ResolveHEAD between its
+	// read of HEAD's ref and its read of HEAD's commit.
+	testHookBetweenHEADReads func()
 }
 
 func New(logger *slog.Logger) *Store {
@@ -98,17 +101,39 @@ func (s *Store) SetBatchPoolSize(n int) {
 	}
 }
 
+// ResolveHEAD returns the commit HEAD names and HEAD's short ref, or
+// DETACHED. Git reads HEAD once for the ref and once for the commit, and a
+// HEAD write between the two would pair one state's commit with the next
+// state's ref. So it reads the ref before and after the commit, until both
+// reads agree. A switch away and back between the two ref reads also
+// satisfies that, and pairs the other state's commit with the ref. The
+// daemon's check after each reconcile, servesHEAD, serves HEAD again once
+// the switching stops.
 func (s *Store) ResolveHEAD(ctx context.Context, repo model.RepoConfig) (oid string, ref string, err error) {
-	oid, err = runGit(ctx, repo.GitDir, "rev-parse", "HEAD")
-	if err != nil {
-		return "", "", err
+	ref = headRef(ctx, repo)
+	for {
+		if s.testHookBetweenHEADReads != nil {
+			s.testHookBetweenHEADReads()
+		}
+		oid, err = runGit(ctx, repo.GitDir, "rev-parse", "HEAD")
+		if err != nil {
+			return "", "", err
+		}
+		after := headRef(ctx, repo)
+		if after == ref {
+			return strings.TrimSpace(oid), ref, nil
+		}
+		ref = after
 	}
-	ref, err = runGit(ctx, repo.GitDir, "symbolic-ref", "-q", "--short", "HEAD")
+}
+
+// headRef returns HEAD's short ref, or DETACHED when HEAD names no ref.
+func headRef(ctx context.Context, repo model.RepoConfig) string {
+	ref, err := runGit(ctx, repo.GitDir, "symbolic-ref", "-q", "--short", "HEAD")
 	if err != nil {
-		ref = "DETACHED"
-		err = nil
+		return "DETACHED"
 	}
-	return strings.TrimSpace(oid), strings.TrimSpace(ref), nil
+	return strings.TrimSpace(ref)
 }
 
 // CommitTimestamp returns the committer timestamp of the given commit OID.

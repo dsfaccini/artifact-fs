@@ -7,9 +7,11 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/registry"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
+	"github.com/cloudflare/artifact-fs/internal/watcher"
 	"github.com/dsfaccini/fuse/fuseops"
 )
 
@@ -28,7 +31,6 @@ type headReconcileFixture struct {
 	t       *testing.T
 	ctx     context.Context
 	cancel  context.CancelFunc
-	done    chan struct{}
 	workDir string
 	oldOID  string
 	nextOID string
@@ -80,6 +82,17 @@ func newHeadReconcileFixture(t *testing.T) *headReconcileFixture {
 // newHeadReconcileFixtureWithBackoff starts the HEAD reconcile loop with backoff
 // as its first retry delay.
 func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *headReconcileFixture {
+	t.Helper()
+	f := newIdleHeadReconcileFixture(t, backoff)
+	f.rt.workers.Go(func() {
+		f.svc.headReconcileLoop(f.rt)
+	})
+	return f
+}
+
+// newIdleHeadReconcileFixture builds a headReconcileFixture whose runtime runs
+// no worker yet.
+func newIdleHeadReconcileFixture(t *testing.T, backoff time.Duration) *headReconcileFixture {
 	t.Helper()
 	root := t.TempDir()
 	workDir := filepath.Join(root, "work")
@@ -145,6 +158,7 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 		overlay:     ov,
 		resolver:    resolver,
 		headChanges: make(chan struct{}, 1),
+		watcher:     watcher.New(),
 		head:        servedHead{oid: oldOID, ref: "main", gen: oldGen},
 		fetch:       fetchStatus{state: fetchNever},
 		mount:       mountNone,
@@ -166,7 +180,6 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 		t:       t,
 		ctx:     ctx,
 		cancel:  cancel,
-		done:    make(chan struct{}),
 		workDir: workDir,
 		oldOID:  oldOID,
 		nextOID: nextOID,
@@ -176,13 +189,9 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 		rt:      rt,
 		logs:    logs,
 	}
-	go func() {
-		defer close(f.done)
-		svc.headReconcileLoop(rt)
-	}()
 	t.Cleanup(func() {
 		cancel()
-		<-f.done
+		rt.workers.Wait()
 		rt.headMu.Lock()
 		_ = rt.snapshot.Close()
 		_ = rt.overlay.Close()
@@ -195,6 +204,13 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 func (f *headReconcileFixture) updateMain(oid string) {
 	f.t.Helper()
 	runCmd(f.t, "git", "-C", f.workDir, "update-ref", "refs/heads/main", oid)
+}
+
+// moveMain points main at oid from a goroutine other than the test's.
+func (f *headReconcileFixture) moveMain(oid string) {
+	if out, err := exec.Command("git", "-C", f.workDir, "update-ref", "refs/heads/main", oid).CombinedOutput(); err != nil {
+		f.t.Errorf("update-ref main %s: %v\n%s", oid, err, out)
+	}
 }
 
 func (f *headReconcileFixture) signal() {
@@ -216,6 +232,88 @@ func (f *headReconcileFixture) waitForHead(oid, ref string, generation int64) {
 			f.rt.head.gen == generation &&
 			f.rt.resolver.Generation() == generation
 	})
+}
+
+// steppedHEADGit resolves HEAD in git. Around its nth resolve, counting from
+// one, it runs before[n-1] and after[n-1] where they are set.
+type steppedHEADGit struct {
+	model.GitStore
+	calls         atomic.Int32
+	before, after []func()
+}
+
+func (g *steppedHEADGit) ResolveHEAD(ctx context.Context, repo model.RepoConfig) (string, string, error) {
+	n := int(g.calls.Add(1))
+	if n <= len(g.before) && g.before[n-1] != nil {
+		g.before[n-1]()
+	}
+	oid, ref, err := g.GitStore.ResolveHEAD(ctx, repo)
+	if n <= len(g.after) && g.after[n-1] != nil {
+		g.after[n-1]()
+	}
+	return oid, ref, err
+}
+
+// A reconcile reads HEAD after the signal that started it. When HEAD moves on
+// before any poll could see the state the reconcile served, the daemon still
+// ends up serving HEAD.
+func TestHeadReconcileServesAHEADThatMovedDuringItsRead(t *testing.T) {
+	t.Parallel()
+	f := newHeadReconcileFixture(t)
+	f.svc.git = &steppedHEADGit{
+		GitStore: f.svc.git,
+		before:   []func(){func() { f.moveMain(f.nextOID) }},
+		after:    []func(){func() { f.moveMain(f.lastOID) }},
+	}
+	f.signal()
+	f.waitForHead(f.lastOID, "main", f.oldGen+2)
+}
+
+// A reconcile serves a HEAD no poll saw, and HEAD then returns to the state
+// the watcher polled last. The next poll must still signal that return.
+func TestHEADWatcherSignalsAReturnToTheStateItPolledLast(t *testing.T) {
+	t.Parallel()
+	f := newIdleHeadReconcileFixture(t, time.Millisecond)
+	movedBack := make(chan struct{})
+	f.svc.git = &steppedHEADGit{
+		GitStore: f.svc.git,
+		// The reconcile of the watcher's startup call reads next, which no
+		// poll sees.
+		before: []func(){func() { f.moveMain(f.nextOID) }},
+		// Once the reconcile's check of HEAD read next, HEAD returns to old,
+		// the state the watcher took at startup.
+		after: []func(){nil, func() {
+			f.moveMain(f.oldOID)
+			close(movedBack)
+		}},
+	}
+	polls := make(chan time.Time)
+	f.svc.headPollTicks = polls
+	f.rt.cfg.RemoteRefreshDisabled = true
+	f.svc.startRepoBackground(f.rt)
+	<-movedBack
+	polls <- time.Now()
+	f.waitForHead(f.oldOID, "main", f.oldGen+2)
+}
+
+// A reconcile that starts once its runtime is stopping changes nothing. The
+// loop must not take that for a HEAD it still has to serve, or it reconciles
+// again and again and never sees the stop cancel it.
+func TestHeadReconcileLoopEndsWhenItsRuntimeStopsMidReconcile(t *testing.T) {
+	t.Parallel()
+	f := newHeadReconcileFixture(t)
+	f.rt.headMu.Lock()
+	f.signal()
+	// The loop took the signal and waits for headMu in reconcileHEAD.
+	waitFor(t, nil, func() bool { return len(f.rt.headChanges) == 0 })
+	f.svc.mu.Lock()
+	f.rt.stopping = true
+	f.svc.mu.Unlock()
+	// Cancel first. A check of HEAD that ran before the cancel would find
+	// HEAD served and end the loop with or without the guard.
+	f.cancel()
+	f.rt.headMu.Unlock()
+	f.rt.workers.Wait()
 }
 
 func TestHeadReconcileRetriesTransientResolveFailureWithoutAnotherSignal(t *testing.T) {
@@ -695,7 +793,7 @@ func TestHeadReconcileBackoffStopsOnCancellation(t *testing.T) {
 	f.waitForLog("HEAD resolve failed")
 
 	f.cancel()
-	<-f.done
+	f.rt.workers.Wait()
 }
 
 func TestHeadReconcileResumesAfterUnmountFailure(t *testing.T) {
