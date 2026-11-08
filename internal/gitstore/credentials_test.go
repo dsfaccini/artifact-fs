@@ -374,15 +374,15 @@ func TestCloneBloblessRejectsBeforeGit(t *testing.T) {
 		wantErr string
 		secrets []string
 	}{
-		{"malformed escape in the password", "https://alice7:zq1%zz@example.com/org/repo.git", "main", "", []string{"alice7", "zq1"}},
+		{"malformed escape in the password", "https://alice7:zq1%zz@example.com/org/repo.git", "main", "malformed remote URL", []string{"alice7", "zq1"}},
 		{"option-like remote", "--upload-pack=a@b:c", "main", "must not start with '-'", nil},
 		// A ref outside refs/heads/ takes the ls-remote path, where git runs an
 		// injected --upload-pack value.
 		{"option-like remote of an exact ref", "--upload-pack=a@b:c", "refs/tags/v1", "must not start with '-'", nil},
-		{"https with one slash", "https:/alice7:zq2secret@github.com/org/repo.git", "main", "", []string{"alice7", "zq2secret"}},
-		{"https without a colon", "https//zq3secret%zz@github.com/org/repo.git", "main", "", []string{"zq3secret", "%zz"}},
-		{"git-style user and password", "git:zq4secret@github.com:org/repo.git", "main", "", []string{"zq4secret"}},
-		{"password that url.Parse splits at a slash", "https://alice7:4711/zq5secret@example.com/org/repo.git", "main", "", []string{"alice7", "4711", "zq5secret"}},
+		{"https with one slash", "https:/alice7:zq2secret@github.com/org/repo.git", "main", "malformed remote URL", []string{"alice7", "zq2secret"}},
+		{"https without a colon", "https//zq3secret%zz@github.com/org/repo.git", "main", "malformed remote URL", []string{"zq3secret", "%zz"}},
+		{"git-style user and password", "git:zq4secret@github.com:org/repo.git", "main", "malformed remote URL", []string{"zq4secret"}},
+		{"password that url.Parse splits at a slash", "https://alice7:4711/zq5secret@example.com/org/repo.git", "main", "malformed remote URL", []string{"alice7", "4711", "zq5secret"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{GitDir: filepath.Join(t.TempDir(), "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: tt.remote, Branch: tt.branch}}

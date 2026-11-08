@@ -423,8 +423,8 @@ func TestPrepareFetchedBranchRollsBackAtAHeldLock(t *testing.T) {
 				t.Fatal(err)
 			}
 			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}}
-			if err := New(nil).PrepareFetchedBranch(t.Context(), cfg, tt.fetchRef); err == nil {
-				t.Fatalf("PrepareFetchedBranch succeeded although %s was held", tt.lock)
+			if err := New(nil).PrepareFetchedBranch(t.Context(), cfg, tt.fetchRef); err == nil || !strings.Contains(err.Error(), tt.lock) {
+				t.Fatalf("PrepareFetchedBranch error = %v, want the failure at the held %s", err, tt.lock)
 			}
 			if err := os.Remove(lock); err != nil {
 				t.Fatal(err)
@@ -1457,9 +1457,10 @@ func TestComputeAheadBehindOfAVerifiedSource(t *testing.T) {
 	}
 }
 
-// Neither the clone nor a fetch brings tags, also ones that point into the
-// history it fetches. The clone records --no-tags in its remote config, so the
-// fetches run in a prepared git dir, whose remote config lacks it. A clone
+// Neither a clone, of a branch or of an exact ref, nor a fetch brings tags,
+// also ones that point into the history it fetches. The branch clone records
+// --no-tags in its remote config, so the fetches run in a prepared git dir,
+// whose remote config lacks it. A clone
 // replaces the batch pool of the git dir it creates.
 func TestCloneAndFetchRefSkipTags(t *testing.T) {
 	t.Parallel()
@@ -1491,6 +1492,13 @@ func TestCloneAndFetchRefSkipTags(t *testing.T) {
 		t.Fatalf("CloneBlobless: %v", err)
 	}
 	requireNoTags(cloneGitDir, "the clone")
+	exact := cfg
+	exact.GitDir = filepath.Join(tmp, "exact.git")
+	exact.Branch = "refs/tags/v1"
+	if err := store.CloneBlobless(ctx, exact); err != nil {
+		t.Fatalf("CloneBlobless of an exact ref: %v", err)
+	}
+	requireNoTags(exact.GitDir, "the exact-ref clone")
 	newPool, err := store.getPool(cloneGitDir)
 	if err != nil {
 		t.Fatal(err)

@@ -7,9 +7,11 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -21,8 +23,8 @@ import (
 
 // A blob larger than the batch reader's 256 KiB buffer, with NULs, CRs,
 // invalid UTF-8 and no trailing newline, reaches the cache byte for byte from
-// a blobless clone's remote. The next blob read from the same process shows
-// the stream stayed in step.
+// a blobless clone's remote, and the batch process stays in step for the
+// next blob.
 func TestBlobToCacheBinarySafe(t *testing.T) {
 	t.Parallel()
 	var binary strings.Builder
@@ -39,7 +41,17 @@ func TestBlobToCacheBinarySafe(t *testing.T) {
 	if err := store.CloneBlobless(t.Context(), cfg); err != nil {
 		t.Fatal(err)
 	}
-	for _, file := range files {
+	pool, err := store.getPool(cfg.GitDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processes := func() []*batchCatFile {
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		return slices.Collect(maps.Keys(pool.all))
+	}
+	var first []*batchCatFile
+	for i, file := range files {
 		oid := strings.TrimSpace(runOutput(t, "git", "--git-dir", cfg.GitDir, "rev-parse", "HEAD:"+file.name))
 		dst := filepath.Join(tmp, "cache", oid)
 		size, err := store.BlobToCache(t.Context(), cfg.RepoPaths, oid, dst)
@@ -53,6 +65,14 @@ func TestBlobToCacheBinarySafe(t *testing.T) {
 		if size != int64(len(file.content)) || !bytes.Equal(data, []byte(file.content)) {
 			t.Fatalf("BlobToCache(%s) wrote %d bytes, reported %d; want the blob's %d bytes", file.name, len(data), size, len(file.content))
 		}
+		if i == 0 {
+			first = processes()
+		}
+	}
+	// BlobToCache retries a read that fails on a fresh process, so only the
+	// same process shows the first read left the stream in step.
+	if after := processes(); len(first) != 1 || !slices.Equal(after, first) {
+		t.Fatalf("batch processes = %v after the second read, want the first read's %v", after, first)
 	}
 }
 

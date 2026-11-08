@@ -150,11 +150,20 @@ func TestEnsureIndexInitializedPreservesStagedEntries(t *testing.T) {
 	run(t, "git", "-C", repo, "config", "core.fsmonitor", fsmonitorHook)
 
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
+	indexPath := filepath.Join(cfg.GitDir, "index")
+	before, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := New(nil).EnsureIndexInitialized(t.Context(), cfg); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(fsmonitorCalled); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("fsmonitor hook ran during index validation: %v", err)
+	}
+	// Git writes an index by renaming a new file over it.
+	if after, err := os.Stat(indexPath); err != nil || !os.SameFile(before, after) {
+		t.Fatalf("index validation rewrote the index: %v", err)
 	}
 	staged := runOutput(t, "git", "-C", repo, "-c", "core.fsmonitor=false", "diff", "--cached", "--name-only")
 	if !strings.Contains(staged, "tracked.txt") {
