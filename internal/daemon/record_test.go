@@ -243,7 +243,10 @@ func TestUnmountReportsTheDaemonsFailure(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "busy") || strings.Contains(err.Error(), "hunter2secret") {
 		t.Fatalf("Unmount = %v, want the daemon's redacted unmount failure", err)
 	}
-	requireFailure(t, ctl, phaseUnmount, "busy")
+	// A failed unmount leaves the repo mounted.
+	if st := requireFailure(t, ctl, phaseUnmount, "busy"); st.State != repoStateMounted {
+		t.Fatalf("status = %+v, want state %s", st, repoStateMounted)
+	}
 }
 
 // A stop whose drain timed out has unmounted the repo, so status reports the

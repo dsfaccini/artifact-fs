@@ -737,10 +737,7 @@ func (s *Service) stopRuntime(ctx context.Context, rt *repoRuntime) error {
 	if rt.gate != nil {
 		rt.gate.MarkFailed(context.Canceled)
 	}
-	drainCtx, cancel := context.WithTimeout(context.Background(), drainTimeout)
-	if s.drainContext != nil {
-		drainCtx, cancel = s.drainContext()
-	}
+	drainCtx, cancel := s.withDrainTimeout()
 	defer cancel()
 	select {
 	case <-drained:
@@ -761,4 +758,11 @@ func (s *Service) stopRuntime(ctx context.Context, rt *repoRuntime) error {
 	}
 	s.git.CloseBatchPool(cfg.GitDir)
 	return nil
+}
+
+func (s *Service) withDrainTimeout() (context.Context, context.CancelFunc) {
+	if s.drainContext != nil {
+		return s.drainContext()
+	}
+	return context.WithTimeout(context.Background(), drainTimeout)
 }

@@ -190,6 +190,10 @@ it unmounts the repo, retrying a busy mount for up to 20 seconds, then waits up
 to 30 seconds for the repo's FUSE server and workers. A stop whose unmount has
 not returned after 21 seconds keeps waiting, and `status` shows `unmount has
 not returned after 21s` as `last_error`, with `last_error_phase` `unmount`.
+A stop whose wait for the FUSE server and workers times out has unmounted the
+repo: `unmount` or `remount` exits non-zero, `status` shows `unmounted` with
+`timed out draining unmounted repo` as `last_error` and `last_error_phase`
+`unmount`, and the daemon retries the stop at its next sync.
 Before a mount, the daemon waits at most 21 seconds for an unmount it starts,
 and does not wait for the one it starts after a FUSE connection fails. An
 unmount that hangs, as one can on a dead FSKit volume, holds up the daemon's
