@@ -624,6 +624,44 @@ func testE2EOpenFileReadsWhileHEADKeepsPathAway(t *testing.T, repo *mountedE2ERe
 	}
 }
 
+// POSIX applies ftruncate and fchmod through a descriptor to its open file.
+// After an unlink through the mount, both change the open file's own copy,
+// and fstat and a read through the descriptor show the change, also once the
+// kernel's attributes expire and fstat fetches them again.
+func testE2EOpenFileChangesAfterUnlink(t *testing.T, repo *mountedE2ERepo) {
+	path := filepath.Join(repo.mountPath, "README.md")
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	data, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := string(data[:len(data)/2])
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(int64(len(want))); err != nil {
+		t.Fatalf("ftruncate of the open file after unlinking it: %v", err)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		t.Fatalf("fchmod of the open file after unlinking it: %v", err)
+	}
+	time.Sleep(kernelCacheExpiry)
+	st, err := f.Stat()
+	if err != nil {
+		t.Fatalf("fstat of the open file after ftruncate and fchmod: %v", err)
+	}
+	if st.Size() != int64(len(want)) || st.Mode().Perm() != 0o600 {
+		t.Fatalf("fstat of the open file after ftruncate and fchmod = size %d, mode %v; want size %d, mode 0600", st.Size(), st.Mode().Perm(), len(want))
+	}
+	if got, err := readAtE2E(f, len(data)); err != nil || got != want {
+		t.Fatalf("read through the open file after ftruncate = %q, %v; want %q", got, err, want)
+	}
+}
+
 // openAndReadE2E opens path, reads all of it, and keeps the file open until
 // the test ends.
 func openAndReadE2E(t *testing.T, path string) (*os.File, string) {
