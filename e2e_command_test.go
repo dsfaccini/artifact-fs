@@ -13,10 +13,10 @@ import (
 
 // commandIn returns a command that runs name in dir, changing to dir after
 // exec. Never set exec.Cmd.Dir in this package. On Linux the child changes to
-// Cmd.Dir before exec, while it shares this process's memory and the thread
-// that started it cannot stop. When Cmd.Dir is on a mount this process serves,
-// a stop-the-world in that window waits forever on that thread, and the
-// stopped FUSE server never answers the child.
+// Cmd.Dir before exec, while the thread that started it waits, holding its P,
+// unable to stop. When Cmd.Dir is on a mount this process serves, the child
+// waits for the FUSE server. The server never runs again once a GC waits for
+// that thread to stop, or once forking threads hold every P.
 func commandIn(dir, name string, args ...string) *exec.Cmd {
 	if dir == "" {
 		return exec.Command(name, args...)
