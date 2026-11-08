@@ -964,7 +964,7 @@ func assertGitStatus(t *testing.T, dir string, want map[string]string) {
 				hookEvents = append(hookEvents, line)
 			}
 		}
-		t.Fatalf("git status got no answer, or only a full rescan, from the fsmonitor hook; its fsm_hook trace2 events: %v", hookEvents)
+		t.Fatalf("git status got no answer, or only a full rescan, from the fsmonitor hook; its fsm_hook trace2 events: %v\nstderr: %s", hookEvents, stderr.String())
 	}
 }
 

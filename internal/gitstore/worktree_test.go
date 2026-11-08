@@ -47,6 +47,52 @@ func TestConfigureStatusOptimizationDoesNotWriteIndex(t *testing.T) {
 	}
 }
 
+// A daemon configures the hook again while Git may run it. The new hook
+// replaces the file by rename, so the file a Git opened stays whole.
+func TestReconfiguringTheFSMonitorHookLeavesTheOpenHookWhole(t *testing.T) {
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, "git", "init", repo)
+	gitDir := filepath.Join(repo, ".git")
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", GitDir: gitDir, MountPath: repo}}
+	store := New(nil)
+	if err := store.ConfigureFSMonitorHook(t.Context(), cfg, tmp); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := runGit(context.Background(), gitDir, "config", "--unset", "core.fsmonitor"); err != nil {
+			t.Errorf("disable test fsmonitor hook: %v", err)
+		}
+	})
+	hookPath := fsmonitorHookPath(gitDir)
+	opened, err := os.Open(hookPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	before, err := opened.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.ConfigureFSMonitorHook(t.Context(), cfg, tmp); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(hookPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, after) {
+		t.Fatal("reconfiguring rewrote the hook file in place, which a Git running it holds")
+	}
+	if after.Mode().Perm() != 0o755 {
+		t.Fatalf("hook mode = %v, want 0755", after.Mode().Perm())
+	}
+	if entries, err := filepath.Glob(filepath.Join(filepath.Dir(hookPath), ".*")); err != nil || len(entries) != 0 {
+		t.Fatalf("temporary hook files left = %v, %v", entries, err)
+	}
+}
+
 func TestFSMonitorHookScriptQuotesArgs(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()

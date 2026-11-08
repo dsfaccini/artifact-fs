@@ -264,8 +264,7 @@ func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfi
 	if err := os.MkdirAll(filepath.Dir(hookPath), 0o755); err != nil {
 		return err
 	}
-	script := fsmonitorHookScript(stateRoot, exe, repo.Name)
-	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+	if err := replaceExecutable(hookPath, fsmonitorHookScript(stateRoot, exe, repo.Name)); err != nil {
 		return err
 	}
 	if _, err := runGit(ctx, repo.GitDir, append(configArgs, "core.fsmonitor", hookPath)...); err != nil {
@@ -277,6 +276,32 @@ func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfi
 	// Git adds the fsmonitor extension on the next porcelain index read. The
 	// daemon must not write the shared index behind a concurrent Git process.
 	return nil
+}
+
+// replaceExecutable writes script to a new file beside path, then renames it
+// over path. Linux refuses to exec a file that is open for writing, so
+// rewriting the hook in place would fail a Git that runs it meanwhile, and Git
+// would then rescan the worktree.
+func replaceExecutable(path, script string) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	_, err = f.WriteString(script)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Chmod(tmp, 0o755)
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+	}
+	return err
 }
 
 func fsmonitorHookPath(gitDir string) string {
