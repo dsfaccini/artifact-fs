@@ -495,17 +495,30 @@ func testE2EKernelCacheFollowsHEADMoveOutsideTheMount(t *testing.T, repo *mounte
 	if _, err := gitOutput("", "--git-dir", gitDir, "update-ref", "refs/heads/main", next, head); err != nil {
 		t.Fatal(err)
 	}
-	// Stat both names until the daemon serves next, so the kernel holds a
-	// fresh entry for each when the switch happens.
-	waitForCondition(t, 30*time.Second, "the daemon to serve "+next, func() (bool, string) {
+	// Stat both names until the daemon serves next, with no pause, so the
+	// kernel holds a fresh entry for each when the switch happens.
+	for deadline := time.Now().Add(30 * time.Second); ; {
 		_, _ = os.Stat(readmePath)
 		_, _ = os.Stat(addedPath)
 		st, err := repo.ctl.Status(context.Background(), repoName)
-		if err != nil {
-			return false, err.Error()
+		if err == nil && st.CurrentHEADOID == next {
+			break
 		}
-		return st.CurrentHEADOID == next, "HEAD " + st.CurrentHEADOID
-	})
+		if time.Now().After(deadline) {
+			t.Fatalf("the daemon did not serve %s within 30s: HEAD %s, %v", next, st.CurrentHEADOID, err)
+		}
+	}
+	// Check both names before failing, so a run without the invalidation
+	// shows each cache that went stale.
+	if _, err := os.Stat(addedPath); err != nil {
+		t.Errorf("stat ADDED.md once the daemon serves %s: %v", next, err)
+	}
+	if st, err := os.Stat(readmePath); err != nil || st.Size() != int64(len(readme)) {
+		t.Errorf("stat README.md once the daemon serves %s = %v, %v; want size %d", next, st, err, len(readme))
+	}
+	if t.Failed() {
+		return
+	}
 	assertFileContent(t, readmePath, readme)
 	assertFileContent(t, addedPath, added)
 }
