@@ -498,9 +498,15 @@ func (e *Engine) Flush(ctx context.Context, path string) error {
 	return e.Overlay.FlushFile(ctx, path)
 }
 
+// Sync makes path's overlay file and its recorded size and times durable. A
+// path the overlay does not hold serves base content, which never changes, so
+// it has nothing to sync.
 func (e *Engine) Sync(ctx context.Context, path string) error {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
+	if _, ok, err := e.Overlay.Lookup(ctx, path); err != nil || !ok {
+		return err
+	}
 	return e.Overlay.SyncFile(ctx, path)
 }
 

@@ -124,11 +124,12 @@ type ArtifactFuse struct {
 	// detached. Such a write recreates its path, so the switch pass leaves
 	// mapped the path of an inode written since the pass read the table.
 	writeSeq uint64
-	// cacheCloses counts the calls that close the files handles cached:
-	// closeCachedFilesForPath and closeReconciledFiles. Each bumps it while it
-	// collects the handles, holding fs.mu. An open reads it before it opens
-	// its file, and addFileHandle registers the handle without that file
-	// when a close ran since, because the close could not see the handle.
+	// cacheCloses counts the calls that close other handles' cached files
+	// while ops hold handleOps shared: closeCachedFilesForPath and
+	// closeReconciledFiles. Each bumps it while it collects the handles,
+	// holding fs.mu. An open reads it before it opens its file, and opens
+	// again when a close ran since, because the close could not see the
+	// handle. See addFileHandle.
 	cacheCloses atomic.Uint64
 
 	// notifier is nil when nothing should reach the kernel. fs.mu guards it:
@@ -1824,54 +1825,71 @@ func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, ch
 			return err
 		}
 		fh := &FileHandle{inode: ref, path: ref.Path, writable: !op.OpenFlags.IsReadOnly()}
-		closes := fs.cacheCloses.Load()
-		if ref.Path != ".git" {
-			var access uint32
-			if checkPermissions && !created {
-				access = ownerRead | ownerWrite
-				if op.OpenFlags.IsReadOnly() {
-					access = ownerRead
-				} else if op.OpenFlags.IsWriteOnly() {
-					access = ownerWrite
-				}
-				if op.OpenFlags&syscall.O_TRUNC != 0 {
-					access |= ownerWrite
-				}
+		var access uint32
+		if checkPermissions && !created && ref.Path != ".git" {
+			access = ownerRead | ownerWrite
+			if op.OpenFlags.IsReadOnly() {
+				access = ownerRead
+			} else if op.OpenFlags.IsWriteOnly() {
+				access = ownerWrite
 			}
-			// An open for writing only reads nothing, so it prefetches nothing.
-			f, gen, blob, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen, !op.OpenFlags.IsWriteOnly(), access)
+			if op.OpenFlags&syscall.O_TRUNC != 0 {
+				access |= ownerWrite
+			}
+		}
+		for attempt := 1; ; attempt++ {
+			closes := fs.cacheCloses.Load()
+			if ref.Path != ".git" {
+				// An open for writing only reads nothing, so it prefetches nothing.
+				f, gen, blob, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen, !op.OpenFlags.IsWriteOnly(), access)
+				if err != nil {
+					return err
+				}
+				fh.cacheFile, fh.cacheGeneration = f, gen
+				op.KeepPageCache = fs.openedBlob(op.Inode, blob)
+			}
+			if fs.testHookBeforeAddFileHandle != nil {
+				fs.testHookBeforeAddFileHandle()
+			}
+			// A create may have retired the inode during the open, after its
+			// retirement detached the handles already open.
+			handle, dropped, err := fs.addFileHandle(op.Inode, fh, closes, attempt == openAttempts)
+			if dropped != nil {
+				_ = dropped.Close()
+			}
+			if errors.Is(err, errCloseOverlapped) {
+				continue
+			}
 			if err != nil {
+				if fh.cacheFile != nil {
+					_ = fh.cacheFile.Close()
+				}
 				return err
 			}
-			fh.cacheFile, fh.cacheGeneration = f, gen
-			op.KeepPageCache = fs.openedBlob(op.Inode, blob)
+			op.Handle = handle
+			return nil
 		}
-		if fs.testHookBeforeAddFileHandle != nil {
-			fs.testHookBeforeAddFileHandle()
-		}
-		// A create may have retired the inode during the open, after its
-		// retirement detached the handles already open.
-		handle, dropped, err := fs.addFileHandle(op.Inode, fh, closes)
-		if dropped != nil {
-			_ = dropped.Close()
-		}
-		if err != nil {
-			if fh.cacheFile != nil {
-				_ = fh.cacheFile.Close()
-			}
-			return err
-		}
-		op.Handle = handle
-		return nil
 	})
 }
 
+// openAttempts bounds the opens of one open op that closes of the files
+// handles cached overlap. A handle whose last open a close overlapped
+// registers without its file.
+const openAttempts = 3
+
+// errCloseOverlapped makes an open open its file again: a close of the files
+// handles cached ran since it began, and could not see its handle.
+var errCloseOverlapped = errors.New("a close of cached files overlapped the open")
+
 // addFileHandle registers fh, a new handle on id, unless id is retired.
 // closes is the count of cacheCloses the open read before it opened fh's
-// file. When a close ran since, addFileHandle registers fh without that file,
-// which may be one the close removed or no longer serves, and returns it for
-// the caller to close. The handle's next read then resolves the path afresh.
-func (fs *ArtifactFuse) addFileHandle(id fuseops.InodeID, fh *FileHandle, closes uint64) (fuseops.HandleID, *os.File, error) {
+// file. When a close ran since, the file may be one the close removed or no
+// longer serves. addFileHandle then returns the file for the caller to close,
+// and errCloseOverlapped unless last is set. With last, it registers fh
+// without the file, and the handle's next read resolves the path afresh. A
+// handle that keeps a descriptor of its blob still reads it after a prune of
+// its generation.
+func (fs *ArtifactFuse) addFileHandle(id fuseops.InodeID, fh *FileHandle, closes uint64, last bool) (fuseops.HandleID, *os.File, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	if ref := fs.inodes[id]; ref != nil && ref.Stale {
@@ -1880,6 +1898,9 @@ func (fs *ArtifactFuse) addFileHandle(id fuseops.InodeID, fh *FileHandle, closes
 	var dropped *os.File
 	if fh.cacheFile != nil && fs.cacheCloses.Load() != closes {
 		dropped, fh.cacheFile, fh.cacheGeneration = fh.cacheFile, nil, 0
+		if !last {
+			return 0, dropped, errCloseOverlapped
+		}
 	}
 	handle := fs.nextHandleID
 	fs.nextHandleID++
