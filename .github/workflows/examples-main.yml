@@ -1,0 +1,12 @@
+name: Examples on main
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  examples:
+    uses: ./.github/workflows/examples.yml

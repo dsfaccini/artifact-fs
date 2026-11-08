@@ -3,9 +3,9 @@
 #
 #   git config core.hooksPath .githooks
 #
-# Always runs gofmt on the staged Go files, go vet on their packages, and a
-# build of the CLI. Then runs unit tests for those packages unless the machine
-# is under load; CI runs every test on push.
+# Always runs gofmt on the staged Go files, go vet and modernize on their
+# packages, and a build of the CLI. Then runs unit tests for those packages
+# unless the machine is under load; CI runs every test on push.
 #
 #   AFS_PRECOMMIT_TESTS         auto (default), always, or never.
 #   AFS_PRECOMMIT_LOAD_PER_CPU  1-minute load average per CPU at which auto
@@ -72,6 +72,12 @@ if [ -n "$module_files" ]; then
 fi
 if [ -n "$vet_targets" ]; then
 	go vet $vet_targets
+	# Keep the version in step with the modernize check in build-test.yml.
+	modernize=golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@v0.52.0
+	if ! go run "$modernize" $vet_targets; then
+		echo "pre-commit: apply these fixes with: go run $modernize -fix" $vet_targets >&2
+		exit 1
+	fi
 fi
 go build -o /dev/null ./cmd/artifact-fs
 

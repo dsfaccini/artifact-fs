@@ -674,9 +674,9 @@ Contributions are welcome, but not all contributions will be accepted. As guidan
 
 AI/LLM submissions are welcome, but overall issue/PR quality is ultimately the responsibility of the submitter, and the codebase is the responsibility (and long term maintenance burden) of the maintainers.
 
-See [AGENTS.md](AGENTS.md) for build commands, architecture details, and conventions. Before submitting changes, run `go vet ./...` with `GOOS=linux` and with `GOOS=darwin`, then `go test -race ./...`.
+See [AGENTS.md](AGENTS.md) for build commands, architecture details, and conventions. Before submitting changes, run the CI checks in the order that AGENTS.md lists them under "Validation".
 
-Enable the pre-commit checks with `git config core.hooksPath .githooks`. For staged Go changes they run `gofmt`, `go vet`, a CLI build, and the changed packages' unit tests. The hook skips the tests when the machine is under load; set `AFS_PRECOMMIT_TESTS` to `always` or `never` to override, or tune `AFS_PRECOMMIT_LOAD_PER_CPU` (default `1`).
+Enable the pre-commit checks with `git config core.hooksPath .githooks`. For staged Go changes they run `gofmt`, `go vet`, `modernize`, a CLI build, and the changed packages' unit tests. The hook skips the tests when the machine is under load; set `AFS_PRECOMMIT_TESTS` to `always` or `never` to override, or tune `AFS_PRECOMMIT_LOAD_PER_CPU` (default `1`).
 
 ## Credits
 

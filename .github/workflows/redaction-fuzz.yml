@@ -1,0 +1,41 @@
+name: Redaction fuzz
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  push:
+    # A release has a version tag, such as 1.0.0-rc.10 or v1.2.3.
+    tags: ["[0-9]*", "v[0-9]*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          # This job shares build-test's cache key. Saving that key first would
+          # leave build-test a cache without its build output.
+          cache: false
+
+      - name: Fuzz redaction
+        run: |
+          status=0
+          go test -run '^$' -fuzz '^FuzzRedactionHidesPassword$' -fuzztime 10m ./internal/auth \
+            >"$RUNNER_TEMP/fuzz.log" 2>&1 || status=$?
+          # A failure message shows the input that leaked, and this log is
+          # public. Print only the fuzzer's progress and the verdict.
+          grep -E '^(fuzz: |--- FAIL|FAIL|ok |PASS$)' "$RUNNER_TEMP/fuzz.log" || true
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Redaction fuzzing failed. Its input stays out of this public log: rerun go test -fuzz '^FuzzRedactionHidesPassword$' ./internal/auth locally."
+          fi
+          exit "$status"
