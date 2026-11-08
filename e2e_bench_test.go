@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,8 +17,6 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
-	"github.com/cloudflare/artifact-fs/internal/hydrator"
-	"github.com/cloudflare/artifact-fs/internal/logging"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -147,9 +144,9 @@ func TestE2EBenchmarkRepos(t *testing.T) {
 func runE2EBenchmarkOnce(t *testing.T, repo e2eBenchRepoSpec, iteration int, hydratorWorkers int, callerWorkers int) e2eBenchRun {
 	t.Helper()
 
+	skipIfOverMountBudget(t, 1)
 	root := t.TempDir()
-	mountDir := t.TempDir()
-	repoName := fmt.Sprintf("bench-%s-%02d", repo.name, iteration)
+	mountDir := newE2EMountDir(t)
 	mountPath := filepath.Join(mountDir, repoName)
 	if err := os.MkdirAll(mountPath, 0o755); err != nil {
 		t.Fatal(err)
@@ -158,7 +155,7 @@ func runE2EBenchmarkOnce(t *testing.T, repo e2eBenchRepoSpec, iteration int, hyd
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	logger := logging.NewJSONLogger(os.Stderr, slog.LevelWarn)
+	logger := newTestE2ELogger(t)
 	git := gitstore.New(logger)
 	defer git.Close()
 	git.SetBatchPoolSize(hydratorWorkers)
@@ -207,11 +204,11 @@ func runE2EBenchmarkOnce(t *testing.T, repo e2eBenchRepoSpec, iteration int, hyd
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer svc.Close()
 	svc.SetHydrationConcurrency(hydratorWorkers)
 	ctl := newE2EController(t, root)
 
 	if err := ctl.AddRepo(ctx, cfg); err != nil {
+		_ = svc.Close()
 		t.Fatalf("add-repo: %v", err)
 	}
 
@@ -219,21 +216,15 @@ func runE2EBenchmarkOnce(t *testing.T, repo e2eBenchRepoSpec, iteration int, hyd
 
 	if err := waitForMount(ctl, mountPath, 60*time.Second); err != nil {
 		cancel()
+		_ = svc.Close()
 		t.Fatal(err)
 	}
+	defer stopE2EDaemon(t, svc, cancel, errCh, mountPath)
 	primeE2EMountPolling(t, mountPath)
 
-	hydrateDur, hydratedBytes, err := hydrateColdObjects(ctx, git, cfg.RepoPaths, targets, hydratorWorkers, callerWorkers)
+	hydrateDur, hydratedBytes, err := readColdFilesThroughMount(mountPath, targets, callerWorkers)
 	if err != nil {
-		cancel()
-		t.Fatalf("hydrateColdObjects: %v", err)
-	}
-
-	cancel()
-	select {
-	case <-errCh:
-	case <-time.After(10 * time.Second):
-		t.Log("daemon did not exit within 10s")
+		t.Fatalf("read cold files through the mount: %v", err)
 	}
 
 	result := e2eBenchRun{
@@ -302,14 +293,13 @@ func countUnknownSizes(nodes []model.BaseNode) int {
 	return count
 }
 
-func hydrateColdObjects(ctx context.Context, git *gitstore.Store, cfg model.RepoPaths, targets []model.BaseNode, hydratorWorkers int, callerWorkers int) (time.Duration, int64, error) {
+// readColdFilesThroughMount reads each target through the mount with
+// callerWorkers readers, so each read hydrates its blob through the daemon. It
+// returns how long the reads took and how many bytes they returned.
+func readColdFilesThroughMount(mountPath string, targets []model.BaseNode, callerWorkers int) (time.Duration, int64, error) {
 	if len(targets) == 0 {
 		return 0, 0, nil
 	}
-
-	h := hydrator.New(git)
-	h.Start(hydratorWorkers, cfg)
-	defer h.Stop()
 
 	jobs := make(chan model.BaseNode)
 	errCh := make(chan error, 1)
@@ -320,27 +310,17 @@ func hydrateColdObjects(ctx context.Context, git *gitstore.Store, cfg model.Repo
 	worker := func() {
 		defer wg.Done()
 		for n := range jobs {
-			select {
-			case <-ctx.Done():
-				select {
-				case errCh <- ctx.Err():
-				default:
-				}
-				return
-			default:
-			}
-
-			_, size, err := h.EnsureHydrated(ctx, cfg, n)
+			data, err := os.ReadFile(filepath.Join(mountPath, n.Path))
 			if err != nil {
 				select {
-				case errCh <- fmt.Errorf("hydrate %s: %w", n.Path, err):
+				case errCh <- fmt.Errorf("read %s: %w", n.Path, err):
 				default:
 				}
 				return
 			}
 
 			mu.Lock()
-			totalBytes += size
+			totalBytes += int64(len(data))
 			mu.Unlock()
 		}
 	}
