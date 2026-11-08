@@ -1511,13 +1511,6 @@ func overlayEntryMatchesBase(e model.OverlayEntry, base model.BaseNode) (bool, e
 	return model.FileMatchesBlobOID(e.BackingPath, base.ObjectOID)
 }
 
-func (s *Store) DirtyCount(ctx context.Context) (int64, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM overlay_entries WHERE kind <> ?`, model.OverlayKindDelete)
-	var c int64
-	err := row.Scan(&c)
-	return c, err
-}
-
 // suspendChangeLog drops the triggers for the rest of tx, so a bulk operation
 // pays no per-row trigger cost. SQLite runs a trigger's program for each row
 // even when a WHEN clause skips its body. Other connections keep seeing the
