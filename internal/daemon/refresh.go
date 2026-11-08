@@ -60,8 +60,7 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 				s.mu.Lock()
 				rt.fetch.state = fetchFailed
 				s.mu.Unlock()
-				ticker.Reset(s.retryFailure(cfg, retry, err))
-				s.recordRuntimeState(rt)
+				ticker.Reset(s.retryFailure(cfg, retry, err, s.runtimeState(rt)))
 				continue
 			}
 			state, abErr := s.fetchState(ctx, cfg)

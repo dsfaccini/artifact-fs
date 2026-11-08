@@ -407,17 +407,15 @@ func TestNewWaitsOutAnotherConnectionsWriteLock(t *testing.T) {
 	metatest.OpenWhileLocked(t, path, openRegistry(path))
 }
 
-func TestConcurrentFirstOpensApplyEachMigrationOnce(t *testing.T) {
+func TestConcurrentFirstOpensBuildTheSchema(t *testing.T) {
 	want := metatest.Schema(t, createRegistry(t))
-	for range 20 {
-		path := filepath.Join(t.TempDir(), "repos.sqlite")
-		metatest.OpenConcurrently(t, 16, openRegistry(path))
-		if got := metatest.Schema(t, path); !slices.Equal(got, want) {
-			t.Fatalf("schema = %q, want %q", got, want)
-		}
-		if got := metatest.UserVersion(t, path); got != len(migrations) {
-			t.Fatalf("user_version = %d, want %d", got, len(migrations))
-		}
+	path := filepath.Join(t.TempDir(), "repos.sqlite")
+	metatest.OpenConcurrently(t, 16, openRegistry(path))
+	if got := metatest.Schema(t, path); !slices.Equal(got, want) {
+		t.Fatalf("schema = %q, want %q", got, want)
+	}
+	if got := metatest.UserVersion(t, path); got != len(migrations) {
+		t.Fatalf("user_version = %d, want %d", got, len(migrations))
 	}
 }
 

@@ -297,8 +297,36 @@ func TestUnlinkKeepsOpenHandleContent(t *testing.T) {
 	if got := f.read(t, inode, handle); got != "FILE one" {
 		t.Fatalf("read after write = %q, want FILE one", got)
 	}
+	if err := f.fs.SyncFile(context.Background(), &fuseops.SyncFileOp{Inode: inode, Handle: handle}); err != nil {
+		t.Fatalf("SyncFile after unlink: %v", err)
+	}
 	if _, err := f.resolver.ResolvePath("file.txt"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("resolve after unlink = %v, want not exist", err)
+	}
+	if err := f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: handle}); err != nil {
+		t.Fatalf("ReleaseFileHandle after unlink: %v", err)
+	}
+}
+
+// Truncating a base file copies it into the overlay first, so the file keeps
+// the prefix of its base content.
+func TestTruncateOfBaseFileKeepsItsPrefix(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "file one", 0o100644))
+	inode := f.lookup(fuseops.RootInodeID, "file.txt")
+	size := uint64(4)
+	setattr := &fuseops.SetInodeAttributesOp{Inode: inode, Size: &size}
+	if err := f.fs.SetInodeAttributes(f.ctx, setattr); err != nil {
+		t.Fatalf("SetInodeAttributes: %v", err)
+	}
+	getattr := &fuseops.GetInodeAttributesOp{Inode: inode}
+	if err := f.fs.GetInodeAttributes(f.ctx, getattr); err != nil {
+		t.Fatal(err)
+	}
+	if setattr.Attributes.Size != size || getattr.Attributes.Size != size {
+		t.Fatalf("size after a truncate to %d = %d, then %d", size, setattr.Attributes.Size, getattr.Attributes.Size)
+	}
+	if got := readWholeFile(t, f.fs, inode); got != "file" {
+		t.Fatalf("content after a truncate to %d = %q, want file", size, got)
 	}
 }
 
@@ -538,10 +566,37 @@ func TestCanceledHydrationReturnsEINTR(t *testing.T) {
 				return f.fs.Unlink(ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"})
 			}
 		}},
+		{"OpenFile", func(t *testing.T, f trackedFixture) func(context.Context) error {
+			inode := f.lookup(t, fuseops.RootInodeID, "file.txt")
+			return func(ctx context.Context) error {
+				return f.fs.OpenFile(ctx, &fuseops.OpenFileOp{Inode: inode})
+			}
+		}},
+		{"Rename", func(t *testing.T, f trackedFixture) func(context.Context) error {
+			f.lookup(t, fuseops.RootInodeID, "file.txt")
+			return func(ctx context.Context) error {
+				return f.fs.Rename(ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "file.txt", NewParent: fuseops.RootInodeID, NewName: "renamed.txt"})
+			}
+		}},
+		// A handle open on the destination makes Rename copy it first.
+		{"Rename over a destination with an open handle", func(t *testing.T, f trackedFixture) func(context.Context) error {
+			f.open(t, f.lookup(t, fuseops.RootInodeID, "file.txt"))
+			return func(ctx context.Context) error {
+				return f.fs.Rename(ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "other.txt", NewParent: fuseops.RootInodeID, NewName: "file.txt"})
+			}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newTrackedFixture(t)
 			op := tc.prepare(t, f)
+			file := f.lookup(t, fuseops.RootInodeID, "file.txt")
+			overlay, err := f.store.ListAll(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A handle leaked by an interrupted open reaches no op, so only
+			// fileHandles shows it.
+			handles := len(f.fs.fileHandles)
 			started, _ := f.hydrator.arm()
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan error, 1)
@@ -557,6 +612,19 @@ func TestCanceledHydrationReturnsEINTR(t *testing.T) {
 			}
 			if n, err := f.resolver.ResolvePath("file.txt"); err != nil || n.FromOverlay {
 				t.Fatalf("file.txt after interrupted op = (%+v, %v), want base entry", n, err)
+			}
+			if after, err := f.store.ListAll(context.Background()); err != nil || !slices.Equal(after, overlay) {
+				t.Fatalf("overlay after interrupted op = %+v, %v; want %+v", after, err, overlay)
+			}
+			if got := f.lookup(t, fuseops.RootInodeID, "file.txt"); got != file {
+				t.Fatalf("file.txt after interrupted op = inode %d, want %d", got, file)
+			}
+			missing := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "renamed.txt"}
+			if err := f.fs.LookUpInode(context.Background(), missing); !lookupMissed(err, missing) {
+				t.Fatalf("renamed.txt after interrupted op = inode %d, %v; want missing", missing.Entry.Child, err)
+			}
+			if got := len(f.fs.fileHandles); got != handles {
+				t.Fatalf("interrupted op changed the open handles from %d to %d", handles, got)
 			}
 		})
 	}

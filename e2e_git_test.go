@@ -10,7 +10,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -272,8 +271,7 @@ func testE2EGitConcurrentReads(t *testing.T, repo *mountedE2ERepo) {
 					return
 				}
 				for _, args := range [][]string{{"rev-parse", "--is-shallow-repository"}, {"for-each-ref", "--merged", "HEAD"}} {
-					cmd := exec.Command("git", gitArgsWithSafeDirectory(repo.mountPath, args...)...)
-					cmd.Dir = repo.mountPath
+					cmd := commandIn(repo.mountPath, "git", gitArgsWithSafeDirectory(repo.mountPath, args...)...)
 					if out, err := cmd.CombinedOutput(); err != nil {
 						errs <- fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, out)
 						return
@@ -935,8 +933,7 @@ func testE2EGitPush(t *testing.T, repo *mountedE2ERepo) {
 func assertGitStatus(t *testing.T, dir string, want map[string]string) {
 	t.Helper()
 	trace := filepath.Join(t.TempDir(), "trace2.json")
-	cmd := exec.Command("git", gitArgsWithSafeDirectory(dir, "status", "--short", "--untracked-files=all")...)
-	cmd.Dir = dir
+	cmd := commandIn(dir, "git", gitArgsWithSafeDirectory(dir, "status", "--short", "--untracked-files=all")...)
 	cmd.Env = append(os.Environ(), "GIT_TRACE2_EVENT="+trace)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -991,8 +988,7 @@ func gitCmdQuiet(t *testing.T, dir string, args ...string) {
 }
 
 func gitCmdResult(dir string, args ...string) (string, string, error) {
-	cmd := exec.Command("git", gitArgsWithSafeDirectory(dir, args...)...)
-	cmd.Dir = dir
+	cmd := commandIn(dir, "git", gitArgsWithSafeDirectory(dir, args...)...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

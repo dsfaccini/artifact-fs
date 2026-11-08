@@ -35,12 +35,13 @@ func (r *retrier) succeed() { r.delay, r.next = 0, time.Time{} }
 // due reports whether the step may run at now.
 func (r *retrier) due(now time.Time) bool { return !now.Before(r.next) }
 
-// retryFailure records err, redacted, as a failure of r's phase for cfg and
-// returns how long until r runs the step again.
-func (s *Service) retryFailure(cfg model.RepoConfig, r *retrier, err error) time.Duration {
+// retryFailure records err, redacted, as a failure of r's phase for cfg, with
+// updates in the same write, and returns how long until r runs the step
+// again.
+func (s *Service) retryFailure(cfg model.RepoConfig, r *retrier, err error, updates ...func(*model.RepoRuntimeRecord)) time.Duration {
 	now := time.Now()
 	next := r.fail(now)
-	s.recordFailure(cfg, r.phase, err, next)
+	s.recordFailure(cfg, r.phase, err, next, updates...)
 	return next.Sub(now)
 }
 

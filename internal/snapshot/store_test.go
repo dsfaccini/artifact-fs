@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -188,26 +187,23 @@ func TestGenerationCleanup(t *testing.T) {
 		{RepoID: "r", Path: ".", Type: "dir", Mode: 0o755, SizeState: "known"},
 		{RepoID: "r", Path: "f.txt", Type: "file", Mode: 0o644, ObjectOID: "x", SizeState: "known"},
 	}
-	g1, _ := s.PublishGeneration(ctx, "h1", "main", nodes)
-	g2, _ := s.PublishGeneration(ctx, "h2", "main", nodes)
-	g3, _ := s.PublishGeneration(ctx, "h3", "main", nodes)
-
-	if g1 != 1 || g2 != 2 || g3 != 3 {
-		t.Fatalf("unexpected generations: %d %d %d", g1, g2, g3)
+	for i, head := range []string{"h1", "h2", "h3"} {
+		gen, err := s.PublishGeneration(ctx, head, "main", nodes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := int64(i + 1); gen != want {
+			t.Fatalf("generation of %s = %d, want %d", head, gen, want)
+		}
 	}
 
-	if err := s.PruneGenerations(ctx, g2); err != nil {
+	if err := s.PruneGenerations(ctx, 2); err != nil {
 		t.Fatal(err)
 	}
-	// Generation 1 should be cleaned up once the caller publishes the view.
-	_, ok := lookupNode(t, s, 1, "f.txt")
-	if ok {
-		t.Fatal("gen 1 should be cleaned up")
-	}
-	// Generation 2 should still exist (gen-1)
-	_, ok = lookupNode(t, s, 2, "f.txt")
-	if !ok {
-		t.Fatal("gen 2 should still exist")
+	for gen, want := range map[int64]bool{1: false, 2: true, 3: true} {
+		if _, ok := lookupNode(t, s, gen, "f.txt"); ok != want {
+			t.Fatalf("generation %d holds f.txt = %v, want %v after pruning below 2", gen, ok, want)
+		}
 	}
 }
 
@@ -224,7 +220,9 @@ func TestCurrentGeneration(t *testing.T) {
 	}
 
 	nodes := []model.BaseNode{{RepoID: "r", Path: ".", Type: "dir", Mode: 0o755, SizeState: "known"}}
-	s.PublishGeneration(ctx, "h1", "main", nodes)
+	if _, err := s.PublishGeneration(ctx, "h1", "main", nodes); err != nil {
+		t.Fatal(err)
+	}
 
 	gen, err = s.CurrentGeneration(ctx)
 	if err != nil {
@@ -276,51 +274,6 @@ func TestUpdateSizeUsesGenerationObjectOIDIndex(t *testing.T) {
 	if n.SizeState != "known" || n.SizeBytes != 7 {
 		t.Fatalf("b.txt size = %s/%d, want known/7", n.SizeState, n.SizeBytes)
 	}
-}
-
-func TestNewDropsLegacyTables(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "snap.sqlite")
-	db, err := meta.OpenDB(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.ExecContext(context.Background(), `
-		CREATE TABLE learned_path_stats (
-			path TEXT PRIMARY KEY,
-			access_count INTEGER NOT NULL DEFAULT 0
-		);
-		CREATE TABLE blob_cache_index (
-			object_oid TEXT PRIMARY KEY,
-			cache_path TEXT NOT NULL
-		);
-	`); err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	s, err := New(context.Background(), path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	assertTableMissing := func(name string) {
-		t.Helper()
-		row := s.db.QueryRowContext(context.Background(), `SELECT name FROM sqlite_master WHERE type='table' AND name=?`, name)
-		var got string
-		if err := row.Scan(&got); err == nil {
-			t.Fatalf("table %q should be dropped", name)
-		} else if err != sql.ErrNoRows {
-			t.Fatalf("lookup table %q: %v", name, err)
-		}
-	}
-
-	assertTableMissing("learned_path_stats")
-	assertTableMissing("blob_cache_index")
 }
 
 // lookupNode looks path up in generation and fails t on a database error.

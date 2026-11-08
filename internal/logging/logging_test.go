@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -15,6 +16,10 @@ type credentialStringer string
 
 func (s credentialStringer) String() string { return string(s) }
 
+type credentialValuer string
+
+func (v credentialValuer) LogValue() slog.Value { return slog.StringValue(string(v)) }
+
 func TestNewJSONLoggerRedactsEveryStringBoundary(t *testing.T) {
 	secret := "https://credential-user:super-secret@example.com/org/repo.git"
 	want := auth.RedactString(secret)
@@ -24,6 +29,8 @@ func TestNewJSONLoggerRedactsEveryStringBoundary(t *testing.T) {
 		"string", secret,
 		"error", errors.New(secret),
 		"stringer", credentialStringer(secret),
+		"valuer", credentialValuer(secret),
+		slog.Group("group", "string", secret, slog.Group("nested", "error", errors.New(secret))),
 		"attempt", 2,
 	)
 
@@ -36,12 +43,46 @@ func TestNewJSONLoggerRedactsEveryStringBoundary(t *testing.T) {
 	if err := json.Unmarshal(output.Bytes(), &record); err != nil {
 		t.Fatalf("decode JSON log: %v\n%s", err, output.String())
 	}
-	for _, key := range []string{"msg", "string", "error", "stringer"} {
+	for _, key := range []string{"msg", "string", "error", "stringer", "valuer"} {
 		if got := record[key]; got != want {
 			t.Fatalf("%s = %v, want %q", key, got, want)
 		}
 	}
+	wantGroup := map[string]any{"string": want, "nested": map[string]any{"error": want}}
+	if got := record["group"]; !reflect.DeepEqual(got, wantGroup) {
+		t.Fatalf("group = %v, want %v", got, wantGroup)
+	}
 	if got := record["attempt"]; got != float64(2) {
 		t.Fatalf("attempt = %v, want 2", got)
+	}
+}
+
+type remoteName string
+
+// The logger does not look inside a value of a named string type without a
+// String method, a struct, a slice or a map. The JSON handler marshals one as it is, so a credential in it
+// reaches the log.
+func TestNewJSONLoggerLeavesOtherValuesAsTheyAre(t *testing.T) {
+	secret := "https://credential-user:super-secret@example.com/org/repo.git"
+	var output bytes.Buffer
+	NewJSONLogger(&output, slog.LevelInfo).Info("other values",
+		"named", remoteName(secret),
+		"slice", []string{secret},
+		"map", map[string]string{"remote": secret},
+		"struct", struct{ Remote string }{secret},
+	)
+	var record map[string]any
+	if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+		t.Fatalf("decode JSON log: %v\n%s", err, output.String())
+	}
+	for key, want := range map[string]any{
+		"named":  secret,
+		"slice":  []any{secret},
+		"map":    map[string]any{"remote": secret},
+		"struct": map[string]any{"Remote": secret},
+	} {
+		if got := record[key]; !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s = %v, want %v", key, got, want)
+		}
 	}
 }
