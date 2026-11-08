@@ -17,11 +17,32 @@ import (
 // unable to stop. When Cmd.Dir is on a mount this process serves, the child
 // waits for the FUSE server. The server never runs again once a GC waits for
 // that thread to stop, or once forking threads hold every P.
+//
+// The child reaches the mount before exec the same way in three more cases:
+//   - The program, or its #! or ELF interpreter, lies on the mount. Linux opens
+//     the program before it releases the forking thread. With a non-empty dir,
+//     commandIn execs /bin/sh, which starts the program after exec. With an
+//     empty dir, commandIn execs the program itself.
+//   - This process changed directory into the mount, with os.Chdir or
+//     t.Chdir, and the program path is relative.
+//   - A descriptor that the child's dup2 replaces, such as an ExtraFiles
+//     target, holds a file on the mount. Closing the child's copy sends a
+//     FUSE FLUSH. No test does this today.
+//
+// An error in resolving dir lands in the command's Err, so Start reports it:
+// callers run commandIn on goroutines where t.Fatal must not run.
 func commandIn(dir, name string, args ...string) *exec.Cmd {
 	if dir == "" {
 		return exec.Command(name, args...)
 	}
-	return exec.Command("/bin/sh", append([]string{"-c", `cd "$0" && exec "$@"`, dir, name}, args...)...)
+	// An absolute dir keeps cd from searching CDPATH, which also prints the
+	// directory to stdout.
+	abs, err := filepath.Abs(dir)
+	cmd := exec.Command("/bin/sh", append([]string{"-c", `cd -- "$0" && exec "$@"`, abs, name}, args...)...)
+	if err != nil {
+		cmd.Err = err
+	}
+	return cmd
 }
 
 func TestNoCommandSetsDir(t *testing.T) {

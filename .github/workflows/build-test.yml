@@ -89,6 +89,10 @@ jobs:
   fuse-e2e:
     name: fuse-e2e (${{ matrix.user }})
     runs-on: ubuntu-24.04
+    # The suite's watchdog ends a hung run about 22.5 min after the suite
+    # starts, which is 20 s to 66 s into the job, so about 23.6 min into the
+    # job at worst. Raise this timeout with a longer suite -test.timeout or a
+    # new step before the suite.
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -151,8 +155,7 @@ jobs:
             as_user=(sudo --preserve-env=AFS_RUN_E2E_TESTS)
           fi
           # A hang can stop the binary's -test.timeout panic from printing, so a
-          # watchdog dumps every goroutine a minute after that timeout. The job
-          # timeout must leave room for both.
+          # watchdog dumps every goroutine a minute after that timeout.
           "${as_user[@]}" .github/scripts/run-with-hang-dump.sh 180 "$RUNNER_TEMP/artifact-fs-e2e.test" \
             -test.count=1 \
             -test.run '^TestFUSEMountSmoke$' \

@@ -933,8 +933,7 @@ func testE2EGitPush(t *testing.T, repo *mountedE2ERepo) {
 func assertGitStatus(t *testing.T, dir string, want map[string]string) {
 	t.Helper()
 	trace := filepath.Join(t.TempDir(), "trace2.json")
-	cmd := exec.Command("git", gitArgsWithSafeDirectory(dir, "status", "--short", "--untracked-files=all")...)
-	cmd.Dir = dir
+	cmd := commandIn(dir, "git", gitArgsWithSafeDirectory(dir, "status", "--short", "--untracked-files=all")...)
 	cmd.Env = append(os.Environ(), "GIT_TRACE2_EVENT="+trace)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
