@@ -175,6 +175,11 @@ func TestAddRepoAsyncCLIFlagValidation(t *testing.T) {
 			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--ref", "refs/heads/main", "--branch", "main"},
 			want: "--ref and --branch cannot be used together",
 		},
+		{
+			name: "fetch_ref_conflicts_with_required_commit",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--ref", "refs/heads/main", "--require-commit", "0123456789012345678901234567890123456789", "--fetch-ref", "refs/heads/other"},
+			want: "--fetch-ref cannot be combined with --require-commit",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -279,6 +284,102 @@ func TestPrepareCLIReportsQueuedPrepare(t *testing.T) {
 	}
 	if got := stdout.String(); got != "preparing repo\n" {
 		t.Fatalf("stdout = %q, want preparing repo", got)
+	}
+}
+
+// An async repo that is ready and follows its ref has nothing to prepare, so
+// prepare queues nothing and must not claim to prepare.
+func TestPrepareCLIReportsNothingToPrepare(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ARTIFACT_FS_ROOT", root)
+	ctx := context.Background()
+	if _, stderr, code := runCLI(t, "add-repo", "--name", "repo", "--remote", "https://github.com/example/repo.git", "--async"); code != 0 {
+		t.Fatalf("add-repo exit = %d, stderr=%q", code, stderr)
+	}
+	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	cfg, err := reg.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.UpdatePrepareStateForRequest(ctx, cfg, model.PrepareStateReady, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, code := runCLI(t, "prepare", "--name", "repo")
+	if code != 0 {
+		t.Fatalf("prepare exit = %d, stderr=%q", code, stderr)
+	}
+	if want := "repo is ready; nothing to prepare\n"; stdout != want {
+		t.Fatalf("stdout = %q, want %q", stdout, want)
+	}
+	if got, err := reg.GetRepo(ctx, "repo"); err != nil || got.PrepareRequest != cfg.PrepareRequest || got.PrepareState != model.PrepareStateReady {
+		t.Fatalf("registry after prepare = request %q, state %q, %v; want it unchanged", got.PrepareRequest, got.PrepareState, err)
+	}
+}
+
+// add-repo registers and prepares a repo, and only the daemon mounts it.
+// --adopt-gitdir and --prepared-gitdir take no --remote, and --require-commit
+// takes no --fetch-ref.
+func TestAddRepoHelpDescribesRegistration(t *testing.T) {
+	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+	stdout, stderr, code := runCLI(t, "add-repo", "--help")
+	if code != 0 {
+		t.Fatalf("add-repo --help exit = %d, stderr=%q", code, stderr)
+	}
+	for _, want := range []string{
+		"register a repository and prepare it for the daemon to mount",
+		"remote URL; required unless --adopt-gitdir or --prepared-gitdir is set",
+		"ref to fetch and serve; defaults to --ref; cannot be combined with --require-commit",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("add-repo --help = %q, want %q", stdout, want)
+		}
+	}
+}
+
+// status prints every time in UTC, last_fetch included, whatever the local
+// time zone.
+func TestStatusCLIPrintsLastFetchInUTC(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ARTIFACT_FS_ROOT", root)
+	ctx := context.Background()
+	if _, stderr, code := runCLI(t, "add-repo", "--name", "repo", "--remote", "https://github.com/example/repo.git", "--async"); code != 0 {
+		t.Fatalf("add-repo exit = %d, stderr=%q", code, stderr)
+	}
+	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := reg.GetRepo(ctx, "repo")
+	if closeErr := reg.Close(); err != nil || closeErr != nil {
+		t.Fatalf("get repo: %v, close: %v", err, closeErr)
+	}
+	// A CLI fetch shows in status only through FETCH_HEAD's mtime.
+	fetchHead := filepath.Join(cfg.GitDir, "FETCH_HEAD")
+	if err := os.MkdirAll(cfg.GitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fetchHead, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fetched := time.Date(2026, time.March, 31, 12, 34, 56, 0, time.UTC)
+	if err := os.Chtimes(fetchHead, fetched, fetched); err != nil {
+		t.Fatal(err)
+	}
+	local := time.Local
+	time.Local = time.FixedZone("UTC+5", 5*60*60)
+	t.Cleanup(func() { time.Local = local })
+
+	stdout, stderr, code := runCLI(t, "status", "--name", "repo")
+	if code != 0 {
+		t.Fatalf("status exit = %d, stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stdout, " last_fetch=2026-03-31T12:34:56Z ") {
+		t.Fatalf("status = %q, want last_fetch in UTC", stdout)
 	}
 }
 

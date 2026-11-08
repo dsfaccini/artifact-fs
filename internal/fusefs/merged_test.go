@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -58,6 +59,13 @@ func (f *fakeOverlay) ListByPrefix(_ context.Context, prefix string) ([]model.Ov
 		}
 	}
 	return out, nil
+}
+func (f *fakeOverlay) HasEntryBelow(ctx context.Context, path string) (bool, error) {
+	entries, err := f.ListByPrefix(ctx, path)
+	path = model.CleanPath(path)
+	return slices.ContainsFunc(entries, func(e model.OverlayEntry) bool {
+		return path == "." || strings.HasPrefix(e.Path, path+"/")
+	}), err
 }
 func (f *fakeOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoPaths, path string, base model.BaseNode) (model.OverlayEntry, error) {
 	if f.entries == nil {

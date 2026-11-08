@@ -31,13 +31,13 @@ func TestRunGitClassifiesBeforeCredentialRedaction(t *testing.T) {
 	}
 }
 
-func TestKillCommandProcessGroupReportsExitedProcess(t *testing.T) {
+func TestTerminateCommandProcessGroupReportsExitedProcess(t *testing.T) {
 	cmd := exec.Command("git", "version")
 	configureCommandProcessGroup(cmd)
 	if err := cmd.Run(); err != nil {
 		t.Fatal(err)
 	}
-	if err := killCommandProcessGroup(cmd); !errors.Is(err, os.ErrProcessDone) {
-		t.Fatalf("kill exited process error = %v, want os.ErrProcessDone", err)
+	if err := terminateCommandProcessGroup(cmd); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("terminate exited process error = %v, want os.ErrProcessDone", err)
 	}
 }

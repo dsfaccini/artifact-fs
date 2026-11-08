@@ -223,7 +223,8 @@ func TestSupersededPrepareDoesNotMutateExistingClone(t *testing.T) {
 
 	prepareErr := make(chan error, 1)
 	go func() {
-		prepareErr <- svc.ctl().Prepare(ctx, cfg.Name)
+		_, err := svc.ctl().Prepare(ctx, cfg.Name)
+		prepareErr <- err
 	}()
 	waitFor(t, prepareErr, func() bool {
 		current, err := svc.registry.GetRepo(ctx, cfg.Name)
@@ -1046,7 +1047,7 @@ func TestSyncPrepareRetryPersistsCurrentFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := svc.ctl().Prepare(ctx, "repo"); err == nil {
+	if _, err := svc.ctl().Prepare(ctx, "repo"); err == nil {
 		t.Fatal("expected prepare retry failure")
 	}
 	got, err := svc.registry.GetRepo(ctx, "repo")
@@ -1662,7 +1663,7 @@ func TestPrepareRequeuesReadyVerifiedSourceForRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := svc.ctl().Prepare(ctx, cfg.Name); err != nil {
+	if _, err := svc.ctl().Prepare(ctx, cfg.Name); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 	cfg, err = svc.registry.GetRepo(ctx, cfg.Name)

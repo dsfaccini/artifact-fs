@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 )
@@ -214,7 +216,7 @@ func TestPrepareOnReadyVerifiedRepoKeepsItsMount(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if err := svc.ctl().Prepare(ctx, cfg.Name); err != nil {
+			if _, err := svc.ctl().Prepare(ctx, cfg.Name); err != nil {
 				t.Fatal(err)
 			}
 			if err := svc.syncRepos(ctx); err != nil {
@@ -265,7 +267,7 @@ func TestPrepareOnServedSyncRepoKeepsItsMount(t *testing.T) {
 	}
 
 	advanced := commitFile(t, filepath.Join(tmp, "remote"), "ADVANCED.md", "advanced\n")
-	if err := ctl.Prepare(ctx, "repo"); err != nil {
+	if _, err := ctl.Prepare(ctx, "repo"); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.syncRepos(ctx); err != nil {
@@ -410,7 +412,7 @@ func TestPrepareCancelsTheAsyncPreparationItSupersedes(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, nil, func() bool { return clones("start") == 1 })
-	if err := svc.ctl().Prepare(ctx, "repo"); err != nil {
+	if _, err := svc.ctl().Prepare(ctx, "repo"); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.syncRepos(ctx); err != nil {
@@ -439,7 +441,7 @@ func TestFailedSyncPrepareKeepsServingAcrossRestart(t *testing.T) {
 	if err := os.Rename(remote, filepath.Join(tmp, "remote-gone")); err != nil {
 		t.Fatal(err)
 	}
-	if err := ctl.Prepare(ctx, "repo"); err == nil {
+	if _, err := ctl.Prepare(ctx, "repo"); err == nil {
 		t.Fatal("prepare from a missing remote succeeded")
 	}
 	if err := svc.syncRepos(ctx); err != nil {
@@ -556,7 +558,7 @@ func TestCanceledPreparationRestoresTheIndex(t *testing.T) {
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, nil, func() bool {
+	waitFor(t, preparationsEnded(svc, "repo"), func() bool {
 		_, err := os.Stat(blocked)
 		return err == nil
 	})
@@ -574,5 +576,103 @@ func TestCanceledPreparationRestoresTheIndex(t *testing.T) {
 	}
 	if staged := runCmdOutput(t, realGit, "--git-dir", gitDir, "diff-index", "--cached", "--name-only", "HEAD"); staged != "" {
 		t.Fatalf("the index differs from HEAD in %q", staged)
+	}
+}
+
+// preparationsEnded reports name's prepare state once svc's async
+// preparations end, so a wait for a step inside one fails when it ends first.
+// Call it after the preparation started.
+func preparationsEnded(svc *Service, name string) <-chan error {
+	ended := make(chan error, 1)
+	go func() {
+		svc.prepareWorkers.Wait()
+		cfg, err := svc.registry.GetRepo(context.Background(), name)
+		if err == nil {
+			err = fmt.Errorf("the preparation ended %q with %q", cfg.PrepareState, cfg.PrepareError)
+		}
+		ended <- err
+	}()
+	return ended
+}
+
+// A stop's drain outlasts the rollback of the preparation it cancels.
+func TestDrainOutlastsTheRollbackOfACanceledPreparation(t *testing.T) {
+	if gitstore.RollbackBound >= drainTimeout {
+		t.Fatalf("gitstore.RollbackBound = %v, want below drainTimeout %v", gitstore.RollbackBound, drainTimeout)
+	}
+}
+
+// A preparation canceled while git read-tree holds index.lock leaves no lock
+// behind, so the next preparation succeeds.
+func TestCanceledReadTreeLeavesNoIndexLock(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	runCmd(t, "git", "init", "--initial-branch", "main", remote)
+	commitFile(t, remote, "README.md", "main\n")
+	clone := filepath.Join(tmp, "clone")
+	runCmd(t, "git", "clone", remote, clone)
+	advanced := commitFile(t, remote, "ADVANCED.md", "advanced\n")
+	gitDir := filepath.Join(clone, ".git")
+
+	// git read-tree runs the fsmonitor hook while it holds index.lock. The
+	// hook hangs there once, until the preparation is canceled.
+	blocked := filepath.Join(tmp, "read-tree-blocked")
+	hook := filepath.Join(tmp, "fsmonitor-hook")
+	script := "#!/bin/sh\nif [ -e \"$AFS_INDEX_LOCK\" ] && [ ! -e \"$AFS_BLOCKED\" ]; then\n  : > \"$AFS_BLOCKED\"\n  sleep 60\nfi\nexit 1\n"
+	if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", clone, "config", "core.fsmonitor", hook)
+	t.Setenv("AFS_INDEX_LOCK", filepath.Join(gitDir, "index.lock"))
+	t.Setenv("AFS_BLOCKED", blocked)
+
+	root := filepath.Join(tmp, "artifact-fs")
+	svc, err := New(ctx, root, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = svc.Close()
+		}
+	}()
+	svc.mount = (&recordingMount{}).mount
+	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: gitDir}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + remote, Branch: "main"}, Enabled: true}, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, preparationsEnded(svc, "repo"), func() bool {
+		_, err := os.Stat(blocked)
+		return err == nil
+	})
+	// Stopping the daemon cancels the preparation.
+	closed = true
+	if err := svc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := New(ctx, root, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	restarted.mount = (&recordingMount{}).mount
+	if err := restarted.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	restarted.prepareWorkers.Wait()
+	stored, err := restarted.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.PrepareState != model.PrepareStateReady {
+		t.Fatalf("the next preparation ended %q with %q, want ready", stored.PrepareState, stored.PrepareError)
+	}
+	if head := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "rev-parse", "HEAD")); head != advanced {
+		t.Fatalf("HEAD = %s, want %s", head, advanced)
 	}
 }

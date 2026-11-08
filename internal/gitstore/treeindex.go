@@ -97,7 +97,7 @@ func streamTreeRecords(ctx context.Context, gitDir string, headOID string, fn fu
 			msg = auth.RedactString(waitErr.Error())
 		}
 		if contextErr := ctx.Err(); contextErr != nil {
-			if strings.EqualFold(msg, "signal: killed") {
+			if isCancellationSignal(msg) {
 				return contextErr
 			}
 			return errors.Join(errors.New(msg), contextErr)

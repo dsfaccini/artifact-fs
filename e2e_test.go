@@ -466,10 +466,10 @@ func TestE2E(t *testing.T) {
 		)
 
 		// Poll until reconciliation completes. The watcher polls HEAD at
-		// 500ms; after detecting the change, onHEADChanged re-indexes the
-		// tree, reconciles the overlay, refreshes the git index, and swaps
-		// the snapshot generation. When git status reports the committed
-		// file as clean, all of that has finished.
+		// 500ms; after detecting the change, reconcileHEAD publishes the new
+		// commit's tree, reconciles the overlay, and switches the snapshot
+		// generation. When git status reports the committed file as clean,
+		// all of that has finished.
 		deadline := time.Now().Add(10 * time.Second)
 		reconciled := false
 		for time.Now().Before(deadline) {
@@ -575,6 +575,95 @@ func TestE2EFilesystemDirectoryRenamePersistsAcrossRestart(t *testing.T) {
 	if got := readFileStr(t, filepath.Join(trackedDestination, "nested", "incoming.txt")); got != "incoming\n" {
 		t.Fatalf("replacement content after restart = %q", got)
 	}
+}
+
+// An open file keeps reading the content it held after an unlink through the
+// mount removes its path, also once the kernel's attributes for it expire and
+// a read makes the kernel fetch them again.
+func testE2EOpenFileReadsAfterUnlink(t *testing.T, repo *mountedE2ERepo) {
+	path := filepath.Join(repo.mountPath, "README.md")
+	f, want := openAndReadE2E(t, path)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(kernelCacheExpiry)
+	if got, err := readAtE2E(f, len(want)); err != nil || got != want {
+		t.Fatalf("read through the open file after unlinking it = %q, %v; want %q", got, err, want)
+	}
+}
+
+// An open file keeps reading the content it held while a HEAD change made
+// outside the mount keeps its path away, also once the kernel's attributes for
+// it expire and a read makes the kernel fetch them again.
+func testE2EOpenFileReadsWhileHEADKeepsPathAway(t *testing.T, repo *mountedE2ERepo) {
+	path := filepath.Join(repo.mountPath, "README.md")
+	f, want := openAndReadE2E(t, path)
+	gitDir := filepath.Join(repo.root, "repos", repoName, "git")
+	head, err := gitOutput("", "--git-dir", gitDir, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyTree, err := gitOutput("", "--git-dir", gitDir, "mktree")
+	if err != nil {
+		t.Fatal(err)
+	}
+	away, err := gitOutput("", "--git-dir", gitDir,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit-tree", emptyTree, "-p", head, "-m", "move README.md away",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moveMainE2E(t, repo, gitDir, away, head)
+	time.Sleep(kernelCacheExpiry)
+	got, readErr := readAtE2E(f, len(want))
+	moveMainE2E(t, repo, gitDir, head, away)
+	if readErr != nil || got != want {
+		t.Fatalf("read through the open file while HEAD kept its path away = %q, %v; want %q", got, readErr, want)
+	}
+}
+
+// openAndReadE2E opens path, reads all of it, and keeps the file open until
+// the test ends.
+func openAndReadE2E(t *testing.T, path string) (*os.File, string) {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	data, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f, string(data)
+}
+
+// readAtE2E reads up to n bytes of f from its start.
+func readAtE2E(f *os.File, n int) (string, error) {
+	buf := make([]byte, n+1)
+	got, err := f.ReadAt(buf, 0)
+	if errors.Is(err, io.EOF) {
+		err = nil
+	}
+	return string(buf[:got]), err
+}
+
+// moveMainE2E moves refs/heads/main from from to to in gitDir, outside the
+// mount, and waits until the daemon serves to.
+func moveMainE2E(t *testing.T, repo *mountedE2ERepo, gitDir, to, from string) {
+	t.Helper()
+	if _, err := gitOutput("", "--git-dir", gitDir, "update-ref", "refs/heads/main", to, from); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, 30*time.Second, "the daemon to serve "+to, func() (bool, string) {
+		st, err := repo.ctl.Status(context.Background(), repoName)
+		if err != nil {
+			return false, err.Error()
+		}
+		return st.CurrentHEADOID == to, "HEAD " + st.CurrentHEADOID
+	})
 }
 
 func testE2EFilesystemDirectoryRenameConcurrentAccess(t *testing.T, repo *mountedE2ERepo) {

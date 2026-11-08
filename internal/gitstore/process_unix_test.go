@@ -118,7 +118,8 @@ func TestRunGitCancellationKillsDescendants(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The child marks git started only once its sleep runs, so the cancel cannot race the fork.
-	script := "#!/bin/sh\n(exec 3>\"$AFS_CHILD_FIFO\"; sleep 60 & : > \"$AFS_GIT_STARTED\"; wait; : > \"$AFS_CHILD_FINISHED\") &\nwait\n"
+	// The child and its sleep ignore SIGTERM, so only the SIGKILL that follows it ends them.
+	script := "#!/bin/sh\n(trap '' TERM; exec 3>\"$AFS_CHILD_FIFO\"; sleep 60 & : > \"$AFS_GIT_STARTED\"; wait; : > \"$AFS_CHILD_FINISHED\") &\nwait\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -279,5 +280,103 @@ func TestRunGitEscapedDescriptorHelper(t *testing.T) {
 	if err := os.WriteFile(os.Getenv("AFS_ESCAPED_FINISHED"), nil, 0o644); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
+	}
+}
+
+// A canceled git command's error carries the caller's context error, not the
+// signal the cancellation sent.
+func TestCanceledRunGitErrorOmitsCancellationSignal(t *testing.T) {
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, "git", "init", "--initial-branch", "main", repo)
+	run(t, "git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@e", "commit", "--allow-empty", "-m", "base")
+	gitDir := filepath.Join(repo, ".git")
+	blocked := filepath.Join(tmp, "blocked")
+	hook := filepath.Join(tmp, "hook")
+	script := "#!/bin/sh\nif [ ! -e \"$AFS_BLOCKED\" ]; then\n  : > \"$AFS_BLOCKED\"\n  sleep 60\nfi\nexit 1\n"
+	if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "config", "core.fsmonitor", hook)
+	t.Setenv("AFS_BLOCKED", blocked)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := runGit(ctx, gitDir, "read-tree", "-m", "HEAD", "HEAD")
+		errCh <- err
+	}()
+	for {
+		if _, err := os.Stat(blocked); err == nil {
+			break
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("read-tree returned before the hook ran: %v", err)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	err := <-errCh
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", err)
+	}
+	if strings.Contains(err.Error(), "signal:") {
+		t.Fatalf("canceled runGit error carries the cancellation's signal: %q", err.Error())
+	}
+}
+
+// A blob read canceled while its lazy fetch runs auto-maintenance leaves no
+// objects/maintenance.lock: git maintenance run --auto skips without a word
+// while that lock exists.
+func TestCanceledLazyFetchLeavesNoMaintenanceLock(t *testing.T) {
+	tmp := t.TempDir()
+	gitDir, _, blob := partialClone(t, tmp, "blob:none")
+	// The lazy fetch adds a second pack, so gc --auto runs its pre-auto-gc hook
+	// while git maintenance run --auto holds objects/maintenance.lock.
+	run(t, "git", "--git-dir", gitDir, "config", "gc.autoPackLimit", "1")
+	// Git 2.45 and 2.46 run a fetch's auto-maintenance in the foreground with
+	// the gc task on; newer Git needs these two settings to do the same.
+	run(t, "git", "--git-dir", gitDir, "config", "maintenance.autoDetach", "false")
+	run(t, "git", "--git-dir", gitDir, "config", "maintenance.gc.enabled", "true")
+	blocked := filepath.Join(tmp, "pre-auto-gc-blocked")
+	hook := "#!/bin/sh\n: > \"$AFS_BLOCKED\"\nsleep 60\nexit 1\n"
+	if err := os.MkdirAll(filepath.Join(gitDir, "hooks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "hooks", "pre-auto-gc"), []byte(hook), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AFS_BLOCKED", blocked)
+	lock := filepath.Join(gitDir, "objects", "maintenance.lock")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	store := New(nil)
+	defer store.Close()
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := store.BlobToCache(ctx, model.RepoPaths{ID: "x", GitDir: gitDir}, blob, filepath.Join(tmp, "cache", blob))
+		errCh <- err
+	}()
+	for {
+		if _, err := os.Stat(blocked); err == nil {
+			break
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("BlobToCache returned before auto-maintenance ran: %v", err)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if _, err := os.Stat(lock); err != nil {
+		t.Fatalf("maintenance does not hold its lock while the hook runs: %v", err)
+	}
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", err)
+	}
+	store.Close()
+	if _, err := os.Stat(lock); err == nil {
+		t.Fatal("a canceled blob read left objects/maintenance.lock behind")
 	}
 }

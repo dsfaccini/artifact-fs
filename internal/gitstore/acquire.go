@@ -470,19 +470,20 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 		return err
 	}
 	if target.branch == "" {
+		index := indexFile(repo.GitDir)
 		if err := readTreeTransition(ctx, repo.GitDir, oldOID, oid); err != nil {
-			return err
+			return s.rollbackLandedReadTree(ctx, repo.GitDir, index, oldOID, oid, err)
 		}
 		oldHeadOID, err := refOIDOrZero(ctx, repo.GitDir, "HEAD")
 		if err != nil {
-			return rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+			return s.rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
 		}
 		updateArgs := []string{"update-ref", "--no-deref", "HEAD", oid}
 		if strings.Trim(oldHeadOID, "0") != "" {
 			updateArgs = append(updateArgs, oldHeadOID)
 		}
 		if _, err := runGit(ctx, repo.GitDir, updateArgs...); err != nil {
-			return rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+			return s.rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
 		}
 		return nil
 	}
@@ -496,16 +497,29 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 	if err != nil {
 		return err
 	}
+	index := indexFile(repo.GitDir)
 	if err := readTreeTransition(ctx, repo.GitDir, oldOID, oid); err != nil {
-		return err
+		return s.rollbackLandedReadTree(ctx, repo.GitDir, index, oldOID, oid, err)
 	}
 	if _, err := runGit(ctx, repo.GitDir, "update-ref", refName, oid, oldBranchOID); err != nil {
-		return rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+		return s.rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
 	}
 	if _, err := runGit(ctx, repo.GitDir, "symbolic-ref", "HEAD", refName); err != nil {
-		refErr := restoreRef(ctx, repo.GitDir, refName, oldBranchOID, oid)
-		indexErr := rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
-		return errors.Join(indexErr, refErr)
+		ctx, cancel := s.rollbackContext(ctx)
+		defer cancel()
+		// HEAD resolves to the fetched commit when it was on the branch
+		// already, or when symbolic-ref finished before a cancel stopped it.
+		// The git dir then holds the whole transition.
+		if headAt(ctx, repo.GitDir, oid) {
+			return err
+		}
+		// HEAD is not on the branch, so a branch ref left at the fetched
+		// commit is harmless, while an index that differs from HEAD reaches
+		// the next preparation's read-tree as staged changes. The index goes
+		// first, so a ref restore that uses up the deadline cannot keep it
+		// from HEAD.
+		indexErr := restoreIndex(ctx, repo.GitDir, oid, oldOID, err)
+		return errors.Join(indexErr, restoreRef(ctx, repo.GitDir, refName, oldBranchOID, oid))
 	}
 	if _, err := runGit(ctx, repo.GitDir, "branch", "--set-upstream-to", "origin/"+target.branch, target.branch); err != nil {
 		s.logger.WarnContext(ctx, "set upstream failed", "repo", repo.Name, "error", err)
@@ -521,27 +535,107 @@ func refOIDOrZero(ctx context.Context, gitDir string, refName string) (string, e
 	return zeroOIDForGitDir(ctx, gitDir)
 }
 
-// rollbackTimeout bounds a rollback, which runs after its caller's context
-// ended too: a canceled preparation must still restore the index and refs it
-// changed.
-const rollbackTimeout = 30 * time.Second
+// defaultRollbackTimeout bounds a rollback, all its steps together. A
+// rollback runs after its caller's context ended too: a canceled preparation
+// must still restore the index and refs it changed.
+const defaultRollbackTimeout = 20 * time.Second
 
-func rollbackContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+// RollbackBound bounds how long PrepareFetchedBranch runs once its context
+// ends: the git command the cancel stops exits within gitCommandWaitDelay,
+// then the rollback ends at its deadline, plus gitCommandWaitDelay for the git
+// command that deadline stops. The daemon's drain must outlast it.
+const RollbackBound = defaultRollbackTimeout + 2*gitCommandWaitDelay
+
+// defaultRollbackContext is the context of one rollback: it outlives ctx's
+// cancellation and ends after defaultRollbackTimeout.
+func defaultRollbackContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), defaultRollbackTimeout)
 }
 
-func rollbackIndexTransition(ctx context.Context, gitDir string, fromOID string, toOID string, cause error) error {
-	ctx, cancel := rollbackContext(ctx)
+// rollbackIndexTransition restores the index from fromOID back to toOID after
+// a ref update failed, unless HEAD resolves to fromOID: the update landed after
+// all, as when a cancel arrives after git wrote the ref, and the index already
+// matches HEAD.
+func (s *Store) rollbackIndexTransition(ctx context.Context, gitDir string, fromOID string, toOID string, cause error) error {
+	ctx, cancel := s.rollbackContext(ctx)
 	defer cancel()
+	if headAt(ctx, gitDir, fromOID) {
+		return cause
+	}
+	return restoreIndex(ctx, gitDir, fromOID, toOID, cause)
+}
+
+// rollbackLandedReadTree restores the index from newOID back to oldOID when
+// a read-tree that reported failure moved it after all, as when a cancel
+// arrives after git wrote the index. index is the index file before the
+// read-tree. Git writes the index by renaming index.lock over it, so a
+// read-tree that wrote nothing leaves the same file, even when the user staged
+// what it would have written. Otherwise the read-tree moved the index when
+// every path that differs between the two commits stands at newOID in the
+// index; a staged path it kept differs between neither.
+func (s *Store) rollbackLandedReadTree(ctx context.Context, gitDir string, index os.FileInfo, oldOID string, newOID string, cause error) error {
+	if oldOID == newOID || sameFile(index, indexFile(gitDir)) {
+		return cause
+	}
+	ctx, cancel := s.rollbackContext(ctx)
+	defer cancel()
+	// A submodule.<name>.ignore setting would hide a changed gitlink.
+	changed, err := runGit(ctx, gitDir, "diff-tree", "-r", "-z", "--name-only", "--ignore-submodules=none", oldOID, newOID)
+	if err != nil {
+		return errors.Join(cause, fmt.Errorf("check index after read-tree failure: %w", err))
+	}
+	if changed == "" {
+		return cause
+	}
+	notNew, err := runGit(ctx, gitDir, "diff-index", "--cached", "-z", "--name-only", "--ignore-submodules=none", newOID)
+	if err != nil {
+		return errors.Join(cause, fmt.Errorf("check index after read-tree failure: %w", err))
+	}
+	stale := map[string]bool{}
+	for path := range strings.SplitSeq(notNew, "\x00") {
+		stale[path] = true
+	}
+	for path := range strings.SplitSeq(changed, "\x00") {
+		if path != "" && stale[path] {
+			return cause
+		}
+	}
+	return restoreIndex(ctx, gitDir, newOID, oldOID, cause)
+}
+
+// indexFile is the index file git reads for gitDir, nil when it is missing.
+func indexFile(gitDir string) os.FileInfo {
+	path, err := gitIndexPath(gitDir)
+	if err != nil {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	return info
+}
+
+func sameFile(a, b os.FileInfo) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return os.SameFile(a, b)
+}
+
+func headAt(ctx context.Context, gitDir string, oid string) bool {
+	head, err := runGit(ctx, gitDir, "rev-parse", "--verify", "HEAD^{commit}")
+	return err == nil && strings.TrimSpace(head) == oid
+}
+
+func restoreIndex(ctx context.Context, gitDir string, fromOID string, toOID string, cause error) error {
 	if err := readTreeTransition(ctx, gitDir, fromOID, toOID); err != nil {
-		return errors.Join(cause, fmt.Errorf("restore index after ref update failure: %w", err))
+		return errors.Join(cause, fmt.Errorf("restore index after failed update: %w", err))
 	}
 	return cause
 }
 
 func restoreRef(ctx context.Context, gitDir string, refName string, oldOID string, newOID string) error {
-	ctx, cancel := rollbackContext(ctx)
-	defer cancel()
 	if _, err := runGit(ctx, gitDir, "update-ref", refName, oldOID, newOID); err != nil {
 		return fmt.Errorf("restore ref after HEAD update failure: %w", err)
 	}

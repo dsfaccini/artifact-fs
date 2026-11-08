@@ -352,6 +352,8 @@ type OverlayStore interface {
 	SetMtime(ctx context.Context, path string, t time.Time) error
 	ReconcileChecked(ctx context.Context, baseLookup func(path string) (BaseNode, bool, error), lock sync.Locker, switchBase func()) error
 	ListByPrefix(ctx context.Context, prefix string) ([]OverlayEntry, error)
+	// HasEntryBelow reports whether an entry of any kind lies below path.
+	HasEntryBelow(ctx context.Context, path string) (bool, error)
 }
 
 type Hydrator interface {

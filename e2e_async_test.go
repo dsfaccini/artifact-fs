@@ -110,7 +110,7 @@ func TestE2EAsyncPreparedGitDirFailureThenRetry(t *testing.T) {
 	}
 
 	gitCmd(t, preparedWorktree, "remote", "set-url", "origin", remoteURL)
-	if err := repo.ctl.Prepare(context.Background(), repoName); err != nil {
+	if _, err := repo.ctl.Prepare(context.Background(), repoName); err != nil {
 		t.Fatalf("prepare retry: %v", err)
 	}
 

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -551,7 +552,7 @@ func TestDetachedFileHandleRemainsReadableWritableAndSyncable(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	fh := &FileHandle{path: "file.txt", cacheFile: f, cacheGeneration: -1, detached: true}
+	fh := &FileHandle{path: "file.txt", cacheFile: f, cacheGeneration: -1, detached: true, pinned: true}
 	fs := &ArtifactFuse{fileHandles: map[fuseops.HandleID]*FileHandle{1: fh}}
 
 	write := &fuseops.WriteFileOp{Handle: 1, Offset: 0, Data: []byte("after!")}
@@ -594,7 +595,7 @@ func TestWriteThroughOpenedBaseHandlePromotesAndWrites(t *testing.T) {
 	if err := fs.OpenFile(context.Background(), open); err != nil {
 		t.Fatal(err)
 	}
-	if err := fs.WriteFile(context.Background(), &fuseops.WriteFileOp{Handle: open.Handle, Data: []byte("local")}); err != nil {
+	if err := fs.WriteFile(context.Background(), &fuseops.WriteFileOp{Inode: lookup.Entry.Child, Handle: open.Handle, Data: []byte("local")}); err != nil {
 		t.Fatal(err)
 	}
 	if ov.writes != 1 || string(ov.data) != "local" {
@@ -697,7 +698,7 @@ func TestMoveInodePathRewritesDirectoryDescendants(t *testing.T) {
 	replaced := fs.allocInode("destination", Attrs{Type: "dir", Mode: 0o755, Gen: 1})
 	replacedChild := fs.allocInode("destination/nested/file.txt", Attrs{Type: "file", Mode: 0o100644, Gen: 1})
 	fs.dirHandles[1] = &DirHandle{inode: &InodeRef{Path: "source/nested"}}
-	fs.fileHandles[2] = &FileHandle{path: "source/nested/file.txt"}
+	fs.fileHandles[2] = &FileHandle{inode: child, path: "source/nested/file.txt"}
 	fs.mu.Unlock()
 
 	fs.moveInodePath("source", "destination")
@@ -1985,6 +1986,76 @@ func TestCreateFileKeepsExistingEntry(t *testing.T) {
 	attrs := &fuseops.LookUpInodeOp{Parent: f.nestInode, Name: "base.txt"}
 	if err := f.fs.LookUpInode(ctx, attrs); err != nil || attrs.Entry.Attributes.Size != uint64(base.SizeBytes) {
 		t.Fatalf("base file after CreateFile = size %d, %v; want size %d", attrs.Entry.Attributes.Size, err, base.SizeBytes)
+	}
+}
+
+// The kernel can send MKDIR or SYMLINK for a name its lookup missed before a
+// HEAD change added it. The op must fail with EEXIST and keep the base file.
+func TestMkDirAndCreateSymlinkKeepEntryASwitchAdded(t *testing.T) {
+	for _, op := range []string{"MkDir", "CreateSymlink"} {
+		t.Run(op, func(t *testing.T) {
+			f := newCacheFixture(t)
+			if got := f.lookup(fuseops.RootInodeID, "x"); got != 0 {
+				t.Fatalf("lookup of x before the switch = inode %d, want a miss", got)
+			}
+			f.switchTo(baseFile("x", "blob-X", 0o100644))
+			var err error
+			if op == "MkDir" {
+				err = f.fs.MkDir(f.ctx, &fuseops.MkDirOp{Parent: fuseops.RootInodeID, Name: "x", Mode: os.ModeDir | 0o755})
+			} else {
+				err = f.fs.CreateSymlink(f.ctx, &fuseops.CreateSymlinkOp{Parent: fuseops.RootInodeID, Name: "x", Target: "elsewhere"})
+			}
+			id, exists, idErr := f.fs.engine.Identity("x")
+			if idErr != nil {
+				t.Fatal(idErr)
+			}
+			if kernelErrno(err) != syscall.EEXIST || !exists || id.Type != "file" || id.Blob != "blob-X" {
+				t.Fatalf("%s over base file x = %v, and x is now %+v (exists %t); want EEXIST and the base file kept", op, err, id, exists)
+			}
+		})
+	}
+}
+
+// A listing shows a directory that only overlay entries below it imply: one a
+// HEAD change removed while it held an untracked file, or one whose file a
+// write through a held inode recreated. A lookup of it finds a directory.
+func TestLookUpFindsImplicitDirectory(t *testing.T) {
+	for _, how := range []string{"untracked file", "write through held inode"} {
+		t.Run(how, func(t *testing.T) {
+			f := newCacheFixture(t, baseDir("d", "d1"), baseFile("d/file.txt", "blob-A", 0o100644))
+			d := f.lookup(fuseops.RootInodeID, "d")
+			held := f.lookup(d, "file.txt")
+			open := f.open(held)
+			if how == "untracked file" {
+				create := &fuseops.CreateFileOp{Parent: d, Name: "new.txt", Mode: 0o644}
+				if err := f.fs.CreateFile(f.ctx, create); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.switchTo()
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if how == "write through held inode" {
+				if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("new")}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			listed, _, _, err := f.fs.engine.ReadDir(f.ctx, ".")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.ContainsFunc(listed, func(e ReaddirEntry) bool { return e.Name == "d" && e.Type == "dir" }) {
+				t.Fatalf("root listing %+v lacks directory d", listed)
+			}
+			op := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "d"}
+			if err := f.fs.LookUpInode(f.ctx, op); err != nil || op.Entry.Child == 0 || !op.Entry.Attributes.Mode.IsDir() {
+				t.Fatalf("lookup of d, which the root listing shows, = inode %d mode %v, %v; want a directory", op.Entry.Child, op.Entry.Attributes.Mode, err)
+			}
+		})
 	}
 }
 

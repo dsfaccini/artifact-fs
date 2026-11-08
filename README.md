@@ -242,7 +242,7 @@ The cache shards blobs by the first two hex characters of their object ID, `<blo
 
 ## Logging
 
-ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the mode, source, attempt, phase, state, duration, and deadline. Clone and fetch operations retry known transient transport failures up to three total attempts. Preparation has a 30-minute timeout. Caller cancellation stops the active Git command and retry backoff; synchronous preparation records a redacted `prepare canceled` status, while daemon shutdown leaves async preparation queued for restart.
+ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the mode, source, attempt, phase, state, duration, and deadline. Clone and fetch operations retry known transient transport failures up to three total attempts. Preparation has a 30-minute timeout. Caller cancellation stops the active Git command and retry backoff. The command gets `SIGTERM`, so Git removes the lock files it created, such as `index.lock`, and `SIGKILL` 250 ms later if it still runs. A branch update that fails or is canceled after Git moved the index restores the index, then the branch, within 20 seconds in all, unless HEAD already reached the fetched commit, for example because Git finished the update before the cancel stopped it. Synchronous preparation records a redacted `prepare canceled` status, while daemon shutdown leaves async preparation queued for restart.
 
 Existing-clone preparation reports remote configuration, fetch, and branch update as separate `configure_remote`, `fetch`, and `update_branch` phases.
 
@@ -315,7 +315,7 @@ The running daemon mounts a placeholder at its next registry poll, within 3 seco
 ./artifact-fs prepare --name workers-sdk
 ```
 
-`prepare` never unmounts the repo. The daemon prepares an async repo again behind its gate, so operations wait as they did during the first preparation. For a repo `add-repo` prepared without `--async`, `prepare` fetches and prepares in the CLI while the daemon keeps serving the repo, and `status` reports `preparing` meanwhile. Once the fetch moves HEAD, the watcher moves the live mount to that commit. When that `prepare` fails, the daemon keeps serving the repo, and a restarted daemon serves the git dir's HEAD. A repo whose `--remote` carried inline credentials stores no remote URL, so `prepare` fetches nothing for it and republishes the git dir's HEAD. `status` shows the `prepare_error` with the commit the daemon serves. An async repo that is ready and has no `--require-commit` has nothing to prepare. `set-refresh` never prepares a repo again.
+`prepare` never unmounts the repo. The daemon prepares an async repo again behind its gate, so operations wait as they did during the first preparation. For a repo `add-repo` prepared without `--async`, `prepare` fetches and prepares in the CLI while the daemon keeps serving the repo, and `status` reports `preparing` meanwhile. Once the fetch moves HEAD, the watcher moves the live mount to that commit. When that `prepare` fails, the daemon keeps serving the repo, and a restarted daemon serves the git dir's HEAD. A repo whose `--remote` carried inline credentials stores no remote URL, so `prepare` fetches nothing for it and republishes the git dir's HEAD. `status` shows the `prepare_error` with the commit the daemon serves. An async repo that is ready and has no `--require-commit` has nothing to prepare, and `prepare` says so. `set-refresh` never prepares a repo again.
 
 Async HTTPS remotes must use ambient credentials, such as a configured Git credential helper or repo-local Git config. Inline credentials in the remote URL are rejected for async repositories.
 
@@ -335,7 +335,7 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
   --fetch-ref main
 ```
 
-`--ref` and `--fetch-ref` take a full ref name, a branch name, or `origin/<branch>`, and `add-repo` stores each as a full ref name. `origin/X` and `refs/remotes/origin/X` name branch `X`, so a branch literally named `origin/X` needs `--ref refs/heads/origin/X`. `--fetch-ref` defaults to `--ref`. Preparation fetches the fetch ref and serves it, also right after a fresh clone of `--ref`. With `--require-commit`, preparation fetches and verifies `--ref` and ignores `--fetch-ref`.
+`--ref` and `--fetch-ref` take a full ref name, a branch name, or `origin/<branch>`, and `add-repo` stores each as a full ref name. `origin/X` and `refs/remotes/origin/X` name branch `X`, so a branch literally named `origin/X` needs `--ref refs/heads/origin/X`. `--fetch-ref` defaults to `--ref`. Preparation fetches the fetch ref and serves it, also right after a fresh clone of `--ref`. With `--require-commit`, preparation fetches and verifies `--ref`, and `add-repo` rejects `--fetch-ref`.
 
 ## Adopting linked Git worktrees
 
@@ -493,8 +493,8 @@ it at a later HEAD change or preparation.
 
 | Backend | After a HEAD change |
 |---------|---------------------|
-| Linux | The mount invalidates three things at once: the attributes and cached pages of each inode the kernel holds whose permission bits or blob changed, or that the kernel last saw from the overlay and that now resolves to a base blob; the entry of each name that vanished or changed type; and each negative entry whose name now exists. The mount caches a missing name as a negative entry for 1 s. A name made through the mount replaces its negative entry, and a write that recreates a vanished file invalidates it. The mount negotiates `FUSE_AUTO_INVAL_DATA` without writeback caching, so the kernel drops a file's cached pages when its size or mtime changes. The kernel keeps a base file's pages across opens only while its opens serve the same blob. For up to 1 s, a reader can still see attributes the mount does not invalidate, such as the old mtime of a file whose blob did not change, or of a directory. A lookup that races the switch can leave old names for up to 1 s. A lookup or getattr that reports an inode's new identity between the switch and the invalidations does not stop that inode's invalidation, and the kernel discards an attribute reply older than an invalidation. |
-| macFUSE kernel extension | The mount sends the inode and entry invalidations it sends on Linux. The extension mounts with `novncache`, so it caches no names and the mount caches no negative entries. It drops a file's cached attributes and pages on each `InvalidateInode`, and a getattr that reports a size other than the one it holds drops all the file's cached pages. A lookup leaves a held file's size alone. An open does not drop the pages, and `KeepPageCache` has no effect. So the mount still invalidates an inode whose new identity a lookup or getattr reported between the switch and the invalidations. Two races remain. A lookup can resolve a file before the switch, for an inode the extension does not hold, and the mount can record its reply after its invalidation pass read the inode table. That file's old pages can last until the next HEAD change. A getattr can resolve a held file before the switch, and its reply can reach the extension after the pass invalidated that inode, because the fuse library sends a reply after the op returns. The extension keeps an attribute reply whatever its age, so it holds the old size, and the old blob's pages can last until the next invalidation of that inode or a getattr that reports a different size. For up to 1 s, a reader can still see the old mtime of a file whose blob did not change, and of a directory. macFUSE 5's extension is closed source, so this row follows the open-source [osxfuse extension](https://github.com/osxfuse/kext/tree/534773bd3135f04b7f6fb801faa2f8991daf4a6b). |
+| Linux | The mount invalidates three things at once: the attributes and cached pages of each inode the kernel holds whose permission bits or blob changed, or that the kernel last saw from the overlay and that now resolves to a base blob; the entry of each name that vanished, and both the entry and the inode of each name that changed type; and each negative entry whose name now exists. The mount caches a missing name as a negative entry for 1 s. A name made through the mount replaces its negative entry, and a write that recreates a vanished file invalidates it. The mount negotiates `FUSE_AUTO_INVAL_DATA` without writeback caching, so the kernel drops a file's cached pages when its size or mtime changes. The kernel keeps a base file's pages across opens only while its opens serve the same blob. For up to 1 s, a reader can still see attributes the mount does not invalidate, such as the old mtime of a file whose blob did not change, or of a directory. A lookup that races the switch can leave old names for up to 1 s. A lookup or getattr that reports an inode's new identity between the switch and the invalidations does not stop that inode's invalidation, and the kernel discards an attribute reply older than an invalidation. |
+| macFUSE kernel extension | The mount sends the inode and entry invalidations it sends on Linux. The extension mounts with `novncache`, so it caches no names and the mount caches no negative entries. It drops a file's cached attributes and pages on each `InvalidateInode`, and a getattr that reports a size other than the one it holds drops all the file's cached pages. A lookup leaves a held file's size alone. An open does not drop the pages, and `KeepPageCache` has no effect. So the mount still invalidates an inode whose new identity a lookup or getattr reported between the switch and the invalidations. After each `InvalidateInode` of a regular file, the extension fetches the file's attributes again, under the lock that a getattr holds until it has stored its reply. A vanished name gets only its entry invalidation, because its file's content did not change: its open files keep reading what they read. One race remains: a lookup can resolve a file before the switch, for an inode the extension does not hold, and the mount can record its reply after its invalidation pass read the inode table. That file's old pages can last until the next HEAD change. For up to 1 s, a reader can still see the old mtime of a file whose blob did not change, and of a directory. macFUSE 5's extension is closed source, so this row follows the open-source [osxfuse extension](https://github.com/osxfuse/kext/tree/534773bd3135f04b7f6fb801faa2f8991daf4a6b). |
 | FSKit | FSKit takes no invalidations, so the mount sends none and caches no negative entries. FSKit keeps what it cached until it asks again, which the mount cannot hasten. FSKit keeps its own attribute cache, and artifact-fs knows no bound for it. Until then, a reader can see the old commit's names, sizes and modes, and an inode reads the old generation while the daemon keeps it. After that, the inode reads the current content. The fuse library answers EIO to a read inside the size it last reported that the current content does not fill. A read that FSKit sends before a reply reporting a smaller size reaches it can still get a short reply without EIO. |
 
 ### Inode numbers
@@ -504,10 +504,33 @@ the inode, so Git's stat data stays valid. A rename moves the numbers of the
 whole subtree. A path that stops existing retires its number: an unlink, rmdir
 or rename over it through the mount, or a HEAD change that removes it. A file,
 directory or symlink made there later gets a new number, even while the kernel
-still holds the old inode. A successful write through a file that is still open after a HEAD change
-removed its path recreates the path under the file's own number, unless another
-file took the path first. Numbers last for one mount: a remount or a daemon restart
-numbers paths again.
+still holds the old inode.
+
+A file or directory that the kernel still holds when a HEAD change removes its
+path gets the path back if a later HEAD change restores the path unchanged: a
+directory again, or a file or symlink with the same type, permission bits and
+blob. An open file and a shell's working directory therefore keep working across
+a HEAD change made outside the mount and later undone, such as with `git
+update-ref`, `git reset --soft`, or a ref moved from another worktree. A `git
+checkout` inside the mount instead unlinks and recreates through the mount each
+path it changes, which makes the file or directory held there stale. A
+successful write through such an open file recreates its path under the file's
+own number, while no other file holds the path. A rename of a parent directory
+moves that path too.
+
+The held file or directory becomes stale when its path comes back changed, when
+another file takes the path through a create, a lookup or a listing, or when an
+unlink, rmdir or rename over it through the mount removes it. `setattr` and
+`open` on a stale file return `ESTALE`, and its handles never reach the path
+again. A handle reads the content it already holds, and returns `ESTALE` when it
+holds none. `getattr` on a stale file, or on a held file whose path is away,
+answers with the size and times of that content, and returns `ESTALE` when its
+handles hold none. Linux fetches an open file's attributes before a read once
+they expire, so a read through such a file keeps working. A write through it
+returns `ESTALE`, unless an unlink of its path or a rename over it through the
+mount gave the handle its own copy of the file. A lookup below a stale directory
+misses. Numbers last for one mount: a remount or a daemon restart numbers paths
+again.
 
 The mount keeps one mapping for each existing path that the kernel has looked
 up or that an op made through the mount. After each HEAD change, it finds the

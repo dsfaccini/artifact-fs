@@ -176,7 +176,7 @@ func TestCloneBloblessPreservesTransportFailureAtCallerDeadline(t *testing.T) {
 	if operationErr.Attempts != 1 || !operationErr.Retryable {
 		t.Fatalf("GitOperationError = %+v, want one retryable attempt", operationErr)
 	}
-	if !strings.Contains(err.Error(), "HTTP 500") || strings.Contains(err.Error(), "signal: killed") {
+	if !strings.Contains(err.Error(), "HTTP 500") || strings.Contains(err.Error(), "signal:") {
 		t.Fatalf("error did not safely preserve transport failure: %v", err)
 	}
 	count, readErr := os.ReadFile(countPath)
