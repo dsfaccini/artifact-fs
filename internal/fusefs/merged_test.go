@@ -98,7 +98,7 @@ func (f *fakeOverlay) WriteFile(_ context.Context, _ string, _ int64, data []byt
 func (f *fakeOverlay) FlushFile(_ context.Context, _ string) error         { return nil }
 func (f *fakeOverlay) SyncFile(_ context.Context, _ string) error          { return nil }
 func (f *fakeOverlay) Truncate(_ context.Context, _ string, _ int64) error { return nil }
-func (f *fakeOverlay) Remove(_ context.Context, _ string, _ bool) error    { return nil }
+func (f *fakeOverlay) Remove(_ context.Context, _ string) error            { return nil }
 func (f *fakeOverlay) Rename(_ context.Context, oldPath, newPath string, _ bool) error {
 	oldPath = model.CleanPath(oldPath)
 	newPath = model.CleanPath(newPath)
@@ -680,7 +680,7 @@ func TestReaddirTypedDerivesOverlayChildrenFromOneListing(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	if err := store.Remove(ctx, "src/gone.txt", true); err != nil {
+	if err := store.Remove(ctx, "src/gone.txt"); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Mkdir(ctx, "src/made", 0o755); err != nil {

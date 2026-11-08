@@ -242,7 +242,7 @@ func (panickingOverlay) CreateFile(context.Context, string, uint32) (model.Overl
 	panic("overlay bug")
 }
 
-func (panickingOverlay) Remove(context.Context, string, bool) error { panic("overlay bug") }
+func (panickingOverlay) Remove(context.Context, string) error { panic("overlay bug") }
 
 // The fuse library recovers a panic in an op and keeps serving. An op that
 // panics while it holds handleOps, shared or exclusively, must release it, or
@@ -438,11 +438,11 @@ func (o *faultyOverlay) CreateFile(ctx context.Context, path string, mode uint32
 	return o.OverlayStore.CreateFile(ctx, path, mode)
 }
 
-func (o *faultyOverlay) Remove(ctx context.Context, path string, tracked bool) error {
+func (o *faultyOverlay) Remove(ctx context.Context, path string) error {
 	if o.removeErr != nil {
 		return o.removeErr
 	}
-	return o.OverlayStore.Remove(ctx, path, tracked)
+	return o.OverlayStore.Remove(ctx, path)
 }
 
 func (o *faultyOverlay) Truncate(ctx context.Context, path string, size int64) error {
@@ -989,7 +989,7 @@ func TestSwitchGenerationServesReadsWhileItLooksUpTheBase(t *testing.T) {
 	ctx := context.Background()
 	delete(f.snapshot.nodes[2], "link")
 	f.snapshot.kids[2]["."] = slices.DeleteFunc(f.snapshot.kids[2]["."], func(n model.BaseNode) bool { return n.Path == "link" })
-	if err := f.store.Remove(ctx, "link", true); err != nil {
+	if err := f.store.Remove(ctx, "link"); err != nil {
 		t.Fatal(err)
 	}
 	committed := model.BaseNode{RepoID: "repo", Path: "committed.txt", Type: "file", Mode: 0o100644, ObjectOID: blobOID("committed"), SizeState: "known", SizeBytes: int64(len("committed"))}

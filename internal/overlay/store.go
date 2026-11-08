@@ -639,11 +639,7 @@ func (s *Store) Truncate(ctx context.Context, path string, size int64) error {
 	return s.upsertEntry(ctx, e)
 }
 
-// Remove removes path from the merged view. tracked says whether the served
-// base has path. A tracked path gets a delete entry, which hides the base's.
-// An untracked path keeps no entry at all, so the overlay holds nothing that
-// would hide a path a later base adds.
-func (s *Store) Remove(ctx context.Context, path string, tracked bool) error {
+func (s *Store) Remove(ctx context.Context, path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.flushAllLocked(ctx); err != nil {
@@ -654,13 +650,9 @@ func (s *Store) Remove(ctx context.Context, path string, tracked bool) error {
 	if err != nil {
 		return err
 	}
-	if tracked {
-		now := time.Now().UnixNano()
-		e := model.OverlayEntry{RepoID: s.repo.ID, Path: path, Kind: model.OverlayKindDelete, Mode: 0, MtimeUnixNs: now, CtimeUnixNs: now}
-		if err := s.upsertEntry(ctx, e); err != nil {
-			return err
-		}
-	} else if _, err := s.db.ExecContext(ctx, `DELETE FROM overlay_entries WHERE path=?`, path); err != nil {
+	now := time.Now().UnixNano()
+	e := model.OverlayEntry{RepoID: s.repo.ID, Path: path, Kind: model.OverlayKindDelete, Mode: 0, MtimeUnixNs: now, CtimeUnixNs: now}
+	if err := s.upsertEntry(ctx, e); err != nil {
 		return err
 	}
 	if existing.BackingPath != "" {
@@ -1498,14 +1490,6 @@ func overlayEntryMatchesBase(e model.OverlayEntry, base model.BaseNode) (bool, e
 		return model.ReaderMatchesBlobOID(strings.NewReader(e.TargetPath), int64(len(e.TargetPath)), base.ObjectOID)
 	}
 	return model.FileMatchesBlobOID(e.BackingPath, base.ObjectOID)
-}
-
-// DirtyCount counts the overlay's entries, deletes included.
-func (s *Store) DirtyCount(ctx context.Context) (int64, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM overlay_entries`)
-	var c int64
-	err := row.Scan(&c)
-	return c, err
 }
 
 // suspendChangeLog drops the triggers for the rest of tx, so a bulk operation

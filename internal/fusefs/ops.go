@@ -581,17 +581,7 @@ func (e *Engine) Unlink(ctx context.Context, b *Blobs, path string, files openFi
 			return err
 		}
 	}
-	return e.remove(ctx, path)
-}
-
-// remove removes path from the overlay, with a delete entry only when the
-// served base has path.
-func (e *Engine) remove(ctx context.Context, path string) error {
-	_, tracked, err := e.Resolver.Snapshot.LookupNode(ctx, e.Resolver.Generation(), path)
-	if err != nil {
-		return err
-	}
-	return e.Overlay.Remove(ctx, path, tracked)
+	return e.Overlay.Remove(ctx, path)
 }
 
 // pinOpenFiles points the open handles on path at its overlay file, if it has one.
@@ -867,7 +857,7 @@ func (e *Engine) Rmdir(ctx context.Context, path string) error {
 	if len(children) > 0 {
 		return syscall.ENOTEMPTY
 	}
-	return e.remove(ctx, path)
+	return e.Overlay.Remove(ctx, path)
 }
 
 // errAttrUnsupported rejects a mode or mtime change on the root or on a base

@@ -796,8 +796,8 @@ func (o *hookedOverlay) CreateFile(ctx context.Context, path string, mode uint32
 	return e, err
 }
 
-func (o *hookedOverlay) Remove(ctx context.Context, path string, tracked bool) error {
-	err := o.OverlayStore.Remove(ctx, path, tracked)
+func (o *hookedOverlay) Remove(ctx context.Context, path string) error {
+	err := o.OverlayStore.Remove(ctx, path)
 	if err == nil {
 		fire(&o.afterRemove)
 	}
@@ -1618,7 +1618,7 @@ func TestUnlinkOfReturnedPathWithoutLookupRetiresHeldInode(t *testing.T) {
 // failingRemoveOverlay fails every Remove.
 type failingRemoveOverlay struct{ model.OverlayStore }
 
-func (o *failingRemoveOverlay) Remove(context.Context, string, bool) error {
+func (o *failingRemoveOverlay) Remove(context.Context, string) error {
 	return errors.New("remove failed")
 }
 

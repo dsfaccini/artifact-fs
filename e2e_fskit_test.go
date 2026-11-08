@@ -188,7 +188,7 @@ func TestSharedMountReadOnlyTestChangesMountHelper(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer store.Close()
-			if err := store.Remove(ctx, "README.md", true); err != nil {
+			if err := store.Remove(ctx, "README.md"); err != nil {
 				t.Fatal(err)
 			}
 		case "head":

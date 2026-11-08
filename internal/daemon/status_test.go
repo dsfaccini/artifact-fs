@@ -129,7 +129,7 @@ func (f *bootstrapFixture) bootstrap() error {
 // removeTracked records a delete of tracked.txt.
 func (f *bootstrapFixture) removeTracked(t *testing.T) {
 	t.Helper()
-	if err := f.ov.Remove(context.Background(), "tracked.txt", true); err != nil {
+	if err := f.ov.Remove(context.Background(), "tracked.txt"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -515,7 +515,7 @@ func TestFSMonitorHookReturnsPathsChangedSinceToken(t *testing.T) {
 	if _, err := ov.CreateFile(ctx, "moved.txt", 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := ov.Remove(ctx, "deleted.txt", true); err != nil {
+	if err := ov.Remove(ctx, "deleted.txt"); err != nil {
 		t.Fatal(err)
 	}
 	_, token, paths := hookAnswer(t, svc, "other-hook:1")

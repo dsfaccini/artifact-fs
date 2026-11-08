@@ -326,7 +326,7 @@ func TestRemoveCreatesWhiteout(t *testing.T) {
 	ctx := context.Background()
 
 	s.CreateFile(ctx, "del.txt", 0o644)
-	if err := s.Remove(ctx, "del.txt", true); err != nil {
+	if err := s.Remove(ctx, "del.txt"); err != nil {
 		t.Fatal(err)
 	}
 	if e, ok := lookupEntry(t, s, "del.txt"); !ok || !e.IsDeleted() {
@@ -595,7 +595,7 @@ func TestRenameTreeWhiteoutsEveryTrackedSourcePath(t *testing.T) {
 	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET source_oid=?, source_mode=? WHERE path=?`, "bbb", 0o120000, "src/link"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Remove(ctx, "src/deleted.txt", true); err != nil {
+	if err := s.Remove(ctx, "src/deleted.txt"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -703,7 +703,7 @@ func TestRenameTreeAllowsDeletedDestinationDescendants(t *testing.T) {
 	if err := s.Mkdir(ctx, "dst", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Remove(ctx, "dst/deleted.txt", true); err != nil {
+	if err := s.Remove(ctx, "dst/deleted.txt"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -734,10 +734,10 @@ func TestRenameTreeKeepsReplacedBaseDescendantsHidden(t *testing.T) {
 	if err := s.Mkdir(ctx, "dst", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Remove(ctx, "dst/overlap", true); err != nil {
+	if err := s.Remove(ctx, "dst/overlap"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Remove(ctx, "dst/gone.txt", true); err != nil {
+	if err := s.Remove(ctx, "dst/gone.txt"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -789,7 +789,7 @@ func TestRenameTreePersistsAcrossReopen(t *testing.T) {
 	if err := s.Mkdir(ctx, "dst", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Remove(ctx, "dst/old.txt", true); err != nil {
+	if err := s.Remove(ctx, "dst/old.txt"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -888,10 +888,10 @@ func TestRenameOverlayDirectoryIgnoresDeletedDescendants(t *testing.T) {
 	if _, err := s.CreateFile(ctx, "a_b/a.txt", 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Remove(ctx, "a_b/a.txt", true); err != nil {
+	if err := s.Remove(ctx, "a_b/a.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Remove(ctx, "axb/secret.txt", true); err != nil {
+	if err := s.Remove(ctx, "axb/secret.txt"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Rename(ctx, "a_b", "dst", false); err != nil {
@@ -921,7 +921,7 @@ func TestRenameOverlayDirectoryCleansUTF8DeletedDescendants(t *testing.T) {
 	if _, err := s.CreateFile(ctx, child, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Remove(ctx, child, true); err != nil {
+	if err := s.Remove(ctx, child); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Rename(ctx, dir, "dst", false); err != nil {
@@ -942,7 +942,7 @@ func TestRenameOverlayDirectoryDoesNotDependOnDestinationBackingPath(t *testing.
 	if _, err := s.CreateFile(ctx, "src/a.txt", 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Remove(ctx, "src/a.txt", true); err != nil {
+	if err := s.Remove(ctx, "src/a.txt"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Rename(ctx, "src", "dst", false); err != nil {
@@ -1276,29 +1276,6 @@ func TestTruncateUpdatesSizeAndTimes(t *testing.T) {
 	}
 }
 
-// Every entry counts, so a delete-only overlay is dirty too.
-func TestDirtyCount(t *testing.T) {
-	s, _ := testStore(t)
-	ctx := context.Background()
-
-	c, _ := s.DirtyCount(ctx)
-	if c != 0 {
-		t.Fatalf("expected 0, got %d", c)
-	}
-	if err := s.Remove(ctx, "tracked.txt", true); err != nil {
-		t.Fatal(err)
-	}
-	c, _ = s.DirtyCount(ctx)
-	if c != 1 {
-		t.Fatalf("delete-only overlay: expected 1, got %d", c)
-	}
-	s.CreateFile(ctx, "a.txt", 0o644)
-	c, _ = s.DirtyCount(ctx)
-	if c != 2 {
-		t.Fatalf("expected 2, got %d", c)
-	}
-}
-
 func TestListByPrefix(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
@@ -1385,7 +1362,7 @@ func TestReconcileAfterCommit(t *testing.T) {
 	s.CreateFile(ctx, "new.txt", 0o644)
 
 	// And a whiteout for a file that was deleted in the commit.
-	s.Remove(ctx, "gone.txt", true)
+	s.Remove(ctx, "gone.txt")
 
 	// Reconcile against a base where:
 	// - foo.txt exists with different OID (was committed)
@@ -1438,7 +1415,7 @@ func TestReconcileKeepsValidEntries(t *testing.T) {
 	s.CreateFile(ctx, "local-only.txt", 0o644)
 
 	// Whiteout a file that still exists in base.
-	s.Remove(ctx, "hidden.txt", true)
+	s.Remove(ctx, "hidden.txt")
 
 	baseLookup := func(path string) (model.BaseNode, bool) {
 		switch path {
@@ -1564,7 +1541,7 @@ func TestReconcileLogsOnlyDeleteMarkersOverBasePaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := range 3 {
-		if err := s.Remove(ctx, fmt.Sprintf("gone/%d.txt", i), true); err != nil {
+		if err := s.Remove(ctx, fmt.Sprintf("gone/%d.txt", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1770,7 +1747,7 @@ func TestReconcileClassifiesAnEntryWhoseBackingFileVanishedDuringItsLookups(t *t
 	var once sync.Once
 	if err := reconcile(ctx, s, func(path string) (model.BaseNode, bool) {
 		once.Do(func() {
-			if err := s.Remove(ctx, "x.txt", true); err != nil {
+			if err := s.Remove(ctx, "x.txt"); err != nil {
 				t.Error(err)
 			}
 		})
