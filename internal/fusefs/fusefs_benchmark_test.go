@@ -154,8 +154,8 @@ func BenchmarkSwitchGeneration20kOverlayEntries(b *testing.B) {
 			b.StartTimer()
 			switchGeneration(b, r, gen, &cpu)
 			b.StopTimer()
-			if dirty, err := ov.DirtyCount(ctx); err != nil || dirty != 0 {
-				b.Fatalf("overlay after the switch holds %d entries, %v; want none", dirty, err)
+			if entries, err := ov.ListAll(ctx); err != nil || len(entries) != 0 {
+				b.Fatalf("overlay after the switch holds %d entries, %v; want none", len(entries), err)
 			}
 			_ = ov.Close()
 			b.StartTimer()

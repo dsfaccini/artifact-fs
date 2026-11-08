@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
+	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/registry"
@@ -341,6 +343,226 @@ func TestStatusReportsPublishedAndServedGenerationsAfterOverlayFailure(t *testin
 		st.ServedHEADOID != f.oldOID || st.ServedGeneration != f.oldGen ||
 		st.CurrentHEADOID != f.oldOID || st.NextRetryAt.IsZero() || st.Attempts == 0 {
 		t.Fatalf("status after a failed overlay transition = %+v, want %s/%d published and %s/%d served with a retry", st, f.nextOID, f.oldGen+1, f.oldOID, f.oldGen)
+	}
+}
+
+// engine is the FUSE adapter's engine on f's runtime, without a mount, with
+// a hydrator for the base blobs a copy-on-write reads.
+func (f *headReconcileFixture) engine() *fusefs.Engine {
+	repo := f.rt.cfg.RepoPaths
+	repo.BlobCacheDir = f.t.TempDir()
+	h := hydrator.New(f.svc.git)
+	h.Start(1, repo)
+	f.t.Cleanup(h.Stop)
+	return &fusefs.Engine{Resolver: f.rt.resolver, Repo: repo, Overlay: f.rt.overlay, Hydrator: h}
+}
+
+func (f *headReconcileFixture) unlink(e *fusefs.Engine, path string) {
+	f.t.Helper()
+	if err := e.Do(f.ctx, nil, func(ctx context.Context, b *fusefs.Blobs) error { return e.Unlink(ctx, b, path, nil) }); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// overlayDirty registers f's repo, if it is not yet, and reads its status.
+func (f *headReconcileFixture) overlayDirty() bool {
+	f.t.Helper()
+	if _, err := f.svc.registry.GetRepo(f.ctx, f.rt.cfg.Name); err != nil {
+		if err := f.svc.registry.AddRepo(f.ctx, f.rt.cfg); err != nil {
+			f.t.Fatal(err)
+		}
+	}
+	st, err := f.svc.ctl().Status(f.ctx, f.rt.cfg.Name)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return st.DirtyOverlay
+}
+
+// commitToMain commits the work tree's changes on main and returns the commit.
+func (f *headReconcileFixture) commitToMain(message string) string {
+	f.t.Helper()
+	runCmd(f.t, "git", "-C", f.workDir, "add", "-A")
+	runCmd(f.t, "git", "-C", f.workDir, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", message)
+	return strings.TrimSpace(runCmdOutput(f.t, "git", "-C", f.workDir, "rev-parse", "HEAD"))
+}
+
+// Deleting a tracked file is dirty. A HEAD change that removes the file
+// makes the delete stale, and the reconcile prunes it.
+func TestStatusReportsATrackedDeleteDirtyUntilReconcilePrunesIt(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	f.unlink(f.engine(), "README.md")
+	if !f.overlayDirty() {
+		t.Fatal("status of a delete-only overlay reports it clean")
+	}
+	runCmd(t, "git", "-C", f.workDir, "rm", "-q", "-f", "README.md")
+	if err := os.WriteFile(filepath.Join(f.workDir, "other.txt"), []byte("other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	without := f.commitToMain("drop README")
+	f.signal()
+	f.waitForHead(without, "main", f.oldGen+1)
+	if f.overlayDirty() {
+		t.Fatal("status reports the overlay dirty after the reconcile pruned its stale delete")
+	}
+}
+
+// With a daemon running, status reads a delete against the generation the
+// mount serves. After a failed overlay transition, the published generation
+// lacks the deleted path while the served one still has it.
+func TestStatusReadsDeletesAgainstTheServedGeneration(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	if err := f.svc.registry.AddRepo(f.ctx, f.rt.cfg); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := acquireDaemonLock(f.svc.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	f.svc.recordRuntimeState(f.rt, "")
+	f.unlink(f.engine(), "README.md")
+	runCmd(t, "git", "-C", f.workDir, "rm", "-q", "-f", "README.md")
+	if err := os.WriteFile(filepath.Join(f.workDir, "other.txt"), []byte("other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.commitToMain("drop README")
+	if err := f.rt.overlay.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.signal()
+	var st model.RepoRuntimeState
+	waitFor(t, nil, func() bool {
+		st, err = f.svc.ctl().Status(f.ctx, f.rt.cfg.Name)
+		return err == nil && st.LastErrorPhase == phaseHEADReconcile
+	})
+	if st.ServedGeneration != f.oldGen || st.PublishedGeneration != f.oldGen+1 {
+		t.Fatalf("served/published generation = %d/%d, want %d/%d", st.ServedGeneration, st.PublishedGeneration, f.oldGen, f.oldGen+1)
+	}
+	if !st.DirtyOverlay {
+		t.Fatal("status reports the overlay clean while it hides a file the served generation has")
+	}
+}
+
+// A path the base never had, made and removed again, leaves the overlay
+// clean, as an editor's swap file or an rm -rf of build output does.
+func TestStatusReportsCleanAfterAnUntrackedPathComesAndGoes(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		op   func(f *headReconcileFixture, e *fusefs.Engine) error
+	}{
+		{"file", func(f *headReconcileFixture, e *fusefs.Engine) error {
+			if err := e.Create(f.ctx, "scratch.swp", 0o644); err != nil {
+				return err
+			}
+			f.unlink(e, "scratch.swp")
+			return nil
+		}},
+		{"directory", func(f *headReconcileFixture, e *fusefs.Engine) error {
+			if err := e.Mkdir(f.ctx, "build", 0o755); err != nil {
+				return err
+			}
+			return e.Rmdir(f.ctx, "build")
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newHeadReconcileFixture(t)
+			if err := tt.op(f, f.engine()); err != nil {
+				t.Fatal(err)
+			}
+			if f.overlayDirty() {
+				t.Fatal("status reports the overlay dirty after an untracked path came and went")
+			}
+		})
+	}
+}
+
+// A directory made, used as a rename's stop and removed again is gone: the
+// delete entries that rename chain leaves below it do not keep it listed.
+func TestRmdirOfARenameChainStopRemovesTheDirectory(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	e := f.engine()
+	rename := func(from, to string) {
+		t.Helper()
+		if err := e.Do(f.ctx, nil, func(ctx context.Context, b *fusefs.Blobs) error { return e.Rename(ctx, b, from, to, nil) }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.Mkdir(f.ctx, "build", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rename("README.md", "build/r.md")
+	rename("build/r.md", "out.md")
+	if err := e.Rmdir(f.ctx, "build"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.rt.resolver.ResolvePath("build"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("build after rmdir: %v, want it gone", err)
+	}
+	if err := e.Mkdir(f.ctx, "build", 0o755); err != nil {
+		t.Fatalf("mkdir build after rmdir: %v", err)
+	}
+}
+
+// HEAD can move to a commit that has a path before the served generation
+// does. A file written and deleted there stays deleted once the generation
+// catches up, as git status reports it.
+func TestDeleteBeforeTheServedGenerationCatchesUpStaysDeleted(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	if err := os.WriteFile(filepath.Join(f.workDir, "p.txt"), []byte("committed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	with := f.commitToMain("add p.txt")
+	e := f.engine()
+	if err := e.Create(f.ctx, "p.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Do(f.ctx, nil, func(ctx context.Context, b *fusefs.Blobs) error {
+		_, err := e.Write(ctx, b, "p.txt", 0, []byte("written\n"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.unlink(e, "p.txt")
+	f.signal()
+	f.waitForHead(with, "main", f.oldGen+1)
+	if _, err := f.rt.resolver.ResolvePath("p.txt"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("p.txt after the generation caught up: %v, want it deleted", err)
+	}
+	if !f.overlayDirty() {
+		t.Fatal("status reports the overlay clean while it hides a committed file")
+	}
+}
+
+// Status stops at the first delete the served generation has, and finds
+// none among many deletes of paths it lacks.
+func TestStatusReportsManyUntrackedDeletesClean(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	// Ten thousand unlinks through the engine would make this test slow, so
+	// it writes the delete entries they leave in one transaction.
+	db, err := meta.OpenDB(f.rt.cfg.OverlayDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.BeginTx(f.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 10000 {
+		if _, err := tx.ExecContext(f.ctx, `INSERT INTO overlay_entries(path, kind, mode, mtime_unix_ns, ctime_unix_ns) VALUES (?, ?, 0, 0, 0)`, fmt.Sprintf("build/%d.o", i), model.OverlayKindDelete); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if f.overlayDirty() {
+		t.Fatal("status reports deletes of paths the served generation lacks as dirty")
+	}
+	f.unlink(f.engine(), "README.md")
+	if !f.overlayDirty() {
+		t.Fatal("status reports the overlay clean after a delete of a path the served generation has")
 	}
 }
 
