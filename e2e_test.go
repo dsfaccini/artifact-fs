@@ -474,11 +474,14 @@ func testE2EKernelCacheFollowsHEADMoveOutsideTheMount(t *testing.T, repo *mounte
 		}
 	}
 	entries = append(entries, "100644 blob "+blob("README.md", readme)+"\tREADME.md", "100644 blob "+blob("ADDED.md", added)+"\tADDED.md")
-	mktree := exec.Command("git", "--git-dir", gitDir, "mktree")
+	// The blobless clone lacks the blobs no one read, so mktree must not check them.
+	mktree := exec.Command("git", "--git-dir", gitDir, "mktree", "--missing")
 	mktree.Stdin = strings.NewReader(strings.Join(entries, "\n") + "\n")
+	var mktreeStderr bytes.Buffer
+	mktree.Stderr = &mktreeStderr
 	treeOID, err := mktree.Output()
 	if err != nil {
-		t.Fatalf("git mktree: %v", err)
+		t.Fatalf("git mktree: %v: %s", err, mktreeStderr.String())
 	}
 	next, err := gitOutput("", "--git-dir", gitDir,
 		"-c", "user.name=E2E Test",
@@ -1227,7 +1230,6 @@ func TestE2EVerifiedSource(t *testing.T) {
 	run(t, updateWork, "git", "add", "REMOTE-ONLY.md")
 	run(t, updateWork, "git", "-c", "user.name=E2E Test", "-c", "user.email=e2e@test", "commit", "-m", "advance remote")
 	run(t, updateWork, "git", "push", "origin", "main")
-	time.Sleep(time.Second)
 	assertVerifiedSourceStatus(t, ctl, requiredCommit)
 	if _, err := os.Stat(filepath.Join(mountPath, "REMOTE-ONLY.md")); !os.IsNotExist(err) {
 		t.Fatalf("disabled refresh exposed remote-only file: %v", err)
@@ -1243,7 +1245,6 @@ func TestE2EVerifiedSource(t *testing.T) {
 		"commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "local head change",
 	))
 	gitCmd(t, mountPath, "update-ref", "--no-deref", "HEAD", alternateCommit)
-	time.Sleep(time.Second)
 	assertVerifiedSourceStatus(t, ctl, requiredCommit)
 
 	stopE2EDaemon(t, firstSvc, firstCancel, firstErrCh, mountPath)

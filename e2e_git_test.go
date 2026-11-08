@@ -530,6 +530,9 @@ func testE2EGitCheckoutRestorePath(t *testing.T, repo *mountedE2ERepo) {
 		t.Fatal(err)
 	}
 	assertGitStatus(t, repo.mountPath, map[string]string{"README.md": " M"})
+	if diff := gitCmd(t, repo.mountPath, "diff", "README.md"); !strings.Contains(diff, "\n+local change\n") {
+		t.Fatalf("git diff README.md = %q, want the added line", diff)
+	}
 
 	gitCmd(t, repo.mountPath, "checkout", "--", "README.md")
 	assertGitStatus(t, repo.mountPath, map[string]string{})

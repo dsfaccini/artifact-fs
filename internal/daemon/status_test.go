@@ -10,7 +10,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -233,6 +235,69 @@ func TestRequiredCommitIgnoresHEADWatcher(t *testing.T) {
 	if runtime.head.oid != requiredCommit || runtime.head.gen != 1 {
 		t.Fatalf("fixed base changed: %+v", runtime.head)
 	}
+}
+
+// countingGitStore counts the remote fetches and HEAD resolves of a runtime's
+// workers. Each call ends the worker that made it, so the count is all the
+// call leaves behind. Any other call panics through the nil GitStore it embeds.
+type countingGitStore struct {
+	model.GitStore
+	fetches, headResolves atomic.Int32
+}
+
+func (g *countingGitStore) FetchNonInteractive(context.Context, model.RepoConfig) error {
+	g.fetches.Add(1)
+	runtime.Goexit()
+	return nil
+}
+
+func (g *countingGitStore) ResolveHEAD(context.Context, model.RepoConfig) (string, string, error) {
+	g.headResolves.Add(1)
+	runtime.Goexit()
+	return "", "", nil
+}
+
+// A runtime on a required commit with remote refresh disabled keeps serving
+// that commit: its workers never fetch, and never follow a HEAD move.
+func TestFixedBaseRuntimeNeitherFetchesNorFollowsHEAD(t *testing.T) {
+	const requiredCommit = "0123456789012345678901234567890123456789"
+	gitDir := t.TempDir()
+	branch := filepath.Join(gitDir, "refs", "heads", "main")
+	if err := os.MkdirAll(filepath.Dir(branch), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{filepath.Join(gitDir, "HEAD"): "ref: refs/heads/main\n", branch: requiredCommit + "\n"} {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		git := &countingGitStore{}
+		rt := &repoRuntime{
+			ctx: ctx,
+			cfg: model.RepoConfig{
+				RepoPaths:     model.RepoPaths{ID: "verified", Name: "verified", GitDir: gitDir},
+				RepoSpec:      model.RepoSpec{RequiredCommit: requiredCommit},
+				RefreshPolicy: model.RefreshPolicy{RefreshInterval: 100 * time.Millisecond, RemoteRefreshDisabled: true},
+			},
+			head: servedHead{oid: requiredCommit, gen: 1},
+		}
+		svc := &Service{core: &core{git: git, logger: slog.New(slog.DiscardHandler)}, running: map[model.RepoID]*repoRuntime{"verified": rt}}
+		svc.startRepoBackground(rt)
+		synctest.Wait()
+		if err := os.WriteFile(branch, []byte(strings.Repeat("f", 40)+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		if fetches, resolves := git.fetches.Load(), git.headResolves.Load(); fetches != 0 || resolves != 0 {
+			t.Fatalf("fixed-base runtime fetched %d times and resolved HEAD %d times, want neither", fetches, resolves)
+		}
+		cancel()
+		rt.workers.Wait()
+	})
 }
 
 func TestPersistedVerifiedStatusDoesNotCountAcquisitionAsRefresh(t *testing.T) {
