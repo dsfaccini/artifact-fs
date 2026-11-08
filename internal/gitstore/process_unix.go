@@ -3,6 +3,7 @@
 package gitstore
 
 import (
+	"io/fs"
 	"os"
 	"os/exec"
 	"syscall"
@@ -34,4 +35,11 @@ func terminateCommandProcessGroup(cmd *exec.Cmd) error {
 		time.AfterFunc(gitCommandWaitDelay, func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
 	}
 	return err
+}
+
+// privateToEUID reports whether info has mode 0700 and the effective uid as
+// owner.
+func privateToEUID(info fs.FileInfo) bool {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	return ok && info.Mode().Perm() == 0o700 && st.Uid == uint32(os.Geteuid())
 }

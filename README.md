@@ -26,7 +26,7 @@ ArtifactFS is the optional FUSE driver -- it lets you mount an Artifact (or any 
 
 ## Build and Install
 
-Requires Go 1.26+ and a FUSE implementation:
+Requires Go 1.26.5+ and a FUSE implementation:
 
 - **macOS** -- [macFUSE](https://osxfuse.github.io/)
 - **Linux** -- `fuse3` (`apt install fuse3` on Debian/Ubuntu, `dnf install fuse3` on Fedora)
@@ -165,7 +165,7 @@ Check the state of a mounted repo with `status`:
 | `last_error` / `last_error_phase` / `last_error_at` | Last redacted failure the daemon retries, the phase that failed (`mount`, `serve`, `unmount`, `head_reconcile`, `fetch` or `registry_sync`) and when. `serve` is a FUSE connection that failed or exited. A success of that phase clears it |
 | `next_retry` / `attempts` | When the daemon retries the failed phase, and how many times in a row it failed; `next_retry` is `none` when no daemon runs |
 | `hydrated_blobs` / `hydrated_bytes` | Blob count and bytes in the repo's blob cache, read from counters kept with the cache (see [Evicting the blob cache](#evicting-the-blob-cache)) |
-| `overlay_dirty` | `true` if the overlay holds any entry other than a delete: a created, modified or renamed file, a symlink or a directory; delete-only overlays are not counted |
+| `overlay_dirty` | `true` if the overlay holds a created, modified or renamed file, a symlink, a directory, or the delete of a path that `base_commit` has. The delete of a path `base_commit` lacks, such as an editor's removed swap file, does not count. In a repo that follows HEAD, a delete counts until a HEAD change removes its path. A `--require-commit` repo does not follow HEAD, so its deletes count for as long as the overlay holds them |
 | `last_fetch` / `result` | Result (`ok` or `failed`) of the daemon's last remote refresh, with the time of its last successful one; or `ok` with the time of a later successful fetch that wrote `FETCH_HEAD`, such as a `fetch` command; otherwise `never` |
 
 `status` reads what the daemon records in the registry, so it reports the same
@@ -514,8 +514,8 @@ it at a later HEAD change or preparation.
 
 | Backend | After a HEAD change |
 |---------|---------------------|
-| Linux | The mount invalidates three things at once: the attributes and cached pages of each inode the kernel holds whose permission bits or blob changed, or that the kernel last saw from the overlay and that now resolves to a base blob; the entry of each name that vanished or changed type; and each negative entry whose name now exists. The mount caches a missing name as a negative entry for 1 s. A name made through the mount replaces its negative entry, and a write that recreates a vanished file invalidates it. The mount negotiates `FUSE_AUTO_INVAL_DATA` without writeback caching, so the kernel drops a file's cached pages when its size or mtime changes. The kernel keeps a base file's pages across opens only while its opens serve the same blob. For up to 1 s, a reader can still see attributes the mount does not invalidate, such as the old mtime of a file whose blob did not change, or of a directory. A lookup or getattr that races the switch can leave old names and sizes for up to 1 s, and old pages within one open. |
-| macFUSE kernel extension | The mount sends the inode and entry invalidations it sends on Linux. The extension mounts with `novncache`, so it caches no names and the mount caches no negative entries. It drops a file's cached attributes and pages on each `InvalidateInode`, and a getattr that reports a size other than the one it holds drops all the file's cached pages. A lookup leaves a held file's size alone. An open does not drop the pages, and `KeepPageCache` has no effect. So a lookup or getattr that races the switch can leave the old blob's pages beyond one open, until the next invalidation of that inode or a getattr that reports a different size. For up to 1 s, a reader can still see the old mtime of a file whose blob did not change, and of a directory. macFUSE 5's extension is closed source, so this row follows the open-source [osxfuse extension](https://github.com/osxfuse/kext/tree/534773bd3135f04b7f6fb801faa2f8991daf4a6b). |
+| Linux | The mount invalidates three things at once: the attributes and cached pages of each inode the kernel holds whose permission bits or blob changed, or that the kernel last saw from the overlay and that now resolves to a base blob; the entry of each name that vanished, and both the entry and the inode of each name that changed type; and each negative entry whose name now exists. The mount caches a missing name as a negative entry for 1 s. A name made through the mount replaces its negative entry, and a write that recreates a vanished file invalidates it. The mount negotiates `FUSE_AUTO_INVAL_DATA` without writeback caching, so the kernel drops a file's cached pages when its size or mtime changes. The kernel keeps a base file's pages across opens only while its opens serve the same blob. For up to 1 s, a reader can still see attributes the mount does not invalidate, such as the old mtime of a file whose blob did not change, or of a directory. A lookup that resolves a file before the switch and whose reply the mount records after its invalidation pass read the inode table, for an inode the kernel does not hold, makes the kernel create the inode with the old attributes. That leaves old names and sizes for up to 1 s, and old pages within one open: the kernel drops a file's pages only when its size or mtime changes, or at the next open that serves another blob. A lookup or getattr that reports an inode's new identity between the switch and the invalidations does not stop that inode's invalidation, and the kernel discards an attribute reply older than an invalidation. |
+| macFUSE kernel extension | The mount sends the inode and entry invalidations it sends on Linux. The extension mounts with `novncache`, so it caches no names and the mount caches no negative entries. It drops a file's cached attributes and pages on each `InvalidateInode`, and a getattr that reports a size other than the one it holds drops all the file's cached pages. A lookup leaves a held file's size alone. An open does not drop the pages, and `KeepPageCache` has no effect. So the mount still invalidates an inode whose new identity a lookup or getattr reported between the switch and the invalidations. After each `InvalidateInode` of a regular file, the extension fetches the file's attributes again, under the lock that a getattr holds until it has stored its reply. A vanished name gets only its entry invalidation, because its file's content did not change: its open files keep reading what they read. Two races remain. A lookup can resolve a file before the switch, for an inode the extension does not hold, and the mount can record its reply after its invalidation pass read the inode table. That file's old pages can last until the next HEAD change. An `mmap` page-in between an `InvalidateInode` and the reply to the extension's own attribute fetch can page in the old blob, because page-ins take only the extension's global lock, not the file's. A fetch that reports the same size keeps those pages, and they can last until the next invalidation of that inode or a getattr that reports a different size. A `read(2)` waits for that fetch, so it is not affected. For up to 1 s, a reader can still see the old mtime of a file whose blob did not change, and of a directory. macFUSE 5's extension is closed source, so this row follows the open-source [osxfuse extension](https://github.com/osxfuse/kext/tree/534773bd3135f04b7f6fb801faa2f8991daf4a6b). |
 | FSKit | FSKit takes no invalidations, so the mount sends none and caches no negative entries. FSKit keeps what it cached until it asks again, which the mount cannot hasten. FSKit keeps its own attribute cache, and artifact-fs knows no bound for it. Until then, a reader can see the old commit's names, sizes and modes, and an inode reads the old generation while the daemon keeps it. After that, the inode reads the current content. The fuse library answers EIO to a read inside the size it last reported that the current content does not fill. A read that FSKit sends before a reply reporting a smaller size reaches it can still get a short reply without EIO. |
 
 ### Inode numbers
@@ -541,17 +541,20 @@ moves that path too.
 
 The held file or directory becomes stale when its path comes back changed, when
 another file takes the path through a create, a lookup or a listing, or when an
-unlink, rmdir or rename over it through the mount removes it. `setattr` and
-`open` on a stale file return `ESTALE`, and its handles never reach the path
-again. A handle reads the content it already holds, and returns `ESTALE` when it
-holds none. `getattr` on a stale file, or on a held file whose path is away,
-answers with the size and times of that content, and returns `ESTALE` when its
-handles hold none. Linux fetches an open file's attributes before a read once
-they expire, so a read through such a file keeps working. A write through it
-returns `ESTALE`, unless an unlink of its path or a rename over it through the
-mount gave the handle its own copy of the file. A lookup below a stale directory
-misses. Numbers last for one mount: a remount or a daemon restart numbers paths
-again.
+unlink, rmdir or rename over it through the mount removes it. `open` on a stale
+file returns `ESTALE`, and its handles never reach the path again. A handle
+reads the content it already holds, and returns `ESTALE` when it holds none.
+`getattr` on a stale file, or on a held file whose path is away, answers with
+the file's mode and the size and times of that content, and returns `ESTALE`
+when its handles hold none. Linux fetches an open file's attributes before a
+read once they expire, so a read through such a file keeps working. An unlink of
+a file's path or a rename over it through the mount gives the file's open
+handles one copy of their own, which they share. A write or `setattr` through
+the stale file, such as `ftruncate`, `fchmod` or `futimens`, then changes that
+copy, and `getattr` reports the change. The copy keeps a time that `setattr`
+sets to the microsecond. Without such a copy, a write or `setattr` returns
+`ESTALE`. A lookup below a stale directory misses. Numbers last for one mount: a
+remount or a daemon restart numbers paths again.
 
 The mount keeps one mapping for each existing path that the kernel has looked
 up or that an op made through the mount. After each HEAD change, it finds the
@@ -674,9 +677,9 @@ Contributions are welcome, but not all contributions will be accepted. As guidan
 
 AI/LLM submissions are welcome, but overall issue/PR quality is ultimately the responsibility of the submitter, and the codebase is the responsibility (and long term maintenance burden) of the maintainers.
 
-See [AGENTS.md](AGENTS.md) for build commands, architecture details, and conventions. Before submitting changes, run `go vet ./...` with `GOOS=linux` and with `GOOS=darwin`, then `go test -race ./...`.
+See [AGENTS.md](AGENTS.md) for build commands, architecture details, and conventions. Before submitting changes, run the CI checks in the order that AGENTS.md lists them under "Validation".
 
-Enable the pre-commit checks with `git config core.hooksPath .githooks`. For staged Go changes they run `gofmt`, `go vet`, a CLI build, and the changed packages' unit tests. The hook skips the tests when the machine is under load; set `AFS_PRECOMMIT_TESTS` to `always` or `never` to override, or tune `AFS_PRECOMMIT_LOAD_PER_CPU` (default `1`).
+Enable the pre-commit checks with `git config core.hooksPath .githooks`. For staged Go changes they run `gofmt`, `go vet`, `modernize`, a CLI build, and the changed packages' unit tests. The hook skips the tests when the machine is under load; set `AFS_PRECOMMIT_TESTS` to `always` or `never` to override, or tune `AFS_PRECOMMIT_LOAD_PER_CPU` (default `1`).
 
 ## Credits
 

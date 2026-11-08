@@ -301,7 +301,7 @@ func (s *Store) getPool(gitDir string) (*batchPool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return nil, errors.New("git store closed")
+		return nil, errStoreClosed
 	}
 	if p, ok := s.pools[gitDir]; ok {
 		return p, nil

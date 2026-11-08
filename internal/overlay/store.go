@@ -151,8 +151,8 @@ func New(ctx context.Context, cfg model.RepoPaths) (*Store, error) {
 // commitPendingFromBackingFiles commits the size and mtime of each path a
 // process left with uncommitted writes, from its backing file.
 func commitPendingFromBackingFiles(ctx context.Context, db *sql.DB) error {
-	// Read outside the write transaction: SQLite fails a read transaction's
-	// upgrade to a write at once, without the busy handler.
+	// Read outside the write transaction, so an open with nothing pending
+	// takes no write lock.
 	rows, err := db.QueryContext(ctx, `SELECT e.path, e.backing_path FROM overlay_pending p JOIN overlay_entries e USING(path)`)
 	if err != nil {
 		return err
@@ -201,6 +201,22 @@ func (s *Store) Close() error {
 	return errors.Join(flushErr, s.db.Close())
 }
 
+// testHookBetweenReads, when set, runs in a read between its two reads: the
+// pending writes and the committed entries. Keep each call between the two
+// reads: the test catches a call that no longer runs, not a moved one.
+var testHookBetweenReads func()
+
+// testHookBetweenCommitAndForget, when set, runs in a flush between its commit
+// of the pending writes and its forgetting them. Keep each call between the
+// two steps: the test catches a call that no longer runs, not a moved one.
+var testHookBetweenCommitAndForget func()
+
+func runHook(hook func()) {
+	if hook != nil {
+		hook()
+	}
+}
+
 // overlayCols is the column list for overlay_entries queries. Keep in sync with
 // the Scan call in queryEntries and the single-row scan in Lookup.
 const overlayCols = `path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path`
@@ -214,6 +230,7 @@ func (s *Store) Lookup(ctx context.Context, path string) (model.OverlayEntry, bo
 		values = *p
 	}
 	s.pendingMu.Unlock()
+	runHook(testHookBetweenReads)
 	e, ok, err := s.lookupCommitted(ctx, path)
 	if ok && pending {
 		values.apply(&e)
@@ -555,6 +572,7 @@ func (s *Store) flushLocked(ctx context.Context, paths []string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	runHook(testHookBetweenCommitAndForget)
 	var closeErrs []error
 	s.pendingMu.Lock()
 	for _, path := range flushed {
@@ -593,6 +611,7 @@ func (s *Store) SyncFile(ctx context.Context, path string) error {
 	if err := s.commitSizeAndTimesDurable(ctx, e); err != nil {
 		return err
 	}
+	runHook(testHookBetweenCommitAndForget)
 	s.pendingMu.Lock()
 	p := s.pending[path]
 	delete(s.pending, path)
@@ -611,6 +630,26 @@ func (s *Store) SyncFile(ctx context.Context, path string) error {
 		return err
 	}
 	return dir.Close()
+}
+
+// GrantOwnerAccess lets path's backing file open for writing, as a write
+// through the overlay does: when an earlier version left it read-only, it
+// grants the owner read and write. A file that opens for writing stays as it
+// is.
+func (s *Store) GrantOwnerAccess(ctx context.Context, path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok, err := s.lookupCommitted(ctx, model.CleanPath(path))
+	if err != nil || !ok || e.IsDeleted() || e.BackingPath == "" {
+		return err
+	}
+	return retryWithOwnerAccess(e.BackingPath, e.Mode, func() error {
+		f, err := os.OpenFile(e.BackingPath, os.O_RDWR, 0)
+		if err != nil {
+			return err
+		}
+		return f.Close()
+	})
 }
 
 func (s *Store) Truncate(ctx context.Context, path string, size int64) error {
@@ -1189,8 +1228,8 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 	// Removing an entry the new base matches, rebasing an entry, and removing
 	// a delete marker for a path the new base lacks leave the merged view as
 	// it was. Only a removed delete marker over a base path is a change for Git.
-	// Suspending the log takes the write lock first, so no write lands between
-	// reading the log and applying the result.
+	// The transaction holds the write lock from BEGIN, so no write lands
+	// between reading the log and applying the result.
 	if err := suspendChangeLog(ctx, tx); err != nil {
 		return nil, err
 	}
@@ -1492,13 +1531,6 @@ func overlayEntryMatchesBase(e model.OverlayEntry, base model.BaseNode) (bool, e
 	return model.FileMatchesBlobOID(e.BackingPath, base.ObjectOID)
 }
 
-func (s *Store) DirtyCount(ctx context.Context) (int64, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM overlay_entries WHERE kind <> ?`, model.OverlayKindDelete)
-	var c int64
-	err := row.Scan(&c)
-	return c, err
-}
-
 // suspendChangeLog drops the triggers for the rest of tx, so a bulk operation
 // pays no per-row trigger cost. SQLite runs a trigger's program for each row
 // even when a WHEN clause skips its body. Other connections keep seeing the
@@ -1571,7 +1603,7 @@ func ReadChangesSince(ctx context.Context, cfg model.RepoPaths, since int64) (ch
 		return Changes{}, false, err
 	}
 	defer db.Close()
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return Changes{}, false, err
 	}
@@ -1649,6 +1681,7 @@ func (s *Store) HasEntryBelow(ctx context.Context, path string) (bool, error) {
 // queryEntries runs an arbitrary overlay query and scans the results.
 func (s *Store) queryEntries(ctx context.Context, query string, args ...any) ([]model.OverlayEntry, error) {
 	pending := s.pendingValues()
+	runHook(testHookBetweenReads)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err

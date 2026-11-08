@@ -14,12 +14,24 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Each main run gets a group of its own, so a later merge cancels neither a
+  # running nor a pending main run.
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-test:
+    name: build-test (Go ${{ matrix.go }})
     runs-on: ubuntu-latest
+    # Above go test's own 10m timeout, which prints the goroutines of a hung test.
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # go.mod sets the oldest Go that builds artifact-fs, and stable the newest.
+        # Only go.mod runs modernize and the hook smoke test: neither depends on
+        # the Go release, and a newer Go can break the pinned x/tools.
+        go: [go.mod, stable]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -27,9 +39,11 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go == 'stable' && 'stable' || '' }}
+          go-version-file: ${{ matrix.go == 'go.mod' && 'go.mod' || '' }}
 
       - name: Check modernize
+        if: matrix.go == 'go.mod'
         run: |
           go run golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@v0.52.0 -fix ./...
           git diff --exit-code
@@ -45,6 +59,7 @@ jobs:
         run: go test -race -count=1 ./...
 
       - name: Pre-commit hook on Linux
+        if: matrix.go == 'go.mod'
         run: |
           printf '\n// pre-commit hook smoke test\n' >> internal/model/types.go
           git add internal/model/types.go
@@ -53,21 +68,7 @@ jobs:
   # Runs the package tests on macOS, including the darwin-only files, without mounting.
   darwin-test:
     runs-on: macos-26
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-
-      # setup-go restores Go's test cache, so -count=1 makes each run execute the tests.
-      - name: Test
-        run: go test -race -count=1 ./...
-
-  darwin-build:
-    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -78,13 +79,23 @@ jobs:
           go-version-file: go.mod
 
       - name: Vet
-        run: GOOS=darwin go vet ./...
+        run: go vet ./...
 
-      - name: Build
-        run: GOOS=darwin go build -o /dev/null ./cmd/artifact-fs
+      # setup-go restores Go's test cache, so -count=1 makes each run execute the tests.
+      # go test also compiles cmd/artifact-fs, which has no tests.
+      - name: Test
+        run: go test -race -count=1 ./...
 
   fuse-e2e:
+    name: fuse-e2e (${{ matrix.user }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # As non-root, the mount goes through the setuid fusermount3, as a
+        # user's mount does.
+        user: [root, non-root]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -102,7 +113,32 @@ jobs:
             sudo modprobe fuse
           fi
           test -c /dev/fuse
+          ls -l /dev/fuse
           sudo chmod 666 /dev/fuse
+
+      - name: Show the non-root mount setup
+        if: matrix.user == 'non-root'
+        run: |
+          id
+          ls -l "$(command -v fusermount3)"
+          fusermount3 -V
+          # artifact-fs mounts without allow_other, so fusermount3 needs no
+          # user_allow_other here.
+          grep -v '^#' /etc/fuse.conf || true
+
+      - name: SSH wrapper owner check as root
+        if: matrix.user == 'root'
+        run: |
+          set -o pipefail
+          # Only root can give the SSH wrapper's directory another owner, so
+          # only this job runs that subtest.
+          go test -c -o "$RUNNER_TEMP/gitstore.test" ./internal/gitstore
+          sudo "$RUNNER_TEMP/gitstore.test" \
+            -test.count=1 \
+            -test.run '^TestSSHWrapperIsReusedOnlyWhilePrivate$' \
+            -test.timeout=2m \
+            -test.v | tee "$RUNNER_TEMP/gitstore-root.log"
+          grep -q -- '--- PASS: TestSSHWrapperIsReusedOnlyWhilePrivate/directory_owner' "$RUNNER_TEMP/gitstore-root.log"
 
       - name: FUSE end-to-end tests
         env:
@@ -110,12 +146,16 @@ jobs:
         run: |
           # The daemon runs inside the test binary, so -race covers it under kernel load.
           go test -race -c -o "$RUNNER_TEMP/artifact-fs-e2e.test" .
-          sudo --preserve-env=AFS_RUN_E2E_TESTS "$RUNNER_TEMP/artifact-fs-e2e.test" \
+          as_user=()
+          if [ "${{ matrix.user }}" = root ]; then
+            as_user=(sudo --preserve-env=AFS_RUN_E2E_TESTS)
+          fi
+          "${as_user[@]}" "$RUNNER_TEMP/artifact-fs-e2e.test" \
             -test.count=1 \
             -test.run '^TestFUSEMountSmoke$' \
             -test.timeout=2m \
             -test.v
-          sudo --preserve-env=AFS_RUN_E2E_TESTS "$RUNNER_TEMP/artifact-fs-e2e.test" \
+          "${as_user[@]}" "$RUNNER_TEMP/artifact-fs-e2e.test" \
             -test.count=1 \
             -test.run '^TestE2E' \
             -test.timeout=20m \

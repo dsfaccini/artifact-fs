@@ -10,7 +10,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1444,32 +1446,52 @@ func TestCloneAndFetchRefSkipTags(t *testing.T) {
 	}
 }
 
-func TestFetchStartsBeforeRemoteLookupCompletes(t *testing.T) {
+// A fetch starts while its remote lookup still runs, and returns only once
+// the lookup's git has exited, so no git the call started outlives it.
+func TestFetchStartsBeforeAndEndsAfterItsRemoteLookup(t *testing.T) {
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "bin")
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	fetchStarted := filepath.Join(tmp, "fetch-started")
-	// The fetch marks its start only while the lookup still runs. A passing
-	// Fetch kills the lookup on return; the sleep bound limits how long the
-	// lookup outlives a timeout panic.
+	lookupPID := filepath.Join(tmp, "lookup-pid")
+	// The fetch waits until the lookup runs, then marks its start only while
+	// the lookup still runs. The lookup and its sleep ignore SIGTERM, so only
+	// the SIGKILL gitCommandWaitDelay after the cancel ends them. The sleep
+	// bound limits how long the lookup outlives a timeout panic.
 	script := "#!/bin/sh\n" +
 		"case \"$*\" in\n" +
-		"  'remote get-url origin') sleep 60; : > \"$AFS_LOOKUP_FINISHED\";;\n" +
-		"  'fetch --no-tags origin '*) [ -f \"$AFS_LOOKUP_FINISHED\" ] || : > \"$AFS_FETCH_STARTED\"; printf '%s\\n' 'HTTP 503 transport failure' >&2; exit 1;;\n" +
+		"  'remote get-url origin') trap '' TERM; echo $$ > \"$AFS_LOOKUP_PID.tmp\"; mv \"$AFS_LOOKUP_PID.tmp\" \"$AFS_LOOKUP_PID\"; sleep 60; : > \"$AFS_LOOKUP_FINISHED\";;\n" +
+		"  'fetch --no-tags origin '*) i=0; while [ ! -f \"$AFS_LOOKUP_PID\" ] && [ $i -lt 6000 ]; do sleep 0.01; i=$((i+1)); done; [ -f \"$AFS_LOOKUP_FINISHED\" ] || : > \"$AFS_FETCH_STARTED\"; printf '%s\\n' 'HTTP 503 transport failure' >&2; exit 1;;\n" +
 		"esac\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("AFS_FETCH_STARTED", fetchStarted)
+	t.Setenv("AFS_LOOKUP_PID", lookupPID)
 	t.Setenv("AFS_LOOKUP_FINISHED", filepath.Join(tmp, "lookup-finished"))
 
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	store.gitRetryDelays = nil
 	err := store.FetchNonInteractive(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: "/private/configured/repo.git", FetchRef: "refs/heads/main"}})
+	pidData, pidErr := os.ReadFile(lookupPID)
+	if pidErr != nil {
+		t.Fatal(pidErr)
+	}
+	pid, pidErr := strconv.Atoi(strings.TrimSpace(string(pidData)))
+	if pidErr != nil {
+		t.Fatal(pidErr)
+	}
+	lookup, pidErr := os.FindProcess(pid)
+	if pidErr != nil {
+		t.Fatal(pidErr)
+	}
+	if signalErr := lookup.Signal(syscall.Signal(0)); !errors.Is(signalErr, os.ErrProcessDone) {
+		t.Fatalf("remote lookup git (pid %d) outlived Fetch: signal 0 = %v", pid, signalErr)
+	}
 	if err == nil {
 		t.Fatal("Fetch error = nil, want transport failure")
 	}

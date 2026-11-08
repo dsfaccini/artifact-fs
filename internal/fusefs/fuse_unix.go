@@ -24,6 +24,7 @@ import (
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
 	"github.com/dsfaccini/fuse/fuseutil"
+	"golang.org/x/sys/unix"
 )
 
 // MountedFS matches tigrisfs's interface for mount lifecycle.
@@ -144,6 +145,15 @@ type InodeRef struct {
 	// PageBlob is the base blob that the inode's last open served, while the
 	// kernel's cached pages can hold only that blob. It is empty otherwise.
 	PageBlob string
+	// Prior is the identity a base reply replaced while no switch pass had
+	// invalidated the inode since the kernel received Prior. The kernel's pages
+	// can still hold Prior's blob, and the macFUSE kernel extension ignores a
+	// lookup's attributes for an inode it holds, so the pass checks Prior too.
+	// Its Type is empty when no reply replaced an identity.
+	Prior Identity
+	// Invalidated says the switch pass invalidated the inode and no reply has
+	// been recorded since, so report keeps no Prior for the next reply.
+	Invalidated bool
 	// WrittenAt is the writeSeq of the last write through this inode.
 	WrittenAt uint64
 	Refcnt    int64
@@ -151,7 +161,8 @@ type InodeRef struct {
 	Overlay   bool
 	// Stale says the inode is retired: its path came back changed, another
 	// inode took it, or an op through the mount removed it. Ops on it return
-	// ESTALE.
+	// ESTALE, except what the content its handles hold serves: a getattr, a
+	// read, and a write or setattr of their own copy.
 	Stale bool
 	// CreateOpenPending says a CreateFile made the inode and no OpenFile or
 	// write has reached it since. The next OpenFile skips the permission
@@ -167,10 +178,17 @@ type InodeRef struct {
 // A reply computed before a generation switch can be recorded after a reply
 // computed after it. The switch's InvalidateInode makes the kernel discard
 // the older reply, so report keeps the newer generation.
+//
+// A base reply between a switch and its pass can change the identity before
+// the pass compares it, so report keeps the identity it replaced in Prior.
 func (ref *InodeRef) report(attrs Attrs) {
 	if attrs.Gen != 0 && ref.Gen > attrs.Gen {
 		return
 	}
+	if attrs.Gen != 0 && ref.Type != "" && !ref.Invalidated && ref.Prior.Type == "" && attrs.identity() != ref.identity() {
+		ref.Prior = ref.identity()
+	}
+	ref.Invalidated = false
 	if attrs.Blob != ref.Blob {
 		ref.PageBlob = ""
 	}
@@ -545,20 +563,25 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // mapped path that no longer exists, so a path made there later gets a new
 // number. When send is true it also tells the kernel what changed. Every inode
 // the kernel holds at a path gets the check for a name that vanished or
-// changed type. An unmapped inode whose path came back maps back to the path
-// when the path has its identity, and is retired and invalidated otherwise.
-// An inode whose identity the kernel received from the base
-// snapshot gets the identity comparison. One the kernel last saw from the
-// overlay is invalidated when it now resolves to a base blob, whose bytes can
-// differ from what was written. An overlay entry itself changes only through
-// the mount, which keeps the kernel's view of it current. A dormant mapping
-// gets no invalidation: the kernel holds nothing for it. A failure skips only
-// what it concerns, and the first one is returned.
+// changed type. A name that changed type gets its entry and its inode
+// invalidated, and a vanished name only its entry. An unmapped inode whose
+// path came back maps back to the path when the path has its identity, and
+// is retired and invalidated otherwise. An inode whose identity the kernel
+// received from the base snapshot gets the identity comparison. One the
+// kernel last saw from the overlay is invalidated when it now resolves to a
+// base blob, whose bytes can differ from what was written. An inode whose
+// identity a reply replaced since the last pass is invalidated too: the
+// kernel can still cache pages of the replaced identity, which report keeps
+// in InodeRef.Prior. An overlay entry itself changes only through the mount,
+// which keeps the kernel's view of it current. A dormant mapping gets no
+// invalidation: the kernel holds nothing for it. A failure skips only what it
+// concerns, and the first one is returned.
 func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	type known struct {
 		pathMapping
 		entry    kernelEntry
 		reported Identity
+		prior    Identity
 		base     bool
 	}
 	// unmappedInode is an unmapped inode, whose path may have come back.
@@ -585,7 +608,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			existenceOnly = append(existenceOnly, pathMapping{id, path})
 			continue
 		}
-		inodes = append(inodes, known{pathMapping: pathMapping{id, path}, entry: kernelEntry{parent, filepath.Base(path)}, reported: ref.identity(), base: ref.Gen != 0})
+		inodes = append(inodes, known{pathMapping: pathMapping{id, path}, entry: kernelEntry{parent, filepath.Base(path)}, reported: ref.identity(), prior: ref.Prior, base: ref.Gen != 0})
 	}
 	var returning []unmappedInode
 	for path, id := range fs.unmapped {
@@ -607,6 +630,14 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		}
 	}
 	var entries []kernelEntry
+	// changed holds each held inode the pass invalidates. An entry
+	// invalidation leaves the kernel's attributes and pages of the inode, so
+	// the inode of a name that changed type is in changed too. A vanished
+	// name gets only its entry invalidated, because its inode's content did
+	// not change: its handles keep reading what they read. The inode stays
+	// unmapped until an op or a later pass decides it: the pass, a lookup or
+	// a getattr when its path comes back, createEntry when a create takes
+	// the path, and settleUnmappedBelow before an unlink or a rename.
 	var changed []fuseops.InodeID
 	var vanished []pathMapping
 	for _, k := range inodes {
@@ -615,13 +646,18 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			failed(err, "resolve "+k.path)
 			continue
 		}
+		// A Prior is an identity the kernel can still cache: a reply between
+		// the switch and this pass replaced it.
+		hidden := k.prior.Type != ""
 		switch {
-		case !exists || current.Type != k.reported.Type:
+		case !exists || current.Type != k.reported.Type || hidden && current.Type != k.prior.Type:
 			entries = append(entries, k.entry)
 			if !exists {
 				vanished = append(vanished, k.pathMapping)
+			} else {
+				changed = append(changed, k.id)
 			}
-		case k.base && current != k.reported, !k.base && current.Blob != "":
+		case hidden, k.base && current != k.reported, !k.base && current.Blob != "":
 			changed = append(changed, k.id)
 		}
 	}
@@ -670,6 +706,11 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	for _, m := range retire {
 		if fs.unmapped[m.path] == m.id {
 			fs.retireLocked(m.id)
+		}
+	}
+	for _, id := range changed {
+		if ref := fs.inodes[id]; ref != nil {
+			ref.Invalidated, ref.Prior = true, Identity{}
 		}
 	}
 	overlapped := fs.renameSeq != renameSeq || renameSeq%2 != 0
@@ -997,9 +1038,19 @@ func (fs *ArtifactFuse) hasOpenFile(path string) bool {
 	return false
 }
 
-// pinOpenFiles points the handles open on path at backingPath. A detached
-// handle no longer names path, so it keeps its own file.
+// pinOpenFiles points the handles open on path at backingPath, so they all
+// share one copy. That includes a handle that holds another overlay file,
+// such as one a reconcile removed after a commit: a write through it goes by
+// path, so that file holds nothing the path's content lacks. A handle that
+// holds backingPath through a read-only descriptor, which a backing file an
+// earlier version left read-only gave it, opens it again for writing where
+// it now can. A detached handle no longer names path, so it keeps its own
+// file.
 func (fs *ArtifactFuse) pinOpenFiles(path, backingPath string) error {
+	backing, err := os.Stat(backingPath)
+	if err != nil {
+		return err
+	}
 	fs.mu.RLock()
 	var handles []*FileHandle
 	for _, fh := range fs.fileHandles {
@@ -1013,15 +1064,26 @@ func (fs *ArtifactFuse) pinOpenFiles(path, backingPath string) error {
 	fs.mu.RUnlock()
 	for _, fh := range handles {
 		fh.mu.Lock()
-		if !fh.detached && (fh.cacheFile == nil || fh.cacheGeneration != -1) {
-			f, openErr := os.OpenFile(backingPath, os.O_RDWR, 0)
-			if openErr != nil {
-				f, openErr = os.Open(backingPath)
-				if openErr != nil {
+		holdsBacking := false
+		if fh.cacheFile != nil && fh.cacheGeneration == -1 {
+			st, statErr := fh.cacheFile.Stat()
+			holdsBacking = statErr == nil && os.SameFile(st, backing)
+		}
+		var f *os.File
+		switch {
+		case fh.detached:
+		case !holdsBacking:
+			var openErr error
+			if f, openErr = os.OpenFile(backingPath, os.O_RDWR, 0); openErr != nil {
+				if f, openErr = os.Open(backingPath); openErr != nil {
 					fh.mu.Unlock()
 					return openErr
 				}
 			}
+		case !openForWriting(fh.cacheFile):
+			f, _ = os.OpenFile(backingPath, os.O_RDWR, 0)
+		}
+		if f != nil {
 			old := fh.cacheFile
 			fh.cacheFile = f
 			fh.cacheGeneration = -1
@@ -1354,7 +1416,7 @@ func (fs *ArtifactFuse) setInodeAttributes(ctx context.Context, op *fuseops.SetI
 	return fs.sharedUnlessUnmapped(ctx, func(ctx context.Context, b *Blobs, exclusive bool) error {
 		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 		if err != nil {
-			return err
+			return fs.setPinnedAttributes(op, checkPermissions)
 		}
 		if ref.Path == ".git" {
 			return syscall.EPERM
@@ -1394,6 +1456,121 @@ func (fs *ArtifactFuse) setInodeAttributes(ctx context.Context, op *fuseops.SetI
 		op.AttributesExpiration = attrExpiry(CacheTTL)
 		return nil
 	})
+}
+
+// setPinnedAttributes changes the attributes of a retired inode whose handles
+// an unlink or a rename over its path pinned to their own copy. POSIX applies
+// an ftruncate, fchmod or futimens through a descriptor to its open file, so
+// a size truncates the copy, an mtime becomes the copy's, and permission bits
+// go to InodeRef.Mode, where heldAttrs reads them. It answers with heldAttrs,
+// and returns ESTALE for an inode with no pinned handle, whose handles read
+// content no setattr may change. checkPermissions is as in setInodeAttributes.
+func (fs *ArtifactFuse) setPinnedAttributes(op *fuseops.SetInodeAttributesOp, checkPermissions bool) error {
+	type pinnedHandle struct {
+		id fuseops.HandleID
+		fh *FileHandle
+	}
+	fs.mu.RLock()
+	ref := fs.inodes[op.Inode]
+	var mode uint32
+	if ref != nil {
+		mode = ref.Mode
+	}
+	var pinned []pinnedHandle
+	for id, fh := range fs.fileHandles {
+		fh.mu.Lock()
+		if fh.inode.ID == op.Inode && fh.detached && fh.pinned && fh.cacheFile != nil {
+			pinned = append(pinned, pinnedHandle{id, fh})
+		}
+		fh.mu.Unlock()
+	}
+	fs.mu.RUnlock()
+	if ref == nil || len(pinned) == 0 {
+		return syscall.ESTALE
+	}
+	if op.Size != nil && checkPermissions && !fs.handleWritable(op.Handle) {
+		if err := checkOwnerAccess(mode, ownerWrite); err != nil {
+			return err
+		}
+	}
+	// The handles of a file share their copy, so each copy changes once,
+	// through the first handle that holds it.
+	slices.SortFunc(pinned, func(a, b pinnedHandle) int { return cmp.Compare(a.id, b.id) })
+	var changed []os.FileInfo
+	for _, p := range pinned {
+		var err error
+		if changed, err = p.fh.changeCopy(op.Size, op.Mtime, changed); err != nil {
+			return err
+		}
+	}
+	if op.Mode != nil {
+		fs.mu.Lock()
+		ref.Mode = ref.Mode&^0o777 | uint32(op.Mode.Perm())
+		fs.mu.Unlock()
+	}
+	attrs, ok := fs.heldAttrs(op.Inode)
+	if !ok {
+		return syscall.ESTALE
+	}
+	op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
+	op.AttributesExpiration = attrExpiry(CacheTTL)
+	return nil
+}
+
+// changeCopy truncates fh's own copy to size and sets its mtime, each unless
+// nil, and returns changed with the copy added. It leaves alone a copy that
+// changed holds, which another handle shares, and a handle released
+// meanwhile, which holds no copy. No reply reports the copy's atime, so it
+// takes the mtime too. The copy keeps the mtime to the microsecond.
+func (fh *FileHandle) changeCopy(size *uint64, mtime *time.Time, changed []os.FileInfo) ([]os.FileInfo, error) {
+	if size == nil && mtime == nil {
+		return changed, nil
+	}
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	f := fh.cacheFile
+	if f == nil {
+		return changed, nil
+	}
+	st, err := f.Stat()
+	if err != nil || slices.ContainsFunc(changed, func(c os.FileInfo) bool { return os.SameFile(c, st) }) {
+		return changed, err
+	}
+	if size != nil {
+		if err := f.Truncate(int64(*size)); err != nil {
+			return changed, err
+		}
+	}
+	if mtime != nil {
+		tv := syscall.NsecToTimeval(mtime.UnixNano())
+		if err := controlFile(f, func(fd int) error { return syscall.Futimes(fd, []syscall.Timeval{tv, tv}) }); err != nil {
+			return changed, err
+		}
+	}
+	return append(changed, st), nil
+}
+
+// openForWriting reports whether f's descriptor was opened for writing.
+func openForWriting(f *os.File) bool {
+	var flags int
+	err := controlFile(f, func(fd int) (err error) {
+		flags, err = unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+		return err
+	})
+	return err == nil && flags&unix.O_ACCMODE != unix.O_RDONLY
+}
+
+// controlFile runs op on f's descriptor.
+func controlFile(f *os.File, op func(fd int) error) error {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var opErr error
+	if err := rc.Control(func(fd uintptr) { opErr = op(int(fd)) }); err != nil {
+		return err
+	}
+	return opErr
 }
 
 func (fs *ArtifactFuse) ForgetInode(_ context.Context, op *fuseops.ForgetInodeOp) error {
