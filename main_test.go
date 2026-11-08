@@ -26,6 +26,7 @@ func TestMain(m *testing.M) {
 	if os.Getenv("AFS_E2E_REPO") == "" {
 		gittest.IsolateConfig()
 	}
+	gittest.DisableRaceExitSleep()
 	code := m.Run()
 	if os.Getenv("AFS_RUN_E2E_TESTS") == "1" {
 		fmt.Printf("e2e: started %d FUSE mounts\n", e2eMountsStarted.Load())

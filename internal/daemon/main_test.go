@@ -29,6 +29,7 @@ func TestMain(m *testing.M) {
 		panic(fmt.Sprintf("daemon unit test tried to unmount %q; set Service.unmountPath", path))
 	}
 	gittest.IsolateConfig()
+	gittest.DisableRaceExitSleep()
 	m.Run()
 }
 
