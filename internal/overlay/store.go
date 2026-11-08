@@ -151,8 +151,8 @@ func New(ctx context.Context, cfg model.RepoPaths) (*Store, error) {
 // commitPendingFromBackingFiles commits the size and mtime of each path a
 // process left with uncommitted writes, from its backing file.
 func commitPendingFromBackingFiles(ctx context.Context, db *sql.DB) error {
-	// Read outside the write transaction: SQLite fails a read transaction's
-	// upgrade to a write at once, without the busy handler.
+	// Read outside the write transaction, so an open with nothing pending
+	// takes no write lock.
 	rows, err := db.QueryContext(ctx, `SELECT e.path, e.backing_path FROM overlay_pending p JOIN overlay_entries e USING(path)`)
 	if err != nil {
 		return err
@@ -1228,8 +1228,8 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 	// Removing an entry the new base matches, rebasing an entry, and removing
 	// a delete marker for a path the new base lacks leave the merged view as
 	// it was. Only a removed delete marker over a base path is a change for Git.
-	// Suspending the log takes the write lock first, so no write lands between
-	// reading the log and applying the result.
+	// The transaction holds the write lock from BEGIN, so no write lands
+	// between reading the log and applying the result.
 	if err := suspendChangeLog(ctx, tx); err != nil {
 		return nil, err
 	}
@@ -1603,7 +1603,7 @@ func ReadChangesSince(ctx context.Context, cfg model.RepoPaths, since int64) (ch
 		return Changes{}, false, err
 	}
 	defer db.Close()
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return Changes{}, false, err
 	}

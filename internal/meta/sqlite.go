@@ -26,6 +26,11 @@ func OpenDB(path string) (*sql.DB, error) {
 	// In WAL mode NORMAL syncs the WAL only at checkpoints. A process crash
 	// loses no commit; an OS crash can lose the commits since the last sync.
 	params.Add("_pragma", "synchronous(NORMAL)")
+	// A transaction takes the write lock at BEGIN, so another connection's
+	// write waits out busy_timeout. SQLite fails a read transaction's upgrade
+	// to a write at once with SQLITE_BUSY, without the busy handler. A
+	// transaction begun with sql.TxOptions{ReadOnly: true} stays deferred.
+	params.Add("_txlock", "immediate")
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: params.Encode()}).String()
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

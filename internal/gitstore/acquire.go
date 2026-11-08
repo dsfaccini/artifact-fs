@@ -338,8 +338,8 @@ func (s *Store) FetchNonInteractive(ctx context.Context, repo model.RepoConfig) 
 		args = append(args, fmt.Sprintf("--depth=%d", depth))
 	}
 	args = append(args, "origin")
-	remotesForLogging, cancelLookup := s.startRemotesForLogging(ctx, repo)
-	defer cancelLookup()
+	remotesForLogging, stopLookup := s.startRemotesForLogging(ctx, repo)
+	defer stopLookup()
 	return s.retryGitOperationForRemoteLookup(ctx, GitOperationFetch, repo.Name, remotesForLogging, func() error {
 		_, err := s.runNetworkGit(ctx, repo.GitDir, nil, args...)
 		return err
@@ -390,22 +390,28 @@ func (s *Store) fetchRef(ctx context.Context, repo model.RepoConfig, ref string,
 		args = append(args, fmt.Sprintf("--depth=%d", depth))
 	}
 	args = append(args, "origin", refspec)
-	remotesForLogging, cancelLookup := s.startRemotesForLogging(ctx, repo)
-	defer cancelLookup()
+	remotesForLogging, stopLookup := s.startRemotesForLogging(ctx, repo)
+	defer stopLookup()
 	return s.retryGitOperationForRemoteLookup(ctx, GitOperationFetch, repo.Name, remotesForLogging, func() error {
 		_, err := s.runNetworkGit(ctx, repo.GitDir, env, args...)
 		return err
 	})
 }
 
-func (s *Store) startRemotesForLogging(ctx context.Context, repo model.RepoConfig) (func() ([]string, bool), context.CancelFunc) {
+// startRemotesForLogging looks up origin's URL in the background, for the
+// logs of the operation it runs beside. The returned stop cancels the lookup
+// and returns once its git has exited, at most about gitCommandWaitDelay
+// later, so no git the operation started outlives it.
+func (s *Store) startRemotesForLogging(ctx context.Context, repo model.RepoConfig) (func() ([]string, bool), func()) {
 	type lookupResult struct {
 		remote string
 		err    error
 	}
 	lookupCtx, cancel := context.WithCancel(ctx)
 	result := make(chan lookupResult, 1)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		remote, err := runGit(lookupCtx, repo.GitDir, "remote", "get-url", "origin")
 		result <- lookupResult{remote: strings.TrimSpace(remote), err: err}
 	}()
@@ -428,7 +434,7 @@ func (s *Store) startRemotesForLogging(ctx context.Context, repo model.RepoConfi
 			remotes = append(remotes, actualRemote)
 		}
 		return remotes, known
-	}, cancel
+	}, func() { cancel(); <-done }
 }
 
 // ConfigureRemoteAmbient points origin at repo's remote, which holds no
