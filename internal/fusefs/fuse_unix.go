@@ -925,10 +925,13 @@ func (fs *ArtifactFuse) OpenFileGenerations() []int64 {
 // pinInode returns a copy of id's inode, or ESTALE for a retired or missing
 // one. It pins the read generation, which the open reads in every attempt,
 // in the same fs.mu hold, so a prune keeps it until the open registers its
-// handle or fails. It returns the pinned generation, or 0 for none.
-func (fs *ArtifactFuse) pinInode(id fuseops.InodeID) (*InodeRef, int64, error) {
+// handle or fails. It returns the pinned generation, or 0 for none. It then
+// releases carried, the pin of the open's run that stopped to hydrate, so the
+// generation stays pinned across the hydration.
+func (fs *ArtifactFuse) pinInode(id fuseops.InodeID, carried int64) (*InodeRef, int64, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.unpinLocked(carried)
 	ref := fs.inodes[id]
 	if ref == nil || ref.Stale {
 		return nil, 0, syscall.ESTALE
@@ -939,6 +942,16 @@ func (fs *ArtifactFuse) pinInode(id fuseops.InodeID) (*InodeRef, int64, error) {
 	}
 	fs.openPins[ref.ReadGen]++
 	return &snapshot, ref.ReadGen, nil
+}
+
+// unpin releases a pin of gen that pinInode took, if gen is not 0.
+func (fs *ArtifactFuse) unpin(gen int64) {
+	if gen == 0 {
+		return
+	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.unpinLocked(gen)
 }
 
 // unpinLocked releases a pin of gen that pinInode took, if gen is not 0.
@@ -1929,17 +1942,21 @@ func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) er
 // write for O_TRUNC.
 func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, checkPermissions bool) error {
 	created := fs.takeCreateOpenPending(op.Inode)
-	return fs.shared(ctx, func(ctx context.Context, b *Blobs) error {
-		ref, pinned, err := fs.pinInode(op.Inode)
+	// carried holds the pin of a run that stopped to hydrate its blob, which
+	// Engine.Do does with no lock held, until the next run pins.
+	var carried int64
+	defer func() { fs.unpin(carried) }()
+	return fs.shared(ctx, func(ctx context.Context, b *Blobs) (err error) {
+		ref, pinned, err := fs.pinInode(op.Inode, carried)
+		carried = 0
 		if err != nil {
 			return err
 		}
 		defer func() {
-			if pinned != 0 {
-				fs.mu.Lock()
-				fs.unpinLocked(pinned)
-				fs.mu.Unlock()
+			if _, hydrating := errors.AsType[*notHydratedError](err); hydrating {
+				carried, pinned = pinned, 0
 			}
+			fs.unpin(pinned)
 		}()
 		fh := &FileHandle{inode: ref, path: ref.Path, writable: !op.OpenFlags.IsReadOnly()}
 		var access uint32

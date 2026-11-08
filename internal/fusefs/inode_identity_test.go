@@ -2130,6 +2130,64 @@ func TestOpenOverlappedByAPruneKeepsItsGeneration(t *testing.T) {
 	}
 }
 
+// pruningHydrator runs prune once, inside the first OpenHydrated, while the
+// op that waits for the blob holds no lock.
+type pruningHydrator struct {
+	model.Hydrator
+	prune func()
+}
+
+func (h *pruningHydrator) OpenHydrated(ctx context.Context, repo model.RepoPaths, node model.BaseNode) (*os.File, int64, error) {
+	if prune := h.prune; prune != nil {
+		h.prune = nil
+		prune()
+	}
+	return h.Hydrator.OpenHydrated(ctx, repo, node)
+}
+
+// An open of a base file stops to hydrate its blob with no lock held, then
+// runs again. A HEAD change can remove the path first, and a prune can run
+// during the hydration. The prune must keep the generation the open pinned,
+// so the rerun still opens the blob. Once the handle closes, no pin remains.
+func TestOpenKeepsItsGenerationWhileItHydrates(t *testing.T) {
+	other := baseFile("other.txt", "blob-OTHER", 0o100644)
+	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644), other)
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	f.switchTo(other)
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	f.fs.engine.Hydrator = &pruningHydrator{Hydrator: f.blobs, prune: func() {
+		if err := f.snap.PruneGenerations(f.ctx, f.resolver.Generation(), f.mount.OpenFileGenerations()...); err != nil {
+			t.Error(err)
+		}
+	}}
+	open := f.open(held)
+	if got := mustReadHandle(t, f, held, open.Handle); got != "blob-AAAA" {
+		t.Fatalf("the open that a prune overlapped while it hydrated reads %q, want blob-AAAA", got)
+	}
+	if err := f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: open.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.mount.OpenFileGenerations(); len(got) != 0 {
+		t.Fatalf("open file generations after the handle closed = %v, want none", got)
+	}
+}
+
+// An open whose blob fails to hydrate fails, and must release the pin it
+// carried across the hydration.
+func TestOpenThatFailsToHydrateReleasesItsPin(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	f.blobs.errorsByOID = map[string]error{"blob-AAAA": errors.New("fetch failed")}
+	if err := f.fs.OpenFile(f.ctx, &fuseops.OpenFileOp{Inode: held}); err == nil {
+		t.Fatal("OpenFile succeeded, want the hydration's error")
+	}
+	if got := f.mount.OpenFileGenerations(); len(got) != 0 {
+		t.Fatalf("open file generations after the open failed = %v, want none", got)
+	}
+}
+
 // pruneAfterTwoSwitches opens file.txt on a fixture mounted through
 // backend, then switches twice to later and prunes the generations below the
 // current one that the mount does not report for open files. It reports
