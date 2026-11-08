@@ -143,6 +143,14 @@ func IsolatePrompts(t *testing.T) string {
 	return runs
 }
 
+// FakeGitScript returns the script of a fake git that runs body. Before every
+// Git command that can contact a remote, gitstore looks up core.sshCommand.
+// The script answers that lookup as Git does when the key is unset, so body
+// fakes only the command itself.
+func FakeGitScript(body string) string {
+	return "#!/bin/sh\nif [ \"$*\" = 'config --get core.sshCommand' ]; then exit 1; fi\n" + body
+}
+
 // RequireNoPrompt fails t if the program IsolatePrompts set ran.
 func RequireNoPrompt(t testing.TB, runs string) {
 	t.Helper()

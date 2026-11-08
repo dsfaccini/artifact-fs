@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -23,8 +24,8 @@ import (
 )
 
 // sshSessionReportEnv makes this test binary act as an SSH command that
-// appends a line with its session ID and SSH_ASKPASS_REQUIRE to the named
-// file and fails.
+// appends a line with its session ID, whether it got BatchMode=yes, and
+// SSH_ASKPASS_REQUIRE to the named file, then fails.
 const sshSessionReportEnv = "AFS_TEST_SSH_SESSION_REPORT"
 
 // sshServeOnceEnv makes the first run of that SSH command serve the named
@@ -40,7 +41,7 @@ func init() {
 		if err == nil {
 			var f *os.File
 			if f, err = os.OpenFile(report, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
-				_, err = fmt.Fprintf(f, "%d %s\n", sid, os.Getenv("SSH_ASKPASS_REQUIRE"))
+				_, err = fmt.Fprintf(f, "%d %t %s\n", sid, slices.Contains(os.Args[1:], "BatchMode=yes"), os.Getenv("SSH_ASKPASS_REQUIRE"))
 				err = errors.Join(err, f.Close())
 			}
 		}
@@ -60,7 +61,47 @@ func init() {
 	}
 }
 
-func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
+// sshContact is one run of the SSH command that sshSessionReportEnv names.
+type sshContact struct {
+	sid       string
+	batchMode bool
+	askpass   string
+}
+
+func readSSHContacts(t *testing.T, report string) []sshContact {
+	t.Helper()
+	data, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatalf("git did not run the SSH command: %v", err)
+	}
+	var contacts []sshContact
+	for line := range strings.Lines(string(data)) {
+		sid, rest, _ := strings.Cut(strings.TrimSuffix(line, "\n"), " ")
+		batchMode, askpass, _ := strings.Cut(rest, " ")
+		contacts = append(contacts, sshContact{sid: sid, batchMode: batchMode == "true", askpass: askpass})
+	}
+	return contacts
+}
+
+// fakeSSHOnPath puts this test binary on PATH as ssh, the command Git runs
+// when no SSH command is set.
+func fakeSSHOnPath(t *testing.T) {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	if err := os.Symlink(exe, filepath.Join(bin, "ssh")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// Every Git command that can contact a remote runs SSH without a controlling
+// terminal. It runs the user's core.sshCommand as set, and plain ssh with
+// BatchMode, so ssh does not try passwords that a server may count.
+func TestNetworkGitRunsSSHWithoutTerminal(t *testing.T) {
 	const sshRemote = "ssh://git@example.invalid/repo.git"
 	// elsewhere is a repo config that clones or acquires from sshRemote next
 	// to cfg's git dir.
@@ -115,58 +156,103 @@ func TestLazyFetchUsesCoreSSHCommandWithoutTerminal(t *testing.T) {
 			return err
 		}},
 	} {
-		t.Run(tt.name, func(t *testing.T) {
+		for _, sshCommand := range []bool{true, false} {
+			name := "core.sshCommand"
+			if !sshCommand {
+				name = "plain ssh"
+			}
+			t.Run(tt.name+"/"+name, func(t *testing.T) {
+				gittest.IsolatePrompts(t)
+				// Git would first probe an SSH command it does not know with -G.
+				t.Setenv("GIT_SSH_VARIANT", "ssh")
+				tmp := t.TempDir()
+				gitDir, commit, blob := partialClone(t, tmp, tt.filter)
+				run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", sshRemote)
+				if sshCommand {
+					exe, err := os.Executable()
+					if err != nil {
+						t.Fatal(err)
+					}
+					run(t, "git", "--git-dir", gitDir, "config", "core.sshCommand", shellScriptQuote(exe))
+					if tt.globalSSH {
+						t.Setenv("GIT_CONFIG_COUNT", "1")
+						t.Setenv("GIT_CONFIG_KEY_0", "core.sshCommand")
+						t.Setenv("GIT_CONFIG_VALUE_0", shellScriptQuote(exe))
+					}
+				} else {
+					fakeSSHOnPath(t)
+				}
+				if tt.serveOnce {
+					src := filepath.Join(tmp, "src")
+					run(t, "git", "-C", src, "tag", "v1")
+					t.Setenv(sshServeOnceEnv, src)
+				}
+				report := filepath.Join(tmp, "ssh-session")
+				t.Setenv(sshSessionReportEnv, report)
+
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+				err := tt.read(ctx, store, model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: gitDir}}, commit, blob)
+				store.Close()
+				if err == nil {
+					t.Fatal("reached a remote through an SSH command that fails")
+				}
+				contacts := readSSHContacts(t, report)
+				testSID, err := unix.Getsid(0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tt.serveOnce && len(contacts) < 2 {
+					t.Fatalf("git contacted the remote %d times, want a second contact after the served one", len(contacts))
+				}
+				for _, contact := range contacts {
+					if contact.sid == strconv.Itoa(testSID) {
+						t.Fatalf("SSH ran in the caller's session %d, which can have a controlling terminal", testSID)
+					}
+					if contact.askpass != "never" {
+						t.Fatalf("SSH ran with SSH_ASKPASS_REQUIRE=%q, want never", contact.askpass)
+					}
+					if !sshCommand && !contact.batchMode {
+						t.Fatal("plain ssh ran without BatchMode=yes")
+					}
+				}
+			})
+		}
+	}
+}
+
+// An SSH program the environment names runs as the user set it, without
+// BatchMode added.
+func TestNetworkGitKeepsTheEnvironmentsSSHProgram(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct{ key, value string }{
+		{"GIT_SSH_COMMAND", shellScriptQuote(exe)},
+		{"GIT_SSH", exe},
+	} {
+		t.Run(tt.key, func(t *testing.T) {
 			gittest.IsolatePrompts(t)
-			// Git would first probe an SSH command it does not know with -G.
 			t.Setenv("GIT_SSH_VARIANT", "ssh")
+			// Plain ssh on PATH reports BatchMode, so a BatchMode command
+			// that replaced the user's program would show.
+			fakeSSHOnPath(t)
+			t.Setenv(tt.key, tt.value)
 			tmp := t.TempDir()
-			gitDir, commit, blob := partialClone(t, tmp, tt.filter)
-			exe, err := os.Executable()
-			if err != nil {
-				t.Fatal(err)
-			}
-			run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", sshRemote)
-			run(t, "git", "--git-dir", gitDir, "config", "core.sshCommand", shellScriptQuote(exe))
-			if tt.globalSSH {
-				t.Setenv("GIT_CONFIG_COUNT", "1")
-				t.Setenv("GIT_CONFIG_KEY_0", "core.sshCommand")
-				t.Setenv("GIT_CONFIG_VALUE_0", shellScriptQuote(exe))
-			}
-			if tt.serveOnce {
-				src := filepath.Join(tmp, "src")
-				run(t, "git", "-C", src, "tag", "v1")
-				t.Setenv(sshServeOnceEnv, src)
-			}
+			gitDir, _, _ := partialClone(t, tmp, "blob:none")
+			run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", "ssh://git@example.invalid/repo.git")
 			report := filepath.Join(tmp, "ssh-session")
 			t.Setenv(sshSessionReportEnv, report)
-
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
 			store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
-			err = tt.read(ctx, store, model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: gitDir}}, commit, blob)
-			store.Close()
-			if err == nil {
-				t.Fatal("reached a remote through an SSH command that fails")
+			store.gitRetryDelays = nil
+			if err := store.FetchNonInteractive(t.Context(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}}); err == nil {
+				t.Fatal("fetched through an SSH command that fails")
 			}
-			data, err := os.ReadFile(report)
-			if err != nil {
-				t.Fatalf("git did not run the SSH command: %v", err)
-			}
-			testSID, err := unix.Getsid(0)
-			if err != nil {
-				t.Fatal(err)
-			}
-			contacts := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
-			if tt.serveOnce && len(contacts) < 2 {
-				t.Fatalf("git contacted the remote %d times, want a second contact after the served one", len(contacts))
-			}
-			for _, contact := range contacts {
-				sid, askpass, _ := strings.Cut(contact, " ")
-				if sid == strconv.Itoa(testSID) {
-					t.Fatalf("core.sshCommand ran in the caller's session %d, which can have a controlling terminal", testSID)
-				}
-				if askpass != "never" {
-					t.Fatalf("core.sshCommand ran with SSH_ASKPASS_REQUIRE=%q, want never", askpass)
+			for _, contact := range readSSHContacts(t, report) {
+				if contact.batchMode {
+					t.Fatalf("%s did not run: Git ran SSH with BatchMode=yes", tt.key)
 				}
 			}
 		})
@@ -286,7 +372,7 @@ func assertEscapedGitCancellationIsBounded(t *testing.T, call func(context.Conte
 	}
 	marker := filepath.Join(tmp, "escaped")
 	finished := filepath.Join(tmp, "escaped-finished")
-	script := "#!/bin/sh\n\"$AFS_TEST_BINARY\" -test.run '^TestRunGitEscapedDescriptorHelper$' &\nwait\n"
+	script := gittest.FakeGitScript("\"$AFS_TEST_BINARY\" -test.run '^TestRunGitEscapedDescriptorHelper$' &\nwait\n")
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -388,17 +474,22 @@ func TestPreparedGitDirFetchHonorsCoreSSHCommand(t *testing.T) {
 	}
 }
 
-// Git runs SSH without BatchMode, so SSH can still ask to accept an unknown
-// host key or for a key's passphrase. Without a controlling terminal and with
-// askpass disabled, both prompts fail. DISPLAY makes the SSH_ASKPASS that
-// IsolatePrompts records eligible for both prompts.
+// A user's core.sshCommand runs without BatchMode, so SSH can still ask to
+// accept an unknown host key or for a key's passphrase. Without a controlling
+// terminal and with askpass disabled, both prompts fail. DISPLAY makes the
+// SSH_ASKPASS that IsolatePrompts records eligible for both prompts.
 func TestNetworkGitSSHPromptsFailWithoutTerminal(t *testing.T) {
 	sshd, err := exec.LookPath("sshd")
 	if err != nil {
 		sshd = "/usr/sbin/sshd"
 	}
+	skip := t.Skipf
+	if os.Getenv("CI") != "" {
+		// CI runs go test without -v, so a skip there would go unseen.
+		skip = t.Fatalf
+	}
 	if _, err := os.Stat(sshd); err != nil {
-		t.Skipf("no sshd to answer SSH: %v", err)
+		skip("no sshd to answer SSH: %v", err)
 	}
 	askpassRuns := gittest.IsolatePrompts(t)
 	t.Setenv("DISPLAY", ":0")
@@ -426,7 +517,7 @@ func TestNetworkGitSSHPromptsFailWithoutTerminal(t *testing.T) {
 	ssh := "ssh -F /dev/null -o IdentityAgent=none -o GlobalKnownHostsFile=/dev/null -o 'ProxyCommand=" + sshd + " -i -f " + sshdConfig + "'"
 	probe := ssh + " -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=none git@localhost true"
 	if out, _ := exec.Command("sh", "-c", probe).CombinedOutput(); !strings.Contains(string(out), "Permission denied") {
-		t.Skipf("sshd -i does not serve SSH here: %s", out)
+		skip("sshd -i does not serve SSH here: %s", out)
 	}
 	gitDir, _, _ := partialClone(t, tmp, "blob:none")
 	run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", "ssh://git@localhost/repo.git")

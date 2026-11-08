@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -70,7 +71,7 @@ func fakeGitStderrBoundInsidePassword(t *testing.T, remote string) {
 	t.Helper()
 	lead := remote[:strings.Index(remote, "s3cr")+len("s3cr")]
 	pad := maxGitErrorBytes - len("fatal: ") - len(" ") - len(lead)
-	script := "#!/bin/sh\nprintf 'fatal: ' >&2\nawk 'BEGIN { for (i = 0; i < " + strconv.Itoa(pad) + "; i++) printf \"x\" }' >&2\nprintf ' %s\\n' '" + remote + "' >&2\nexit 128\n"
+	script := gittest.FakeGitScript("printf 'fatal: ' >&2\nawk 'BEGIN { for (i = 0; i < " + strconv.Itoa(pad) + "; i++) printf \"x\" }' >&2\nprintf ' %s\\n' '" + remote + "' >&2\nexit 128\n")
 	bin := t.TempDir()
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)

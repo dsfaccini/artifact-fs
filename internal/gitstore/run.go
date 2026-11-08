@@ -34,10 +34,14 @@ func runGitInput(ctx context.Context, gitDir string, extraEnv []string, input []
 // runLazyFetchGitInput runs a Git command that fetches objects as a lazy fetch
 // does: with lazyFetchEnv, in its own session, so it cannot prompt.
 func runLazyFetchGitInput(ctx context.Context, gitDir string, input []byte, args ...string) (string, error) {
+	env, err := lazyFetchEnv(ctx, gitDir, nil)
+	if err != nil {
+		return "", err
+	}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	configureCancelableCommand(cmd)
 	configureCommandSession(cmd)
-	return runInputCommand(ctx, cmd, gitDir, lazyFetchEnv(), input)
+	return runInputCommand(ctx, cmd, gitDir, env, input)
 }
 
 func runInputCommand(ctx context.Context, cmd *exec.Cmd, gitDir string, extraEnv []string, input []byte) (string, error) {
@@ -75,10 +79,14 @@ func setGitWorktreeDirectory(cmd *exec.Cmd, extraEnv []string) {
 // the terminal stops it at a prompt. Credential helpers and the askpass
 // programs the user set still run.
 func runNetworkGit(ctx context.Context, gitDir string, extraEnv []string, args ...string) (string, error) {
+	env, err := lazyFetchEnv(ctx, gitDir, extraEnv)
+	if err != nil {
+		return "", err
+	}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	configureCancelableCommand(cmd)
 	configureCommandSession(cmd)
-	return runGitCommand(ctx, cmd, gitDir, append(lazyFetchEnv(), extraEnv...), true)
+	return runGitCommand(ctx, cmd, gitDir, append(env, extraEnv...), true)
 }
 
 func runGitWithEnvCapture(ctx context.Context, gitDir string, extraEnv []string, captureOutput bool, args ...string) (string, error) {

@@ -63,11 +63,15 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 }
 
 func streamTreeRecords(ctx context.Context, gitDir string, headOID string, fn func(string)) error {
+	env, err := lazyFetchEnv(ctx, gitDir, nil)
+	if err != nil {
+		return err
+	}
 	cmd := exec.CommandContext(ctx, "git", "ls-tree", "-r", "-t", "-z", headOID)
 	configureCancelableCommand(cmd)
 	// A treeless clone fetches missing trees here.
 	configureCommandSession(cmd)
-	cmd.Env = append(append(os.Environ(), "GIT_DIR="+gitDir), lazyFetchEnv()...)
+	cmd.Env = append(append(os.Environ(), "GIT_DIR="+gitDir), env...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err

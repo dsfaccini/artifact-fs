@@ -345,7 +345,7 @@ func (p *batchPool) acquire(ctx context.Context) (*batchCatFile, error) {
 		if len(p.all)+p.creating < p.maxSize {
 			p.creating++
 			p.mu.Unlock()
-			b, err := newBatchCatFile(p.gitDir, p.logger)
+			b, err := newBatchCatFile(ctx, p.gitDir, p.logger)
 			p.mu.Lock()
 			p.creating--
 			if err == nil && !p.closed {
@@ -465,9 +465,13 @@ type batchCatFile struct {
 	terminateOnce sync.Once
 }
 
-func newBatchCatFile(gitDir string, logger *slog.Logger) (*batchCatFile, error) {
+func newBatchCatFile(ctx context.Context, gitDir string, logger *slog.Logger) (*batchCatFile, error) {
+	env, err := lazyFetchEnv(ctx, gitDir, nil)
+	if err != nil {
+		return nil, err
+	}
 	cmd := exec.Command("git", "cat-file", "--batch")
-	cmd.Env = append(append(os.Environ(), "GIT_DIR="+gitDir), lazyFetchEnv()...)
+	cmd.Env = append(append(os.Environ(), "GIT_DIR="+gitDir), env...)
 	stderr := &gitStderrLogger{logger: logger, gitDir: gitDir}
 	cmd.Stderr = stderr
 	configureCommandSession(cmd)

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -146,7 +147,7 @@ done
 func TestBuildTreeIndexBoundsLazyFetchStderr(t *testing.T) {
 	// A lazy tree fetch's server shapes ls-tree's stderr, which redaction reads.
 	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nprintf 'fatal: %0100000d\\n' 0 >&2\nexit 128\n"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(gittest.FakeGitScript("printf 'fatal: %0100000d\\n' 0 >&2\nexit 128\n")), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -246,7 +247,7 @@ func TestStreamTreeRecordsPreservesDeadline(t *testing.T) {
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nexec sleep 10\n"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(gittest.FakeGitScript("exec sleep 10\n")), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))

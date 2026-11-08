@@ -119,7 +119,7 @@ func TestSyncRegistrationIsNotMountedWhilePreparing(t *testing.T) {
 	}
 	started := filepath.Join(tmp, "git-started")
 	release := filepath.Join(tmp, "git-release")
-	gitScript := "#!/bin/sh\n: > \"$AFS_GIT_STARTED\"\nwhile [ ! -f \"$AFS_GIT_RELEASE\" ]; do sleep 0.01; done\nprintf '%s\\n' 'clone failed' >&2\nexit 1\n"
+	gitScript := gittest.FakeGitScript(": > \"$AFS_GIT_STARTED\"\nwhile [ ! -f \"$AFS_GIT_RELEASE\" ]; do sleep 0.01; done\nprintf '%s\\n' 'clone failed' >&2\nexit 1\n")
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(gitScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -755,7 +755,7 @@ func TestMountRepoPreparationTimesOutAndReleasesLock(t *testing.T) {
 	gitStarted := filepath.Join(tmp, "git-started")
 	gitFinished := filepath.Join(tmp, "git-finished")
 	// The git call finishes only if the prepare deadline fails to kill it.
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\n: > \"$AFS_GIT_STARTED\"\nsleep 60\n: > \"$AFS_GIT_FINISHED\"\nexit 1\n"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(gittest.FakeGitScript(": > \"$AFS_GIT_STARTED\"\nsleep 60\n: > \"$AFS_GIT_FINISHED\"\nexit 1\n")), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -922,7 +922,7 @@ func TestAddRepoSyncCancellationIsLoggedAndPersisted(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := filepath.Join(tmp, "git-started")
-	gitScript := "#!/bin/sh\n: > \"$AFS_GIT_STARTED\"\nexec sleep 10\n"
+	gitScript := gittest.FakeGitScript(": > \"$AFS_GIT_STARTED\"\nexec sleep 10\n")
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(gitScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1108,7 +1108,7 @@ func TestAddRepoSyncFailureDoesNotOverwriteNewerConfig(t *testing.T) {
 	}
 	started := filepath.Join(tmp, "git-started")
 	release := filepath.Join(tmp, "git-release")
-	gitScript := "#!/bin/sh\n: > \"$AFS_GIT_STARTED\"\nwhile [ ! -f \"$AFS_GIT_RELEASE\" ]; do sleep 0.01; done\nprintf '%s\\n' 'fatal: Authentication failed; HTTP 401' >&2\nexit 1\n"
+	gitScript := gittest.FakeGitScript(": > \"$AFS_GIT_STARTED\"\nwhile [ ! -f \"$AFS_GIT_RELEASE\" ]; do sleep 0.01; done\nprintf '%s\\n' 'fatal: Authentication failed; HTTP 401' >&2\nexit 1\n")
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(gitScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1717,7 +1717,7 @@ func createPreparedGitDir(t *testing.T, tmp string) string {
 
 // markCloneStartScript is a fake git that marks AFS_CLONE_STARTED when a clone
 // starts, and never finishes.
-const markCloneStartScript = "#!/bin/sh\ncase \" $* \" in *' clone '*) : > \"$AFS_CLONE_STARTED\";; esac\nexec sleep 10\n"
+var markCloneStartScript = gittest.FakeGitScript("case \" $* \" in *' clone '*) : > \"$AFS_CLONE_STARTED\";; esac\nexec sleep 10\n")
 
 // expirePrepareOnFile makes svc's preparation deadline pass once the fake git
 // creates path, so the timeout interrupts the step the test names.

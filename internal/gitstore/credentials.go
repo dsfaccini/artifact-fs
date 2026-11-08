@@ -1,8 +1,11 @@
 package gitstore
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
@@ -182,12 +185,32 @@ func isSCPStyleRemote(raw string) bool {
 	return at > 0 && colon > at
 }
 
-// lazyFetchEnv keeps a Git command that contacts a remote from prompting. Run
-// the command with configureCommandSession too: without a controlling
-// terminal SSH cannot prompt, and SSH_ASKPASS_REQUIRE keeps it from opening an
-// askpass dialog instead. It leaves GIT_SSH_COMMAND unset, so the repo's
-// core.sshCommand, which an adopted worktree or a prepared git dir keeps,
-// still applies.
-func lazyFetchEnv() []string {
-	return []string{"GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS=", "SSH_ASKPASS_REQUIRE=never"}
+// lazyFetchEnv returns the environment that keeps a Git command that contacts
+// a remote from prompting. Run the command with configureCommandSession too:
+// without a controlling terminal SSH cannot prompt, and SSH_ASKPASS_REQUIRE
+// keeps it from opening an askpass dialog instead. SSH still tries empty
+// passwords, and a retried command repeats them against a server that may ban
+// the client, so lazyFetchEnv adds BatchMode. It does so only when the command
+// would run plain ssh: with neither GIT_SSH_COMMAND nor GIT_SSH set, and no
+// core.sshCommand in its effective config. The user's own SSH command, such
+// as the one an adopted worktree or a prepared git dir keeps, runs unchanged.
+// extraEnv is the environment the command adds, which can change its config.
+func lazyFetchEnv(ctx context.Context, gitDir string, extraEnv []string) ([]string, error) {
+	env := []string{"GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS=", "SSH_ASKPASS_REQUIRE=never"}
+	for _, key := range []string{"GIT_SSH_COMMAND", "GIT_SSH"} {
+		if _, ok := os.LookupEnv(key); ok {
+			return env, nil
+		}
+	}
+	if gitDir == "" {
+		// A clone reads no repository config, but git config would read the
+		// repository around the working directory.
+		gitDir = os.DevNull
+	}
+	if _, err := runGitWithEnv(ctx, gitDir, extraEnv, "config", "--get", "core.sshCommand"); err == nil {
+		return env, nil
+	} else if exitErr, ok := errors.AsType[*gitCommandError](err); !ok || exitErr.exitCode != 1 {
+		return nil, fmt.Errorf("read core.sshCommand: %w", err)
+	}
+	return append(env, "GIT_SSH_COMMAND=ssh -o BatchMode=yes"), nil
 }
