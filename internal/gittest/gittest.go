@@ -100,8 +100,8 @@ func raceExitSleepSetting(gorace string) (string, bool) {
 // DisableRaceExitSleep stops each race-built binary this process starts from
 // sleeping raceExitSleep after it exits 0. It appends atexit_sleep_ms=0 to
 // GORACE, unless GORACE already sets atexit_sleep_ms. Call it from TestMain in
-// a package whose test binary git runs as the FSMonitor hook: there the sleep
-// adds a second to every git command that reads the index.
+// a package whose test binary git runs as the FSMonitor hook or as SSH: there
+// the sleep adds a second to every git command that runs the binary.
 func DisableRaceExitSleep() {
 	gorace := os.Getenv("GORACE")
 	if _, ok := raceExitSleepSetting(gorace); !ok {

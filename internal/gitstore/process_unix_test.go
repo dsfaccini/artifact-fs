@@ -111,6 +111,8 @@ func TestNetworkGitRunsSSHWithoutTerminal(t *testing.T) {
 	elsewhere := func(cfg model.RepoConfig, branch string) model.RepoConfig {
 		return model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: filepath.Join(filepath.Dir(cfg.GitDir), "other.git")}, RepoSpec: model.RepoSpec{RemoteURL: sshRemote, Branch: branch}}
 	}
+	src, commit, blob := partialCloneSource(t, t.TempDir())
+	run(t, "git", "-C", src, "tag", "v1")
 	for _, tt := range []struct {
 		name   string
 		filter string
@@ -170,7 +172,7 @@ func TestNetworkGitRunsSSHWithoutTerminal(t *testing.T) {
 				// Git would first probe an SSH command it does not know with -G.
 				t.Setenv("GIT_SSH_VARIANT", "ssh")
 				tmp := t.TempDir()
-				gitDir, commit, blob := partialClone(t, tmp, tt.filter)
+				gitDir := partialCloneOf(t, src, tmp, tt.filter)
 				run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", sshRemote)
 				if sshCommand {
 					exe, err := os.Executable()
@@ -187,15 +189,12 @@ func TestNetworkGitRunsSSHWithoutTerminal(t *testing.T) {
 					fakeSSHOnPath(t)
 				}
 				if tt.serveOnce {
-					src := filepath.Join(tmp, "src")
-					run(t, "git", "-C", src, "tag", "v1")
 					t.Setenv(sshServeOnceEnv, src)
 				}
 				report := filepath.Join(tmp, "ssh-session")
 				t.Setenv(sshSessionReportEnv, report)
 
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
+				ctx := t.Context()
 				store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
 				err := tt.read(ctx, store, model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: gitDir}}, commit, blob)
 				store.Close()
@@ -748,8 +747,7 @@ func TestPreparedGitDirFetchHonorsCoreSSHCommand(t *testing.T) {
 	run(t, "git", "--git-dir", gitDir, "config", "core.sshCommand", shellScriptQuote(exe))
 	report := filepath.Join(tmp, "ssh-session")
 	t.Setenv(sshSessionReportEnv, report)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	ctx := t.Context()
 	store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	store.gitRetryDelays = nil
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{PreparedGitDir: true}}

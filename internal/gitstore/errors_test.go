@@ -12,6 +12,7 @@ import (
 )
 
 func TestBoundedGitErrorPreservesClassificationAfterTruncation(t *testing.T) {
+	t.Parallel()
 	var stderr boundedGitError
 	stderr.limit = 16
 	_, _ = stderr.Write([]byte(strings.Repeat("x", 32)))
@@ -33,6 +34,7 @@ func TestBoundedGitErrorPreservesClassificationAfterTruncation(t *testing.T) {
 }
 
 func TestRedactTruncatedCredentialPrefix(t *testing.T) {
+	t.Parallel()
 	credential := "super-secret-token"
 	message := "fatal: authentication failed: super-secret-tok\n" + gitErrorTruncatedLabel
 	got := redactTruncatedCredentialPrefix(message, []string{credential})
