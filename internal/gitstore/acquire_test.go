@@ -653,6 +653,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 		RepoSpec: model.RepoSpec{
 			RemoteURL:      "file://" + bare,
 			Branch:         "refs/heads/main",
+			FetchRef:       "refs/heads/main",
 			RequiredCommit: tip,
 			HistoryDepth:   1,
 		},
@@ -752,8 +753,10 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	if trackingCount != "1" {
 		t.Fatalf("tracking history count after refresh = %q, want 1", trackingCount)
 	}
-	if _, err := runGit(ctx, gitDir, "show-ref", "--verify", "refs/remotes/origin/side"); err == nil {
-		t.Fatal("verified source refresh fetched an unrelated branch")
+	for _, ref := range []string{"refs/remotes/origin/side", "refs/remotes/origin/main"} {
+		if _, err := runGit(ctx, gitDir, "show-ref", "--verify", ref); err == nil {
+			t.Fatalf("verified source refresh fetched %s; the source lands only in %s", ref, verifiedSourceTrackingRef)
+		}
 	}
 	cmd := exec.CommandContext(ctx, "git", "cat-file", "-e", blobOID)
 	cmd.Env = append(os.Environ(), "GIT_DIR="+gitDir, "GIT_NO_LAZY_FETCH=1")
@@ -1131,6 +1134,244 @@ func TestCloneBloblessUsesExactCanonicalTag(t *testing.T) {
 	}
 }
 
+// newFetchFixture is a remote with a main branch and a git dir whose origin
+// is that remote, with Git's default refspec for every branch.
+func newFetchFixture(t *testing.T, tmp string) (work, gitDir string) {
+	t.Helper()
+	bare := filepath.Join(tmp, "origin.git")
+	work = filepath.Join(tmp, "work")
+	gitDir = filepath.Join(tmp, "repo.git")
+	run(t, "git", "init", "--bare", "--initial-branch", "main", bare)
+	run(t, "git", "clone", "-q", bare, work)
+	commit(t, work, "README.md")
+	run(t, "git", "-C", work, "push", "-q", "origin", "HEAD:main")
+	run(t, "git", "init", "-q", "--bare", gitDir)
+	run(t, "git", "--git-dir", gitDir, "remote", "add", "origin", "file://"+bare)
+	return work, gitDir
+}
+
+// commit commits a file named name in work and returns the commit.
+func commit(t *testing.T, work, name string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(work, name), []byte(name+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", work, "add", name)
+	run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", name)
+	return strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
+}
+
+// A fetch ref that is a tag lands where preparation fetches it, also when
+// the tag moves, and ahead/behind compares HEAD with it. Once the tag's
+// tracking ref exists, a refresh passes no --depth, so it keeps the shallow
+// boundary and HEAD's history, and a tag moved to unrelated history reads as
+// diverged.
+func TestFetchNonInteractiveFetchesATagFetchRef(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		depth     int
+		unrelated bool
+		ahead     int
+	}{
+		{"forward", 0, false, 0},
+		{"forward with depth 1", 1, false, 0},
+		{"forward with depth 3", 3, false, 0},
+		{"unrelated history with depth 1", 1, true, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			work, gitDir := newFetchFixture(t, tmp)
+			for _, name := range []string{"ONE.md", "TWO.md", "THREE.md"} {
+				commit(t, work, name)
+			}
+			run(t, "git", "-C", work, "tag", "v1")
+			run(t, "git", "-C", work, "push", "-q", "origin", "v1")
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{Branch: "refs/heads/main", FetchRef: "refs/tags/v1", HistoryDepth: tt.depth}}
+			store := New(nil)
+			ctx := context.Background()
+			if err := store.FetchNonInteractive(ctx, cfg); err != nil {
+				t.Fatal(err)
+			}
+			// Preparation serves the fetched tag.
+			run(t, "git", "--git-dir", gitDir, "update-ref", "--no-deref", "HEAD", fetchedFullRefRemoteTrackingRef+"^{commit}")
+			history := func() string {
+				return strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-list", "--count", "HEAD"))
+			}
+			shallow := func() string {
+				data, err := os.ReadFile(filepath.Join(gitDir, "shallow"))
+				if err != nil && !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+				return string(data)
+			}
+			historyBefore, shallowBefore := history(), shallow()
+			if tt.unrelated {
+				run(t, "git", "-C", work, "checkout", "-q", "--orphan", "unrelated")
+				run(t, "git", "-C", work, "rm", "-rq", "--cached", ".")
+			}
+			moved := commit(t, work, "AGAIN.md")
+			run(t, "git", "-C", work, "tag", "-f", "v1")
+			run(t, "git", "-C", work, "push", "-q", "-f", "origin", "v1")
+			if err := store.FetchNonInteractive(ctx, cfg); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", fetchedFullRefRemoteTrackingRef+"^{commit}")); got != moved {
+				t.Fatalf("%s = %s, want the moved tag's %s", fetchedFullRefRemoteTrackingRef, got, moved)
+			}
+			if got := history(); got != historyBefore {
+				t.Fatalf("HEAD's history = %s commits after the refresh, want the %s it had", got, historyBefore)
+			}
+			if got := shallow(); got != shallowBefore {
+				t.Fatalf("shallow = %q after the refresh, want %q", got, shallowBefore)
+			}
+			ahead, behind, diverged, err := store.ComputeAheadBehind(ctx, cfg)
+			if err != nil || ahead != tt.ahead || behind != 1 || diverged != tt.unrelated {
+				t.Fatalf("ahead/behind/diverged = %d/%d/%t, %v; want %d/1/%t", ahead, behind, diverged, err, tt.ahead, tt.unrelated)
+			}
+		})
+	}
+}
+
+// A branch fetch ref in a --depth clone reports a rewritten upstream tip as
+// diverged, and a forward push as behind.
+func TestComputeAheadBehindOfARewrittenBranch(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		amend    bool
+		ahead    int
+		diverged bool
+	}{{"forward", false, 0, false}, {"amended tip", true, 1, true}} {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			work, _ := newFetchFixture(t, tmp)
+			bare := filepath.Join(tmp, "origin.git")
+			run(t, "git", "-C", bare, "config", "uploadpack.allowFilter", "true")
+			commit(t, work, "TWO.md")
+			commit(t, work, "THREE.md")
+			run(t, "git", "-C", work, "push", "-q", "origin", "HEAD:main")
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: filepath.Join(tmp, "clone.git")}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + bare, Branch: "refs/heads/main", FetchRef: "refs/heads/main", HistoryDepth: 1}}
+			store := New(nil)
+			ctx := context.Background()
+			if err := store.CloneBlobless(ctx, cfg); err != nil {
+				t.Fatal(err)
+			}
+			if tt.amend {
+				run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "--amend", "-m", "amended")
+			} else {
+				commit(t, work, "FOUR.md")
+			}
+			run(t, "git", "-C", work, "push", "-q", "-f", "origin", "HEAD:main")
+			if err := store.FetchNonInteractive(ctx, cfg); err != nil {
+				t.Fatal(err)
+			}
+			ahead, behind, diverged, err := store.ComputeAheadBehind(ctx, cfg)
+			if err != nil || ahead != tt.ahead || behind == 0 || diverged != tt.diverged {
+				t.Fatalf("ahead/behind/diverged = %d/%d/%t, %v; want %d/>0/%t", ahead, behind, diverged, err, tt.ahead, tt.diverged)
+			}
+			if !tt.amend && behind != 1 {
+				t.Fatalf("behind = %d after a forward push of one commit, want 1", behind)
+			}
+		})
+	}
+}
+
+// A read of the tracking ref that fails, such as one the refresh's deadline
+// cuts short, returns its error, so the refresh keeps the counts it stored.
+func TestComputeAheadBehindReturnsAFailedRead(t *testing.T) {
+	tmp := t.TempDir()
+	_, gitDir := newFetchFixture(t, tmp)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{FetchRef: "refs/heads/main"}}
+	if _, _, _, err := New(nil).ComputeAheadBehind(ctx, cfg); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ComputeAheadBehind error = %v, want context canceled", err)
+	}
+}
+
+// The refresh passes --depth only while the git dir lacks both the tracking
+// ref and the fetch ref's branch. With the branch kept and the tracking ref
+// deleted, a refresh with --depth would mark the fetched tip shallow, and the
+// next preparation would refuse to move the branch onto it.
+func TestRefreshWithoutTheTrackingRefLetsPreparationMoveTheBranch(t *testing.T) {
+	tmp := t.TempDir()
+	work, _ := newFetchFixture(t, tmp)
+	bare := filepath.Join(tmp, "origin.git")
+	commit(t, work, "TWO.md")
+	run(t, "git", "-C", work, "push", "-q", "origin", "HEAD:main")
+	gitDir := filepath.Join(tmp, "prepared.git")
+	run(t, "git", "init", "-q", "--separate-git-dir", gitDir, "--initial-branch", "main", filepath.Join(tmp, "prepared"))
+	run(t, "git", "--git-dir", gitDir, "remote", "add", "origin", "file://"+bare)
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "p", GitDir: gitDir}, RepoSpec: model.RepoSpec{Branch: "refs/heads/main", FetchRef: "refs/heads/main", PreparedGitDir: true, HistoryDepth: 1}}
+	store := New(nil)
+	ctx := context.Background()
+	if err := store.FetchRefAmbient(ctx, cfg, cfg.FetchRef); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PrepareFetchedBranch(ctx, cfg, cfg.FetchRef); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "--git-dir", gitDir, "update-ref", "-d", "refs/remotes/origin/main")
+	next := commit(t, work, "THREE.md")
+	run(t, "git", "-C", work, "push", "-q", "origin", "HEAD:main")
+	if err := store.FetchNonInteractive(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PrepareFetchedBranch(ctx, cfg, cfg.FetchRef); err != nil {
+		t.Fatalf("prepare after the refresh: %v", err)
+	}
+	if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", "refs/heads/main")); got != next {
+		t.Fatalf("main = %s, want %s", got, next)
+	}
+}
+
+// A verified source refreshes into its tracking ref, and ahead/behind
+// compares HEAD with it. With --depth, each refresh passes --depth, so a
+// source moved by --depth commits reports 0/0. Without --depth, a source
+// force-pushed to unrelated history reads as diverged.
+func TestComputeAheadBehindOfAVerifiedSource(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		depth     int
+		unrelated bool
+		ahead     int
+		behind    int
+	}{
+		{"forward", 0, false, 0, 1},
+		{"forward with depth 1", 1, false, 0, 0},
+		{"unrelated history", 0, true, 1, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			work, _ := newFetchFixture(t, tmp)
+			run(t, "git", "-C", filepath.Join(tmp, "origin.git"), "config", "uploadpack.allowFilter", "true")
+			tip := strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
+			gitDir := filepath.Join(tmp, "verified.git")
+			cfg := model.RepoConfig{
+				RepoPaths: model.RepoPaths{ID: "verified", Name: "verified", GitDir: gitDir, MountPath: filepath.Join(tmp, "mounted")},
+				RepoSpec:  model.RepoSpec{RemoteURL: "file://" + filepath.Join(tmp, "origin.git"), Branch: "refs/heads/main", FetchRef: "refs/heads/main", RequiredCommit: tip, HistoryDepth: tt.depth},
+			}
+			store := New(nil)
+			ctx := context.Background()
+			if _, err := store.PrepareSource(ctx, cfg, model.SourceRequirement{Ref: cfg.Branch, RequiredCommit: tip, Depth: tt.depth}); err != nil {
+				t.Fatal(err)
+			}
+			if tt.unrelated {
+				run(t, "git", "-C", work, "checkout", "-q", "--orphan", "unrelated")
+				run(t, "git", "-C", work, "rm", "-rq", "--cached", ".")
+			}
+			commit(t, work, "NEXT.md")
+			run(t, "git", "-C", work, "push", "-q", "-f", "origin", "HEAD:main")
+			if err := store.FetchNonInteractive(ctx, cfg); err != nil {
+				t.Fatal(err)
+			}
+			ahead, behind, diverged, err := store.ComputeAheadBehind(ctx, cfg)
+			if err != nil || ahead != tt.ahead || behind != tt.behind || diverged != tt.unrelated {
+				t.Fatalf("ahead/behind/diverged = %d/%d/%t, %v; want %d/%d/%t", ahead, behind, diverged, err, tt.ahead, tt.behind, tt.unrelated)
+			}
+		})
+	}
+}
+
 func TestCloneAndFetchRefSkipTags(t *testing.T) {
 	tmp := t.TempDir()
 	bare := filepath.Join(tmp, "origin.git")
@@ -1222,7 +1463,7 @@ func TestFetchStartsBeforeAndEndsAfterItsRemoteLookup(t *testing.T) {
 	script := "#!/bin/sh\n" +
 		"case \"$*\" in\n" +
 		"  'remote get-url origin') trap '' TERM; echo $$ > \"$AFS_LOOKUP_PID.tmp\"; mv \"$AFS_LOOKUP_PID.tmp\" \"$AFS_LOOKUP_PID\"; sleep 60; : > \"$AFS_LOOKUP_FINISHED\";;\n" +
-		"  'fetch --no-tags origin') i=0; while [ ! -f \"$AFS_LOOKUP_PID\" ] && [ $i -lt 6000 ]; do sleep 0.01; i=$((i+1)); done; [ -f \"$AFS_LOOKUP_FINISHED\" ] || : > \"$AFS_FETCH_STARTED\"; printf '%s\\n' 'HTTP 503 transport failure' >&2; exit 1;;\n" +
+		"  'fetch --no-tags origin '*) i=0; while [ ! -f \"$AFS_LOOKUP_PID\" ] && [ $i -lt 6000 ]; do sleep 0.01; i=$((i+1)); done; [ -f \"$AFS_LOOKUP_FINISHED\" ] || : > \"$AFS_FETCH_STARTED\"; printf '%s\\n' 'HTTP 503 transport failure' >&2; exit 1;;\n" +
 		"esac\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -1235,7 +1476,7 @@ func TestFetchStartsBeforeAndEndsAfterItsRemoteLookup(t *testing.T) {
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	store.gitRetryDelays = nil
-	err := store.FetchNonInteractive(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: "/private/configured/repo.git"}})
+	err := store.FetchNonInteractive(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: "/private/configured/repo.git", FetchRef: "refs/heads/main"}})
 	pidData, pidErr := os.ReadFile(lookupPID)
 	if pidErr != nil {
 		t.Fatal(pidErr)

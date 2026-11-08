@@ -23,6 +23,9 @@ type fetchRefInfo struct {
 	branch    string
 }
 
+// refspec fetches the remote's sourceRef into remoteRef.
+func (t fetchRefInfo) refspec() string { return "+" + t.sourceRef + ":" + t.remoteRef }
+
 func (s *Store) CloneBlobless(ctx context.Context, cfg model.RepoConfig) error {
 	if _, err := os.Stat(cfg.GitDir); err == nil {
 		return nil
@@ -329,21 +332,59 @@ func installGitDir(candidate string, destination string) error {
 	return nil
 }
 
-// FetchNonInteractive fetches origin for the daemon's refresh and the fetch
-// command. Like every Git command that contacts a remote, it runs through
-// runNetworkGit, so a remote that needs a prompt makes it fail.
+// FetchNonInteractive fetches, for the daemon's refresh and the fetch
+// command, what preparation fetches, into the same ref: a verified source's
+// ref, or else the fetch ref. It passes that refspec explicitly: the git dir's
+// configured refspec can name every branch, and a --depth git dir would get
+// each new one in full. Like every Git command that contacts a remote, it runs
+// through runNetworkGit, so a remote that needs a prompt makes it fail.
 func (s *Store) FetchNonInteractive(ctx context.Context, repo model.RepoConfig) error {
+	refspec, tracking, err := refreshTarget(repo)
+	if err != nil {
+		return err
+	}
 	args := []string{"fetch", "--no-tags"}
-	if depth := fetchDepth(ctx, repo, model.BranchName(repo.FetchRef)); depth > 0 {
+	if depth := refreshDepth(ctx, repo, tracking); depth > 0 {
 		args = append(args, fmt.Sprintf("--depth=%d", depth))
 	}
-	args = append(args, "origin")
+	args = append(args, "origin", refspec)
 	remotesForLogging, stopLookup := s.startRemotesForLogging(ctx, repo)
 	defer stopLookup()
 	return s.retryGitOperationForRemoteLookup(ctx, GitOperationFetch, repo.Name, remotesForLogging, func() error {
 		_, err := s.runNetworkGit(ctx, repo.GitDir, nil, args...)
 		return err
 	})
+}
+
+// refreshTarget returns the refspec FetchNonInteractive fetches for repo and
+// the tracking ref it fetches into, which ComputeAheadBehind compares HEAD
+// with.
+func refreshTarget(repo model.RepoConfig) (refspec, trackingRef string, err error) {
+	if repo.RequiredCommit != "" {
+		return "+" + repo.Branch + ":" + verifiedSourceTrackingRef, verifiedSourceTrackingRef, nil
+	}
+	target, err := fetchRefTarget(repo.FetchRef)
+	if err != nil {
+		return "", "", err
+	}
+	return target.refspec(), target.remoteRef, nil
+}
+
+// refreshDepth returns the --depth of FetchNonInteractive's fetch into
+// tracking: fetchDepth's, and none once tracking exists. A fetch onto the
+// tracking ref's history then transfers only the new commits and keeps them
+// connected to HEAD. A fetch with --depth would cut the new tip off from HEAD
+// and shorten HEAD's history to the depth. A verified source keeps
+// fetchDepth's depth, which bounds its history on every refresh.
+func refreshDepth(ctx context.Context, repo model.RepoConfig, tracking string) int {
+	depth := fetchDepth(ctx, repo, model.BranchName(repo.FetchRef))
+	if depth <= 0 || repo.RequiredCommit != "" {
+		return depth
+	}
+	if _, err := runGit(ctx, repo.GitDir, "rev-parse", "--verify", "--quiet", tracking); err == nil {
+		return 0
+	}
+	return depth
 }
 
 // fetchDepth returns the --depth of a fetch onto branch: repo's history depth
@@ -381,10 +422,7 @@ func (s *Store) fetchRef(ctx context.Context, repo model.RepoConfig, ref string,
 	if err != nil {
 		return err
 	}
-	refspec := "+" + target.sourceRef + ":" + target.remoteRef
-	if target.branch != "" {
-		refspec = fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", target.branch, target.branch)
-	}
+	refspec := target.refspec()
 	args := []string{"fetch", "--filter=blob:none", "--no-tags"}
 	if depth := fetchDepth(ctx, repo, target.branch); depth > 0 {
 		args = append(args, fmt.Sprintf("--depth=%d", depth))
