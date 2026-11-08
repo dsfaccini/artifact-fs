@@ -633,8 +633,9 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// the inode of a name that changed type is in changed too. A vanished
 	// name gets only its entry invalidated, because its inode's content did
 	// not change: its handles keep reading what they read. The inode stays
-	// unmapped until its path comes back, when the pass, a lookup or a
-	// getattr decides it.
+	// unmapped until an op or a later pass decides it: the pass, a lookup or
+	// a getattr when its path comes back, createEntry when a create takes
+	// the path, and settleUnmappedBelow before an unlink or a rename.
 	var changed []fuseops.InodeID
 	var vanished []pathMapping
 	for _, k := range inodes {
