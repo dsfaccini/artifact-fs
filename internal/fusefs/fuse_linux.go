@@ -25,6 +25,7 @@ func platformMountConfig(cfg *fuse.MountConfig) {
 	// With DisableWritebackCaching, the kernel then drops a file's cached
 	// pages when new attributes carry a changed mtime, as well as a changed size.
 	cfg.EnableAutoInvalData = true
+	cfg.DisableDefaultPermissions = true
 }
 
 // platformMount ignores backend: Linux has only the kernel transport.
