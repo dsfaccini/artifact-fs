@@ -1606,6 +1606,9 @@ func TestReadChangesSinceDistrustsALogMissingATrigger(t *testing.T) {
 func TestReadChangesSinceReadsWhileAWriterHoldsTheLock(t *testing.T) {
 	s, cfg := testStore(t)
 	ctx := context.Background()
+	if err := s.Mkdir(ctx, "dir", 0o755); err != nil {
+		t.Fatal(err)
+	}
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -1615,7 +1618,9 @@ func TestReadChangesSinceReadsWhileAWriterHoldsTheLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.ExecContext(ctx, `ROLLBACK`)
-	changesSince(t, cfg, 0)
+	if got, want := changesSince(t, cfg, 0).Paths, []string{"dir"}; !slices.Equal(got, want) {
+		t.Fatalf("changed paths = %q, want %q", got, want)
+	}
 }
 
 // Writes that land while a reconcile looks up the base must end as if they

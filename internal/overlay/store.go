@@ -151,8 +151,8 @@ func New(ctx context.Context, cfg model.RepoPaths) (*Store, error) {
 // commitPendingFromBackingFiles commits the size and mtime of each path a
 // process left with uncommitted writes, from its backing file.
 func commitPendingFromBackingFiles(ctx context.Context, db *sql.DB) error {
-	// Read outside the write transaction: SQLite fails a read transaction's
-	// upgrade to a write at once, without the busy handler.
+	// Read outside the write transaction, so an open with nothing pending
+	// takes no write lock.
 	rows, err := db.QueryContext(ctx, `SELECT e.path, e.backing_path FROM overlay_pending p JOIN overlay_entries e USING(path)`)
 	if err != nil {
 		return err
