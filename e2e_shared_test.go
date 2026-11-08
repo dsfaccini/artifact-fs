@@ -292,14 +292,17 @@ func (s *sharedE2ERepo) settle() (model.RepoRuntimeState, error) {
 	}
 }
 
-// discardOverlay leaves the overlay without entries. Restoring files with Git
-// writes them through the overlay, and the daemon keeps an entry that matches
-// its base until HEAD moves. Removing each entry's path turns it into a delete
-// marker, and the daemon drops every delete marker when HEAD moves to a tree
-// without that path.
+// discardOverlay leaves the overlay without entries, and the daemon on s.head.
+// Restoring files with Git writes them through the overlay, and the daemon
+// keeps an entry that matches its base until HEAD moves. Removing each entry's
+// path turns it into a delete marker, and the daemon drops every delete marker
+// when HEAD moves to a tree without that path. The move to the empty commit
+// and back also outlasts any reconcile a test left in flight: the daemon
+// reconciles one HEAD change at a time, so once it serves the empty commit,
+// no earlier reconcile can switch it later.
 func (s *sharedE2ERepo) discardOverlay() error {
 	entries, err := s.overlayEntries()
-	if err != nil || len(entries) == 0 {
+	if err != nil {
 		return err
 	}
 	for _, e := range entries {
