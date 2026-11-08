@@ -108,7 +108,7 @@ func (s *Store) FetchMissingBlobs(ctx context.Context, repo model.RepoPaths, obj
 	if err == nil {
 		// The fetch downloads every wanted object again, present or not, so
 		// it asks only for the missing ones.
-		_, err = runLazyFetchGitInput(ctx, repo.GitDir, []byte(strings.Join(missing, "\n")+"\n"),
+		_, err = s.runLazyFetchGitInput(ctx, repo.GitDir, []byte(strings.Join(missing, "\n")+"\n"),
 			"-c", "fetch.negotiationAlgorithm=noop", "fetch", "--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--filter=blob:none", "--stdin", "--", remote)
 	}
 	// The hydrator cancels a batch fetch only when it stops, which is not a
@@ -119,21 +119,31 @@ func (s *Store) FetchMissingBlobs(ctx context.Context, repo model.RepoPaths, obj
 	return err
 }
 
-// promisorRemote returns the remote git's lazy fetch tries first, following
-// promisor_remote_config in git's promisor-remote.c. In config order, a remote
-// is a promisor when remote.<name>.promisor is true or
-// remote.<name>.partialclonefilter is set, and the remote that
-// extensions.partialClone names goes last. It returns "" when there is none.
+// promisorRemote returns the remote git's lazy fetch tries first, and "" when
+// there is none.
 func promisorRemote(ctx context.Context, gitDir string) (string, error) {
+	remotes, err := promisorRemotes(ctx, gitDir)
+	if err != nil || len(remotes) == 0 {
+		return "", err
+	}
+	return remotes[0], nil
+}
+
+// promisorRemotes returns the remotes git's lazy fetch tries, in order,
+// following promisor_remote_config in git's promisor-remote.c. In config
+// order, a remote is a promisor when remote.<name>.promisor is true or
+// remote.<name>.partialclonefilter is set, and the remote that
+// extensions.partialClone names goes last.
+func promisorRemotes(ctx context.Context, gitDir string) ([]string, error) {
 	entries, err := configEntries(ctx, gitDir, `^(remote\..+\.(promisor|partialclonefilter)|extensions\.partialclone)$`)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	// Git reads promisor as a boolean, so git parses it here too: an empty
 	// value is false and a nonzero number is true.
 	flags, err := configEntries(ctx, gitDir, `^remote\..+\.promisor$`, "--type=bool")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	var remotes []string
 	partialClone := ""
@@ -147,7 +157,7 @@ func promisorRemote(ctx context.Context, gitDir string) (string, error) {
 		name, subkey := rest[:dot], rest[dot+1:]
 		if subkey == "promisor" {
 			if len(flags) == 0 {
-				return "", errors.New("git config listed fewer promisor flags than promisor keys")
+				return nil, errors.New("git config listed fewer promisor flags than promisor keys")
 			}
 			promisor := flags[0].value == "true"
 			flags = flags[1:]
@@ -162,10 +172,7 @@ func promisorRemote(ctx context.Context, gitDir string) (string, error) {
 	if partialClone != "" {
 		remotes = append(slices.DeleteFunc(remotes, func(r string) bool { return r == partialClone }), partialClone)
 	}
-	if len(remotes) == 0 {
-		return "", nil
-	}
-	return remotes[0], nil
+	return remotes, nil
 }
 
 type configEntry struct {
@@ -299,7 +306,7 @@ func (s *Store) getPool(gitDir string) (*batchPool, error) {
 	if p, ok := s.pools[gitDir]; ok {
 		return p, nil
 	}
-	p := &batchPool{gitDir: gitDir, logger: s.logger, maxSize: s.poolMaxSize, all: map[*batchCatFile]struct{}{}, changed: make(chan struct{})}
+	p := &batchPool{gitDir: gitDir, env: s.lazyFetchEnv, logger: s.logger, maxSize: s.poolMaxSize, all: map[*batchCatFile]struct{}{}, changed: make(chan struct{})}
 	s.pools[gitDir] = p
 	return p, nil
 }
@@ -310,6 +317,7 @@ type batchPool struct {
 	mu       sync.Mutex
 	free     []*batchCatFile
 	gitDir   string
+	env      func() ([]string, error)
 	logger   *slog.Logger
 	maxSize  int
 	creating int
@@ -338,7 +346,7 @@ func (p *batchPool) acquire(ctx context.Context) (*batchCatFile, error) {
 		if len(p.all)+p.creating < p.maxSize {
 			p.creating++
 			p.mu.Unlock()
-			b, err := newBatchCatFile(p.gitDir, p.logger)
+			b, err := newBatchCatFile(p.gitDir, p.env, p.logger)
 			p.mu.Lock()
 			p.creating--
 			if err == nil && !p.closed {
@@ -458,9 +466,13 @@ type batchCatFile struct {
 	terminateOnce sync.Once
 }
 
-func newBatchCatFile(gitDir string, logger *slog.Logger) (*batchCatFile, error) {
+func newBatchCatFile(gitDir string, lazyFetchEnv func() ([]string, error), logger *slog.Logger) (*batchCatFile, error) {
+	env, err := lazyFetchEnv()
+	if err != nil {
+		return nil, err
+	}
 	cmd := exec.Command("git", "cat-file", "--batch")
-	cmd.Env = append(append(os.Environ(), "GIT_DIR="+gitDir), lazyFetchEnv()...)
+	cmd.Env = append(append(os.Environ(), "GIT_DIR="+gitDir), env...)
 	stderr := &gitStderrLogger{logger: logger, gitDir: gitDir}
 	cmd.Stderr = stderr
 	configureCommandSession(cmd)

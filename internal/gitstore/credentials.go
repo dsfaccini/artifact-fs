@@ -2,8 +2,11 @@ package gitstore
 
 import (
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
@@ -183,149 +186,62 @@ func isSCPStyleRemote(raw string) bool {
 	return at > 0 && colon > at
 }
 
-// nonInteractiveGitEnv keeps Git and SSH from prompting. An empty SSH_ASKPASS
-// stops Git from falling back to a desktop askpass program; one the user set
-// through GIT_ASKPASS or core.askPass still runs.
-func nonInteractiveGitEnv() []string {
-	return []string{"GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS=", "GIT_SSH_COMMAND=" + sshBatchModeCommand(os.Getenv("GIT_SSH_COMMAND"))}
+// lazyFetchEnv returns the environment that keeps a Git command that contacts
+// a remote from prompting. Run the command with configureCommandSession too:
+// without a controlling terminal SSH cannot prompt, and SSH_ASKPASS_REQUIRE
+// keeps it from opening an askpass dialog instead. SSH still tries empty
+// passwords, and a retried command repeats them against a server that may ban
+// the client, so GIT_SSH names a wrapper that runs ssh with BatchMode. Git
+// runs GIT_SSH only when neither GIT_SSH_COMMAND nor an effective
+// core.sshCommand names an SSH command, so the user's own command, such as the
+// one an adopted worktree, a prepared git dir or a conditional include sets,
+// runs unchanged. A GIT_SSH the user set stays.
+func (s *Store) lazyFetchEnv() ([]string, error) {
+	env := []string{"GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS=", "SSH_ASKPASS_REQUIRE=never"}
+	if _, ok := os.LookupEnv("GIT_SSH"); ok {
+		return env, nil
+	}
+	wrapper, err := s.batchModeSSH()
+	if err != nil || wrapper == "" {
+		return env, err
+	}
+	return append(env, "GIT_SSH="+wrapper), nil
 }
 
-// lazyFetchEnv keeps a lazy fetch, which reading a missing object starts, from
-// prompting. Run the command with configureCommandSession too. Unlike
-// nonInteractiveGitEnv, it leaves GIT_SSH_COMMAND unset, because that would
-// override the repo's core.sshCommand, which an adopted worktree keeps.
-// Without a controlling terminal SSH cannot prompt, and SSH_ASKPASS_REQUIRE
-// keeps it from opening an askpass dialog instead.
-func lazyFetchEnv() []string {
-	return []string{"GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS=", "SSH_ASKPASS_REQUIRE=never"}
-}
-
-func sshBatchModeCommand(existing string) string {
-	existing = strings.TrimSpace(existing)
-	if existing == "" {
-		return "ssh -o BatchMode=yes"
+// batchModeSSH returns a program named ssh, so that Git passes it OpenSSH's
+// options, that runs the ssh on PATH with BatchMode. It returns "" when PATH
+// has no ssh, because Git then reaches no SSH remote either. The Store writes
+// the program once, in a directory of its own that Close removes, and again
+// if a temp cleaner removed it.
+func (s *Store) batchModeSSH() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return "", errors.New("git store closed")
 	}
-	tokens := splitShellFields(existing)
-	filtered := make([]string, 0, len(tokens)+2)
-	for i := 0; i < len(tokens); i++ {
-		tok := tokens[i]
-		lower := strings.ToLower(tok)
-		if lower == "-o" && i+1 < len(tokens) && isBatchModeOption(tokens[i+1]) {
-			i++
-			continue
+	if s.sshWrapperDir != "" {
+		wrapper := filepath.Join(s.sshWrapperDir, "ssh")
+		if _, err := os.Stat(wrapper); err == nil {
+			return wrapper, nil
 		}
-		if strings.HasPrefix(lower, "-obatchmode=") {
-			continue
-		}
-		filtered = append(filtered, tok)
+		_ = os.RemoveAll(s.sshWrapperDir)
+		s.sshWrapperDir = ""
 	}
-	if len(filtered) == 0 {
-		filtered = append(filtered, "ssh")
+	// LookPath refuses an ssh that a relative PATH entry finds, so the
+	// wrapper runs an absolute path, and never itself.
+	ssh, err := exec.LookPath("ssh")
+	if err != nil {
+		return "", nil
 	}
-	filtered = append(filtered, "-o", "BatchMode=yes")
-	for i, tok := range filtered {
-		filtered[i] = shellQuote(tok)
+	dir, err := os.MkdirTemp("", "artifact-fs-ssh-")
+	if err != nil {
+		return "", fmt.Errorf("create SSH wrapper: %w", err)
 	}
-	return strings.Join(filtered, " ")
-}
-
-func splitShellFields(s string) []string {
-	var fields []string
-	var b strings.Builder
-	var quote rune
-	escaped := false
-	for _, r := range s {
-		if escaped {
-			if r == '$' {
-				b.WriteString(`\$`)
-			} else {
-				b.WriteRune(r)
-			}
-			escaped = false
-			continue
-		}
-		switch {
-		case quote != 0:
-			if r == quote {
-				quote = 0
-			} else if r == '$' && quote == '\'' {
-				b.WriteString(`\$`)
-			} else if r == '\\' && quote == '"' {
-				escaped = true
-			} else {
-				b.WriteRune(r)
-			}
-		case r == '\'' || r == '"':
-			quote = r
-		case r == '\\':
-			escaped = true
-		case r == ' ' || r == '\t' || r == '\n':
-			if b.Len() > 0 {
-				fields = append(fields, b.String())
-				b.Reset()
-			}
-		default:
-			b.WriteRune(r)
-		}
+	wrapper := filepath.Join(dir, "ssh")
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nexec "+shellScriptQuote(ssh)+" -o BatchMode=yes \"$@\"\n"), 0o700); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("create SSH wrapper: %w", err)
 	}
-	if escaped {
-		b.WriteRune('\\')
-	}
-	if b.Len() > 0 {
-		fields = append(fields, b.String())
-	}
-	return fields
-}
-
-func isBatchModeOption(opt string) bool {
-	parts := strings.Fields(strings.ToLower(strings.TrimSpace(opt)))
-	if len(parts) == 0 {
-		return false
-	}
-	return parts[0] == "batchmode" || strings.HasPrefix(parts[0], "batchmode=")
-}
-
-func shellQuote(s string) string {
-	if s == "" {
-		return "''"
-	}
-	if strings.Contains(s, "$") {
-		return doubleQuote(s)
-	}
-	if isShellSafe(s) {
-		return s
-	}
-	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
-}
-
-func doubleQuote(s string) string {
-	var b strings.Builder
-	b.WriteByte('"')
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' && i+1 < len(s) && s[i+1] == '$' {
-			b.WriteString(`\$`)
-			i++
-			continue
-		}
-		switch s[i] {
-		case '\\', '"', '`':
-			b.WriteByte('\\')
-		}
-		b.WriteByte(s[i])
-	}
-	b.WriteByte('"')
-	return b.String()
-}
-
-func isShellSafe(s string) bool {
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
-			continue
-		}
-		if strings.ContainsRune("@%_+=:,./-~$", r) {
-			continue
-		}
-		return false
-	}
-	return true
+	s.sshWrapperDir = dir
+	return wrapper, nil
 }

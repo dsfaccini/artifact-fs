@@ -92,6 +92,9 @@ var migrations = []meta.Migration{
 		  END
 		  WHERE adopt_gitdir = 0`,
 	),
+	// claims_leftover keeps a daemon's claim on a mount an earlier daemon
+	// left, also while the repo's state is unmounted.
+	meta.SQL(`ALTER TABLE repo_runtime ADD COLUMN claims_leftover INTEGER NOT NULL DEFAULT 0`),
 }
 
 const reposTableV1 = `CREATE TABLE IF NOT EXISTS repos (
@@ -259,12 +262,12 @@ func (s *Store) RequestMount(ctx context.Context, repoID model.RepoID, enabled b
 func (s *Store) PutRuntime(ctx context.Context, rec model.RepoRuntimeRecord) error {
 	_, err := s.db.ExecContext(ctx, `
 	INSERT OR REPLACE INTO repo_runtime (`+runtimeColumns+`)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, string(rec.RepoID), rec.State, rec.Phase, rec.LastError, rec.LastErrorPhase, unixNano(rec.LastErrorAt), unixNano(rec.NextRetryAt), rec.Attempts, rec.ServedGeneration, rec.ServedCommit, rec.ServedRef, unixNano(rec.LastFetchAt), rec.LastFetchResult, rec.AheadCount, rec.BehindCount, boolToInt(rec.Diverged), rec.MountRequest, time.Now().UnixNano())
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, string(rec.RepoID), rec.State, rec.Phase, rec.LastError, rec.LastErrorPhase, unixNano(rec.LastErrorAt), unixNano(rec.NextRetryAt), rec.Attempts, rec.ServedGeneration, rec.ServedCommit, rec.ServedRef, unixNano(rec.LastFetchAt), rec.LastFetchResult, rec.AheadCount, rec.BehindCount, boolToInt(rec.Diverged), rec.MountRequest, boolToInt(rec.ClaimsLeftover), time.Now().UnixNano())
 	return err
 }
 
-const runtimeColumns = `repo_id, state, phase, last_error, last_error_phase, last_error_at_ns, next_retry_at_ns, attempts, served_generation, served_commit, served_ref, last_fetch_at_ns, last_fetch_result, ahead, behind, diverged, mount_request, updated_at_ns`
+const runtimeColumns = `repo_id, state, phase, last_error, last_error_phase, last_error_at_ns, next_retry_at_ns, attempts, served_generation, served_commit, served_ref, last_fetch_at_ns, last_fetch_result, ahead, behind, diverged, mount_request, claims_leftover, updated_at_ns`
 
 // GetRuntime returns the daemon's record of repoID, and false when it has none.
 func (s *Store) GetRuntime(ctx context.Context, repoID model.RepoID) (model.RepoRuntimeRecord, bool, error) {
@@ -281,8 +284,8 @@ func (s *Store) GetRuntime(ctx context.Context, repoID model.RepoID) (model.Repo
 func scanRuntime(row interface{ Scan(...any) error }) (model.RepoRuntimeRecord, error) {
 	var rec model.RepoRuntimeRecord
 	var lastErrorAt, nextRetryAt, lastFetchAt, updatedAt int64
-	var diverged int
-	if err := row.Scan(&rec.RepoID, &rec.State, &rec.Phase, &rec.LastError, &rec.LastErrorPhase, &lastErrorAt, &nextRetryAt, &rec.Attempts, &rec.ServedGeneration, &rec.ServedCommit, &rec.ServedRef, &lastFetchAt, &rec.LastFetchResult, &rec.AheadCount, &rec.BehindCount, &diverged, &rec.MountRequest, &updatedAt); err != nil {
+	var diverged, claimsLeftover int
+	if err := row.Scan(&rec.RepoID, &rec.State, &rec.Phase, &rec.LastError, &rec.LastErrorPhase, &lastErrorAt, &nextRetryAt, &rec.Attempts, &rec.ServedGeneration, &rec.ServedCommit, &rec.ServedRef, &lastFetchAt, &rec.LastFetchResult, &rec.AheadCount, &rec.BehindCount, &diverged, &rec.MountRequest, &claimsLeftover, &updatedAt); err != nil {
 		return model.RepoRuntimeRecord{}, err
 	}
 	rec.LastErrorAt = fromUnixNano(lastErrorAt)
@@ -290,6 +293,7 @@ func scanRuntime(row interface{ Scan(...any) error }) (model.RepoRuntimeRecord, 
 	rec.LastFetchAt = fromUnixNano(lastFetchAt)
 	rec.UpdatedAt = fromUnixNano(updatedAt)
 	rec.Diverged = diverged == 1
+	rec.ClaimsLeftover = claimsLeftover == 1
 	return rec, nil
 }
 

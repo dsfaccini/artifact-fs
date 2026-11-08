@@ -273,6 +273,19 @@ var legacyRegistries = map[string]struct {
 		},
 		want: fullRepoWithRequests,
 	},
+	// This schema, after migration 5.
+	"user_version 5": {
+		stmts: []string{
+			reposTableV3,
+			`ALTER TABLE repos ADD COLUMN prepare_request TEXT NOT NULL DEFAULT ''`,
+			repoRuntimeTableV3,
+			`ALTER TABLE repo_runtime ADD COLUMN claims_leftover INTEGER NOT NULL DEFAULT 0`,
+			fullRepoRow,
+			`UPDATE repos SET mount_request = 'request-1', prepare_request = 'prepare-1'`,
+			`PRAGMA user_version = 5`,
+		},
+		want: fullRepoWithRequests,
+	},
 }
 
 // Migration 4 stores every ref of a repo that clones or fetches in full, with

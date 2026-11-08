@@ -247,7 +247,7 @@ func TestAdoptGitDirWarnsAboutCredentialedOriginOncePerPrepare(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer svc.Close()
-	warnings := func() int { return strings.Count(logs.String(), "adopted worktree origin embeds credentials") }
+	warnings := func() int { return strings.Count(logs.String(), "adopted worktree remote embeds credentials") }
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
 	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
 		t.Fatalf("adoption with a credentialed origin failed: %v", err)
@@ -284,6 +284,137 @@ func TestAdoptGitDirWarnsAboutCredentialedOriginOncePerPrepare(t *testing.T) {
 	}
 	if got := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "remote", "get-url", "origin")); got != origin {
 		t.Fatalf("adoption changed origin to %q", got)
+	}
+}
+
+// Missing blobs and trees come from the promisor remote, so adoption warns
+// when that remote embeds credentials, also when origin does not.
+func TestAdoptGitDirWarnsAboutCredentialedPromisorRemote(t *testing.T) {
+	ctx := t.Context()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
+	runCmd(t, "git", "init", "--initial-branch=main", source)
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", source, "add", "README.md")
+	runCmd(t, "git", "-C", source, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
+	runCmd(t, "git", "-C", source, "remote", "add", "origin", "https://example.invalid/repository.git")
+	runCmd(t, "git", "-C", source, "remote", "add", "upstream", "https://alice:pwqzz@example.invalid/repository.git")
+	runCmd(t, "git", "-C", source, "config", "remote.upstream.promisor", "true")
+	runCmd(t, "git", "-C", source, "config", "remote.upstream.partialclonefilter", "blob:none")
+	runCmd(t, "git", "-C", source, "worktree", "add", "--no-checkout", "-b", "topic", worktree)
+	gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
+	runCmd(t, "git", "--git-dir", gitDir, "read-tree", "HEAD")
+
+	logs := &lockedBuffer{}
+	svc, err := New(ctx, filepath.Join(dir, "state"), slog.New(slog.NewJSONHandler(logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
+		t.Fatalf("adoption with a credentialed promisor remote failed: %v", err)
+	}
+	if got := strings.Count(logs.String(), "embeds credentials"); got != 1 {
+		t.Fatalf("add-repo logged %d credential warnings, want 1: %s", got, logs.String())
+	}
+	if strings.Contains(logs.String(), "pwqzz") {
+		t.Fatalf("warning logged the remote's password: %s", logs.String())
+	}
+}
+
+// remove-repo hands the worktree back to native Git, so the filesystem
+// settings adoption pinned for the mount go too.
+func TestRemoveRepoRestoresAdoptedWorktreeFilesystemConfig(t *testing.T) {
+	ctx := t.Context()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
+	runCmd(t, "git", "init", "--initial-branch=main", source)
+	runCmd(t, "git", "-C", source, "config", "core.filemode", "false")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", source, "add", "README.md")
+	runCmd(t, "git", "-C", source, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
+	runCmd(t, "git", "-C", source, "worktree", "add", "-b", "topic", worktree)
+	gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
+	svc, err := New(ctx, filepath.Join(dir, "state"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.git.ConfigureFSMonitorHook(ctx, stored, filepath.Join(dir, "state")); err != nil {
+		t.Fatal(err)
+	}
+	pinned := []string{"core.fsmonitor", "fsmonitor.allowRemote", "core.filemode", "core.ignorecase", "core.symlinks"}
+	worktreeConfig := filepath.Join(gitDir, "config.worktree")
+	for _, key := range pinned {
+		runCmd(t, "git", "config", "--file", worktreeConfig, "--get", key)
+	}
+	if err := svc.ctl().RemoveRepo(ctx, cfg.Name); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range pinned {
+		if out, err := exec.Command("git", "config", "--file", worktreeConfig, "--get", key).Output(); err == nil {
+			t.Fatalf("%s = %q after remove-repo, want it unset", key, out)
+		}
+	}
+	if err := os.Chmod(filepath.Join(worktree, "README.md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := runCmdOutput(t, "git", "-C", worktree, "status", "--porcelain"); got != "" {
+		t.Fatalf("status after remove-repo and a mode change = %q, want clean as core.filemode=false makes it", got)
+	}
+}
+
+// remove-repo unsets only the values adoption pins, so an adoption that
+// failed before it wrote any leaves the worktree's own config.worktree alone.
+func TestRemoveRepoAfterFailedAdoptionKeepsWorktreeConfig(t *testing.T) {
+	ctx := t.Context()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, worktree, elsewhere := filepath.Join(dir, "source"), filepath.Join(dir, "worktree"), filepath.Join(dir, "elsewhere")
+	runCmd(t, "git", "init", "--initial-branch=main", source)
+	commitFile(t, source, "README.md", "base\n")
+	runCmd(t, "git", "-C", source, "worktree", "add", "-b", "topic", worktree)
+	runCmd(t, "git", "-C", source, "config", "extensions.worktreeConfig", "true")
+	runCmd(t, "git", "-C", worktree, "config", "--worktree", "core.symlinks", "false")
+	gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
+	if err := os.MkdirAll(elsewhere, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := New(ctx, filepath.Join(dir, "state"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: elsewhere}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
+	if err := svc.ctl().AddRepo(ctx, cfg); err == nil || !strings.Contains(err.Error(), "must match the registered worktree path") {
+		t.Fatalf("adoption with a mismatched mount path = %v, want the path mismatch", err)
+	}
+	if err := svc.ctl().RemoveRepo(ctx, cfg.Name); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "config", "--worktree", "--get", "core.symlinks")); got != "false" {
+		t.Fatalf("core.symlinks = %q after remove-repo, want the worktree's own false", got)
 	}
 }
 

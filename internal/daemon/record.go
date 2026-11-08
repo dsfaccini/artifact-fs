@@ -33,8 +33,9 @@ func (s *Service) recordPhase(cfg model.RepoConfig, phase string) {
 var errFUSEServerExited = errors.New("FUSE server exited")
 
 // recordRuntime applies update, under s.mu, to the daemon's record of id and
-// writes the record to repo_runtime, which status reads. The caller must not
-// hold s.mu.
+// writes the record to repo_runtime, which status reads. The record also
+// carries whether the daemon claims a leftover at id's mount point. The
+// caller must not hold s.mu.
 func (s *Service) recordRuntime(id model.RepoID, update func(*model.RepoRuntimeRecord)) {
 	s.recordMu.Lock()
 	defer s.recordMu.Unlock()
@@ -50,6 +51,7 @@ func (s *Service) recordRuntimeLocked(id model.RepoID, update func(*model.RepoRu
 		s.records[id] = rec
 	}
 	update(rec)
+	rec.ClaimsLeftover = s.leftovers[id]
 	written := *rec
 	s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), prepareStateWriteTimeout)
@@ -62,13 +64,15 @@ func (s *Service) recordRuntimeLocked(id model.RepoID, update func(*model.RepoRu
 // recordRuntimeState writes rt's state: what it serves, its fetch result and
 // its divergence from the remote. cleared names the phases that just
 // succeeded, whose recorded failure it clears. It reads the state under recordMu, so
-// the last write holds the latest state.
+// the last write holds the latest state. It writes nothing of a runtime a
+// stop unmounted, which stays running until its stop finishes, so a late
+// write of its join or its preparation leaves the stop's record.
 func (s *Service) recordRuntimeState(rt *repoRuntime, cleared ...string) {
 	s.mu.Lock()
 	id := rt.cfg.ID
 	s.mu.Unlock()
 	s.recordRuntime(id, func(rec *model.RepoRuntimeRecord) {
-		if s.running[id] != rt {
+		if s.running[id] != rt || rt.mount == mountUnmounted {
 			return
 		}
 		rec.State = rt.reportedState()

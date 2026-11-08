@@ -34,6 +34,9 @@ const (
 	// its FUSE server once it is unmounted. It exceeds gitstore.RollbackBound,
 	// so a stop waits out the rollback of the preparation it cancels.
 	drainTimeout = 30 * time.Second
+	// stopWaitTimeout bounds how long a caller waits for a stop: its unmount,
+	// then its drain.
+	stopWaitTimeout = unmountTimeout + unmountReturnSlack + drainTimeout
 )
 
 // mountState is where a runtime's FUSE mount stands.
@@ -124,8 +127,8 @@ type repoRuntime struct {
 	// stopping holds from a stop's start until its unmount fails or the
 	// runtime is gone. Nothing mounts or reconciles HEAD meanwhile.
 	stopping bool
-	// stopRunning is set while a stop runs.
-	stopRunning bool
+	// stop is the stop of the runtime that runs, nil otherwise.
+	stop *unmountOp
 	// retired holds the generations the resolver stopped serving, with when.
 	// retiredMu guards it, and is taken alone.
 	retiredMu sync.Mutex
@@ -279,7 +282,7 @@ func (s *Service) attachMount(rt *repoRuntime) (bool, error) {
 			return false, fmt.Errorf("unmount %s after its connection failed: %w", cfg.Name, err)
 		}
 	case mountAbandoned:
-		if err := s.releaseAbandonedMount(cfg, abandoned); err != nil {
+		if err := s.releaseAbandonedMount(cfg, abandoned, s.unmountMountPoint); err != nil {
 			return false, err
 		}
 		s.mu.Lock()
@@ -359,8 +362,8 @@ var (
 // releaseAbandonedMount returns nil once abandoned, a mount whose wait timed
 // out, has ended and left nothing at cfg's mount point. A late mount whose
 // cleanup failed stays at the mount point whatever source the mount table
-// names, so it unmounts the mount point by path.
-func (s *Service) releaseAbandonedMount(cfg model.RepoConfig, abandoned fusefs.AbandonedMount) error {
+// names, so it unmounts the mount point by path through unmountMountPoint.
+func (s *Service) releaseAbandonedMount(cfg model.RepoConfig, abandoned fusefs.AbandonedMount, unmountMountPoint func(model.RepoConfig) error) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	err := abandoned.Wait(ctx)
@@ -374,7 +377,7 @@ func (s *Service) releaseAbandonedMount(cfg model.RepoConfig, abandoned fusefs.A
 		return nil
 	}
 	s.logger.Warn("unmounting the abandoned mount the library could not", "repo", cfg.Name, "error", auth.RedactLogString(err.Error(), cfg.RemoteURL))
-	return s.unmountMountPoint(cfg)
+	return unmountMountPoint(cfg)
 }
 
 // unmountMountPoint unmounts whatever cfg's mount point holds, by path.
@@ -384,6 +387,15 @@ func (s *Service) unmountMountPoint(cfg model.RepoConfig) error {
 		return fmt.Errorf("mount %s: %w", cfg.Name, errUnmountInProgress)
 	}
 	if err := s.waitUnmount(op); err != nil {
+		return fmt.Errorf("unmount %s: %w", cfg.MountPath, err)
+	}
+	return nil
+}
+
+// unmountMountPointHeld is unmountMountPoint for a stop, which already holds
+// the repo's unmount.
+func (s *Service) unmountMountPointHeld(cfg model.RepoConfig) error {
+	if err := s.unmountPath(cfg.MountPath); err != nil {
 		return fmt.Errorf("unmount %s: %w", cfg.MountPath, err)
 	}
 	return nil
@@ -494,8 +506,9 @@ func (s *Service) joinMount(rt *repoRuntime, mfs fusefs.MountedFS) {
 // unmountOp is an unmount that runs on its own goroutine, because unmount(2)
 // can hang on a dead FSKit volume. A repo runs one at a time.
 type unmountOp struct {
-	done chan struct{}
-	err  error
+	started time.Time
+	done    chan struct{}
+	err     error
 }
 
 // startUnmount runs unmount for cfg's repo on its own goroutine, unless an
@@ -506,18 +519,23 @@ type unmountOp struct {
 func (s *Service) startUnmount(cfg model.RepoConfig, unmount func(context.Context) error, finished func(error)) (*unmountOp, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if op := s.unmounting[cfg.ID]; op != nil {
+	return s.startUnmountLocked(cfg.ID, unmount, finished)
+}
+
+// startUnmountLocked is startUnmount for a caller that holds s.mu.
+func (s *Service) startUnmountLocked(id model.RepoID, unmount func(context.Context) error, finished func(error)) (*unmountOp, bool) {
+	if op := s.unmounting[id]; op != nil {
 		return op, false
 	}
-	op := &unmountOp{done: make(chan struct{})}
-	s.unmounting[cfg.ID] = op
+	op := &unmountOp{started: time.Now(), done: make(chan struct{})}
+	s.unmounting[id] = op
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), unmountTimeout)
 		err := unmount(ctx)
 		cancel()
 		s.mu.Lock()
-		if s.unmounting[cfg.ID] == op {
-			delete(s.unmounting, cfg.ID)
+		if s.unmounting[id] == op {
+			delete(s.unmounting, id)
 		}
 		op.err = err
 		if finished != nil {
@@ -598,38 +616,82 @@ func (s *Service) startRepoBackground(rt *repoRuntime) {
 	}
 }
 
-// unmount stops id's runtime and forgets it. A failed stop keeps it running.
-func (s *Service) unmount(id model.RepoID) error {
+// stop starts stopping id's runtime on its own goroutine and returns the
+// stop. The stop runs as the repo's unmount through startUnmount, so it holds
+// the repo's unmount from its unmount through its drain, and the sync loop
+// never waits for it. A stop of the runtime that runs already is returned,
+// with started false. A repo that does not run returns nil, and an earlier
+// unmount of the repo that has not returned is an error. done, when set,
+// runs on the stop's goroutine with its result. Then a stop that succeeded
+// forgets the runtime and wakes the sync loop, which can mount the repo
+// again.
+func (s *Service) stop(id model.RepoID, done func(error)) (op *unmountOp, started bool, err error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	rt, ok := s.running[id]
 	if !ok {
-		s.mu.Unlock()
-		return nil
+		return nil, false, nil
 	}
-	if rt.stopRunning {
-		s.mu.Unlock()
-		return errors.New("runtime is already stopping")
+	if rt.stop != nil {
+		return rt.stop, false, nil
 	}
-	rt.stopRunning = true
-	s.mu.Unlock()
-	err := s.stopRuntime(rt)
-	s.mu.Lock()
-	rt.stopRunning = false
-	if err == nil {
+	if s.unmounting[id] != nil {
+		return nil, false, fmt.Errorf("unmount %s: %w", rt.cfg.Name, errUnmountInProgress)
+	}
+	rt.stopping = true
+	rt.stop, _ = s.startUnmountLocked(id, func(ctx context.Context) error {
+		err := s.stopRuntime(ctx, rt)
+		if done != nil {
+			done(err)
+		}
+		return err
+	}, func(err error) {
+		rt.stop = nil
+		if err != nil || s.running[id] != rt {
+			return
+		}
 		delete(s.running, id)
+		select {
+		case s.wake <- struct{}{}:
+		default:
+		}
+	})
+	return rt.stop, true, nil
+}
+
+// stopHung reports whether op, rt's stop, has not finished its unmount
+// within unmountTimeout plus unmountReturnSlack, as an unmount(2) that hangs.
+func (s *Service) stopHung(rt *repoRuntime, op *unmountOp) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return rt.mount != mountUnmounted && time.Since(op.started) > unmountTimeout+unmountReturnSlack
+}
+
+// unmount stops id's runtime, or joins the stop of it that runs, and waits at
+// most stopWaitTimeout for it. A failed stop keeps the runtime running.
+func (s *Service) unmount(id model.RepoID) error {
+	op, _, err := s.stop(id, nil)
+	if op == nil || err != nil {
+		return err
 	}
-	s.mu.Unlock()
-	return err
+	timer := time.NewTimer(stopWaitTimeout)
+	defer timer.Stop()
+	select {
+	case <-op.done:
+		return op.err
+	case <-timer.C:
+		return fmt.Errorf("stop of %s has not returned after %s", id, stopWaitTimeout)
+	}
 }
 
 // stopRuntime unmounts rt, then cancels its context, which cancels its FUSE
 // ops in flight, waits for its workers and its server, and closes its stores
-// and its git cat-file processes. A failed unmount leaves rt serving. After a
-// drain that timed out, rt stays unmounted and the next stop waits again.
-func (s *Service) stopRuntime(rt *repoRuntime) error {
+// and its git cat-file processes. It runs as the repo's unmount, so ctx ends
+// after unmountTimeout. A failed unmount leaves rt serving. After a drain
+// that timed out, rt stays unmounted and the next stop waits again.
+func (s *Service) stopRuntime(ctx context.Context, rt *repoRuntime) error {
 	s.mu.Lock()
 	cfg, state, mfs, abandoned := rt.cfg, rt.mount, rt.mfs, rt.abandoned
-	rt.stopping = true
 	s.mu.Unlock()
 	keepServing := func(err error) error {
 		s.mu.Lock()
@@ -640,15 +702,11 @@ func (s *Service) stopRuntime(rt *repoRuntime) error {
 	}
 	switch {
 	case mfs != nil && (state == mountServing || state == mountFailed):
-		op, started := s.startUnmount(cfg, s.unmountHeld(cfg, mfs), func(err error) { s.releaseMount(rt, mfs, err, mountUnmounted) })
-		if !started {
-			return keepServing(fmt.Errorf("unmount %s: %w", cfg.Name, errUnmountInProgress))
-		}
-		if err := s.waitUnmount(op); err != nil {
+		if err := s.unmountHeld(cfg, mfs)(ctx); err != nil {
 			return keepServing(fmt.Errorf("unmount %s: %w", cfg.Name, err))
 		}
 	case state == mountAbandoned:
-		if err := s.releaseAbandonedMount(cfg, abandoned); err != nil {
+		if err := s.releaseAbandonedMount(cfg, abandoned, s.unmountMountPointHeld); err != nil {
 			return keepServing(err)
 		}
 	}

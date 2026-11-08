@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
@@ -589,131 +588,6 @@ func TestCredentialEnvAllowsAtInHTTPSPath(t *testing.T) {
 	if len(env) != 0 {
 		t.Fatalf("expected no credential helper env, got %v", env)
 	}
-}
-
-func TestNonInteractiveGitEnvForcesSSHBatchMode(t *testing.T) {
-	t.Setenv("GIT_SSH_COMMAND", "ssh -o BatchMode=no -i /secrets/deploy_key -o IdentitiesOnly=yes")
-	env := nonInteractiveGitEnv()
-	for _, e := range env {
-		if strings.HasPrefix(e, "GIT_SSH_COMMAND=") {
-			if !strings.Contains(e, "-i /secrets/deploy_key") {
-				t.Fatalf("expected existing identity option to be preserved, got %q", e)
-			}
-			if strings.Contains(e, "BatchMode=no") {
-				t.Fatalf("expected existing BatchMode option to be replaced, got %q", e)
-			}
-			if strings.Contains(e, "BatchMode=yes") {
-				return
-			}
-			break
-		}
-	}
-	t.Fatalf("expected forced GIT_SSH_COMMAND, got %v", env)
-}
-
-func TestNonInteractiveGitEnvDefaultSSHBatchMode(t *testing.T) {
-	t.Setenv("GIT_SSH_COMMAND", "")
-	env := nonInteractiveGitEnv()
-	if slices.Contains(env, "GIT_SSH_COMMAND=ssh -o BatchMode=yes") {
-		return
-	}
-	t.Fatalf("expected forced GIT_SSH_COMMAND, got %v", env)
-}
-
-func TestNonInteractiveGitEnvStripsQuotedBatchMode(t *testing.T) {
-	for _, command := range []string{
-		`ssh -o "BatchMode=no" -i /secrets/deploy_key`,
-		`ssh -o BatchMode="no" -i /secrets/deploy_key`,
-		`ssh -o "BatchMode"=no -i /secrets/deploy_key`,
-		`ssh -o 'BatchMode no' -i /secrets/deploy_key`,
-		`ssh '-o' 'BatchMode=no' -i /secrets/deploy_key`,
-		`ssh -oBatchMode="no" -i /secrets/deploy_key`,
-	} {
-		t.Run(command, func(t *testing.T) {
-			t.Setenv("GIT_SSH_COMMAND", command)
-			env := nonInteractiveGitEnv()
-			for _, e := range env {
-				if strings.HasPrefix(e, "GIT_SSH_COMMAND=") {
-					if strings.Contains(e, "BatchMode=no") || strings.Contains(e, `BatchMode="no"`) {
-						t.Fatalf("expected quoted BatchMode option to be replaced, got %q", e)
-					}
-					if !strings.Contains(e, "-i /secrets/deploy_key") || !strings.Contains(e, "BatchMode=yes") {
-						t.Fatalf("expected identity and BatchMode=yes, got %q", e)
-					}
-					return
-				}
-			}
-			t.Fatalf("expected forced GIT_SSH_COMMAND, got %v", env)
-		})
-	}
-}
-
-func TestNonInteractiveGitEnvPreservesProxyCommand(t *testing.T) {
-	t.Setenv("GIT_SSH_COMMAND", "ssh -o ProxyCommand='ssh -o BatchMode=no bastion' -i /secrets/deploy_key")
-	env := nonInteractiveGitEnv()
-	for _, e := range env {
-		if strings.HasPrefix(e, "GIT_SSH_COMMAND=") {
-			if !strings.Contains(e, "ProxyCommand=ssh -o BatchMode=no bastion") {
-				t.Fatalf("expected ProxyCommand to be preserved, got %q", e)
-			}
-			if !strings.Contains(e, "BatchMode=yes") {
-				t.Fatalf("expected top-level BatchMode=yes, got %q", e)
-			}
-			return
-		}
-	}
-	t.Fatalf("expected forced GIT_SSH_COMMAND, got %v", env)
-}
-
-func TestNonInteractiveGitEnvQuotesShellMetacharacters(t *testing.T) {
-	t.Setenv("GIT_SSH_COMMAND", `ssh -i /tmp/key\ prod -o UserKnownHostsFile=/tmp/known\ hosts`)
-	env := nonInteractiveGitEnv()
-	for _, e := range env {
-		if strings.HasPrefix(e, "GIT_SSH_COMMAND=") {
-			if !strings.Contains(e, "'/tmp/key prod'") || !strings.Contains(e, "'UserKnownHostsFile=/tmp/known hosts'") {
-				t.Fatalf("expected escaped shell paths to be quoted, got %q", e)
-			}
-			if !strings.Contains(e, "BatchMode=yes") {
-				t.Fatalf("expected BatchMode=yes, got %q", e)
-			}
-			return
-		}
-	}
-	t.Fatalf("expected forced GIT_SSH_COMMAND, got %v", env)
-}
-
-func TestNonInteractiveGitEnvPreservesShellExpansion(t *testing.T) {
-	t.Setenv("GIT_SSH_COMMAND", `ssh -i "$HOME/.ssh/deploy key"`)
-	env := nonInteractiveGitEnv()
-	for _, e := range env {
-		if strings.HasPrefix(e, "GIT_SSH_COMMAND=") {
-			if !strings.Contains(e, "$HOME/.ssh/deploy key") {
-				t.Fatalf("expected HOME expansion to be preserved, got %q", e)
-			}
-			if strings.Contains(e, "'$HOME/.ssh/deploy key'") {
-				t.Fatalf("expected HOME expansion not to be single-quoted, got %q", e)
-			}
-			return
-		}
-	}
-	t.Fatalf("expected forced GIT_SSH_COMMAND, got %v", env)
-}
-
-func TestNonInteractiveGitEnvPreservesEscapedDollar(t *testing.T) {
-	t.Setenv("GIT_SSH_COMMAND", `ssh -i '/tmp/key$prod dir'`)
-	env := nonInteractiveGitEnv()
-	for _, e := range env {
-		if strings.HasPrefix(e, "GIT_SSH_COMMAND=") {
-			if !strings.Contains(e, `/tmp/key\$prod dir`) {
-				t.Fatalf("expected escaped dollar to be preserved, got %q", e)
-			}
-			if strings.Contains(e, `/tmp/key$prod dir`) {
-				t.Fatalf("expected literal dollar not to become expandable, got %q", e)
-			}
-			return
-		}
-	}
-	t.Fatalf("expected forced GIT_SSH_COMMAND, got %v", env)
 }
 
 func TestCloneBloblessAcceptsAtSignInPathAfterHostAndPort(t *testing.T) {

@@ -95,11 +95,12 @@ records the failure, and mounts the repo again only once the stalled mount has
 ended. macOS treats an FSKit mount as a network volume, so
 `umount <path>` returns `Operation not permitted` unless the terminal app has
 the Network Volumes permission (Privacy & Security → Files & Folders). The daemon
-unmounts an FSKit mount it serves through `unmount(2)`, then through
-`diskutil unmount` when `unmount(2)` is refused. A mount it unmounts by its
-path, such as one an earlier daemon left or a late mount the fuse library could
-not unmount, gets no `diskutil` fallback. `diskutil unmount <path>`
-removes an FSKit mount that `umount` cannot.
+unmounts an FSKit mount through `unmount(2)`, then through `diskutil unmount`
+when `unmount(2)` is refused. That holds for a mount it serves and for one it
+unmounts by its path, such as one an earlier daemon left or a late mount the
+fuse library could not unmount: the mount table marks an FSKit volume, so the
+daemon tells one apart without touching it. `diskutil unmount <path>` removes
+an FSKit mount that `umount` cannot.
 
 Quick start against a public repo:
 
@@ -184,12 +185,18 @@ the outcome. They exit non-zero when the daemon failed, when no daemon runs on
 the state root, when a later `unmount` or `remount` replaced the request, or
 after two minutes without an outcome. The daemon retries a failed unmount or
 mount; `status` shows the retry. The daemon runs each unmount on its own
-thread. It waits at most 21 seconds for an unmount, and does not wait for the
-one it starts after a FUSE connection fails. An unmount that hangs, as one can
-on a dead FSKit volume, holds up the daemon's other repos for that one wait,
-then stalls only its own repo. While that unmount has not returned, `unmount`
-and `remount` of the repo fail at once with `an earlier unmount of the repo has
-not returned`, and `status` shows that error as `last_error`, with
+thread. A stop runs there whole, so it never holds up the daemon's other repos:
+it unmounts the repo, retrying a busy mount for up to 20 seconds, then waits up
+to 30 seconds for the repo's FUSE server and workers. A stop whose unmount has
+not returned after 21 seconds keeps waiting, and `status` shows `unmount has
+not returned after 21s` as `last_error`, with `last_error_phase` `unmount`.
+Before a mount, the daemon waits at most 21 seconds for an unmount it starts,
+and does not wait for the one it starts after a FUSE connection fails. An
+unmount that hangs, as one can on a dead FSKit volume, holds up the daemon's
+other repos for at most that one wait, then stalls only its own repo. While an
+unmount the daemon started outside a stop has not returned, `unmount` and
+`remount` of the repo fail at once with `an earlier unmount of the repo has not
+returned`, and `status` shows that error as `last_error`, with
 `last_error_phase` `unmount` while a stop waits for it and `mount` while a mount
 retry does.
 
@@ -210,7 +217,11 @@ next registry poll, within 3 seconds.
 
 Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The first time a base file in a directory is opened for reading or read at a given snapshot generation, the mount also queues up to 256 of that directory's files, the opened one included, for background hydration, ranking code and manifests (`package.json`, `go.mod`, `README.md`) ahead of binary files. Listing or walking directories queues nothing. A blobless clone knows a file's size only once its blob is local, so the first `stat` of a file hydrates that one file. A worker takes up to 256 queued blobs, all reads or all prefetches, and fetches the missing ones with one `git fetch` from the promisor remote, so a blobless clone pays one fetch per batch, not one per blob. Queued reads go ahead of queued prefetches, and a blob a prefetch has already downloaded is copied into the cache before more prefetches download. With more than one worker, one worker takes only reads and those copies, so a read never waits for an unrelated prefetch download, though it can wait for one copy of a blob already on disk. With a single worker, a read can wait for a running prefetch download. A read of a file whose own prefetch is downloading waits for that download.
 
-For every repo, ArtifactFS reads blobs (`git cat-file --batch`) and trees (`git ls-tree`), and fetches queued blobs in batches (`git fetch --stdin`), without a controlling terminal, with `GIT_TERMINAL_PROMPT=0` and an empty `SSH_ASKPASS`. When a batch fetch runs, or a read lazily fetches a missing object, a remote that needs an interactive password or passphrase prompt makes the fetch fail instead of prompting. The repo's `core.sshCommand`, credential helpers, and any program set through `GIT_ASKPASS` or `core.askPass` still run. Git Credential Manager can still show its GUI prompt unless `GCM_INTERACTIVE=never` is set.
+For every repo, ArtifactFS reads blobs (`git cat-file --batch`) and trees (`git ls-tree`), and fetches queued blobs in batches (`git fetch --stdin`), without a controlling terminal, with `GIT_TERMINAL_PROMPT=0`, an empty `SSH_ASKPASS` and `SSH_ASKPASS_REQUIRE=never`. Unless `GIT_SSH` is set, ArtifactFS sets it to a wrapper that runs `ssh -o BatchMode=yes`, so SSH tries no passwords that a server could count as failed logins. Git runs `GIT_SSH` only when neither `GIT_SSH_COMMAND` nor a `core.sshCommand` applies, including one that an include sets for the repository being cloned, so the SSH command the user set wins. When a batch fetch runs, or a read lazily fetches a missing object, a remote that needs an interactive password or passphrase prompt makes the fetch fail instead of prompting. The SSH command the user set, credential helpers, and any program set through `GIT_ASKPASS` or `core.askPass` still run.
+
+Every other Git command ArtifactFS runs that can contact a remote runs the same way: without a controlling terminal, with `GIT_TERMINAL_PROMPT=0`, an empty `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE=never`, and BatchMode for plain `ssh`. These are the clones, `ls-remote` calls and fetches of `add-repo`, `prepare`, the daemon's preparation and remote refresh, and the `fetch` command, every `read-tree` that builds or moves a git dir's index, and the `diff-tree` and `diff-index` that check a failed move. In a git dir cloned with `--filter=tree:0`, those three fetch the trees it lacks. ArtifactFS's other Git commands read only commits and refs, or run with `GIT_NO_LAZY_FETCH=1`. A remote that needs a password, a passphrase or a new host key fails the command, and `status` reports a failed refresh. The SSH command the user set, credential helpers, and any program set through `GIT_ASKPASS` or `core.askPass` still run.
+
+Git Credential Manager can still show its GUI prompt unless `GCM_INTERACTIVE=never` is set. Other waits are not terminal prompts either, so these settings do not end them: an ssh-agent key added with `ssh-add -c`, a FIDO security key waiting for a touch, `ControlMaster ask` or `autoask`, and a `ProxyCommand` that waits for a browser login. Such a wait holds the command until its context ends: a remote refresh after 30 seconds, a preparation after 30 minutes, a hydration batch fetch after 2 minutes, and the `fetch` command until Ctrl-C.
 
 When the Git index matches the published snapshot and the overlay is empty, startup marks snapshot entries valid for Git's filesystem monitor before the mount serves the repo: before a prepared repo mounts, and before an async repo's gate opens. This lets the first `git status` use the daemon's change list instead of reading every tracked blob, and each later `git status` receives only the paths the overlay changed since Git's previous query, plus each file whose writes are not yet flushed. Paths with no `text` attribute, or under `text=auto`, `-text` or `binary`, are marked, unless `eol=lf` applies without `text=auto`. Paths under `text`, `text=input` or `eol=lf` without `text=auto` stay unmarked, because Git's check-in turns CRLF into LF and a blob that holds CRLF then differs from its file; Git compares those paths itself. `-text eol=lf` stays unmarked too, because `git check-attr` prints it like the literal `text=unset`, which Git converts under `eol=lf`. A `git status` that runs while the worktree is unmounted sees the empty mountpoint, so Git's next query gets a rescan. When startup marks the baseline again, its own query takes that rescan, and the first `git status` after the mount receives only the overlay's changes. ArtifactFS skips this baseline when the index or a `.gitattributes` blob is uncertain, when `core.attributesFile` is configured or `core.autocrlf` is set to anything but false, when an `eol=crlf`, `crlf`, `filter`, `ident` or `working-tree-encoding` attribute applies, or when staged work or overlay changes exist; Git then performs its normal status scan.
 
@@ -256,12 +267,12 @@ The daemon logs at `INFO`, so it drops the `DEBUG` records. The library reports 
 
 A repo's FUSE connection can end while its mount stays in place: after an error fatal to the connection, such as a failed read from the kernel, or after the connection is aborted. The daemon then logs `fuse connection failed, unmounting`, records the connection's error as the repo's `mount_error` (for an abort, which carries no error, `fuse connection ended while the mount point still holds the mount`), unmounts the repo, and mounts it again. While that unmount fails and the mount table still lists the mount point, or the table, the path or the mount point cannot be read, each mount retry tries the unmount again instead of mounting. The daemon looks the mount point up in the kernel's mount table by its absolute path, with symlinks in the parent and a symlinked final component resolved. On macOS the lookup ignores case.
 
-A daemon that stops without unmounting, for example after a crash, leaves its mounts behind. A daemon that stops cleanly records each repo it unmounted as stopped, unless it still claims a mount an earlier daemon left at the repo's mount point. The next daemon on the same state root reads which repos the stopped daemon still ran from its last status records. Before it prepares or mounts such a repo, it unmounts the mount the table lists at the repo's mount point when that mount is one a daemon made for the repo, and logs `unmounting a mount an earlier daemon left`:
+A daemon that stops without unmounting, for example after a crash, leaves its mounts behind. A daemon that stops cleanly records each repo it unmounted as stopped. The next daemon on the same state root reads from the stopped daemon's last status records which repos it still ran, and which mounts an earlier daemon left that it still claimed. Before it prepares or mounts such a repo, it unmounts the mount the table lists at the repo's mount point when that mount is one a daemon made for the repo, and logs `unmounting a mount an earlier daemon left`:
 
 - On Linux, a mount of type `fuse.artifact-fs` whose source is `artifact-fs:<repo>`.
-- On macOS, any mount whose type starts with `macfuse`. FSKit lists every macFUSE mount with the type `macfuse` and a source `macfuse://<UUID>` that names no repo, so a macFUSE mount another tool made at the mount point after a crash is unmounted too.
+- On macOS, any mount whose type starts with `macfuse`. FSKit lists every macFUSE mount with the type `macfuse` and a source `macfuse://<UUID>` that names no repo, so a macFUSE mount another tool made at the mount point after a crash is unmounted too. The macFUSE kernel extension's source is closed, and no source code states the type it lists. macFUSE's [Mount Options](https://github.com/macfuse/macfuse/wiki/Mount-Options/5f8969079d1fe965a513685be6a28fe4cf49338e) page shows the type `macfuse`, and `macfuse_<name>` under the `fstypename` option, which artifact-fs never sets. The open-source [osxfuse extension](https://github.com/osxfuse/kext/blob/534773bd3135f04b7f6fb801faa2f8991daf4a6b/osxfuse/fuse_vfsops.c#L155) builds both names the same way, from its own name `osxfuse`.
 
-While that unmount fails, the daemon does not mount the repo and retries with the mount backoff. When that unmount fails before the daemon starts the repo's runtime, only that daemon retries it: it records the repo unmounted, so the next daemon no longer claims the leftover. It leaves every other mount alone, such as an `sshfs` mount on Linux, or any mount at the mount point of a repo the stopped daemon did not run or had stopped, including one of a daemon on another state root. This unmount has no `diskutil` fallback, so on FSKit it needs the Network Volumes permission.
+While that unmount fails, the daemon does not mount the repo and retries with the mount backoff. The daemon keeps its claim on the leftover until it unmounts it or finds no mount there that it would unmount. Each status record carries the claim, so a daemon that stops first leaves the claim to the next one, and `status` still shows a stopped repo `unmounted`. A repo that `unmount` disabled releases the claim too: the daemon unmounts the leftover then, and while that unmount fails, `status` shows it as an `unmount` failure that the daemon retries with the mount backoff. A running daemon ends a removed repo's claim at its next registry sync, so a repo added again under that name after the sync claims nothing. A repo removed and added again while no daemon runs keeps the claim. It leaves every other mount alone, such as an `sshfs` mount on Linux, or any mount at the mount point of a repo the stopped daemon did not run or had stopped, including one of a daemon on another state root. On FSKit this unmount falls back to `diskutil unmount`, as described above.
 
 A mount that does not finish within 30 seconds ends in the background. When the fuse library cannot unmount it once it completes, it stays at the mount point, and the daemon unmounts the mount point before it mounts the repo again.
 
@@ -337,6 +348,12 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
 
 `--ref` and `--fetch-ref` take a full ref name, a branch name, or `origin/<branch>`, and `add-repo` stores each as a full ref name. `origin/X` and `refs/remotes/origin/X` name branch `X`, so a branch literally named `origin/X` needs `--ref refs/heads/origin/X`. `--fetch-ref` defaults to `--ref`. Preparation fetches the fetch ref and serves it, also right after a fresh clone of `--ref`. With `--require-commit`, preparation fetches and verifies `--ref`, and `add-repo` rejects `--fetch-ref`.
 
+With `--depth`, a fetch transfers at most that many commits of a fetch ref whose branch the git dir does not hold yet, or of a fetch ref that is not a branch. A fetch onto a branch the git dir holds transfers only the new commits. So `prepare` and the remote refresh make a `--prepared-gitdir` git dir shallow when it lacks the fetch ref's branch, or when the fetch ref is not a branch.
+
+The remote refresh and the `fetch` command fetch every branch of the git dir's configured refspec, and choose `--depth` from the fetch ref's branch alone. Once that branch exists, they pass no `--depth`. A `--prepared-gitdir` git dir with `--depth` and a refspec for several branches then receives a new or force-pushed upstream branch with its whole history. A clone that `add-repo` makes fetches only its branch, so the cost does not apply to it.
+
+A prepared git dir whose remote-tracking branch an earlier build's refresh made shallow refuses its next preparation with `refusing non-fast-forward update`. Deepen it once in that git dir, with `git fetch --deepen=<n>` or `git fetch --unshallow`.
+
 ## Adopting linked Git worktrees
 
 `--adopt-gitdir` registers an initialized linked worktree without cloning, fetching,
@@ -368,9 +385,9 @@ Adoption disables remote refresh and rejects acquisition options (`--remote`,
 watching remains active, including shared loose and packed branch refs, so
 commits and branch changes reconcile normally. Run ordinary Git fetch/push
 commands when needed; the worktree's original remote configuration is retained.
-If `origin` embeds credentials, adoption logs a warning that names no remote and proceeds:
-fetches of missing blobs and trees, Git's lazy fetches and the hydrator's batch
-fetches, use the promisor remote, usually `origin`.
+If `origin` or a promisor remote embeds credentials, adoption logs a warning that names no
+remote and proceeds: fetches of missing blobs and trees, Git's lazy fetches and the
+hydrator's batch fetches, use the promisor remotes, usually `origin`.
 
 ArtifactFS enables `extensions.worktreeConfig`, migrating shared `core.worktree`
 and `core.bare=true` settings into the primary worktree's config when necessary.
@@ -382,8 +399,12 @@ Stop the owning daemon and wait for process exit and actual unmount before
 restoring the saved gitfile, unlocking metadata or removing the worktree.
 `remove-repo` updates the registry and Git config and returns. The running daemon
 unmounts the repo at its next registry poll, so the return does not mean the live mount has stopped.
-It unsets the worktree's `core.fsmonitor` and keeps `extensions.worktreeConfig`,
-which sibling worktrees may rely on. Preserve a recovery ref before deleting a
+It unsets what adoption pinned in the worktree's config for the mount
+(`core.fsmonitor`, `fsmonitor.allowRemote`, `core.filemode`, `core.ignorecase`
+and `core.symlinks`), so the worktree inherits its repository's settings again.
+A value the worktree's own config held before adoption does not come back. It
+keeps the worktree's path pins and `extensions.worktreeConfig`, which sibling
+worktrees may rely on. Preserve a recovery ref before deleting a
 branch containing local commits.
 
 ## Verified shallow sources

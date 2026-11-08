@@ -395,7 +395,7 @@ func TestPrepareFetchedBranchUndoesALandedReadTreeOfAnIgnoredGitlink(t *testing.
 	}
 }
 
-func TestFetchRefNonInteractiveAndPrepareFetchedBranch(t *testing.T) {
+func TestFetchRefAmbientAndPrepareFetchedBranch(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
 	bare := filepath.Join(tmp, "origin.git")
@@ -422,8 +422,8 @@ func TestFetchRefNonInteractiveAndPrepareFetchedBranch(t *testing.T) {
 	if err := store.ValidatePreparedGitDir(ctx, cfg); err != nil {
 		t.Fatalf("ValidatePreparedGitDir: %v", err)
 	}
-	if err := store.FetchRefNonInteractive(ctx, cfg, "master"); err != nil {
-		t.Fatalf("FetchRefNonInteractive: %v", err)
+	if err := store.FetchRefAmbient(ctx, cfg, "master"); err != nil {
+		t.Fatalf("FetchRefAmbient: %v", err)
 	}
 	if err := store.PrepareFetchedBranch(ctx, cfg, "master"); err != nil {
 		t.Fatalf("PrepareFetchedBranch: %v", err)
@@ -486,8 +486,8 @@ func TestPrepareFetchedBranchRefusesPreparedGitDirRewind(t *testing.T) {
 	}
 	localOID = strings.TrimSpace(localOID)
 
-	if err := store.FetchRefNonInteractive(ctx, cfg, "master"); err != nil {
-		t.Fatalf("FetchRefNonInteractive: %v", err)
+	if err := store.FetchRefAmbient(ctx, cfg, "master"); err != nil {
+		t.Fatalf("FetchRefAmbient: %v", err)
 	}
 	err = store.PrepareFetchedBranch(ctx, cfg, "master")
 	if err == nil {
@@ -575,17 +575,17 @@ func TestFetchedBranchReplacesExistingCloneBranch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + bare, Branch: "master", FetchRef: "master"}}
-	if err := store.CloneBloblessNonInteractive(ctx, cfg); err != nil {
-		t.Fatalf("CloneBloblessNonInteractive: %v", err)
+	if err := store.CloneBlobless(ctx, cfg); err != nil {
+		t.Fatalf("CloneBlobless: %v", err)
 	}
 	assertArtifactWorktreeConfig(t, ctx, gitDir)
 	cfg.Branch = "dev"
 	cfg.FetchRef = "dev"
-	if err := store.ConfigureRemoteNonInteractive(ctx, cfg); err != nil {
-		t.Fatalf("ConfigureRemoteNonInteractive: %v", err)
+	if err := store.ConfigureRemoteAmbient(ctx, cfg); err != nil {
+		t.Fatalf("ConfigureRemoteAmbient: %v", err)
 	}
-	if err := store.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
-		t.Fatalf("FetchRefNonInteractive: %v", err)
+	if err := store.FetchRefAmbient(ctx, cfg, cfg.FetchRef); err != nil {
+		t.Fatalf("FetchRefAmbient: %v", err)
 	}
 	if err := store.PrepareFetchedBranch(ctx, cfg, cfg.FetchRef); err != nil {
 		t.Fatalf("PrepareFetchedBranch: %v", err)
@@ -726,7 +726,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "advance main")
 	run(t, "git", "-C", work, "push", "origin", "main")
 	advancedTip := strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
-	if err := New(nil).Fetch(ctx, cfg); err != nil {
+	if err := New(nil).FetchNonInteractive(ctx, cfg); err != nil {
 		t.Fatalf("verified source refresh: %v", err)
 	}
 	count, err = runGit(ctx, gitDir, "rev-list", "--count", "HEAD")
@@ -1170,8 +1170,8 @@ func TestCloneAndFetchRefSkipTags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CloneBloblessNonInteractive(ctx, cfg); err != nil {
-		t.Fatalf("CloneBloblessNonInteractive: %v", err)
+	if err := store.CloneBlobless(ctx, cfg); err != nil {
+		t.Fatalf("CloneBlobless: %v", err)
 	}
 	newPool, err := store.getPool(gitDir)
 	if err != nil {
@@ -1180,10 +1180,10 @@ func TestCloneAndFetchRefSkipTags(t *testing.T) {
 	if newPool == oldPool {
 		t.Fatal("clone reused the batch pool from the previously missing Git directory")
 	}
-	if err := store.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
-		t.Fatalf("FetchRefNonInteractive: %v", err)
+	if err := store.FetchRefAmbient(ctx, cfg, cfg.FetchRef); err != nil {
+		t.Fatalf("FetchRefAmbient: %v", err)
 	}
-	if err := store.Fetch(ctx, cfg); err != nil {
+	if err := store.FetchNonInteractive(ctx, cfg); err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
 
@@ -1228,7 +1228,7 @@ func TestFetchStartsBeforeRemoteLookupCompletes(t *testing.T) {
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	store.gitRetryDelays = nil
-	err := store.Fetch(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: "/private/configured/repo.git"}})
+	err := store.FetchNonInteractive(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: "/private/configured/repo.git"}})
 	if err == nil {
 		t.Fatal("Fetch error = nil, want transport failure")
 	}
@@ -1265,7 +1265,7 @@ func TestRemoteLookupIncludesConfiguredAndActualOrigin(t *testing.T) {
 	}
 }
 
-func TestFetchRefNonInteractiveFullRefPreparesDetachedHEAD(t *testing.T) {
+func TestFetchRefAmbientFullRefPreparesDetachedHEAD(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
 	bare := filepath.Join(tmp, "origin.git")
@@ -1294,8 +1294,8 @@ func TestFetchRefNonInteractiveFullRefPreparesDetachedHEAD(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := store.FetchRefNonInteractive(ctx, cfg, "refs/pull/10/head"); err != nil {
-		t.Fatalf("FetchRefNonInteractive: %v", err)
+	if err := store.FetchRefAmbient(ctx, cfg, "refs/pull/10/head"); err != nil {
+		t.Fatalf("FetchRefAmbient: %v", err)
 	}
 	if _, err := runGit(ctx, preparedGitDir, "rev-parse", "--verify", fetchedFullRefRemoteTrackingRef+"^{commit}"); err != nil {
 		t.Fatalf("expected fetched full ref at safe remote-tracking ref: %v", err)

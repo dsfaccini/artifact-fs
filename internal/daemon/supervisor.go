@@ -3,6 +3,9 @@ package daemon
 import (
 	"cmp"
 	"context"
+	"fmt"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
@@ -21,11 +24,17 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 	s.mu.Lock()
 	for _, rec := range previous {
-		if rec.State != "" && rec.State != repoStateUnmounted {
+		if rec.ClaimsLeftover || rec.State != "" && rec.State != repoStateUnmounted {
 			s.leftovers[rec.RepoID] = true
 		}
 	}
+	claimed := slices.Collect(maps.Keys(s.leftovers))
 	s.mu.Unlock()
+	// Every record carries the daemon's claim, so the claim outlasts a daemon
+	// that stops before it records the repo otherwise.
+	for _, id := range claimed {
+		s.recordRuntime(id, func(*model.RepoRuntimeRecord) {})
+	}
 	// The socket only wakes the sync loop early, so the daemon runs without it.
 	control, err := s.listenControl()
 	if err != nil {
@@ -70,7 +79,7 @@ func (s *Service) syncRepos(ctx context.Context) error {
 	for _, repo := range repos {
 		registered[repo.ID] = true
 		if !repo.Enabled {
-			s.stopRepo(repo, repo.MountRequest, "repo unmount failed")
+			s.stopRepo(repo, repo.MountRequest, "repo unmount failed", nil)
 			continue
 		}
 		s.mu.Lock()
@@ -83,13 +92,17 @@ func (s *Service) syncRepos(ctx context.Context) error {
 		s.mu.Unlock()
 		if running && (runningConfigVersion != repo.ConfigVersion || runningRequest != repo.MountRequest) {
 			s.logger.InfoContext(ctx, logRepoConfigChanged, "repo", auth.RedactLogString(repo.Name))
-			if !s.stopRepo(repo, runningRequest, "repo prepare remount unmount failed") {
+			// The next mount carries out the new config or request at once.
+			reset := func() {
+				s.supersedePrepare(repo.ID)
+				s.mu.Lock()
+				delete(s.mountRetries, repo.ID)
+				s.mu.Unlock()
+			}
+			if !s.stopRepo(repo, runningRequest, "repo prepare remount unmount failed", reset) {
 				continue
 			}
-			s.supersedePrepare(repo.ID)
-			s.mu.Lock()
-			delete(s.mountRetries, repo.ID)
-			s.mu.Unlock()
+			reset()
 			running = false
 			alreadyPreparing = false
 		}
@@ -142,15 +155,28 @@ func (s *Service) syncRepos(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 	for _, id := range stale {
-		s.logger.Info("unmounting removed repo", "repo", id)
-		if err := s.unmount(id); err != nil {
-			s.logger.Error("removed repo unmount failed", "repo", id, "error", auth.RedactLogString(err.Error()))
+		failed := func(err error) {
+			if err != nil {
+				s.logger.Error("removed repo unmount failed", "repo", id, "error", auth.RedactLogString(err.Error()))
+			}
 		}
+		_, started, err := s.stop(id, failed)
+		if started {
+			s.logger.Info("unmounting removed repo", "repo", id)
+		}
+		failed(err)
 	}
 	s.mu.Lock()
 	for id := range s.mountRetries {
 		if _, running := s.running[id]; !registered[id] && !running {
 			delete(s.mountRetries, id)
+		}
+	}
+	// A repo added again under a removed repo's name, and so its ID,
+	// inherits no claim.
+	for id := range s.leftovers {
+		if _, running := s.running[id]; !registered[id] && !running {
+			delete(s.leftovers, id)
 		}
 	}
 	var forgotten []model.RepoID
@@ -168,30 +194,69 @@ func (s *Service) syncRepos(ctx context.Context) error {
 	return nil
 }
 
-// stopRepo unmounts repo. A failure is recorded under repo's mount request,
-// and a stopped repo under stopped, the request the stop completes: a
-// remount completes only once it mounted again. It reports whether repo no
-// longer runs.
-func (s *Service) stopRepo(repo model.RepoConfig, stopped string, logMsg string) bool {
+// stopRepo reports whether repo no longer runs. While it runs, stopRepo
+// starts a stop of it unless one runs already, and does not wait for it. The
+// stop records a failure under repo's mount request, retried at the next
+// sync, and a stopped repo under stopped, the request the stop completes: a
+// remount completes only once it mounted again. then, when set, runs before
+// a successful stop records it. A stop whose unmount has not returned in
+// time is recorded as failed while it keeps running. A disabled repo that
+// does not run releases its leftover claim; a failed release backs off as a
+// failed mount does, and the repo is recorded stopped meanwhile.
+func (s *Service) stopRepo(repo model.RepoConfig, stopped string, logMsg string, then func()) bool {
 	s.mu.Lock()
-	_, running := s.running[repo.ID]
+	rt, running := s.running[repo.ID]
 	rec := s.records[repo.ID]
 	recorded := rec != nil && rec.State == repoStateUnmounted && rec.MountRequest == stopped
+	claimed := s.leftovers[repo.ID]
 	s.mu.Unlock()
-	if running {
-		s.recordPhase(repo, phaseUnmount)
+	if !running {
+		released := false
+		if claimed && !repo.Enabled && s.mountDue(repo) {
+			if err := s.releaseLeftoverMount(repo); err != nil {
+				s.logger.Error(logMsg, "repo", repo.Name, "error", auth.RedactLogString(err.Error(), repo.RemoteURL))
+				s.recordFailure(repo, phaseUnmount, err, s.backoffMount(repo))
+				s.recordRuntime(repo.ID, func(rec *model.RepoRuntimeRecord) {
+					rec.State, rec.Phase, rec.MountRequest = repoStateUnmounted, phaseUnmount, stopped
+				})
+				return true
+			}
+			s.mu.Lock()
+			released = !s.leftovers[repo.ID]
+			s.mu.Unlock()
+		}
+		// A claim the release kept, such as on a mount table it cannot read,
+		// changes nothing to record.
+		if released || !recorded {
+			repo.MountRequest = stopped
+			s.recordStopped(repo)
+		}
+		return true
 	}
-	if err := s.unmount(repo.ID); err != nil {
+	failed := func(err error) {
 		s.logger.Error(logMsg, "repo", repo.Name, "error", auth.RedactLogString(err.Error(), repo.RemoteURL))
 		s.recordFailure(repo, phaseUnmount, err, time.Now().Add(registrySyncInterval))
 		s.recordRuntime(repo.ID, func(rec *model.RepoRuntimeRecord) { rec.MountRequest = repo.MountRequest })
-		return false
 	}
-	if running || !recorded {
+	s.recordPhase(repo, phaseUnmount)
+	op, started, err := s.stop(repo.ID, func(err error) {
+		if err != nil {
+			failed(err)
+			return
+		}
+		if then != nil {
+			then()
+		}
 		repo.MountRequest = stopped
 		s.recordStopped(repo)
+	})
+	switch {
+	case err != nil:
+		failed(err)
+	case !started && op != nil && s.stopHung(rt, op):
+		failed(fmt.Errorf("unmount %s: unmount has not returned after %s", repo.Name, unmountTimeout+unmountReturnSlack))
 	}
-	return true
+	return false
 }
 
 // drivePrepare carries out an async repo's latest prepare request on rt, the

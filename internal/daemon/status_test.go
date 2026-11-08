@@ -445,7 +445,7 @@ func TestStopRuntimeKeepsWorkersAliveWhenUnmountFails(t *testing.T) {
 		mount:  mountServing,
 		cfg:    model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}},
 	}
-	if err := (&Service{unmounting: map[model.RepoID]*unmountOp{}, mountPointEntry: heldMountPoint}).stopRuntime(rt); err == nil {
+	if err := (&Service{unmounting: map[model.RepoID]*unmountOp{}, mountPointEntry: heldMountPoint}).stopRuntime(context.Background(), rt); err == nil {
 		t.Fatal("expected unmount failure")
 	}
 	if err := runtimeCtx.Err(); err != nil {

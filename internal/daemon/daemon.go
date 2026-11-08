@@ -129,9 +129,11 @@ type Service struct {
 	preparing       map[model.RepoID]prepareWorker
 	prepareAttempts map[model.RepoID]int64
 	prepareSeq      int64
-	// leftovers holds the repos the daemon process before this one ran and
-	// whose mounts it may have left. Before the daemon mounts such a repo,
-	// it unmounts the mount at its mount point when ownsLeftover matches it.
+	// leftovers holds the repos the daemon process before this one ran or
+	// still claimed, whose mounts an earlier daemon may have left. Before the
+	// daemon mounts such a repo, it unmounts the mount at its mount point
+	// when ownsLeftover matches it. Each repo_runtime record carries the
+	// claim, so it outlasts this daemon until it is released.
 	leftovers map[model.RepoID]bool
 	// mountRetries backs off the mounts of each repo whose mount failed.
 	mountRetries map[model.RepoID]*mountRetry
@@ -247,17 +249,10 @@ func (s *Service) Close() error {
 			errs = append(errs, err)
 			continue
 		}
-		s.mu.Lock()
-		claimed := s.leftovers[cfg.ID]
-		s.mu.Unlock()
-		if claimed {
-			// The earlier daemon's mount may still be at the mount point, so
-			// the next daemon claims it too.
-			continue
-		}
 		// The next daemon on the root finds no mount of this one's to
-		// unmount. The record keeps the last refresh, which status shows
-		// while no daemon runs.
+		// unmount, and claims an earlier daemon's only while the record
+		// keeps that claim. The record keeps the last refresh, which status
+		// shows while no daemon runs.
 		s.recordRuntime(cfg.ID, func(rec *model.RepoRuntimeRecord) {
 			rec.State = repoStateUnmounted
 			clearFailure(rec, phaseUnmount)
