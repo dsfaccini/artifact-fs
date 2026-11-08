@@ -93,7 +93,7 @@ Repository-specific guidance for `artifact-fs`.
 - Make every regression test fail on the code before the fix. Revert the fix and watch the test fail.
 - Drive behavior through the entry point real callers use, not an internal helper.
 - Use real Git repositories in `t.TempDir()`. Fake the `git` binary only for what a local repository cannot produce: an HTTP error, a hang, or a pause at one step.
-- Use the real in-process stores in `t.TempDir()`: `overlay.New`, `snapshot.New` and `registry.New`. Fake a store only by wrapping a real one to inject a fault or a hook, as `faultyOverlay` and `hookedOverlay` do. A fake that reimplements a store tests the fake. `fakeSnapshot` and `generationSnapshot` in `internal/fusefs` still reimplement the snapshot store. Do not copy them.
+- Build every new test on the real in-process stores in `t.TempDir()`: `overlay.New`, `snapshot.New` and `registry.New`. Fake a store only by wrapping a real one to inject a fault or a hook, as `faultyOverlay` and `hookedOverlay` do. A fake that reimplements a store tests the fake. `fakeSnapshot` and `generationSnapshot` in `internal/fusefs` reimplement the snapshot store. Only the tests that already use them may keep them.
 - Assert the observable outcome: what `git status` reports, the resolved entry, or the persisted state. A nil error or a log line is not an outcome.
 - Assert a result that only the code path under test produces. An unchanged index passes whichever check skips the bootstrap. `TestBootstrapCleanStatusIndexSkipsDeleteOnlyOverlay` therefore first bootstraps the same fixture without the overlay entry.
 - Check the error of every setup call. A setup call that failed unseen makes an absence check pass with nothing to remove.

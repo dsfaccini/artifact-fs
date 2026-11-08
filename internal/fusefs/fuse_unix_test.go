@@ -224,40 +224,50 @@ func TestCanceledContextDoesNotHideOverlayStorageFailure(t *testing.T) {
 // commit time is unknown. An overlay entry keeps its mtime and ctime apart,
 // and an overlay directory chmodded to 0 keeps permission bits 0.
 func TestGetInodeAttributesReportsEachEntrysTimesAndMode(t *testing.T) {
-	ctx := context.Background()
-	ov := newOverlay(t, "dir/", "new.txt")
-	r := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{"base.txt": {Path: "base.txt", Type: "file", Mode: 0o100644, SizeState: "known", SizeBytes: 5}}}, ov)
-	r.SetGeneration(7)
-	fs := NewArtifactFuse(model.RepoPaths{ID: "repo"}, &Engine{Resolver: r, Overlay: ov})
-	getattr := func(name string) fuseops.InodeAttributes {
+	f := newCacheFixture(t, baseFile("base.txt", "base", 0o100644))
+	var root fuseops.InodeID = fuseops.RootInodeID
+	getattr := func(inode fuseops.InodeID) fuseops.InodeAttributes {
 		t.Helper()
-		op := &fuseops.GetInodeAttributesOp{Inode: lookUpInode(t, fs, fuseops.RootInodeID, name)}
-		if err := fs.GetInodeAttributes(ctx, op); err != nil {
+		op := &fuseops.GetInodeAttributesOp{Inode: inode}
+		if err := f.fs.GetInodeAttributes(f.ctx, op); err != nil {
 			t.Fatal(err)
 		}
 		return op.Attributes
 	}
-	setattr := func(op *fuseops.SetInodeAttributesOp) {
-		t.Helper()
-		if err := fs.SetInodeAttributes(ctx, op); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	for commitTime, want := range map[int64]time.Time{0: time.Unix(7, 0), 1_700_000_000: time.Unix(1_700_000_000, 0)} {
-		r.SetCommitTime(commitTime)
-		if got := getattr("base.txt"); !got.Mtime.Equal(want) || !got.Ctime.Equal(want) {
+	base := f.lookup(root, "base.txt")
+	for commitTime, want := range map[int64]time.Time{0: time.Unix(f.resolver.Generation(), 0), 1_700_000_000: time.Unix(1_700_000_000, 0)} {
+		f.resolver.SetCommitTime(commitTime)
+		if got := getattr(base); !got.Mtime.Equal(want) || !got.Ctime.Equal(want) {
 			t.Fatalf("base.txt at commit time %d: mtime %v, ctime %v; want both %v", commitTime, got.Mtime, got.Ctime, want)
 		}
 	}
+
+	create := &fuseops.CreateFileOp{Parent: root, Name: "new.txt", Mode: 0o644}
+	if err := f.fs.CreateFile(f.ctx, create); err != nil {
+		t.Fatal(err)
+	}
 	mtime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
-	setattr(&fuseops.SetInodeAttributesOp{Inode: lookUpInode(t, fs, fuseops.RootInodeID, "new.txt"), Mtime: &mtime})
-	if got := getattr("new.txt"); !got.Mtime.Equal(mtime) || !got.Atime.Equal(mtime) || got.Ctime.Equal(mtime) {
-		t.Fatalf("new.txt: atime %v, mtime %v, ctime %v; want atime and mtime %v and the ctime of the change", got.Atime, got.Mtime, got.Ctime, mtime)
+	if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Mtime: &mtime}); err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := lookupOverlay(t, f.resolver.Overlay, "new.txt")
+	if !ok {
+		t.Fatal("new.txt is not in the overlay")
+	}
+	ctime := time.Unix(0, entry.CtimeUnixNs)
+	if got := getattr(create.Entry.Child); !got.Mtime.Equal(mtime) || !got.Atime.Equal(mtime) || !got.Ctime.Equal(ctime) || ctime.Equal(mtime) {
+		t.Fatalf("new.txt: atime %v, mtime %v, ctime %v; want atime and mtime %v and the overlay's ctime %v", got.Atime, got.Mtime, got.Ctime, mtime, ctime)
+	}
+
+	mkdir := &fuseops.MkDirOp{Parent: root, Name: "dir", Mode: os.ModeDir | 0o755}
+	if err := f.fs.MkDir(f.ctx, mkdir); err != nil {
+		t.Fatal(err)
 	}
 	noAccess := os.ModeDir
-	setattr(&fuseops.SetInodeAttributesOp{Inode: lookUpInode(t, fs, fuseops.RootInodeID, "dir"), Mode: &noAccess})
-	if got := getattr("dir").Mode; got != os.ModeDir {
+	if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: mkdir.Entry.Child, Mode: &noAccess}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getattr(mkdir.Entry.Child).Mode; got != os.ModeDir {
 		t.Fatalf("dir mode after chmod 0 = %v, want a directory with permission bits 0", got)
 	}
 }
@@ -527,32 +537,32 @@ func TestRenameReturnsNativeErrorsBeforeMutatingOverlay(t *testing.T) {
 
 func TestInodeAndHandleCreationWaitForNamespaceMutation(t *testing.T) {
 	for _, test := range []struct {
-		name string
+		op   string
 		call func(*ArtifactFuse) error
 	}{
-		{name: "lookup", call: func(fs *ArtifactFuse) error {
+		{"LookUpInode", func(fs *ArtifactFuse) error {
 			return fs.LookUpInode(context.Background(), &fuseops.LookUpInodeOp{})
 		}},
-		{name: "opendir", call: func(fs *ArtifactFuse) error {
+		{"OpenDir", func(fs *ArtifactFuse) error {
 			return fs.OpenDir(context.Background(), &fuseops.OpenDirOp{})
 		}},
-		{name: "readdirplus", call: func(fs *ArtifactFuse) error {
+		{"ReadDirPlus", func(fs *ArtifactFuse) error {
 			return fs.ReadDirPlus(context.Background(), &fuseops.ReadDirPlusOp{})
 		}},
-		{name: "open", call: func(fs *ArtifactFuse) error {
+		{"OpenFile", func(fs *ArtifactFuse) error {
 			return fs.OpenFile(context.Background(), &fuseops.OpenFileOp{})
 		}},
-		{name: "setattr", call: func(fs *ArtifactFuse) error {
+		{"SetInodeAttributes", func(fs *ArtifactFuse) error {
 			return fs.SetInodeAttributes(context.Background(), &fuseops.SetInodeAttributesOp{})
 		}},
-		{name: "mkdir", call: func(fs *ArtifactFuse) error {
+		{"MkDir", func(fs *ArtifactFuse) error {
 			return fs.MkDir(context.Background(), &fuseops.MkDirOp{})
 		}},
-		{name: "rmdir", call: func(fs *ArtifactFuse) error {
+		{"RmDir", func(fs *ArtifactFuse) error {
 			return fs.RmDir(context.Background(), &fuseops.RmDirOp{})
 		}},
 	} {
-		t.Run(test.name, func(t *testing.T) {
+		t.Run(test.op, func(t *testing.T) {
 			fs := &ArtifactFuse{}
 			fs.handleOps.Lock()
 			done := make(chan struct{})
@@ -560,7 +570,7 @@ func TestInodeAndHandleCreationWaitForNamespaceMutation(t *testing.T) {
 				_ = test.call(fs)
 				close(done)
 			}()
-			if !waitParked(done, "(*Engine).Do") {
+			if !waitParked(done, "sync.(*RWMutex).", "(*Engine).Do", "(*ArtifactFuse)."+test.op) {
 				t.Fatal("operation did not wait for namespace mutation")
 			}
 			fs.handleOps.Unlock()
@@ -1081,8 +1091,9 @@ type kernelDirent struct {
 // set. Each entry is a fuse_dirent and its name padded to 8 bytes, after a
 // fuse_entry_out for ReadDirPlus. macFUSE's fuse_attr carries crtime and
 // flags, so its mode lies further in and the struct is longer.
-func decodeDirents(buf []byte, plus bool) []kernelDirent {
+func decodeDirents(buf []byte, plus bool) ([]kernelDirent, error) {
 	const entryOutHeader = 40 // nodeid, generation, and the entry and attribute timeouts
+	const direntHeader = 24   // ino, off, namelen and type
 	attrSize, modeOffset := 88, 60
 	if runtime.GOOS == "darwin" {
 		attrSize, modeOffset = 104, 72
@@ -1091,18 +1102,28 @@ func decodeDirents(buf []byte, plus bool) []kernelDirent {
 	for len(buf) > 0 {
 		var d kernelDirent
 		if plus {
+			if len(buf) < entryOutHeader+attrSize {
+				return out, fmt.Errorf("entry %d: %d bytes left, short of a fuse_entry_out", len(out), len(buf))
+			}
 			attr := buf[entryOutHeader:]
 			d.size = binary.NativeEndian.Uint64(attr[8:])
 			d.mode = binary.NativeEndian.Uint32(attr[modeOffset:])
 			buf = buf[entryOutHeader+attrSize:]
 		}
+		if len(buf) < direntHeader {
+			return out, fmt.Errorf("entry %d: %d bytes left, short of a fuse_dirent", len(out), len(buf))
+		}
 		d.offset = fuseops.DirOffset(binary.NativeEndian.Uint64(buf[8:]))
 		namelen := int(binary.NativeEndian.Uint32(buf[16:]))
-		d.name = string(buf[24 : 24+namelen])
-		buf = buf[(24+namelen+7)&^7:]
+		size := (direntHeader + namelen + 7) &^ 7
+		if len(buf) < size {
+			return out, fmt.Errorf("entry %d: %d bytes left, short of its %d-byte name", len(out), len(buf), namelen)
+		}
+		d.name = string(buf[direntHeader : direntHeader+namelen])
+		buf = buf[size:]
 		out = append(out, d)
 	}
-	return out
+	return out, nil
 }
 
 // readDirPlus lists dir through ReadDirPlus from offset 0 and decodes the reply.
@@ -1116,8 +1137,12 @@ func readDirPlus(t *testing.T, fs *ArtifactFuse, dir fuseops.InodeID) map[string
 	if err := fs.ReadDirPlus(context.Background(), op); err != nil {
 		t.Fatalf("ReadDirPlus: %v", err)
 	}
+	entries, err := decodeDirents(op.Dst[:op.BytesRead], true)
+	if err != nil {
+		t.Fatalf("ReadDirPlus reply: %v", err)
+	}
 	out := map[string]kernelDirent{}
-	for _, d := range decodeDirents(op.Dst[:op.BytesRead], true) {
+	for _, d := range entries {
 		out[d.name] = d
 	}
 	return out
@@ -1127,17 +1152,16 @@ func readDirPlus(t *testing.T, fs *ArtifactFuse, dir fuseops.InodeID) map[string
 // the offset of the last entry before it. Joined, the pieces hold each name
 // once.
 func TestReadDirPagesThroughAListingLongerThanItsBuffer(t *testing.T) {
-	ctx := context.Background()
-	var kids []model.BaseNode
+	var files []model.BaseNode
 	want := []string{".git"}
 	for i := range 20 {
-		kids = append(kids, model.BaseNode{Path: fmt.Sprintf("file-%02d.txt", i), Type: "file", Mode: 0o100644, SizeState: "known"})
-		want = append(want, kids[i].Path)
+		files = append(files, baseFile(fmt.Sprintf("file-%02d.txt", i), fmt.Sprintf("blob-%02d", i), 0o100644))
+		want = append(want, files[i].Path)
 	}
-	fs := NewArtifactFuse(model.RepoPaths{ID: "repo"}, &Engine{Resolver: newResolver(&fakeSnapshot{kids: map[string][]model.BaseNode{".": kids}}, newOverlay(t))})
+	f := newCacheFixture(t, files...)
 	for _, plus := range []bool{false, true} {
 		open := &fuseops.OpenDirOp{Inode: fuseops.RootInodeID}
-		if err := fs.OpenDir(ctx, open); err != nil {
+		if err := f.fs.OpenDir(f.ctx, open); err != nil {
 			t.Fatal(err)
 		}
 		var got []string
@@ -1145,14 +1169,17 @@ func TestReadDirPagesThroughAListingLongerThanItsBuffer(t *testing.T) {
 		// The bound stops reads that keep restarting at an entry already read.
 		for range len(want) {
 			op := &fuseops.ReadDirPlusOp{ReadDirOp: fuseops.ReadDirOp{Handle: open.Handle, Offset: offset, Dst: make([]byte, 400)}}
-			read := func() error { return fs.ReadDir(ctx, &op.ReadDirOp) }
+			read := func() error { return f.fs.ReadDir(f.ctx, &op.ReadDirOp) }
 			if plus {
-				read = func() error { return fs.ReadDirPlus(ctx, op) }
+				read = func() error { return f.fs.ReadDirPlus(f.ctx, op) }
 			}
 			if err := read(); err != nil {
 				t.Fatal(err)
 			}
-			page := decodeDirents(op.Dst[:op.BytesRead], plus)
+			page, err := decodeDirents(op.Dst[:op.BytesRead], plus)
+			if err != nil {
+				t.Fatalf("reply at offset %d: %v", offset, err)
+			}
 			if len(page) == 0 {
 				break
 			}

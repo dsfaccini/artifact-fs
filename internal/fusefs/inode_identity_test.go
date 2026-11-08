@@ -812,11 +812,11 @@ func hookOverlay(f *cacheFixture) *hookedOverlay {
 	return ov
 }
 
-// waitParked polls the goroutine stacks until one waits for a lock with fn on
-// its stack, and reports whether one did before done closed. A second
-// RWMutex.Lock waits in the sync.Mutex inside the RWMutex. A rename of fn
-// leaves waitParked polling until go test -timeout.
-func waitParked(done <-chan struct{}, fn string) bool {
+// waitParked polls the goroutine stacks until one waits for a lock with every
+// one of frames on its stack, and reports whether one did before done closed.
+// A rename of a frame's function leaves waitParked polling until go test
+// -timeout.
+func waitParked(done <-chan struct{}, frames ...string) bool {
 	buf := make([]byte, 1<<20)
 	for {
 		select {
@@ -826,7 +826,10 @@ func waitParked(done <-chan struct{}, fn string) bool {
 		}
 		n := runtime.Stack(buf, true)
 		for g := range strings.SplitSeq(string(buf[:n]), "\n\n") {
-			if header, _, _ := strings.Cut(g, "\n"); strings.Contains(header, "Mutex.") && strings.Contains(g, fn) {
+			// A wait for an RWMutex's write lock first waits in the
+			// sync.Mutex inside it, so the reason can name either type.
+			header, stack, _ := strings.Cut(g, "\n")
+			if strings.Contains(header, "Mutex.") && !slices.ContainsFunc(frames, func(f string) bool { return !strings.Contains(stack, f) }) {
 				return true
 			}
 		}
@@ -834,10 +837,13 @@ func waitParked(done <-chan struct{}, fn string) bool {
 	}
 }
 
-// waitRecheck returns once done is closed, or once a goroutine waits for the
-// handleOps read lock in unmapStillMissing: the switch pass's re-check, which
-// a Rename op holds off until it has moved its mappings.
-func waitRecheck(done <-chan struct{}) { waitParked(done, "(*ArtifactFuse).unmapStillMissing") }
+// waitRecheck returns once done is closed, or once unmapStillMissing waits
+// for a read lock. The only read lock it takes is handleOps, in the switch
+// pass's re-check, which a Rename op holds off until it has moved its
+// mappings.
+func waitRecheck(done <-chan struct{}) {
+	waitParked(done, "sync.(*RWMutex).RLock", "(*ArtifactFuse).unmapStillMissing")
+}
 
 // newRenameFixture makes src/file.txt through the mount. The kernel holds
 // src and has forgotten file.txt.

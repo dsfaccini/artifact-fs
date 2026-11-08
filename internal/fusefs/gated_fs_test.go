@@ -5,6 +5,8 @@ package fusefs
 import (
 	"context"
 	"errors"
+	"reflect"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -63,6 +65,8 @@ func TestGatedFileSystemFailedGateReturnsEIO(t *testing.T) {
 	gate.MarkFailed(errors.New("clone failed"))
 	fs := NewGatedFileSystem(&fuseutil.NotImplementedFileSystem{}, gate)
 	ctx := context.Background()
+	// Destroy returns nothing to compare.
+	covered := map[string]bool{"Destroy": true}
 	for _, tc := range []struct {
 		name  string
 		op    func() error
@@ -105,12 +109,18 @@ func TestGatedFileSystemFailedGateReturnsEIO(t *testing.T) {
 		{"Fallocate", func() error { return fs.Fallocate(ctx, &fuseops.FallocateOp{}) }, true},
 		{"SyncFS", func() error { return fs.SyncFS(ctx, &fuseops.SyncFSOp{}) }, true},
 	} {
+		covered[strings.Fields(tc.name)[0]] = true
 		want := syscall.ENOSYS
 		if tc.gated {
 			want = syscall.EIO
 		}
 		if got := kernelErrno(tc.op()); got != want {
 			t.Errorf("%s = %v, want %v", tc.name, got, want)
+		}
+	}
+	for m := range reflect.TypeFor[fuseutil.FileSystem]().Methods() {
+		if !covered[m.Name] {
+			t.Errorf("no row for %s", m.Name)
 		}
 	}
 }

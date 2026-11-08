@@ -16,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
 	overlaystore "github.com/cloudflare/artifact-fs/internal/overlay"
@@ -248,8 +249,12 @@ func TestInvalidateChangedDropsWhatTheSwitchChanged(t *testing.T) {
 	// Names the kernel caches as missing: one the switch adds, one that stays
 	// missing, and four made through the mount.
 	for _, name := range []string{"new.txt", "never.txt", "made-dir", "made-file", "made-link", "moved.txt"} {
-		if child := f.lookup(root, name); child != 0 {
-			t.Fatalf("lookup of missing %q = inode %d", name, child)
+		op := &fuseops.LookUpInodeOp{Parent: root, Name: name}
+		if err := f.fs.LookUpInode(f.ctx, op); !lookupMissed(err, op) {
+			t.Fatalf("lookup of missing %q = inode %d, %v", name, op.Entry.Child, err)
+		}
+		if negativeLookupEntries && !op.Entry.EntryExpiration.After(time.Now()) {
+			t.Fatalf("negative entry for %q expires %v, want later than now so the kernel caches it", name, op.Entry.EntryExpiration)
 		}
 	}
 	if err := f.fs.MkDir(f.ctx, &fuseops.MkDirOp{Parent: root, Name: "made-dir", Mode: os.ModeDir | 0o755}); err != nil {
