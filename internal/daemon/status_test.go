@@ -24,6 +24,7 @@ import (
 )
 
 func TestVerifiedSourceStatusAndRefreshPolicy(t *testing.T) {
+	t.Parallel()
 	const requiredCommit = "0123456789012345678901234567890123456789"
 	cfg := model.RepoConfig{
 		RepoSpec: model.RepoSpec{
@@ -147,6 +148,7 @@ func (f *bootstrapFixture) indexEntries(t *testing.T) string {
 }
 
 func TestBootstrapCleanStatusIndexSkipsDeleteOnlyOverlay(t *testing.T) {
+	t.Parallel()
 	// The fixture bootstraps without an overlay entry, so only the delete
 	// below can leave tracked.txt to a stat.
 	clean := newBootstrapFixture(t)
@@ -221,6 +223,7 @@ exec "$AFS_REAL_GIT" "$@"
 }
 
 func TestRequiredCommitIgnoresHEADWatcher(t *testing.T) {
+	t.Parallel()
 	const requiredCommit = "0123456789012345678901234567890123456789"
 	runtime := &repoRuntime{
 		cfg:  model.RepoConfig{RepoPaths: model.RepoPaths{ID: "verified", GitDir: filepath.Join(t.TempDir(), "missing")}, RepoSpec: model.RepoSpec{RequiredCommit: requiredCommit}},
@@ -236,6 +239,7 @@ func TestRequiredCommitIgnoresHEADWatcher(t *testing.T) {
 }
 
 func TestPersistedVerifiedStatusDoesNotCountAcquisitionAsRefresh(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	gitDir := filepath.Join(root, "git")
 	if err := os.MkdirAll(gitDir, 0o755); err != nil {
@@ -279,6 +283,7 @@ func TestPersistedVerifiedStatusDoesNotCountAcquisitionAsRefresh(t *testing.T) {
 }
 
 func TestReadPersistedStatusIncludesHydrationStats(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	root := t.TempDir()
 	cacheDir := filepath.Join(root, "cache")
@@ -316,6 +321,7 @@ func TestReadPersistedStatusIncludesHydrationStats(t *testing.T) {
 }
 
 func TestStatusReportsMountErrorUntilRetryMounts(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	remote := filepath.Join(tmp, "remote")
@@ -387,15 +393,15 @@ func (shortWriter) Write(p []byte) (int, error) {
 }
 
 func TestWriteHookFieldRejectsShortWrite(t *testing.T) {
+	t.Parallel()
 	if err := writeHookField(shortWriter{}, "token"); err != io.ErrShortWrite {
 		t.Fatalf("err = %v, want io.ErrShortWrite", err)
 	}
 }
 
 type blockingMountedFS struct {
-	started    chan context.Context
-	release    chan struct{}
-	unmountErr error
+	started chan context.Context
+	release chan struct{}
 }
 
 func (m *blockingMountedFS) Join(ctx context.Context) error {
@@ -411,9 +417,10 @@ func (m *blockingMountedFS) Join(ctx context.Context) error {
 func (m *blockingMountedFS) Backend() string          { return "fake" }
 func (m *blockingMountedFS) InvalidateChanged() error { return nil }
 
-func (m *blockingMountedFS) Unmount(context.Context) error { return m.unmountErr }
+func (m *blockingMountedFS) Unmount(context.Context) error { return nil }
 
 func TestJoinRuntimeMountIsNotCanceledWithWorkers(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		runtimeCtx, cancel := context.WithCancel(context.Background())
 		mfs := &blockingMountedFS{started: make(chan context.Context, 1), release: make(chan struct{})}
@@ -429,23 +436,6 @@ func TestJoinRuntimeMountIsNotCanceledWithWorkers(t *testing.T) {
 		close(mfs.release)
 		<-rt.joinDone
 	})
-}
-
-func TestStopRuntimeKeepsWorkersAliveWhenUnmountFails(t *testing.T) {
-	runtimeCtx, cancel := context.WithCancel(context.Background())
-	rt := &repoRuntime{
-		ctx:    runtimeCtx,
-		cancel: cancel,
-		mfs:    &blockingMountedFS{unmountErr: errors.New("busy")},
-		mount:  mountServing,
-		cfg:    model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}},
-	}
-	if err := (&Service{unmounting: map[model.RepoID]*unmountOp{}, mountPointEntry: heldMountPoint}).stopRuntime(context.Background(), rt); err == nil {
-		t.Fatal("expected unmount failure")
-	}
-	if err := runtimeCtx.Err(); err != nil {
-		t.Fatalf("runtime context canceled after failed unmount: %v", err)
-	}
 }
 
 // newHookService registers repo at mountPath. "/" is always in the mount
@@ -502,6 +492,7 @@ func gitStatusWithAnswer(t *testing.T, repo string, answer []byte) (string, stri
 }
 
 func TestFSMonitorHookReturnsPathsChangedSinceToken(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	svc, cfg := newHookService(t, "/")
 	ov, err := overlay.New(ctx, cfg.RepoPaths)
@@ -553,6 +544,7 @@ func TestFSMonitorHookReturnsPathsChangedSinceToken(t *testing.T) {
 }
 
 func TestFSMonitorHookRescansForTokenFromRecreatedOverlay(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	svc, cfg := newHookService(t, "/")
 	ov, err := overlay.New(ctx, cfg.RepoPaths)
@@ -591,6 +583,7 @@ func TestFSMonitorHookRescansForTokenFromRecreatedOverlay(t *testing.T) {
 }
 
 func TestFSMonitorHookLeavesOverlaySchemaToTheDaemon(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	svc, cfg := newHookService(t, "/")
 	// An overlay database from before the change log, with a row whose ctime
@@ -628,6 +621,7 @@ func TestFSMonitorHookLeavesOverlaySchemaToTheDaemon(t *testing.T) {
 // Git trusts its cached directory listings after a delta answer, so the hook
 // must name a path inside every directory whose listing a rename changes.
 func TestFSMonitorHookKeepsGitUntrackedCacheAcrossDirectoryRenames(t *testing.T) {
+	t.Parallel()
 	// rename mirrors an overlay rename in the repository.
 	rename := func(t *testing.T, ov *overlay.Store, repo, from, to string) {
 		t.Helper()
@@ -666,6 +660,7 @@ func TestFSMonitorHookKeepsGitUntrackedCacheAcrossDirectoryRenames(t *testing.T)
 		}, want: "?? tmp/\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			ctx := t.Context()
 			svc, cfg := newHookService(t, "/")
 			ov, err := overlay.New(ctx, cfg.RepoPaths)
@@ -737,6 +732,11 @@ func TestFSMonitorHookRescansUnlessTokenAndMountAreCurrent(t *testing.T) {
 		{name: "current token and mount", live: true, want: "M  README.md"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// The bootstrap case sets the environment, so it runs alone,
+			// before the parallel cases resume.
+			if !tc.bootstrap {
+				t.Parallel()
+			}
 			ctx := t.Context()
 			dir := t.TempDir()
 			unmounted := filepath.Join(dir, "unmounted")

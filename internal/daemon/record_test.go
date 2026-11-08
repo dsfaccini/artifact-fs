@@ -27,7 +27,7 @@ const credentialRemote = "https://user:hunter2secret@example.com/org/repo.git"
 // repository, and a controller on its root.
 func newSyncedDaemon(t *testing.T) (*Service, *Controller) {
 	t.Helper()
-	return newSyncedDaemonIn(t, t.TempDir())
+	return newSyncedDaemonIn(t, shortTempDir(t))
 }
 
 // newSyncedDaemonIn is newSyncedDaemon with its state root and repositories
@@ -86,6 +86,7 @@ func requireFailure(t *testing.T, ctl *Controller, phase string, wantInError str
 // A store that a newer build migrated fails the mount before the FUSE mount,
 // and the daemon retries it.
 func TestStatusReportsAFailureBeforeTheFUSEMount(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	cfg, err := svc.registry.GetRepo(context.Background(), "repo")
 	if err != nil {
@@ -102,6 +103,7 @@ func TestStatusReportsAFailureBeforeTheFUSEMount(t *testing.T) {
 }
 
 func TestStatusRedactsAFailedFUSEMount(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return nil, errors.New("mount " + credentialRemote + " refused")
@@ -136,28 +138,32 @@ func (m *exitingMount) Join(ctx context.Context) error {
 func (m *exitingMount) Unmount(context.Context) error { return m.err }
 
 func TestStatusReportsAnExitedFUSEServer(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("connection to " + credentialRemote + " lost")}
 	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
+	// The join records the serve failure, then the runtime's state in a
+	// second write, so the test reads status once the join ended.
+	joined := make(chan struct{})
+	var joinOnce sync.Once
+	svc.joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
 	if err := svc.syncRepos(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	close(mfs.exit)
-	waitFor(t, nil, func() bool {
-		st, err := ctl.Status(context.Background(), "repo")
-		return err == nil && st.LastErrorPhase == phaseServe
-	})
+	<-joined
 	if st := requireFailure(t, ctl, phaseServe, "lost"); st.State != repoStateDegraded {
 		t.Fatalf("state = %q, want degraded", st.State)
 	}
 }
 
 // startService runs svc's Start until the test ends and returns the channel
-// that delivers Start's error.
+// that delivers Start's error. svc never polls the registry.
 func startService(t *testing.T, svc *Service) <-chan error {
 	t.Helper()
+	svc.syncInterval = time.Hour
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	stopped := make(chan struct{})
@@ -193,6 +199,7 @@ func syncAndFinishStops(t *testing.T, svc *Service) {
 }
 
 func TestUnmountReportsTheDaemonsFailure(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	svc.mountPointEntry = heldMountPoint
 	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("unmount " + credentialRemote + ": busy")}
@@ -213,6 +220,7 @@ func TestUnmountReportsTheDaemonsFailure(t *testing.T) {
 }
 
 func TestStatusReportsAFailedRegistrySync(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	done := startService(t, svc)
@@ -229,6 +237,7 @@ func TestStatusReportsAFailedRegistrySync(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `INSERT INTO repos (repo_id, name, mount_root, mount_path, remote_url_redacted, branch, refresh_interval_seconds, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, created_at_ns, updated_at_ns) VALUES ('bad', 'bad', '', '', '', '', 0, '', '', '', '', '', ?, 0, 0)`, credentialRemote); err != nil {
 		t.Fatal(err)
 	}
+	wake(svc)
 	waitFor(t, done, func() bool {
 		st, err := ctl.Status(ctx, "repo")
 		return err == nil && st.LastErrorPhase == phaseRegistrySync
@@ -237,6 +246,7 @@ func TestStatusReportsAFailedRegistrySync(t *testing.T) {
 }
 
 func TestStatusReportsAFailedRefresh(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	cfg, err := svc.registry.GetRepo(ctx, "repo")
@@ -249,14 +259,38 @@ func TestStatusReportsAFailedRefresh(t *testing.T) {
 	if err := os.RemoveAll(cfg.RemoteURL); err != nil {
 		t.Fatal(err)
 	}
+	git := &pausedRefreshGit{GitStore: svc.git, retried: make(chan struct{})}
+	svc.git = git
 	done := startService(t, svc)
-	waitFor(t, done, func() bool {
-		st, err := ctl.Status(ctx, "repo")
-		return err == nil && st.LastErrorPhase == phaseFetch
-	})
+	select {
+	case <-git.retried:
+	case err := <-done:
+		t.Fatalf("Start returned before the refresh retried: %v", err)
+	}
 	if st := requireFailure(t, ctl, phaseFetch, "fetch"); st.LastFetchResult != string(fetchFailed) {
 		t.Fatalf("fetch result = %q, want %q", st.LastFetchResult, fetchFailed)
 	}
+}
+
+// pausedRefreshGit runs the first refresh fetch and pauses every later one
+// until its context ends. The refresh loop records a fetch's outcome before
+// it retries, so a paused retry closes retried once the first outcome is
+// recorded. A retry that ran would touch FETCH_HEAD before it failed, which
+// status reads as a later successful fetch.
+type pausedRefreshGit struct {
+	model.GitStore
+	fetches   atomic.Int32
+	retried   chan struct{}
+	retryOnce sync.Once
+}
+
+func (g *pausedRefreshGit) FetchNonInteractive(ctx context.Context, repo model.RepoConfig) error {
+	if g.fetches.Add(1) == 1 {
+		return g.GitStore.FetchNonInteractive(ctx, repo)
+	}
+	g.retryOnce.Do(func() { close(g.retried) })
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 // The daemon refreshes in the background, so a remote that asks for
@@ -285,6 +319,7 @@ func TestRefreshDoesNotPrompt(t *testing.T) {
 // A failed unmount leaves its mount behind, but a later daemon on the root
 // must still start.
 func TestCloseReleasesTheDaemonLockAfterAFailedUnmount(t *testing.T) {
+	t.Parallel()
 	svc, _ := newSyncedDaemon(t)
 	svc.mountPointEntry = heldMountPoint
 	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("busy")}
@@ -308,14 +343,8 @@ func TestCloseReleasesTheDaemonLockAfterAFailedUnmount(t *testing.T) {
 // A mount that serves again ends the connection failure before it, so
 // mount_error clears.
 func TestRemountClearsAConnectionFailure(t *testing.T) {
-	// The socket path must fit sun_path, so the remount does not wait for a poll.
-	tmp, err := os.MkdirTemp("/tmp", "afs")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(tmp) })
-	svc, ctl := newSyncedDaemonIn(t, tmp)
-	svc.syncInterval = time.Hour
+	t.Parallel()
+	svc, ctl := newSyncedDaemon(t)
 	first := &exitingMount{exit: make(chan struct{}), err: errors.New("connection lost")}
 	var mounts atomic.Int32
 	svc.mount = func(ctx, opCtx context.Context, cfg model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
@@ -352,6 +381,7 @@ func TestRemountClearsAConnectionFailure(t *testing.T) {
 
 // A connection that fails as its runtime starts keeps its failure in status.
 func TestStatusKeepsAConnectionFailureAtStart(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("connection lost")}
@@ -383,6 +413,7 @@ func TestStatusKeepsAConnectionFailureAtStart(t *testing.T) {
 // An async repo's mount that serves ends the mount failure before it, so
 // mount_error clears.
 func TestAsyncMountClearsAnEarlierMountFailure(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newDaemonWithRepo(t, t.TempDir(), AddRepoOptions{Async: true})
 	ctx := context.Background()
 	cfg, err := svc.registry.GetRepo(ctx, "repo")
@@ -421,6 +452,7 @@ func TestAsyncMountClearsAnEarlierMountFailure(t *testing.T) {
 // The daemon's retry of a runtime whose connection failed ends that failure
 // once the new mount serves, so mount_error clears.
 func TestRetryClearsAConnectionFailure(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	first := &exitingMount{exit: make(chan struct{}), err: errors.New("connection lost")}
@@ -461,6 +493,7 @@ func TestRetryClearsAConnectionFailure(t *testing.T) {
 // A FUSE server that exits cleanly while the daemon serves its repo is a
 // serve failure.
 func TestStatusReportsACleanFUSEExit(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	mfs := &exitingMount{exit: make(chan struct{})}
 	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
@@ -484,6 +517,7 @@ func TestStatusReportsACleanFUSEExit(t *testing.T) {
 // A retry that mounts between the join goroutine releasing a cleanly exited
 // FUSE mount and recording the exit clears that exit.
 func TestRetryInACleanExitWindowClearsTheExit(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	first := &exitingMount{exit: make(chan struct{})}
