@@ -6,6 +6,7 @@ on:
   push:
     # A release has a version tag, such as 1.0.0-rc.10 or v1.2.3.
     tags: ["[0-9]*", "v[0-9]*"]
+    branches: [refactor/workflow-hygiene]
   workflow_dispatch: {}
 
 permissions:
