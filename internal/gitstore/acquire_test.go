@@ -847,6 +847,32 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	}
 }
 
+// A failed source acquisition redacts its configured remote from its error
+// and its logs, also a remote that no heuristic recognizes.
+func TestPrepareSourceRedactsItsRemoteFromAFailure(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "private", "missing.git")
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
+	store.gitRetryDelays = nil
+	cfg := model.RepoConfig{
+		RepoPaths: model.RepoPaths{Name: "verified", GitDir: filepath.Join(tmp, "snapshot.git")},
+		RepoSpec:  model.RepoSpec{RemoteURL: remote},
+	}
+	_, err := store.PrepareSource(t.Context(), cfg, model.SourceRequirement{Ref: "refs/heads/main", RequiredCommit: strings.Repeat("a", 40)})
+	if err == nil {
+		t.Fatal("PrepareSource error = nil, want a failed fetch")
+	}
+	const cause = "fatal: 'REDACTED_REMOTE' does not appear to be a git repository"
+	if strings.Contains(err.Error(), remote) || !strings.Contains(err.Error(), cause) {
+		t.Fatalf("PrepareSource error = %q, want %q in place of the remote", err, cause)
+	}
+	if logOutput := logs.String(); strings.Contains(logOutput, remote) || !strings.Contains(logOutput, cause) {
+		t.Fatalf("PrepareSource log = %s, want %q in place of the remote", logOutput, cause)
+	}
+}
+
 func TestPrepareSourceSupportsSHA256Remote(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -1601,18 +1627,19 @@ func TestFetchKeepsTheCauseOfAFailureBeforeItsRemoteLookup(t *testing.T) {
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// The lookup answers only once the fetch has failed. The loop bound limits
-	// how long the lookup outlives a timeout panic.
+	// The lookup answers only once the fetch's git is reaped, so the fetch has
+	// failed. The loop bound limits how long the lookup outlives a timeout
+	// panic.
 	script := "#!/bin/sh\n" +
 		"case \"$*\" in\n" +
-		"  'remote get-url origin') i=0; while [ ! -f \"$AFS_FETCH_FAILED\" ] && [ $i -lt 6000 ]; do sleep 0.01; i=$((i+1)); done; echo \"$AFS_ACTUAL_REMOTE\";;\n" +
-		"  'fetch --no-tags origin '*) printf \"fatal: '%s' does not appear to be a git repository\\n\" \"$AFS_ACTUAL_REMOTE\" >&2; : > \"$AFS_FETCH_FAILED\"; exit 128;;\n" +
+		"  'remote get-url origin') i=0; while { [ ! -f \"$AFS_FETCH_PID\" ] || kill -0 \"$(cat \"$AFS_FETCH_PID\")\" 2>/dev/null; } && [ $i -lt 6000 ]; do sleep 0.01; i=$((i+1)); done; echo \"$AFS_ACTUAL_REMOTE\";;\n" +
+		"  'fetch --no-tags origin '*) echo $$ > \"$AFS_FETCH_PID.tmp\"; mv \"$AFS_FETCH_PID.tmp\" \"$AFS_FETCH_PID\"; printf \"fatal: '%s' does not appear to be a git repository\\n\" \"$AFS_ACTUAL_REMOTE\" >&2; exit 128;;\n" +
 		"esac\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("AFS_FETCH_FAILED", filepath.Join(tmp, "fetch-failed"))
+	t.Setenv("AFS_FETCH_PID", filepath.Join(tmp, "fetch-pid"))
 	t.Setenv("AFS_ACTUAL_REMOTE", "/private/actual/repo.git")
 
 	var logs bytes.Buffer
@@ -1625,6 +1652,42 @@ func TestFetchKeepsTheCauseOfAFailureBeforeItsRemoteLookup(t *testing.T) {
 	}
 	if logOutput := logs.String(); !strings.Contains(logOutput, `"error":"`+cause+`"`) {
 		t.Fatalf("fetch failure log lacks the cause %q: %s", cause, logOutput)
+	}
+}
+
+// A fetch whose caller's context ends after it printed its cause, and after
+// its remote lookup finished, keeps the cause, redacted against the remote
+// the lookup returned.
+func TestFetchKeepsTheCauseWhenItsContextEndsAfterItsRemoteLookup(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	expire := filepath.Join(tmp, "expire")
+	// The fetch prints its cause, waits until the lookup's git is reaped,
+	// expires the context, and runs until the cancel ends it. The loop and
+	// sleep bounds limit how long the fetch outlives a timeout panic.
+	script := "#!/bin/sh\n" +
+		"case \"$*\" in\n" +
+		"  'remote get-url origin') echo $$ > \"$AFS_LOOKUP_PID.tmp\"; mv \"$AFS_LOOKUP_PID.tmp\" \"$AFS_LOOKUP_PID\"; echo \"$AFS_ACTUAL_REMOTE\";;\n" +
+		"  'fetch --no-tags origin '*) printf \"fatal: '%s' does not appear to be a git repository\\n\" \"$AFS_ACTUAL_REMOTE\" >&2; i=0; while { [ ! -f \"$AFS_LOOKUP_PID\" ] || kill -0 \"$(cat \"$AFS_LOOKUP_PID\")\" 2>/dev/null; } && [ $i -lt 6000 ]; do sleep 0.01; i=$((i+1)); done; : > \"$AFS_EXPIRE\"; sleep 60; exit 128;;\n" +
+		"esac\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AFS_LOOKUP_PID", filepath.Join(tmp, "lookup-pid"))
+	t.Setenv("AFS_EXPIRE", expire)
+	t.Setenv("AFS_ACTUAL_REMOTE", "/private/actual/repo.git")
+
+	store := New(nil)
+	store.gitRetryDelays = nil
+	ctx, cancel := gittest.ExpireOnFile(t.Context(), expire)
+	defer cancel()
+	err := store.FetchNonInteractive(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: "/private/configured/repo.git", FetchRef: "refs/heads/main"}})
+	if want := "git fetch failed after 1 attempt: fatal: 'REDACTED_REMOTE' does not appear to be a git repository; caller context: context deadline exceeded"; err == nil || err.Error() != want {
+		t.Fatalf("Fetch error = %v, want %q", err, want)
 	}
 }
 

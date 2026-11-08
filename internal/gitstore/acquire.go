@@ -183,7 +183,7 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 		}
 		return nil
 	}
-	if err := s.retryGitOperation(ctx, GitOperationClone, cfg.Name, attempt); err != nil {
+	if err := s.retryGitOperationForRemotes(ctx, GitOperationClone, cfg.Name, []string{cfg.RemoteURL}, attempt); err != nil {
 		if candidateGitDir != "" {
 			_ = os.RemoveAll(candidateGitDir)
 		}
@@ -439,10 +439,10 @@ func (s *Store) fetchRef(ctx context.Context, repo model.RepoConfig, ref string,
 // startRemotesForLogging looks up origin's URL in the background, for the
 // logs of the operation it runs beside. The returned remotes func waits for
 // the lookup, so a failure that comes first still redacts against origin and
-// keeps its cause. When ctx ends first, it reports the remotes incomplete.
-// The returned stop cancels the lookup and returns once its git has exited,
-// at most about gitCommandWaitDelay later, so no git the operation started
-// outlives it.
+// keeps its cause. When ctx ends while the lookup still runs, it reports the
+// remotes incomplete. The returned stop cancels the lookup and returns once
+// its git has exited, at most about gitCommandWaitDelay later, so no git the
+// operation started outlives it.
 func (s *Store) startRemotesForLogging(ctx context.Context, repo model.RepoConfig) (func() ([]string, bool), func()) {
 	type lookupResult struct {
 		remote string
@@ -463,11 +463,17 @@ func (s *Store) startRemotesForLogging(ctx context.Context, repo model.RepoConfi
 	return func() ([]string, bool) {
 		if !finished {
 			select {
+			case <-done:
+			case <-ctx.Done():
+			}
+			// A select picks at random among ready cases, so take a finished
+			// lookup here even when ctx has ended too.
+			select {
 			case lookup := <-result:
 				finished = true
 				known = lookup.err == nil
 				actualRemote = lookup.remote
-			case <-ctx.Done():
+			default:
 			}
 		}
 		remotes := []string{repo.RemoteURL}

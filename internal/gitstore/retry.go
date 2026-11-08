@@ -27,10 +27,6 @@ const (
 
 var defaultGitRetryDelays = []time.Duration{250 * time.Millisecond, time.Second}
 
-func (s *Store) retryGitOperation(ctx context.Context, operation GitOperation, repoName string, attempt func() error) error {
-	return s.retryGitOperationForRemotes(ctx, operation, repoName, nil, attempt)
-}
-
 func (s *Store) retryGitOperationForRemotes(ctx context.Context, operation GitOperation, repoName string, remotes []string, attempt func() error) error {
 	return s.retryGitOperationForRemoteLookup(ctx, operation, repoName, func() ([]string, bool) {
 		return remotes, true
