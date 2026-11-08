@@ -513,7 +513,16 @@ func TestCloneBloblessSkipsSSHAskpass(t *testing.T) {
 // the clone's Git dir, its HEAD commit and the file's blob.
 func partialClone(t *testing.T, dir string, filter string) (gitDir, commit, blob string) {
 	t.Helper()
-	src := filepath.Join(dir, "src")
+	src, commit, blob := partialCloneSource(t, dir)
+	return partialCloneOf(t, src, dir, filter), commit, blob
+}
+
+// partialCloneSource commits one file in a repository in dir that serves
+// partial clones, and returns the repository, its HEAD commit and the file's
+// blob.
+func partialCloneSource(t *testing.T, dir string) (src, commit, blob string) {
+	t.Helper()
+	src = filepath.Join(dir, "src")
 	run(t, "git", "init", "--initial-branch", "main", src)
 	if err := os.WriteFile(filepath.Join(src, "file.txt"), []byte("data\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -521,11 +530,18 @@ func partialClone(t *testing.T, dir string, filter string) (gitDir, commit, blob
 	run(t, "git", "-C", src, "add", "file.txt")
 	run(t, "git", "-C", src, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
 	run(t, "git", "-C", src, "config", "uploadpack.allowFilter", "true")
-	clone := filepath.Join(dir, "clone")
-	run(t, "git", "clone", "--filter="+filter, "--no-checkout", "file://"+src, clone)
 	commit = strings.TrimSpace(runOutput(t, "git", "-C", src, "rev-parse", "HEAD"))
 	blob = strings.TrimSpace(runOutput(t, "git", "-C", src, "rev-parse", "HEAD:file.txt"))
-	return filepath.Join(clone, ".git"), commit, blob
+	return src, commit, blob
+}
+
+// partialCloneOf clones src with filter into dir and returns the clone's Git
+// dir.
+func partialCloneOf(t *testing.T, src, dir, filter string) string {
+	t.Helper()
+	clone := filepath.Join(dir, "clone")
+	run(t, "git", "clone", "--filter="+filter, "--no-checkout", "file://"+src, clone)
+	return filepath.Join(clone, ".git")
 }
 
 func TestBlobToCacheRedactsBatchStderr(t *testing.T) {

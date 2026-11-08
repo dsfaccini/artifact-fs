@@ -1467,7 +1467,7 @@ func TestCloneAndFetchRefSkipTags(t *testing.T) {
 	work, preparedGitDir := newFetchFixture(t, tmp)
 	tag := func(name string) {
 		commit(t, work, name+".md")
-		run(t, "git", "-C", work, "tag", "-a", "-m", name, name)
+		run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "tag", "-a", "-m", name, name)
 		run(t, "git", "-C", work, "tag", name+"-lightweight")
 		run(t, "git", "-C", work, "push", "-q", "origin", "HEAD:main", name, name+"-lightweight")
 	}
