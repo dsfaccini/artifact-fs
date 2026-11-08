@@ -80,21 +80,32 @@ func RequireConfigIsolated(t *testing.T) {
 	}
 }
 
-// raceExitSleepOff is the GORACE that DisableRaceExitSleep sets.
-const raceExitSleepOff = "atexit_sleep_ms=0"
-
 // raceExitSleep is how long a race-built binary sleeps after it exits 0, by
 // default.
 const raceExitSleep = time.Second
 
+// raceExitSleepSetting returns the atexit_sleep_ms value that gorace sets, and
+// whether it sets one. The race runtime splits GORACE on spaces, commas,
+// colons, tabs and newlines, and applies the options in order.
+func raceExitSleepSetting(gorace string) (string, bool) {
+	value, ok := "", false
+	for _, option := range strings.FieldsFunc(gorace, func(r rune) bool { return strings.ContainsRune(" ,:\t\n\r", r) }) {
+		if v, found := strings.CutPrefix(option, "atexit_sleep_ms="); found {
+			value, ok = v, true
+		}
+	}
+	return value, ok
+}
+
 // DisableRaceExitSleep stops each race-built binary this process starts from
-// sleeping raceExitSleep after it exits 0. It leaves a GORACE the caller set.
-// Call it from TestMain in a package whose test binary git runs as the
-// FSMonitor hook: there the sleep adds a second to every git command that
-// reads the index.
+// sleeping raceExitSleep after it exits 0. It appends atexit_sleep_ms=0 to
+// GORACE, unless GORACE already sets atexit_sleep_ms. Call it from TestMain in
+// a package whose test binary git runs as the FSMonitor hook: there the sleep
+// adds a second to every git command that reads the index.
 func DisableRaceExitSleep() {
-	if _, ok := os.LookupEnv("GORACE"); !ok {
-		os.Setenv("GORACE", raceExitSleepOff)
+	gorace := os.Getenv("GORACE")
+	if _, ok := raceExitSleepSetting(gorace); !ok {
+		os.Setenv("GORACE", strings.TrimSpace(gorace+" atexit_sleep_ms=0"))
 	}
 }
 
@@ -104,8 +115,8 @@ func DisableRaceExitSleep() {
 // DisableRaceExitSleep ran.
 func RequireHookSkipsRaceExitSleep(t *testing.T, worktree string) {
 	t.Helper()
-	if v, ok := os.LookupEnv("GORACE"); ok && v != raceExitSleepOff {
-		t.Skipf("GORACE=%q from the caller decides the exit sleep", v)
+	if v, ok := raceExitSleepSetting(os.Getenv("GORACE")); ok && v != "0" {
+		t.Skipf("GORACE sets atexit_sleep_ms=%s, so the caller decides the exit sleep", v)
 	}
 	out, err := exec.Command("git", "-C", worktree, "config", "--get", "core.fsmonitor").Output()
 	if err != nil {

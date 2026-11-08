@@ -8,6 +8,20 @@ import (
 	"testing"
 )
 
+func TestDisableRaceExitSleepAppendsToTheCallersGORACE(t *testing.T) {
+	for _, tc := range []struct{ caller, want string }{
+		{"", "atexit_sleep_ms=0"},
+		{"halt_on_error=1", "halt_on_error=1 atexit_sleep_ms=0"},
+		{"halt_on_error=1,atexit_sleep_ms=50", "halt_on_error=1,atexit_sleep_ms=50"},
+	} {
+		t.Setenv("GORACE", tc.caller)
+		DisableRaceExitSleep()
+		if got := os.Getenv("GORACE"); got != tc.want {
+			t.Errorf("GORACE=%q becomes %q, want %q", tc.caller, got, tc.want)
+		}
+	}
+}
+
 func TestExpireOnFileExpiresWhenFileAppears(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "marker")
 	ctx, cancel := ExpireOnFile(context.Background(), marker)

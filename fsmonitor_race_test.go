@@ -12,8 +12,8 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
-// Every e2e mount installs this test binary as the FSMonitor hook. An adopted
-// worktree takes the same hook without a mount.
+// Every e2e mount installs the FSMonitor hook script, which runs this test
+// binary. An adopted worktree takes the same hook without a mount.
 func TestFSMonitorHookSkipsRaceExitSleep(t *testing.T) {
 	ctx := t.Context()
 	dir, err := filepath.EvalSymlinks(t.TempDir())
