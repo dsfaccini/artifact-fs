@@ -480,8 +480,9 @@ func (s *Service) joinMount(rt *repoRuntime, mfs fusefs.MountedFS) {
 			rt.mount = mountFailed
 			// mfs's Unmount unmounts the mount point by path, whichever
 			// mount holds it then. Starting the unmount in the s.mu section
-			// that marks the mount failed makes a retry wait for it, so the
-			// unmount never reaches the remount.
+			// that marks the mount failed means a retry finds it running and
+			// leaves the mount to the next sync, so the unmount never
+			// reaches a remount.
 			// The sync loop waits for no unmount it did not start, so an
 			// unmount(2) that hangs on the dead mount stalls only this repo.
 			s.startUnmountLocked(cfg.ID, s.unmountHeld(cfg, mfs), func(err error) { s.releaseMount(rt, mfs, err, mountNone) })

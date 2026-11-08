@@ -1697,8 +1697,13 @@ func TestFailedConnectionsUnmountLeavesTheRemount(t *testing.T) {
 			close(resynced)
 		})
 	}
+	joined := make(chan struct{})
+	var joinOnce sync.Once
+	svc.joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
 	close(table.current().fail)
 	<-resynced
+	// The dead mount's join has ended, so any unmount it starts has started.
+	<-joined
 	waitFor(t, nil, unmountsDone)
 	if got, want := table.recorded(), []string{"mount 1", "unmount 1", "mount 2"}; !slices.Equal(got, want) {
 		t.Fatalf("mount table calls = %q, want %q: the dead mount's unmount took down the remount", got, want)

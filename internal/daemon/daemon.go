@@ -117,8 +117,9 @@ type Service struct {
 	// returns, after the runtime's first mount attempt. mountReleased runs in
 	// a join goroutine after it released a FUSE mount whose server exited
 	// cleanly, before it records the exit. joinRecorded runs in a join
-	// goroutine once it recorded how the connection ended and released
-	// recordMu. joinFinished runs as a join goroutine ends. readyRecorded runs
+	// goroutine once it released recordMu. By then it recorded how the
+	// connection ended, unless the runtime was stopping or served a newer
+	// mount. joinFinished runs as a join goroutine ends. readyRecorded runs
 	// after an async preparation persisted ready, before it activates the
 	// runtime.
 	runtimeStarted, mountReleased, joinRecorded, joinFinished, readyRecorded func()

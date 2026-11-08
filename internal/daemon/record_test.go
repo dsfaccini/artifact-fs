@@ -434,23 +434,40 @@ func TestStatusKeepsAConnectionFailureAtStart(t *testing.T) {
 	}
 }
 
-// Status reports a mount once the mount serves, before the runtime finishes
-// starting: the mount point serves while the daemon configures Git.
-func TestStatusReportsAMountBeforeTheRuntimeFinishesStarting(t *testing.T) {
+// statusAtConfigureGit reads status each time the daemon configures Git for
+// a mount.
+type statusAtConfigureGit struct {
+	model.GitStore
+	status func()
+}
+
+func (g *statusAtConfigureGit) ConfigureStatusOptimization(ctx context.Context, repo model.RepoConfig, stateRoot string) error {
+	g.status()
+	return g.GitStore.ConfigureStatusOptimization(ctx, repo, stateRoot)
+}
+
+// Status reports a mount once the mount serves. The mount point serves
+// while the daemon configures Git for it.
+func TestStatusReportsAMountWhileTheDaemonConfiguresGit(t *testing.T) {
 	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
-	var st model.RepoRuntimeState
-	var stErr error
-	svc.runtimeStarted = func() { st, stErr = ctl.Status(ctx, "repo") }
+	var reads []model.RepoRuntimeState
+	svc.git = &statusAtConfigureGit{GitStore: svc.git, status: func() {
+		st, err := ctl.Status(ctx, "repo")
+		if err != nil {
+			t.Error(err)
+		}
+		reads = append(reads, st)
+	}}
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if stErr != nil {
-		t.Fatal(stErr)
+	if len(reads) != 1 {
+		t.Fatalf("the daemon configured Git %d times for one mount, want once", len(reads))
 	}
-	if st.State != repoStateMounted || st.Phase != phaseServe || st.ServedGeneration == 0 {
-		t.Fatalf("status while the mounted runtime starts = %+v, want mounted and serving", st)
+	if st := reads[0]; st.State != repoStateMounted || st.Phase != phaseServe || st.ServedGeneration == 0 {
+		t.Fatalf("status while the daemon configures Git = %+v, want mounted and serving", st)
 	}
 }
 
