@@ -245,6 +245,9 @@ func TestStatusReportsAFailedRegistrySync(t *testing.T) {
 	requireFailure(t, ctl, phaseRegistrySync, "Scan error")
 }
 
+// A failing retry rewrites FETCH_HEAD after the recorded failure, and status
+// must not read it as a later successful fetch, also before the daemon
+// records the retry.
 func TestStatusReportsAFailedRefresh(t *testing.T) {
 	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
@@ -267,16 +270,24 @@ func TestStatusReportsAFailedRefresh(t *testing.T) {
 	case err := <-done:
 		t.Fatalf("Start returned before the refresh retried: %v", err)
 	}
-	if st := requireFailure(t, ctl, phaseFetch, "fetch"); st.LastFetchResult != string(fetchFailed) {
+	st := requireFailure(t, ctl, phaseFetch, "fetch")
+	fi, err := os.Stat(filepath.Join(cfg.GitDir, "FETCH_HEAD"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().After(st.LastErrorAt) {
+		t.Fatalf("FETCH_HEAD written at %v, want the retry's write after the recorded failure at %v", fi.ModTime(), st.LastErrorAt)
+	}
+	if st.LastFetchResult != string(fetchFailed) {
 		t.Fatalf("fetch result = %q, want %q", st.LastFetchResult, fetchFailed)
 	}
 }
 
-// pausedRefreshGit runs the first refresh fetch and pauses every later one
-// until its context ends. The refresh loop records a fetch's outcome before
-// it retries, so a paused retry closes retried once the first outcome is
-// recorded. A retry that ran would touch FETCH_HEAD before it failed, which
-// status reads as a later successful fetch.
+// pausedRefreshGit runs every refresh fetch, and pauses each one after the
+// first, once its git has run, until its context ends. The refresh loop
+// records a fetch's outcome before it retries, so retried closes once the
+// first outcome is recorded and the retry's git has written FETCH_HEAD, and
+// before the daemon records the retry.
 type pausedRefreshGit struct {
 	model.GitStore
 	fetches   atomic.Int32
@@ -285,12 +296,58 @@ type pausedRefreshGit struct {
 }
 
 func (g *pausedRefreshGit) FetchNonInteractive(ctx context.Context, repo model.RepoConfig) error {
+	err := g.GitStore.FetchNonInteractive(ctx, repo)
 	if g.fetches.Add(1) == 1 {
-		return g.GitStore.FetchNonInteractive(ctx, repo)
+		return err
 	}
 	g.retryOnce.Do(func() { close(g.retried) })
 	<-ctx.Done()
-	return ctx.Err()
+	return err
+}
+
+// A fetch command records nothing, so status reads its result from
+// FETCH_HEAD: a fetch that succeeded is ok, and the FETCH_HEAD a failed one
+// emptied is no fetch.
+func TestStatusReportsOnlyASuccessfulFetchCommand(t *testing.T) {
+	t.Parallel()
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetchHead := filepath.Join(cfg.GitDir, "FETCH_HEAD")
+	if err := ctl.FetchNow(ctx, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(fetchHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := ctl.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LastFetchResult != string(fetchOK) || !st.LastFetchAt.Equal(fi.ModTime()) {
+		t.Fatalf("last fetch = %q at %v, want %q at %v", st.LastFetchResult, st.LastFetchAt, fetchOK, fi.ModTime())
+	}
+
+	if err := os.RemoveAll(cfg.RemoteURL); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctl.FetchNow(ctx, "repo"); err == nil {
+		t.Fatal("fetch from a removed remote succeeded")
+	}
+	if fi, err := os.Stat(fetchHead); err != nil || !fi.ModTime().After(st.LastFetchAt) {
+		t.Fatalf("FETCH_HEAD after the failed fetch = %v, want it written after %v", err, st.LastFetchAt)
+	}
+	st, err = ctl.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LastFetchResult != string(fetchNever) || !st.LastFetchAt.IsZero() {
+		t.Fatalf("last fetch after a failed fetch = %q at %v, want %q", st.LastFetchResult, st.LastFetchAt, fetchNever)
+	}
 }
 
 // The daemon refreshes in the background, so a remote that asks for

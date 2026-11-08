@@ -166,7 +166,7 @@ Check the state of a mounted repo with `status`:
 | `next_retry` / `attempts` | When the daemon retries the failed phase, and how many times in a row it failed; `next_retry` is `none` when no daemon runs |
 | `hydrated_blobs` / `hydrated_bytes` | Blob count and bytes in the repo's blob cache, read from counters kept with the cache (see [Evicting the blob cache](#evicting-the-blob-cache)) |
 | `overlay_dirty` | `true` if the overlay holds a created, modified or renamed file, a symlink, a directory, or the delete of a path that `base_commit` has. The delete of a path `base_commit` lacks, such as an editor's removed swap file, does not count. In a repo that follows HEAD, a delete counts until a HEAD change removes its path. A `--require-commit` repo does not follow HEAD, so its deletes count for as long as the overlay holds them |
-| `last_fetch` / `result` | Result (`ok` or `failed`) of the daemon's last remote refresh, with the time of its last successful one; or `ok` with the time of a later successful fetch that wrote `FETCH_HEAD`, such as a `fetch` command; otherwise `never` |
+| `last_fetch` / `result` | Result (`ok` or `failed`) of the daemon's last remote refresh, with the time of its last successful one; or `ok` with the time of a later fetch that left `FETCH_HEAD` filled, such as a `fetch` command that succeeded; otherwise `never`. Git empties `FETCH_HEAD` when a fetch starts, so a fetch that is still running or failed before it received the remote's objects does not count |
 
 `status` reads what the daemon records in the registry, so it reports the same
 state from any process. Only one daemon runs per state root: it holds a lock on

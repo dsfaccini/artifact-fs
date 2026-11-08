@@ -80,13 +80,16 @@ func persistedStatus(ctx context.Context, cfg model.RepoConfig, rec model.RepoRu
 			}
 		}
 	}
-	// A CLI fetch writes FETCH_HEAD and no record, so a FETCH_HEAD newer than
-	// the daemon's last fetch is a later successful fetch.
+	// A CLI fetch writes FETCH_HEAD and no record. Git empties FETCH_HEAD
+	// before it contacts the remote and fills it once it has the remote's
+	// objects, so only a filled FETCH_HEAD newer than the daemon's last fetch
+	// is a later successful fetch. An empty one is a fetch still running or
+	// one that failed.
 	lastFetch := st.LastFetchAt
 	if rec.LastErrorPhase == phaseFetch && rec.LastErrorAt.After(lastFetch) {
 		lastFetch = rec.LastErrorAt
 	}
-	if fi, err := os.Stat(filepath.Join(cfg.GitDir, "FETCH_HEAD")); err == nil && fi.ModTime().After(lastFetch) {
+	if fi, err := os.Stat(filepath.Join(cfg.GitDir, "FETCH_HEAD")); err == nil && fi.Size() > 0 && fi.ModTime().After(lastFetch) {
 		// Verified acquisition itself writes FETCH_HEAD before its receipt.
 		// Only a newer mtime is evidence of a later remote refresh.
 		if cfg.RequiredCommit == "" || (!cfg.AcquiredAt.IsZero() && fi.ModTime().After(cfg.AcquiredAt)) {
