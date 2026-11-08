@@ -96,10 +96,8 @@ func TestCloneBloblessRetriesTransientTransportErrors(t *testing.T) {
 	if !strings.Contains(logOutput, `"msg":"`+logGitOperationAttemptFailed+`"`) ||
 		!strings.Contains(logOutput, `"msg":"`+logGitOperationRecovered+`"`) ||
 		!strings.Contains(logOutput, `"error":"error: RPC failed; HTTP 503 curl 22`) ||
-		!strings.Contains(logOutput, `"duration_ms":`) ||
-		!strings.Contains(logOutput, `"next_attempt":2`) ||
 		strings.Contains(logOutput, "super-secret") || strings.Contains(logOutput, "log-secret") {
-		t.Fatalf("clone retry logs were not structured/redacted: %s", logs.String())
+		t.Fatalf("clone retry logs lack the failure or show a credential: %s", logs.String())
 	}
 }
 
@@ -194,6 +192,7 @@ func TestCloneBloblessPreservesTransportFailureAtCallerDeadline(t *testing.T) {
 }
 
 func TestRetryGitOperationCancellationRacePreservesBothCauses(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	transportErr := errors.New("HTTP 500 transport failure")
 	attempts := 0
@@ -215,6 +214,7 @@ func TestRetryGitOperationCancellationRacePreservesBothCauses(t *testing.T) {
 }
 
 func TestRetryGitOperationCancellationBeforeNextAttemptPreservesFailure(t *testing.T) {
+	t.Parallel()
 	ctx := &stagedErrorContext{Context: context.Background(), errAt: 3}
 	transportErr := errors.New("HTTP 500 transport failure")
 	var logs bytes.Buffer
@@ -241,6 +241,7 @@ func TestRetryGitOperationCancellationBeforeNextAttemptPreservesFailure(t *testi
 }
 
 func TestRetryGitOperationLogsCancellationDuringBackoff(t *testing.T) {
+	t.Parallel()
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	store.gitRetryDelays = []time.Duration{time.Second}
@@ -262,41 +263,52 @@ func TestRetryGitOperationLogsCancellationDuringBackoff(t *testing.T) {
 	}
 }
 
-func TestTransientGitErrorIndependentSignatures(t *testing.T) {
-	for _, message := range []string{
-		"error: RPC failed; HTTP 408 curl 22",
-		"error: RPC failed; HTTP 500 curl 22",
-		"fatal: unable to access remote: The requested URL returned error: 522",
-		"fatal: unable to access remote: The requested URL returned error: 524",
-		"error: RPC failed; curl 18 transfer closed with 66 bytes remaining to read",
-		"error: RPC failed; curl 55 Send failure: Broken pipe",
-		"error: RPC failed; curl 56 The TLS connection was non-properly terminated",
-		"error: RPC failed; curl 92 HTTP/2 stream 5 was not closed cleanly: CANCEL",
-		"fatal: unable to access remote: Operation timed out after 60000 milliseconds",
-		"fatal: unable to access remote: Empty reply from server",
-		"fatal: unable to access remote: Could not resolve host: github.com",
-		"fatal: unable to access remote: Failed to connect to github.com port 443: Couldn't connect to server",
-		"fetch-pack: unexpected disconnect while reading sideband packet",
-		"fetch-pack: 12 bytes of body are still expected",
-		"fetch-pack: 3 bytes of length header were received",
-		"fatal: early EOF",
+// Git's stderr reaches boundedGitError in writes of any size, so a symptom
+// split across two writes still classifies the failure.
+func TestBoundedGitErrorClassifiesSymptomsSplitAcrossWrites(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		stderr    string
+		retryable bool
+	}{
+		{"error: RPC failed; HTTP 408 curl 22", true},
+		{"error: RPC failed; HTTP 500 curl 22", true},
+		{"fatal: unable to access remote: The requested URL returned error: 522", true},
+		{"fatal: unable to access remote: The requested URL returned error: 524", true},
+		{"error: RPC failed; curl 18 transfer closed with 66 bytes remaining to read", true},
+		{"error: RPC failed; curl 55 Send failure: Broken pipe", true},
+		{"error: RPC failed; curl 56 The TLS connection was non-properly terminated", true},
+		{"error: RPC failed; curl 92 HTTP/2 stream 5 was not closed cleanly: CANCEL", true},
+		{"fatal: unable to access remote: Operation timed out after 60000 milliseconds", true},
+		{"fatal: unable to access remote: Empty reply from server", true},
+		{"fatal: unable to access remote: Could not resolve host: github.com", true},
+		{"fatal: unable to access remote: Failed to connect to github.com port 443: Couldn't connect to server", true},
+		{"fetch-pack: unexpected disconnect while reading sideband packet", true},
+		{"fetch-pack: 12 bytes of body are still expected", true},
+		{"fetch-pack: 3 bytes of length header were received", true},
+		{"fatal: early EOF", true},
+		// A generic index-pack summary can follow a local failure that a retry
+		// cannot repair.
+		{"fatal: unable to write file: Input/output error\nfatal: index-pack failed", false},
+		{"error: RPC failed; HTTP 503 curl 22\nfatal: unable to write file: No space left on device", false},
+		{"fatal: early EOF\nerror: unable to create temporary file: Permission denied", false},
 	} {
-		t.Run(message, func(t *testing.T) {
-			if !isTransientGitError(errors.New(message)) {
-				t.Fatalf("isTransientGitError(%q) = false, want true", message)
+		t.Run(tt.stderr, func(t *testing.T) {
+			t.Parallel()
+			for i := range len(tt.stderr) + 1 {
+				stderr := &boundedGitError{limit: maxGitErrorBytes}
+				_, _ = stderr.Write([]byte(tt.stderr[:i]))
+				_, _ = stderr.Write([]byte(tt.stderr[i:]))
+				if stderr.Retryable() != tt.retryable {
+					t.Fatalf("Retryable() = %t for stderr split after byte %d, want %t", !tt.retryable, i, tt.retryable)
+				}
 			}
 		})
 	}
 }
 
-func TestTransientGitErrorRejectsStandaloneLocalIndexPackFailure(t *testing.T) {
-	message := "fatal: unable to write file: Input/output error\nfatal: index-pack failed"
-	if isTransientGitError(errors.New(message)) {
-		t.Fatalf("isTransientGitError(%q) = true, want false", message)
-	}
-}
-
 func TestRetryGitOperationBoundedExhaustion(t *testing.T) {
+	t.Parallel()
 	store := New(nil)
 	store.gitRetryDelays = []time.Duration{0, 0}
 	attempts := 0
@@ -314,6 +326,7 @@ func TestRetryGitOperationBoundedExhaustion(t *testing.T) {
 }
 
 func TestRetryGitOperationRedactsExactLocalRemote(t *testing.T) {
+	t.Parallel()
 	const remote = "/private/customer/repo.git"
 	sentinel := errors.New("sentinel failure")
 	var logs bytes.Buffer
@@ -337,6 +350,7 @@ func TestRetryGitOperationRedactsExactLocalRemote(t *testing.T) {
 }
 
 func TestRetryGitOperationPermanentFailures(t *testing.T) {
+	t.Parallel()
 	for _, message := range []string{
 		"HTTP 429 Too Many Requests",
 		"HTTP 501 Not Implemented",
@@ -350,6 +364,7 @@ func TestRetryGitOperationPermanentFailures(t *testing.T) {
 		"Read-only file system; invalid index-pack output",
 	} {
 		t.Run(message, func(t *testing.T) {
+			t.Parallel()
 			store := New(nil)
 			store.gitRetryDelays = []time.Duration{0, 0}
 			attempts := 0

@@ -32,6 +32,7 @@ func TestRunGitClassifiesBeforeCredentialRedaction(t *testing.T) {
 }
 
 func TestTerminateCommandProcessGroupReportsExitedProcess(t *testing.T) {
+	t.Parallel()
 	cmd := exec.Command("git", "version")
 	configureCommandProcessGroup(cmd)
 	if err := cmd.Run(); err != nil {

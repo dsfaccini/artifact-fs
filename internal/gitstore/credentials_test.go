@@ -98,11 +98,13 @@ func TestValidatePreparedGitDirRejectsCredentialedOrigin(t *testing.T) {
 }
 
 func TestValidatePreparedGitDirRejectsMalformedCredentialedOrigin(t *testing.T) {
+	t.Parallel()
 	for _, remote := range []string{
 		"ssh:/git:secret@github.com/org/repo.git",
 		"alice:ghp_secret@github.com:org/repo.git",
 	} {
 		t.Run(remote, func(t *testing.T) {
+			t.Parallel()
 			tmp := t.TempDir()
 			preparedGitDir := filepath.Join(tmp, "prepared.git")
 			preparedWorktree := filepath.Join(tmp, "prepared")
@@ -181,6 +183,7 @@ func TestCredentialEnvKeepsSecretsOutOfHelperCommand(t *testing.T) {
 }
 
 func TestCredentialEnvScopesCredentialsToOriginalAuthority(t *testing.T) {
+	t.Parallel()
 	_, credentialEnvVars, err := credentialEnv("https://alice:secret@example.com:8443/org/repo.git")
 	if err != nil {
 		t.Fatalf("credentialEnv: %v", err)
@@ -351,221 +354,51 @@ func TestCredentialEnvRejectsUsernameBehindHTTPSRemoteHelper(t *testing.T) {
 	}
 }
 
-func TestCloneBloblessRejectsMalformedCredentialURLBeforeGit(t *testing.T) {
+// CloneBlobless rejects each remote before any git runs, and its error shows
+// none of the remote's credentials.
+func TestCloneBloblessRejectsBeforeGit(t *testing.T) {
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "bin")
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	marker := filepath.Join(tmp, "git-invoked")
-	fakeGit := filepath.Join(bin, "git")
-	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\n: > \"$GIT_INVOKED_MARKER\"\nexit 1\n"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\n: > '"+marker+"'\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("GIT_INVOKED_MARKER", marker)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	cfg := model.RepoConfig{
-		RepoPaths: model.RepoPaths{
-			GitDir: filepath.Join(tmp, "repo.git"),
-		},
-		RepoSpec: model.RepoSpec{
-			RemoteURL: "https://user:bad%zz@example.com/org/repo.git",
-			Branch:    "main",
-		},
-	}
-	store := New(nil)
-	err := store.CloneBlobless(context.Background(), cfg)
-	if err == nil {
-		t.Fatal("expected malformed remote URL error")
-	}
-	if strings.Contains(err.Error(), "bad%zz") || strings.Contains(err.Error(), "user") {
-		t.Fatalf("error leaked credential URL: %v", err)
-	}
-	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("git was invoked before rejecting malformed URL")
-	}
-}
-
-func TestCloneBloblessRejectsOptionRemoteBeforeGit(t *testing.T) {
-	tmp := t.TempDir()
-	bin := filepath.Join(tmp, "bin")
-	if err := os.Mkdir(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	marker := filepath.Join(tmp, "git-invoked")
-	fakeGit := filepath.Join(bin, "git")
-	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\n: > \"$GIT_INVOKED_MARKER\"\nexit 1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GIT_INVOKED_MARKER", marker)
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	// A ref outside refs/heads/ takes the ls-remote path, where git runs an
-	// injected --upload-pack value.
-	for _, branch := range []string{"main", "refs/tags/v1"} {
-		t.Run(branch, func(t *testing.T) {
-			cfg := model.RepoConfig{
-				RepoPaths: model.RepoPaths{
-					GitDir: filepath.Join(tmp, "repo.git"),
-				},
-				RepoSpec: model.RepoSpec{
-					RemoteURL: "--upload-pack=a@b:c",
-					Branch:    branch,
-				},
+	for _, tt := range []struct {
+		name, remote, branch string
+		// wantErr is text the error must hold, and secrets text it must not.
+		wantErr string
+		secrets []string
+	}{
+		{"malformed escape in the password", "https://alice7:zq1%zz@example.com/org/repo.git", "main", "malformed remote URL", []string{"alice7", "zq1"}},
+		{"option-like remote", "--upload-pack=a@b:c", "main", "must not start with '-'", nil},
+		// A ref outside refs/heads/ takes the ls-remote path, where git runs an
+		// injected --upload-pack value.
+		{"option-like remote of an exact ref", "--upload-pack=a@b:c", "refs/tags/v1", "must not start with '-'", nil},
+		{"https with one slash", "https:/alice7:zq2secret@github.com/org/repo.git", "main", "malformed remote URL", []string{"alice7", "zq2secret"}},
+		{"https without a colon", "https//zq3secret%zz@github.com/org/repo.git", "main", "malformed remote URL", []string{"zq3secret", "%zz"}},
+		{"git-style user and password", "git:zq4secret@github.com:org/repo.git", "main", "malformed remote URL", []string{"zq4secret"}},
+		{"password that url.Parse splits at a slash", "https://alice7:4711/zq5secret@example.com/org/repo.git", "main", "malformed remote URL", []string{"alice7", "4711", "zq5secret"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{GitDir: filepath.Join(t.TempDir(), "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: tt.remote, Branch: tt.branch}}
+			err := New(nil).CloneBlobless(t.Context(), cfg)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("CloneBlobless error = %v, want a rejection holding %q", err, tt.wantErr)
 			}
-			err := New(nil).CloneBlobless(context.Background(), cfg)
-			if err == nil || !strings.Contains(err.Error(), "must not start with '-'") {
-				t.Fatalf("CloneBlobless error = %v, want leading-dash rejection", err)
+			for _, secret := range tt.secrets {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("CloneBlobless error = %v, shows %q", err, secret)
+				}
 			}
 			if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
-				t.Fatal("git was invoked before rejecting the remote")
+				t.Fatal("git ran before the remote was rejected")
 			}
 		})
-	}
-}
-
-func TestCloneBloblessRejectsMalformedHTTPSUserinfoBeforeGit(t *testing.T) {
-	tmp := t.TempDir()
-	bin := filepath.Join(tmp, "bin")
-	if err := os.Mkdir(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	marker := filepath.Join(tmp, "git-invoked")
-	fakeGit := filepath.Join(bin, "git")
-	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\n: > \"$GIT_INVOKED_MARKER\"\nexit 1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GIT_INVOKED_MARKER", marker)
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	cfg := model.RepoConfig{
-		RepoPaths: model.RepoPaths{
-			GitDir: filepath.Join(tmp, "repo.git"),
-		},
-		RepoSpec: model.RepoSpec{
-			RemoteURL: "https:/user:ghp_secret@github.com/org/repo.git",
-			Branch:    "main",
-		},
-	}
-	store := New(nil)
-	err := store.CloneBlobless(context.Background(), cfg)
-	if err == nil {
-		t.Fatal("expected malformed remote URL error")
-	}
-	if strings.Contains(err.Error(), "ghp_secret") || strings.Contains(err.Error(), "user") {
-		t.Fatalf("error leaked credential URL: %v", err)
-	}
-	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("git was invoked before rejecting malformed URL")
-	}
-}
-
-func TestCloneBloblessRejectsMalformedHTTPParseErrorBeforeGit(t *testing.T) {
-	tmp := t.TempDir()
-	bin := filepath.Join(tmp, "bin")
-	if err := os.Mkdir(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	marker := filepath.Join(tmp, "git-invoked")
-	fakeGit := filepath.Join(bin, "git")
-	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\n: > \"$GIT_INVOKED_MARKER\"\nexit 1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GIT_INVOKED_MARKER", marker)
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	cfg := model.RepoConfig{
-		RepoPaths: model.RepoPaths{
-			GitDir: filepath.Join(tmp, "repo.git"),
-		},
-		RepoSpec: model.RepoSpec{
-			RemoteURL: "https//ghp_secret%zz@github.com/org/repo.git",
-			Branch:    "main",
-		},
-	}
-	store := New(nil)
-	err := store.CloneBlobless(context.Background(), cfg)
-	if err == nil {
-		t.Fatal("expected malformed remote URL error")
-	}
-	if strings.Contains(err.Error(), "ghp_secret") || strings.Contains(err.Error(), "%zz") {
-		t.Fatalf("error leaked credential URL: %v", err)
-	}
-	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("git was invoked before rejecting malformed URL")
-	}
-}
-
-func TestCloneBloblessRejectsMalformedGitStyleCredentialBeforeGit(t *testing.T) {
-	tmp := t.TempDir()
-	bin := filepath.Join(tmp, "bin")
-	if err := os.Mkdir(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	marker := filepath.Join(tmp, "git-invoked")
-	fakeGit := filepath.Join(bin, "git")
-	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\n: > \"$GIT_INVOKED_MARKER\"\nexit 1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GIT_INVOKED_MARKER", marker)
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	cfg := model.RepoConfig{
-		RepoPaths: model.RepoPaths{
-			GitDir: filepath.Join(tmp, "repo.git"),
-		},
-		RepoSpec: model.RepoSpec{
-			RemoteURL: "git:secret@github.com:org/repo.git",
-			Branch:    "main",
-		},
-	}
-	store := New(nil)
-	err := store.CloneBlobless(context.Background(), cfg)
-	if err == nil {
-		t.Fatal("expected malformed remote URL error")
-	}
-	if strings.Contains(err.Error(), "secret") {
-		t.Fatalf("error leaked credential URL: %v", err)
-	}
-	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("git was invoked before rejecting malformed URL")
-	}
-}
-
-func TestCloneBloblessRejectsPathSplitHTTPCredentialsBeforeGit(t *testing.T) {
-	tmp := t.TempDir()
-	bin := filepath.Join(tmp, "bin")
-	if err := os.Mkdir(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	marker := filepath.Join(tmp, "git-invoked")
-	fakeGit := filepath.Join(bin, "git")
-	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\n: > \"$GIT_INVOKED_MARKER\"\nexit 1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GIT_INVOKED_MARKER", marker)
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	cfg := model.RepoConfig{
-		RepoPaths: model.RepoPaths{
-			GitDir: filepath.Join(tmp, "repo.git"),
-		},
-		RepoSpec: model.RepoSpec{
-			RemoteURL: "https://user:123/ss@example.com/org/repo.git",
-			Branch:    "main",
-		},
-	}
-	store := New(nil)
-	err := store.CloneBlobless(context.Background(), cfg)
-	if err == nil {
-		t.Fatal("expected malformed remote URL error")
-	}
-	if strings.Contains(err.Error(), "123") || strings.Contains(err.Error(), "ss") {
-		t.Fatalf("error leaked credential URL: %v", err)
-	}
-	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("git was invoked before rejecting malformed URL")
 	}
 }
 

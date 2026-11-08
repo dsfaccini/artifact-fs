@@ -22,37 +22,33 @@ func TestResolveHEADAndBuildTreeIndex(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
 	repo := filepath.Join(tmp, "repo")
-	run(t, "git", "init", repo)
-	os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello"), 0o644)
+	run(t, "git", "init", "--initial-branch", "main", repo)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	run(t, "git", "-C", repo, "add", "README.md")
 	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
 
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
 	store := New(nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	oid, ref, err := store.ResolveHEAD(ctx, cfg)
+	oid, ref, err := store.ResolveHEAD(t.Context(), cfg)
 	if err != nil {
 		t.Fatalf("ResolveHEAD: %v", err)
 	}
-	if oid == "" || ref == "" {
-		t.Fatalf("expected oid/ref, got %q %q", oid, ref)
+	if want := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD")); oid != want || ref != "main" {
+		t.Fatalf("ResolveHEAD = %q, %q; want %q, main", oid, ref, want)
 	}
-	nodes, err := store.BuildTreeIndex(ctx, cfg, oid)
+	nodes, err := store.BuildTreeIndex(t.Context(), cfg, oid)
 	if err != nil {
 		t.Fatalf("BuildTreeIndex: %v", err)
 	}
-	found := false
-	for _, n := range nodes {
-		if n.Path == "README.md" {
-			found = true
-			if n.Type != "file" {
-				t.Fatalf("expected type file, got %q", n.Type)
-			}
-		}
+	blob := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD:README.md"))
+	i := slices.IndexFunc(nodes, func(n model.BaseNode) bool { return n.Path == "README.md" })
+	if i < 0 {
+		t.Fatalf("README.md not in tree %+v", nodes)
 	}
-	if !found {
-		t.Fatalf("expected README.md in tree")
+	if n := nodes[i]; n.Type != "file" || n.ObjectOID != blob || n.SizeState != "known" || n.SizeBytes != 5 {
+		t.Fatalf("README.md = %+v, want a file of blob %s with known size 5", n, blob)
 	}
 }
 
@@ -206,13 +202,11 @@ func TestBuildTreeIndexNonASCIIPaths(t *testing.T) {
 
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
 	store := New(nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	oid, _, err := store.ResolveHEAD(ctx, cfg)
+	oid, _, err := store.ResolveHEAD(t.Context(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	nodes, err := store.BuildTreeIndex(ctx, cfg, oid)
+	nodes, err := store.BuildTreeIndex(t.Context(), cfg, oid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,6 +223,7 @@ func TestBuildTreeIndexNonASCIIPaths(t *testing.T) {
 }
 
 func TestReadNullDelimitedRejectsPartialFinalRecord(t *testing.T) {
+	t.Parallel()
 	var records []string
 	err := readNullDelimited(strings.NewReader("first\x00partial"), func(record string) {
 		records = append(records, record)
@@ -242,7 +237,7 @@ func TestReadNullDelimitedRejectsPartialFinalRecord(t *testing.T) {
 }
 
 // The deadline expires once the fake ls-tree runs, so it ends ls-tree itself.
-func TestStreamTreeRecordsPreservesDeadline(t *testing.T) {
+func TestBuildTreeIndexPreservesDeadline(t *testing.T) {
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "bin")
 	if err := os.Mkdir(bin, 0o755); err != nil {
@@ -259,8 +254,8 @@ func TestStreamTreeRecordsPreservesDeadline(t *testing.T) {
 	defer cancel()
 	store := New(nil)
 	defer store.Close()
-	err := store.streamTreeRecords(ctx, filepath.Join(tmp, "repo.git"), "HEAD", func(string) {})
+	_, err := store.BuildTreeIndex(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", GitDir: filepath.Join(tmp, "repo.git")}}, strings.Repeat("a", 40))
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("streamTreeRecords error = %v, want deadline exceeded", err)
+		t.Fatalf("BuildTreeIndex error = %v, want deadline exceeded", err)
 	}
 }

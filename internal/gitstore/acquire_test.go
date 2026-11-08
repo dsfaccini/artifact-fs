@@ -397,6 +397,54 @@ func TestPrepareFetchedBranchUndoesALandedReadTreeOfAnIgnoredGitlink(t *testing.
 	}
 }
 
+// Real Git fails a preparation at a ref lock another Git holds, and the
+// rollback leaves HEAD, the branches and the index as they were.
+func TestPrepareFetchedBranchRollsBackAtAHeldLock(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name      string
+		remoteRef string
+		fetchRef  string
+		// lock is the lock file, relative to the git dir, that fails the
+		// preparation.
+		lock string
+	}{
+		{"branch HEAD is on", "refs/remotes/origin/main", "main", "refs/heads/main.lock"},
+		{"new branch", "refs/remotes/origin/feature", "feature", "refs/heads/feature.lock"},
+		{"HEAD onto a new branch", "refs/remotes/origin/feature", "feature", "HEAD.lock"},
+		{"detached HEAD", fetchedFullRefRemoteTrackingRef, "refs/pull/10/head", "HEAD.lock"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gitDir, baseOID, _ := fetchedAheadRepo(t, t.TempDir(), tt.remoteRef)
+			branches := runOutput(t, "git", "--git-dir", gitDir, "for-each-ref", "refs/heads")
+			lock := filepath.Join(gitDir, tt.lock)
+			if err := os.WriteFile(lock, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}}
+			if err := New(nil).PrepareFetchedBranch(t.Context(), cfg, tt.fetchRef); err == nil || !strings.Contains(err.Error(), tt.lock) {
+				t.Fatalf("PrepareFetchedBranch error = %v, want the failure at the held %s", err, tt.lock)
+			}
+			if err := os.Remove(lock); err != nil {
+				t.Fatal(err)
+			}
+			if ref := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "symbolic-ref", "HEAD")); ref != "refs/heads/main" {
+				t.Fatalf("HEAD = %s, want refs/heads/main", ref)
+			}
+			if head := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", "HEAD")); head != baseOID {
+				t.Fatalf("HEAD = %s, want %s", head, baseOID)
+			}
+			if got := runOutput(t, "git", "--git-dir", gitDir, "for-each-ref", "refs/heads"); got != branches {
+				t.Fatalf("branches = %q, want %q", got, branches)
+			}
+			if staged := runOutput(t, "git", "--git-dir", gitDir, "diff-index", "--cached", "--name-only", "HEAD"); staged != "" {
+				t.Fatalf("the index differs from HEAD in %q", staged)
+			}
+		})
+	}
+}
+
 func TestFetchRefAmbientAndPrepareFetchedBranch(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -418,8 +466,7 @@ func TestFetchRefAmbientAndPrepareFetchedBranch(t *testing.T) {
 
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: preparedGitDir}, RepoSpec: model.RepoSpec{Branch: "master"}}
 	store := New(nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	ctx := t.Context()
 
 	if err := store.ValidatePreparedGitDir(ctx, cfg); err != nil {
 		t.Fatalf("ValidatePreparedGitDir: %v", err)
@@ -436,6 +483,9 @@ func TestFetchRefAmbientAndPrepareFetchedBranch(t *testing.T) {
 	}
 	if ref != "master" {
 		t.Fatalf("ref = %q, want master", ref)
+	}
+	if upstream := strings.TrimSpace(runOutput(t, "git", "--git-dir", preparedGitDir, "rev-parse", "--abbrev-ref", "master@{upstream}")); upstream != "origin/master" {
+		t.Fatalf("master's upstream = %q, want origin/master", upstream)
 	}
 	nodes, err := store.BuildTreeIndex(ctx, cfg, oid)
 	if err != nil {
@@ -480,8 +530,7 @@ func TestPrepareFetchedBranchRefusesPreparedGitDirRewind(t *testing.T) {
 
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: preparedGitDir}, RepoSpec: model.RepoSpec{Branch: "master", PreparedGitDir: true}}
 	store := New(nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	ctx := t.Context()
 	localOID, err := runGit(ctx, preparedGitDir, "rev-parse", "refs/heads/master")
 	if err != nil {
 		t.Fatal(err)
@@ -509,8 +558,10 @@ func TestPrepareFetchedBranchRefusesPreparedGitDirRewind(t *testing.T) {
 }
 
 func TestZeroOIDForGitDirMatchesObjectFormat(t *testing.T) {
+	t.Parallel()
 	for _, objectFormat := range []string{"sha1", "sha256"} {
 		t.Run(objectFormat, func(t *testing.T) {
+			t.Parallel()
 			repo := filepath.Join(t.TempDir(), "repo")
 			initArgs := []string{"init"}
 			if objectFormat == "sha256" {
@@ -525,8 +576,7 @@ func TestZeroOIDForGitDirMatchesObjectFormat(t *testing.T) {
 			run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", objectFormat)
 
 			gitDir := filepath.Join(repo, ".git")
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
+			ctx := t.Context()
 			zero, err := zeroOIDForGitDir(ctx, gitDir)
 			if err != nil {
 				t.Fatal(err)
@@ -574,8 +624,7 @@ func TestFetchedBranchReplacesExistingCloneBranch(t *testing.T) {
 	run(t, "git", "-C", work, "push", "origin", "dev")
 
 	store := New(nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	ctx := t.Context()
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + bare, Branch: "master", FetchRef: "master"}}
 	if err := store.CloneBlobless(ctx, cfg); err != nil {
 		t.Fatalf("CloneBlobless: %v", err)
@@ -615,6 +664,7 @@ func TestFetchedBranchReplacesExistingCloneBranch(t *testing.T) {
 }
 
 func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
+	t.Parallel()
 	tmp := t.TempDir()
 	bare := filepath.Join(tmp, "origin.git")
 	work := filepath.Join(tmp, "work")
@@ -659,8 +709,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 		},
 	}
 	requirement := model.SourceRequirement{Ref: cfg.Branch, RequiredCommit: tip, Depth: 1}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	ctx := t.Context()
 	store := New(nil)
 	prepared, err := store.PrepareSource(ctx, cfg, requirement)
 	if err != nil {
@@ -799,6 +848,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 }
 
 func TestPrepareSourceSupportsSHA256Remote(t *testing.T) {
+	t.Parallel()
 	tmp := t.TempDir()
 	bare := filepath.Join(tmp, "origin.git")
 	work := filepath.Join(tmp, "work")
@@ -833,8 +883,7 @@ func TestPrepareSourceSupportsSHA256Remote(t *testing.T) {
 		RequiredCommit: tip,
 		Depth:          1,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	ctx := t.Context()
 
 	prepared, err := New(nil).PrepareSource(ctx, cfg, requirement)
 	if err != nil {
@@ -860,6 +909,7 @@ func TestPrepareSourceSupportsSHA256Remote(t *testing.T) {
 }
 
 func TestPrepareSourceReacquiresMissingOrCorruptReceiptGitDir(t *testing.T) {
+	t.Parallel()
 	tmp := t.TempDir()
 	bare := filepath.Join(tmp, "origin.git")
 	work := filepath.Join(tmp, "work")
@@ -880,8 +930,7 @@ func TestPrepareSourceReacquiresMissingOrCorruptReceiptGitDir(t *testing.T) {
 		RequiredCommit: tip,
 		Depth:          1,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	ctx := t.Context()
 
 	for _, test := range []struct {
 		name   string
@@ -922,6 +971,7 @@ func TestPrepareSourceReacquiresMissingOrCorruptReceiptGitDir(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			gitDir := filepath.Join(tmp, test.name+".git")
 			cfg := model.RepoConfig{
 				RepoPaths: model.RepoPaths{
@@ -971,6 +1021,7 @@ func TestPrepareSourceReacquiresMissingOrCorruptReceiptGitDir(t *testing.T) {
 }
 
 func TestPrepareSourceReceiptPreservesIndexAndRestoresHEAD(t *testing.T) {
+	t.Parallel()
 	tmp := t.TempDir()
 	bare := filepath.Join(tmp, "origin.git")
 	work := filepath.Join(tmp, "work")
@@ -1003,8 +1054,7 @@ func TestPrepareSourceReceiptPreservesIndexAndRestoresHEAD(t *testing.T) {
 		Ref:            "refs/heads/main",
 		RequiredCommit: requiredCommit,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	ctx := t.Context()
 	store := New(nil)
 	if _, err := store.PrepareSource(ctx, cfg, requirement); err != nil {
 		t.Fatalf("initial PrepareSource: %v", err)
@@ -1051,8 +1101,10 @@ func TestPrepareSourceReceiptPreservesIndexAndRestoresHEAD(t *testing.T) {
 }
 
 func TestCloneBloblessUsesExactCanonicalTag(t *testing.T) {
+	t.Parallel()
 	for _, objectFormat := range []string{"sha1", "sha256"} {
 		t.Run(objectFormat, func(t *testing.T) {
+			t.Parallel()
 			tmp := t.TempDir()
 			bare := filepath.Join(tmp, "origin.git")
 			work := filepath.Join(tmp, "work")
@@ -1103,8 +1155,7 @@ func TestCloneBloblessUsesExactCanonicalTag(t *testing.T) {
 					HistoryDepth: 1,
 				},
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
+			ctx := t.Context()
 			if err := New(nil).CloneBlobless(ctx, cfg); err != nil {
 				t.Fatalf("CloneBlobless: %v", err)
 			}
@@ -1129,6 +1180,32 @@ func TestCloneBloblessUsesExactCanonicalTag(t *testing.T) {
 			wantFetchRef := "+refs/tags/release:" + fetchedFullRefRemoteTrackingRef
 			if fetchRef != wantFetchRef {
 				t.Fatalf("remote.origin.fetch = %q, want %q", fetchRef, wantFetchRef)
+			}
+		})
+	}
+}
+
+// A clone with a history depth holds that many commits of HEAD's history, on
+// the branch path and on the exact-ref path alike.
+func TestCloneBloblessLimitsHistoryToItsDepth(t *testing.T) {
+	t.Parallel()
+	for _, branch := range []string{"refs/heads/main", "refs/tags/v1"} {
+		t.Run(branch, func(t *testing.T) {
+			t.Parallel()
+			tmp := t.TempDir()
+			work, _ := newFetchFixture(t, tmp)
+			bare := filepath.Join(tmp, "origin.git")
+			run(t, "git", "-C", bare, "config", "uploadpack.allowFilter", "true")
+			commit(t, work, "TWO.md")
+			commit(t, work, "THREE.md")
+			run(t, "git", "-C", work, "tag", "v1")
+			run(t, "git", "-C", work, "push", "-q", "origin", "HEAD:main", "v1")
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: filepath.Join(tmp, "clone.git")}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + bare, Branch: branch, HistoryDepth: 2}}
+			if err := New(nil).CloneBlobless(t.Context(), cfg); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", cfg.GitDir, "rev-list", "--count", "HEAD")); got != "2" {
+				t.Fatalf("the clone holds %s commits of HEAD's history, want its depth 2", got)
 			}
 		})
 	}
@@ -1167,6 +1244,7 @@ func commit(t *testing.T, work, name string) string {
 // boundary and HEAD's history, and a tag moved to unrelated history reads as
 // diverged.
 func TestFetchNonInteractiveFetchesATagFetchRef(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		name      string
 		depth     int
@@ -1179,6 +1257,7 @@ func TestFetchNonInteractiveFetchesATagFetchRef(t *testing.T) {
 		{"unrelated history with depth 1", 1, true, 1},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tmp := t.TempDir()
 			work, gitDir := newFetchFixture(t, tmp)
 			for _, name := range []string{"ONE.md", "TWO.md", "THREE.md"} {
@@ -1235,6 +1314,7 @@ func TestFetchNonInteractiveFetchesATagFetchRef(t *testing.T) {
 // A branch fetch ref in a --depth clone reports a rewritten upstream tip as
 // diverged, and a forward push as behind.
 func TestComputeAheadBehindOfARewrittenBranch(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		name     string
 		amend    bool
@@ -1242,6 +1322,7 @@ func TestComputeAheadBehindOfARewrittenBranch(t *testing.T) {
 		diverged bool
 	}{{"forward", false, 0, false}, {"amended tip", true, 1, true}} {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tmp := t.TempDir()
 			work, _ := newFetchFixture(t, tmp)
 			bare := filepath.Join(tmp, "origin.git")
@@ -1278,6 +1359,7 @@ func TestComputeAheadBehindOfARewrittenBranch(t *testing.T) {
 // A read of the tracking ref that fails, such as one the refresh's deadline
 // cuts short, returns its error, so the refresh keeps the counts it stored.
 func TestComputeAheadBehindReturnsAFailedRead(t *testing.T) {
+	t.Parallel()
 	tmp := t.TempDir()
 	_, gitDir := newFetchFixture(t, tmp)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1293,6 +1375,7 @@ func TestComputeAheadBehindReturnsAFailedRead(t *testing.T) {
 // deleted, a refresh with --depth would mark the fetched tip shallow, and the
 // next preparation would refuse to move the branch onto it.
 func TestRefreshWithoutTheTrackingRefLetsPreparationMoveTheBranch(t *testing.T) {
+	t.Parallel()
 	tmp := t.TempDir()
 	work, _ := newFetchFixture(t, tmp)
 	bare := filepath.Join(tmp, "origin.git")
@@ -1329,6 +1412,7 @@ func TestRefreshWithoutTheTrackingRefLetsPreparationMoveTheBranch(t *testing.T) 
 // source moved by --depth commits reports 0/0. Without --depth, a source
 // force-pushed to unrelated history reads as diverged.
 func TestComputeAheadBehindOfAVerifiedSource(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		name      string
 		depth     int
@@ -1341,6 +1425,7 @@ func TestComputeAheadBehindOfAVerifiedSource(t *testing.T) {
 		{"unrelated history", 0, true, 1, 1},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tmp := t.TempDir()
 			work, _ := newFetchFixture(t, tmp)
 			run(t, "git", "-C", filepath.Join(tmp, "origin.git"), "config", "uploadpack.allowFilter", "true")
@@ -1372,78 +1457,68 @@ func TestComputeAheadBehindOfAVerifiedSource(t *testing.T) {
 	}
 }
 
+// Neither a clone, of a branch or of an exact ref, nor a fetch brings tags,
+// also ones that point into the history it fetches. The branch clone records
+// --no-tags in its remote config, so the fetches run in a prepared git dir,
+// whose remote config lacks it. A clone
+// replaces the batch pool of the git dir it creates.
 func TestCloneAndFetchRefSkipTags(t *testing.T) {
+	t.Parallel()
 	tmp := t.TempDir()
-	bare := filepath.Join(tmp, "origin.git")
-	work := filepath.Join(tmp, "work")
-	gitDir := filepath.Join(tmp, "repo.git")
-
-	run(t, "git", "init", "--bare", bare)
-	run(t, "git", "clone", bare, work)
-	run(t, "git", "-C", work, "checkout", "-b", "master")
-	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("master\n"), 0o644); err != nil {
-		t.Fatal(err)
+	work, preparedGitDir := newFetchFixture(t, tmp)
+	tag := func(name string) {
+		commit(t, work, name+".md")
+		run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "tag", "-a", "-m", name, name)
+		run(t, "git", "-C", work, "tag", name+"-lightweight")
+		run(t, "git", "-C", work, "push", "-q", "origin", "HEAD:main", name, name+"-lightweight")
 	}
-	run(t, "git", "-C", work, "add", "README.md")
-	run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "master")
-	run(t, "git", "-C", work, "push", "origin", "master")
-
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
+	requireNoTags := func(gitDir, step string) {
+		t.Helper()
+		if tags := runOutput(t, "git", "--git-dir", gitDir, "for-each-ref", "refs/tags"); tags != "" {
+			t.Fatalf("%s brought tags:\n%s", step, tags)
+		}
 	}
-	bin := filepath.Join(tmp, "bin")
-	if err := os.Mkdir(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	logPath := filepath.Join(tmp, "git.log")
-	fakeGit := filepath.Join(bin, "git")
-	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_COMMAND_LOG\"\nexec \"$REAL_GIT\" \"$@\"\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GIT_COMMAND_LOG", logPath)
-	t.Setenv("REAL_GIT", realGit)
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	store := New(nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + bare, Branch: "master", FetchRef: "master"}}
-	oldPool, err := store.getPool(gitDir)
+	ctx := t.Context()
+	cloneGitDir := filepath.Join(tmp, "clone.git")
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: cloneGitDir}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + filepath.Join(tmp, "origin.git"), Branch: "main", FetchRef: "main"}}
+	oldPool, err := store.getPool(cloneGitDir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	tag("v1")
 	if err := store.CloneBlobless(ctx, cfg); err != nil {
 		t.Fatalf("CloneBlobless: %v", err)
 	}
-	newPool, err := store.getPool(gitDir)
+	requireNoTags(cloneGitDir, "the clone")
+	exact := cfg
+	exact.GitDir = filepath.Join(tmp, "exact.git")
+	exact.Branch = "refs/tags/v1"
+	if err := store.CloneBlobless(ctx, exact); err != nil {
+		t.Fatalf("CloneBlobless of an exact ref: %v", err)
+	}
+	requireNoTags(exact.GitDir, "the exact-ref clone")
+	newPool, err := store.getPool(cloneGitDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if newPool == oldPool {
 		t.Fatal("clone reused the batch pool from the previously missing Git directory")
 	}
+
+	cfg.GitDir = preparedGitDir
+	cfg.PreparedGitDir = true
+	tag("v2")
 	if err := store.FetchRefAmbient(ctx, cfg, cfg.FetchRef); err != nil {
 		t.Fatalf("FetchRefAmbient: %v", err)
 	}
+	requireNoTags(preparedGitDir, "the preparation fetch")
+	tag("v3")
 	if err := store.FetchNonInteractive(ctx, cfg); err != nil {
-		t.Fatalf("Fetch: %v", err)
+		t.Fatalf("FetchNonInteractive: %v", err)
 	}
-
-	logData, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	logText := string(logData)
-	if !strings.Contains(logText, "clone --filter=blob:none --no-checkout --single-branch --no-tags --branch master") {
-		t.Fatalf("clone did not include --no-tags; git log:\n%s", logText)
-	}
-	if !strings.Contains(logText, "fetch --filter=blob:none --no-tags origin +refs/heads/master:refs/remotes/origin/master") {
-		t.Fatalf("fetch did not include --no-tags; git log:\n%s", logText)
-	}
-	if !strings.Contains(logText, "fetch --no-tags origin") {
-		t.Fatalf("refresh fetch did not include --no-tags; git log:\n%s", logText)
-	}
+	requireNoTags(preparedGitDir, "the refresh fetch")
 }
 
 // A fetch starts while its remote lookup still runs, and returns only once
@@ -1508,6 +1583,7 @@ func TestFetchStartsBeforeAndEndsAfterItsRemoteLookup(t *testing.T) {
 }
 
 func TestRemoteLookupIncludesConfiguredAndActualOrigin(t *testing.T) {
+	t.Parallel()
 	tmp := t.TempDir()
 	gitDir := filepath.Join(tmp, "repo.git")
 	run(t, "git", "init", "--bare", gitDir)
@@ -1554,8 +1630,7 @@ func TestFetchRefAmbientFullRefPreparesDetachedHEAD(t *testing.T) {
 
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: preparedGitDir}, RepoSpec: model.RepoSpec{Branch: "master"}}
 	store := New(nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	ctx := t.Context()
 
 	if err := store.FetchRefAmbient(ctx, cfg, "refs/pull/10/head"); err != nil {
 		t.Fatalf("FetchRefAmbient: %v", err)
