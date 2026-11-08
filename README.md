@@ -132,11 +132,20 @@ kill $DAEMON_PID
 ArtifactFS creates the state root and its subdirectories with mode `0700`, and
 narrows existing subdirectories to `0700`. It refuses a state root, or one of
 its subdirectories, that another user owns or that group or others can write:
-the state root holds the hydrated blobs that reads serve, and the fsmonitor
-hook of each clone in its default git dir, which Git runs on every
-`git status`. A state root may be a symlink the current user owns. ArtifactFS
-resolves it at startup and builds the paths of repos it registers from the
-resolved path. Repos registered before that keep the paths they stored.
+the state root holds the hydrated blobs that reads serve, the fsmonitor hook of
+each clone in its default git dir, which Git runs on every `git status`, and,
+in `config/tmp`, the SSH wrapper that Git runs when ArtifactFS contacts a
+remote. The state root must allow execution, because Git runs the SSH wrapper
+from `config/tmp` and the fsmonitor hook from each default git dir. A state
+root may be a symlink the current user owns. ArtifactFS resolves it at startup
+and builds the paths of repos it registers from the resolved path. Repos
+registered before that keep the paths they stored.
+
+The daemon keeps its SSH wrapper in `config/tmp/daemon` and empties that
+directory when it starts. Other CLI commands keep theirs in `config/tmp`, and
+each removes its own when it exits. A process that stops without that cleanup
+leaves its directory behind. Remove other entries in `config/tmp` only while no
+artifact-fs process runs on that state root.
 
 ## Monitoring hydration and repo status
 

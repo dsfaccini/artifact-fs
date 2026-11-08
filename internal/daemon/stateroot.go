@@ -15,7 +15,7 @@ var lstat = unix.Lstat
 
 // stateRootDirs are the state root's fixed subdirectories. Every per-repo
 // directory under the root sits inside one of them.
-var stateRootDirs = []string{"config", filepath.Join("config", "locks"), "repos", "overlays", "cache", "meta"}
+var stateRootDirs = []string{"config", filepath.Join("config", "locks"), filepath.Join("config", "tmp"), "repos", "overlays", "cache", "meta"}
 
 // ensureStateRoot creates the state root and its fixed subdirectories 0700, and
 // returns the root with its symlinks resolved. Use only the resolved root: a
@@ -24,8 +24,9 @@ var stateRootDirs = []string{"config", filepath.Join("config", "locks"), "repos"
 // It refuses the root as given when another user owns it, even as a symlink to
 // a directory of the current user, because that user chose the target. It
 // refuses the resolved root or a subdirectory that another user owns or that
-// group or others can write: whoever can write there can replace the fsmonitor
-// hook that Git runs on every status, or the cached blobs that reads serve.
+// group or others can write: whoever can write there can replace a file that
+// Git runs, such as the fsmonitor hook on every status or the SSH wrapper in
+// config/tmp, or the cached blobs that reads serve.
 // Ancestors of the root are not checked.
 //
 // It narrows each existing subdirectory to 0700. The root keeps its mode,
@@ -68,6 +69,18 @@ func ensureStateRoot(root string) (string, error) {
 		}
 	}
 	return resolved, nil
+}
+
+// emptyDaemonTempDir empties config/tmp/daemon under root and returns it. Call
+// it only while holding the daemon lock. Only the daemon that holds the lock
+// uses the directory, so what is there a daemon left that never closed its
+// git store. The CLI's git stores use config/tmp itself, at the same time.
+func emptyDaemonTempDir(root string) (string, error) {
+	dir := filepath.Join(root, "config", "tmp", "daemon")
+	if err := os.RemoveAll(dir); err != nil {
+		return "", err
+	}
+	return dir, os.Mkdir(dir, 0o700)
 }
 
 func checkPrivateDir(path string) error {

@@ -171,7 +171,12 @@ func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error
 	if err != nil {
 		return nil, err
 	}
-	c, err := newCore(ctx, root, logger)
+	tempDir, err := emptyDaemonTempDir(root)
+	if err != nil {
+		lock.Close()
+		return nil, err
+	}
+	c, err := newCore(ctx, root, tempDir, logger)
 	if err != nil {
 		lock.Close()
 		return nil, err
@@ -200,21 +205,24 @@ func NewController(ctx context.Context, root string, logger *slog.Logger) (*Cont
 	if err != nil {
 		return nil, err
 	}
-	c, err := newCore(ctx, root, logger)
+	c, err := newCore(ctx, root, filepath.Join(root, "config", "tmp"), logger)
 	if err != nil {
 		return nil, err
 	}
 	return &Controller{core: c}, nil
 }
 
-func newCore(ctx context.Context, root string, logger *slog.Logger) (*core, error) {
+// newCore opens the registry under root and a git store that makes the files
+// Git runs under tempDir.
+func newCore(ctx context.Context, root, tempDir string, logger *slog.Logger) (*core, error) {
 	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
 	if err != nil {
 		return nil, err
 	}
-	c := &core{root: root, logger: logger, registry: reg, git: gitstore.New(logger)}
-	c.git.SetBatchPoolSize(DefaultHydrationConcurrency)
-	return c, nil
+	git := gitstore.New(logger)
+	git.SetTempDir(tempDir)
+	git.SetBatchPoolSize(DefaultHydrationConcurrency)
+	return &core{root: root, logger: logger, registry: reg, git: git}, nil
 }
 
 // Close releases the controller's registry and git processes.

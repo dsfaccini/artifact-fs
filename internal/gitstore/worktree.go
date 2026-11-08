@@ -417,7 +417,7 @@ func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.
 	if err := copyFile(indexPath, privatePath); err != nil {
 		return false, err
 	}
-	privateWorktree, err := os.MkdirTemp("", "artifact-fs-index-worktree-*")
+	privateWorktree, err := os.MkdirTemp(s.tempDir, "artifact-fs-index-worktree-*")
 	if err != nil {
 		return false, err
 	}
