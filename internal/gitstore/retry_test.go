@@ -111,7 +111,7 @@ func TestCloneBloblessDoesNotRetryPermanentError(t *testing.T) {
 	}
 	countPath := filepath.Join(tmp, "clone-count")
 	fakeGit := filepath.Join(bin, "git")
-	if err := os.WriteFile(fakeGit, []byte(gittest.FakeGitScript("count=0; [ -f \"$AFS_CLONE_COUNT\" ] && count=$(cat \"$AFS_CLONE_COUNT\")\ncount=$((count + 1)); printf '%s' \"$count\" > \"$AFS_CLONE_COUNT\"\nprintf '%s\\n' 'remote: credential-user' 'remote: super-secret' 'fatal: Authentication failed for https://credential-user:super-secret@example.com/org/repo.git; HTTP 401' >&2\nexit 1\n")), 0o755); err != nil {
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\ncount=0; [ -f \"$AFS_CLONE_COUNT\" ] && count=$(cat \"$AFS_CLONE_COUNT\")\ncount=$((count + 1)); printf '%s' \"$count\" > \"$AFS_CLONE_COUNT\"\nprintf '%s\\n' 'remote: credential-user' 'remote: super-secret' 'fatal: Authentication failed for https://credential-user:super-secret@example.com/org/repo.git; HTTP 401' >&2\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -148,11 +148,12 @@ func TestCloneBloblessPreservesTransportFailureAtCallerDeadline(t *testing.T) {
 	countPath := filepath.Join(tmp, "clone-count")
 	stderrWritten := filepath.Join(tmp, "stderr-written")
 	fakeGit := filepath.Join(bin, "git")
-	script := gittest.FakeGitScript("count=0; [ -f \"$AFS_CLONE_COUNT\" ] && count=$(cat \"$AFS_CLONE_COUNT\")\n" +
+	script := "#!/bin/sh\n" +
+		"count=0; [ -f \"$AFS_CLONE_COUNT\" ] && count=$(cat \"$AFS_CLONE_COUNT\")\n" +
 		"count=$((count + 1)); printf '%s' \"$count\" > \"$AFS_CLONE_COUNT\"\n" +
 		"printf '%s\\n' 'error: RPC failed; HTTP 500 curl 22' >&2\n" +
 		": > \"$AFS_STDERR_WRITTEN\"\n" +
-		"exec sleep 10\n")
+		"exec sleep 10\n"
 	if err := os.WriteFile(fakeGit, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -375,10 +376,11 @@ func TestFetchRefAmbientRetriesTransientFailures(t *testing.T) {
 	}
 	countPath := filepath.Join(tmp, "fetch-count")
 	fakeGit := filepath.Join(bin, "git")
-	script := gittest.FakeGitScript("if [ \"$*\" = 'remote get-url origin' ]; then exit 0; fi\n" +
+	script := "#!/bin/sh\n" +
+		"if [ \"$*\" = 'remote get-url origin' ]; then exit 0; fi\n" +
 		"count=0; [ -f \"$AFS_FETCH_COUNT\" ] && count=$(cat \"$AFS_FETCH_COUNT\")\n" +
 		"count=$((count + 1)); printf '%s' \"$count\" > \"$AFS_FETCH_COUNT\"\n" +
-		"if [ \"$count\" -lt 3 ]; then printf '%s\\n' 'HTTP 503 Service Unavailable' >&2; exit 1; fi\n")
+		"if [ \"$count\" -lt 3 ]; then printf '%s\\n' 'HTTP 503 Service Unavailable' >&2; exit 1; fi\n"
 	if err := os.WriteFile(fakeGit, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

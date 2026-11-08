@@ -57,9 +57,9 @@ func (s *Store) CloneBlobless(ctx context.Context, cfg model.RepoConfig) error {
 				args = append(args, fmt.Sprintf("--depth=%d", cfg.HistoryDepth))
 			}
 			args = append(args, "--no-checkout", "--single-branch", "--no-tags", "--branch", branch, "--", safeURL, target)
-			_, err = runNetworkGit(ctx, "", env, args...)
+			_, err = s.runNetworkGit(ctx, "", env, args...)
 		} else {
-			err = cloneExactRef(ctx, target, safeURL, env, sourceRef, cfg.HistoryDepth)
+			err = s.cloneExactRef(ctx, target, safeURL, env, sourceRef, cfg.HistoryDepth)
 		}
 		if err != nil {
 			_ = os.RemoveAll(target)
@@ -78,7 +78,7 @@ func (s *Store) CloneBlobless(ctx context.Context, cfg model.RepoConfig) error {
 		return err
 	}
 	// Populate the index so git status works inside the mount.
-	if _, err := runNetworkGit(ctx, targetGitDir, nil, "read-tree", "HEAD"); err != nil {
+	if _, err := s.runNetworkGit(ctx, targetGitDir, nil, "read-tree", "HEAD"); err != nil {
 		return err
 	}
 	if err := os.Rename(filepath.Join(target, ".git"), cfg.GitDir); err != nil {
@@ -112,7 +112,7 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 			return model.PreparedSource{}, err
 		}
 		if available {
-			if err := prepareFixedHEAD(ctx, cfg.GitDir, requirement.RequiredCommit, false); err != nil {
+			if err := s.prepareFixedHEAD(ctx, cfg.GitDir, requirement.RequiredCommit, false); err != nil {
 				return model.PreparedSource{}, err
 			}
 			return prepared, nil
@@ -164,7 +164,7 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 			args = append(args, fmt.Sprintf("--depth=%d", requirement.Depth))
 		}
 		args = append(args, "origin", refspec)
-		if _, err := runNetworkGit(ctx, candidateGitDir, env, args...); err != nil {
+		if _, err := s.runNetworkGit(ctx, candidateGitDir, env, args...); err != nil {
 			return err
 		}
 		observed, err := runGit(ctx, candidateGitDir, "rev-parse", "--verify", verifiedSourceTrackingRef+"^{commit}")
@@ -175,7 +175,7 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 		if observed != requirement.RequiredCommit {
 			return fmt.Errorf("source changed: %s resolved to %s, required %s", requirement.Ref, observed, requirement.RequiredCommit)
 		}
-		if err := prepareFixedHEAD(ctx, candidateGitDir, requirement.RequiredCommit, true); err != nil {
+		if err := s.prepareFixedHEAD(ctx, candidateGitDir, requirement.RequiredCommit, true); err != nil {
 			return err
 		}
 		return nil
@@ -212,8 +212,8 @@ func configureArtifactWorktree(ctx context.Context, gitDir string) error {
 	return nil
 }
 
-func cloneExactRef(ctx context.Context, target string, safeURL string, env []string, ref string, depth int) error {
-	advertisement, err := runNetworkGit(ctx, "", env, "ls-remote", "--", safeURL, ref)
+func (s *Store) cloneExactRef(ctx context.Context, target string, safeURL string, env []string, ref string, depth int) error {
+	advertisement, err := s.runNetworkGit(ctx, "", env, "ls-remote", "--", safeURL, ref)
 	if err != nil {
 		return err
 	}
@@ -253,7 +253,7 @@ func cloneExactRef(ctx context.Context, target string, safeURL string, env []str
 		fetchArgs = append(fetchArgs, fmt.Sprintf("--depth=%d", depth))
 	}
 	fetchArgs = append(fetchArgs, "origin", refspec)
-	if _, err := runNetworkGit(ctx, gitDir, env, fetchArgs...); err != nil {
+	if _, err := s.runNetworkGit(ctx, gitDir, env, fetchArgs...); err != nil {
 		return err
 	}
 	commit, err := runGit(ctx, gitDir, "rev-parse", "--verify", fetchedFullRefRemoteTrackingRef+"^{commit}")
@@ -287,7 +287,7 @@ func requiredCommitAvailable(ctx context.Context, gitDir string, commit string) 
 	return string(header) == "DIRC", nil
 }
 
-func prepareFixedHEAD(ctx context.Context, gitDir string, commit string, resetIndex bool) error {
+func (s *Store) prepareFixedHEAD(ctx context.Context, gitDir string, commit string, resetIndex bool) error {
 	resolved, err := runGit(ctx, gitDir, "rev-parse", "--verify", commit+"^{commit}")
 	if err != nil {
 		return fmt.Errorf("required commit %s is unavailable: %w", commit, err)
@@ -301,7 +301,7 @@ func prepareFixedHEAD(ctx context.Context, gitDir string, commit string, resetIn
 	if !resetIndex {
 		return nil
 	}
-	_, err = runNetworkGit(ctx, gitDir, nil, "read-tree", commit)
+	_, err = s.runNetworkGit(ctx, gitDir, nil, "read-tree", commit)
 	return err
 }
 
@@ -341,7 +341,7 @@ func (s *Store) FetchNonInteractive(ctx context.Context, repo model.RepoConfig) 
 	remotesForLogging, cancelLookup := s.startRemotesForLogging(ctx, repo)
 	defer cancelLookup()
 	return s.retryGitOperationForRemoteLookup(ctx, GitOperationFetch, repo.Name, remotesForLogging, func() error {
-		_, err := runNetworkGit(ctx, repo.GitDir, nil, args...)
+		_, err := s.runNetworkGit(ctx, repo.GitDir, nil, args...)
 		return err
 	})
 }
@@ -393,7 +393,7 @@ func (s *Store) fetchRef(ctx context.Context, repo model.RepoConfig, ref string,
 	remotesForLogging, cancelLookup := s.startRemotesForLogging(ctx, repo)
 	defer cancelLookup()
 	return s.retryGitOperationForRemoteLookup(ctx, GitOperationFetch, repo.Name, remotesForLogging, func() error {
-		_, err := runNetworkGit(ctx, repo.GitDir, env, args...)
+		_, err := s.runNetworkGit(ctx, repo.GitDir, env, args...)
 		return err
 	})
 }
@@ -488,7 +488,7 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 	}
 	if target.branch == "" {
 		index := indexFile(repo.GitDir)
-		if err := readTreeTransition(ctx, repo.GitDir, oldOID, oid); err != nil {
+		if err := s.readTreeTransition(ctx, repo.GitDir, oldOID, oid); err != nil {
 			return s.rollbackLandedReadTree(ctx, repo.GitDir, index, oldOID, oid, err)
 		}
 		oldHeadOID, err := refOIDOrZero(ctx, repo.GitDir, "HEAD")
@@ -515,7 +515,7 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 		return err
 	}
 	index := indexFile(repo.GitDir)
-	if err := readTreeTransition(ctx, repo.GitDir, oldOID, oid); err != nil {
+	if err := s.readTreeTransition(ctx, repo.GitDir, oldOID, oid); err != nil {
 		return s.rollbackLandedReadTree(ctx, repo.GitDir, index, oldOID, oid, err)
 	}
 	if _, err := runGit(ctx, repo.GitDir, "update-ref", refName, oid, oldBranchOID); err != nil {
@@ -535,7 +535,7 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 		// the next preparation's read-tree as staged changes. The index goes
 		// first, so a ref restore that uses up the deadline cannot keep it
 		// from HEAD.
-		indexErr := restoreIndex(ctx, repo.GitDir, oid, oldOID, err)
+		indexErr := s.restoreIndex(ctx, repo.GitDir, oid, oldOID, err)
 		return errors.Join(indexErr, restoreRef(ctx, repo.GitDir, refName, oldBranchOID, oid))
 	}
 	if _, err := runGit(ctx, repo.GitDir, "branch", "--set-upstream-to", "origin/"+target.branch, target.branch); err != nil {
@@ -579,7 +579,7 @@ func (s *Store) rollbackIndexTransition(ctx context.Context, gitDir string, from
 	if headAt(ctx, gitDir, fromOID) {
 		return cause
 	}
-	return restoreIndex(ctx, gitDir, fromOID, toOID, cause)
+	return s.restoreIndex(ctx, gitDir, fromOID, toOID, cause)
 }
 
 // rollbackLandedReadTree restores the index from newOID back to oldOID when
@@ -597,14 +597,14 @@ func (s *Store) rollbackLandedReadTree(ctx context.Context, gitDir string, index
 	ctx, cancel := s.rollbackContext(ctx)
 	defer cancel()
 	// A submodule.<name>.ignore setting would hide a changed gitlink.
-	changed, err := runNetworkGit(ctx, gitDir, nil, "diff-tree", "-r", "-z", "--name-only", "--ignore-submodules=none", oldOID, newOID)
+	changed, err := s.runNetworkGit(ctx, gitDir, nil, "diff-tree", "-r", "-z", "--name-only", "--ignore-submodules=none", oldOID, newOID)
 	if err != nil {
 		return errors.Join(cause, fmt.Errorf("check index after read-tree failure: %w", err))
 	}
 	if changed == "" {
 		return cause
 	}
-	notNew, err := runNetworkGit(ctx, gitDir, nil, "diff-index", "--cached", "-z", "--name-only", "--ignore-submodules=none", newOID)
+	notNew, err := s.runNetworkGit(ctx, gitDir, nil, "diff-index", "--cached", "-z", "--name-only", "--ignore-submodules=none", newOID)
 	if err != nil {
 		return errors.Join(cause, fmt.Errorf("check index after read-tree failure: %w", err))
 	}
@@ -617,7 +617,7 @@ func (s *Store) rollbackLandedReadTree(ctx context.Context, gitDir string, index
 			return cause
 		}
 	}
-	return restoreIndex(ctx, gitDir, newOID, oldOID, cause)
+	return s.restoreIndex(ctx, gitDir, newOID, oldOID, cause)
 }
 
 // indexFile is the index file git reads for gitDir, nil when it is missing.
@@ -645,8 +645,8 @@ func headAt(ctx context.Context, gitDir string, oid string) bool {
 	return err == nil && strings.TrimSpace(head) == oid
 }
 
-func restoreIndex(ctx context.Context, gitDir string, fromOID string, toOID string, cause error) error {
-	if err := readTreeTransition(ctx, gitDir, fromOID, toOID); err != nil {
+func (s *Store) restoreIndex(ctx context.Context, gitDir string, fromOID string, toOID string, cause error) error {
+	if err := s.readTreeTransition(ctx, gitDir, fromOID, toOID); err != nil {
 		return errors.Join(cause, fmt.Errorf("restore index after failed update: %w", err))
 	}
 	return cause
@@ -676,8 +676,8 @@ func currentOrEmptyTreeOID(ctx context.Context, gitDir string) (string, error) {
 
 // readTreeTransition moves the index from oldOID's tree to newOID's. In a git
 // dir cloned without trees, read-tree fetches the trees it lacks.
-func readTreeTransition(ctx context.Context, gitDir string, oldOID string, newOID string) error {
-	_, err := runNetworkGit(ctx, gitDir, nil, "read-tree", "-m", oldOID, newOID)
+func (s *Store) readTreeTransition(ctx context.Context, gitDir string, oldOID string, newOID string) error {
+	_, err := s.runNetworkGit(ctx, gitDir, nil, "read-tree", "-m", oldOID, newOID)
 	return err
 }
 

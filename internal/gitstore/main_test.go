@@ -1,6 +1,7 @@
 package gitstore
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
@@ -9,7 +10,17 @@ import (
 
 func TestMain(m *testing.M) {
 	gittest.IsolateConfig()
-	os.Exit(m.Run())
+	// A Store that a test never closes leaves its SSH wrapper's directory in
+	// the temp dir, so the tests share one that goes when they end.
+	tmp, err := os.MkdirTemp("", "gitstore-test-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Setenv("TMPDIR", tmp)
+	code := m.Run()
+	_ = os.RemoveAll(tmp)
+	os.Exit(code)
 }
 
 func TestGitIgnoresMachineConfig(t *testing.T) { gittest.RequireConfigIsolated(t) }

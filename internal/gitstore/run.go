@@ -33,8 +33,8 @@ func runGitInput(ctx context.Context, gitDir string, extraEnv []string, input []
 
 // runLazyFetchGitInput runs a Git command that fetches objects as a lazy fetch
 // does: with lazyFetchEnv, in its own session, so it cannot prompt.
-func runLazyFetchGitInput(ctx context.Context, gitDir string, input []byte, args ...string) (string, error) {
-	env, err := lazyFetchEnv(ctx, gitDir, nil)
+func (s *Store) runLazyFetchGitInput(ctx context.Context, gitDir string, input []byte, args ...string) (string, error) {
+	env, err := s.lazyFetchEnv()
 	if err != nil {
 		return "", err
 	}
@@ -78,8 +78,8 @@ func setGitWorktreeDirectory(cmd *exec.Cmd, extraEnv []string) {
 // SSH can prompt. Without it, git runs in a background process group, and
 // the terminal stops it at a prompt. Credential helpers and the askpass
 // programs the user set still run.
-func runNetworkGit(ctx context.Context, gitDir string, extraEnv []string, args ...string) (string, error) {
-	env, err := lazyFetchEnv(ctx, gitDir, extraEnv)
+func (s *Store) runNetworkGit(ctx context.Context, gitDir string, extraEnv []string, args ...string) (string, error) {
+	env, err := s.lazyFetchEnv()
 	if err != nil {
 		return "", err
 	}

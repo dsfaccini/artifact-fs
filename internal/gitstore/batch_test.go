@@ -482,6 +482,7 @@ func TestBatchPoolBoundsConcurrentProcesses(t *testing.T) {
 	run(t, "git", "init", repo)
 	p := &batchPool{
 		gitDir:  filepath.Join(repo, ".git"),
+		env:     func() ([]string, error) { return nil, nil },
 		logger:  slog.Default(),
 		maxSize: 1,
 		all:     map[*batchCatFile]struct{}{},

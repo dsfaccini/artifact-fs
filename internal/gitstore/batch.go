@@ -108,7 +108,7 @@ func (s *Store) FetchMissingBlobs(ctx context.Context, repo model.RepoPaths, obj
 	if err == nil {
 		// The fetch downloads every wanted object again, present or not, so
 		// it asks only for the missing ones.
-		_, err = runLazyFetchGitInput(ctx, repo.GitDir, []byte(strings.Join(missing, "\n")+"\n"),
+		_, err = s.runLazyFetchGitInput(ctx, repo.GitDir, []byte(strings.Join(missing, "\n")+"\n"),
 			"-c", "fetch.negotiationAlgorithm=noop", "fetch", "--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--filter=blob:none", "--stdin", "--", remote)
 	}
 	// The hydrator cancels a batch fetch only when it stops, which is not a
@@ -306,7 +306,7 @@ func (s *Store) getPool(gitDir string) (*batchPool, error) {
 	if p, ok := s.pools[gitDir]; ok {
 		return p, nil
 	}
-	p := &batchPool{gitDir: gitDir, logger: s.logger, maxSize: s.poolMaxSize, all: map[*batchCatFile]struct{}{}, changed: make(chan struct{})}
+	p := &batchPool{gitDir: gitDir, env: s.lazyFetchEnv, logger: s.logger, maxSize: s.poolMaxSize, all: map[*batchCatFile]struct{}{}, changed: make(chan struct{})}
 	s.pools[gitDir] = p
 	return p, nil
 }
@@ -317,6 +317,7 @@ type batchPool struct {
 	mu       sync.Mutex
 	free     []*batchCatFile
 	gitDir   string
+	env      func() ([]string, error)
 	logger   *slog.Logger
 	maxSize  int
 	creating int
@@ -345,7 +346,7 @@ func (p *batchPool) acquire(ctx context.Context) (*batchCatFile, error) {
 		if len(p.all)+p.creating < p.maxSize {
 			p.creating++
 			p.mu.Unlock()
-			b, err := newBatchCatFile(ctx, p.gitDir, p.logger)
+			b, err := newBatchCatFile(p.gitDir, p.env, p.logger)
 			p.mu.Lock()
 			p.creating--
 			if err == nil && !p.closed {
@@ -465,8 +466,8 @@ type batchCatFile struct {
 	terminateOnce sync.Once
 }
 
-func newBatchCatFile(ctx context.Context, gitDir string, logger *slog.Logger) (*batchCatFile, error) {
-	env, err := lazyFetchEnv(ctx, gitDir, nil)
+func newBatchCatFile(gitDir string, lazyFetchEnv func() ([]string, error), logger *slog.Logger) (*batchCatFile, error) {
+	env, err := lazyFetchEnv()
 	if err != nil {
 		return nil, err
 	}

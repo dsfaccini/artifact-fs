@@ -1,11 +1,12 @@
 package gitstore
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
@@ -190,27 +191,57 @@ func isSCPStyleRemote(raw string) bool {
 // without a controlling terminal SSH cannot prompt, and SSH_ASKPASS_REQUIRE
 // keeps it from opening an askpass dialog instead. SSH still tries empty
 // passwords, and a retried command repeats them against a server that may ban
-// the client, so lazyFetchEnv adds BatchMode. It does so only when the command
-// would run plain ssh: with neither GIT_SSH_COMMAND nor GIT_SSH set, and no
-// core.sshCommand in its effective config. The user's own SSH command, such
-// as the one an adopted worktree or a prepared git dir keeps, runs unchanged.
-// extraEnv is the environment the command adds, which can change its config.
-func lazyFetchEnv(ctx context.Context, gitDir string, extraEnv []string) ([]string, error) {
+// the client, so GIT_SSH names a wrapper that runs ssh with BatchMode. Git
+// runs GIT_SSH only when neither GIT_SSH_COMMAND nor an effective
+// core.sshCommand names an SSH command, so the user's own command, such as the
+// one an adopted worktree, a prepared git dir or a conditional include sets,
+// runs unchanged. A GIT_SSH the user set stays.
+func (s *Store) lazyFetchEnv() ([]string, error) {
 	env := []string{"GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS=", "SSH_ASKPASS_REQUIRE=never"}
-	for _, key := range []string{"GIT_SSH_COMMAND", "GIT_SSH"} {
-		if _, ok := os.LookupEnv(key); ok {
-			return env, nil
-		}
-	}
-	if gitDir == "" {
-		// A clone reads no repository config, but git config would read the
-		// repository around the working directory.
-		gitDir = os.DevNull
-	}
-	if _, err := runGitWithEnv(ctx, gitDir, extraEnv, "config", "--get", "core.sshCommand"); err == nil {
+	if _, ok := os.LookupEnv("GIT_SSH"); ok {
 		return env, nil
-	} else if exitErr, ok := errors.AsType[*gitCommandError](err); !ok || exitErr.exitCode != 1 {
-		return nil, fmt.Errorf("read core.sshCommand: %w", err)
 	}
-	return append(env, "GIT_SSH_COMMAND=ssh -o BatchMode=yes"), nil
+	wrapper, err := s.batchModeSSH()
+	if err != nil || wrapper == "" {
+		return env, err
+	}
+	return append(env, "GIT_SSH="+wrapper), nil
+}
+
+// batchModeSSH returns a program named ssh, so that Git passes it OpenSSH's
+// options, that runs the ssh on PATH with BatchMode. It returns "" when PATH
+// has no ssh, because Git then reaches no SSH remote either. The Store writes
+// the program once, in a directory of its own that Close removes, and again
+// if a temp cleaner removed it.
+func (s *Store) batchModeSSH() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return "", errors.New("git store closed")
+	}
+	if s.sshWrapperDir != "" {
+		wrapper := filepath.Join(s.sshWrapperDir, "ssh")
+		if _, err := os.Stat(wrapper); err == nil {
+			return wrapper, nil
+		}
+		_ = os.RemoveAll(s.sshWrapperDir)
+		s.sshWrapperDir = ""
+	}
+	// LookPath refuses an ssh that a relative PATH entry finds, so the
+	// wrapper runs an absolute path, and never itself.
+	ssh, err := exec.LookPath("ssh")
+	if err != nil {
+		return "", nil
+	}
+	dir, err := os.MkdirTemp("", "artifact-fs-ssh-")
+	if err != nil {
+		return "", fmt.Errorf("create SSH wrapper: %w", err)
+	}
+	wrapper := filepath.Join(dir, "ssh")
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nexec "+shellScriptQuote(ssh)+" -o BatchMode=yes \"$@\"\n"), 0o700); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("create SSH wrapper: %w", err)
+	}
+	s.sshWrapperDir = dir
+	return wrapper, nil
 }

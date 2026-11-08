@@ -16,7 +16,7 @@ import (
 // ReadTreeHEAD initializes the index during controlled clone or preparation.
 // Do not call it from delayed HEAD watchers: it can discard newer staged work.
 func (s *Store) ReadTreeHEAD(ctx context.Context, repo model.RepoConfig) error {
-	_, err := runNetworkGit(ctx, repo.GitDir, nil, "read-tree", "HEAD")
+	_, err := s.runNetworkGit(ctx, repo.GitDir, nil, "read-tree", "HEAD")
 	return err
 }
 

@@ -147,7 +147,7 @@ done
 func TestBuildTreeIndexBoundsLazyFetchStderr(t *testing.T) {
 	// A lazy tree fetch's server shapes ls-tree's stderr, which redaction reads.
 	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(gittest.FakeGitScript("printf 'fatal: %0100000d\\n' 0 >&2\nexit 128\n")), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nprintf 'fatal: %0100000d\\n' 0 >&2\nexit 128\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -241,20 +241,25 @@ func TestReadNullDelimitedRejectsPartialFinalRecord(t *testing.T) {
 	}
 }
 
+// The deadline expires once the fake ls-tree runs, so it ends ls-tree itself.
 func TestStreamTreeRecordsPreservesDeadline(t *testing.T) {
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "bin")
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(gittest.FakeGitScript("exec sleep 10\n")), 0o755); err != nil {
+	started := filepath.Join(tmp, "ls-tree-started")
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nif [ \"$1\" = ls-tree ]; then\n  : > \"$AFS_LS_TREE_STARTED\"\n  exec sleep 10\nfi\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AFS_LS_TREE_STARTED", started)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	ctx, cancel := gittest.ExpireOnFile(context.Background(), started)
 	defer cancel()
-	err := streamTreeRecords(ctx, filepath.Join(tmp, "repo.git"), "HEAD", func(string) {})
+	store := New(nil)
+	defer store.Close()
+	err := store.streamTreeRecords(ctx, filepath.Join(tmp, "repo.git"), "HEAD", func(string) {})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("streamTreeRecords error = %v, want deadline exceeded", err)
 	}

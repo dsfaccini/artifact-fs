@@ -23,7 +23,7 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 	var blobOIDs []string
 	blobIndex := map[string][]int{} // oid -> indices into nodes
 	var parseErr error
-	if err := streamTreeRecords(ctx, repo.GitDir, headOID, func(line string) {
+	if err := s.streamTreeRecords(ctx, repo.GitDir, headOID, func(line string) {
 		n, typ, ok := parseTreeRecord(repo.ID, line)
 		if !ok {
 			if parseErr == nil {
@@ -62,8 +62,8 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 	return addImplicitDirs(repo.ID, nodes), nil
 }
 
-func streamTreeRecords(ctx context.Context, gitDir string, headOID string, fn func(string)) error {
-	env, err := lazyFetchEnv(ctx, gitDir, nil)
+func (s *Store) streamTreeRecords(ctx context.Context, gitDir string, headOID string, fn func(string)) error {
+	env, err := s.lazyFetchEnv()
 	if err != nil {
 		return err
 	}

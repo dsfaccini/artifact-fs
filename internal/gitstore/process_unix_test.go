@@ -222,6 +222,79 @@ func TestNetworkGitRunsSSHWithoutTerminal(t *testing.T) {
 	}
 }
 
+// git clone applies a core.sshCommand that a conditional include sets for the
+// repository it creates, such as one that picks a deploy key by remote URL.
+func TestCloneKeepsAnIncludedCoreSSHCommand(t *testing.T) {
+	gittest.IsolatePrompts(t)
+	fakeSSHOnPath(t)
+	tmp := t.TempDir()
+	t.Setenv(sshSessionReportEnv, filepath.Join(tmp, "plain-ssh"))
+	runs := filepath.Join(tmp, "deploy-ssh-runs")
+	deploySSH := filepath.Join(tmp, "deploy-ssh")
+	if err := os.WriteFile(deploySSH, []byte("#!/bin/sh\necho \"$*\" >> '"+runs+"'\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	include := filepath.Join(tmp, "deploy.inc")
+	if err := os.WriteFile(include, []byte("[core]\n\tsshCommand = "+deploySSH+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	global := filepath.Join(tmp, "global")
+	if err := os.WriteFile(global, []byte("[includeIf \"hasconfig:remote.*.url:ssh://git@corp.invalid/**\"]\n\tpath = "+include+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store.gitRetryDelays = nil
+	defer store.Close()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: filepath.Join(tmp, "x.git")}, RepoSpec: model.RepoSpec{RemoteURL: "ssh://git@corp.invalid/repo.git", Branch: "refs/heads/main"}}
+	if err := store.CloneBlobless(t.Context(), cfg); err == nil {
+		t.Fatal("cloned through an SSH command that fails")
+	}
+	if _, err := os.Stat(runs); err != nil {
+		t.Fatalf("the clone did not run the core.sshCommand its included config sets: %v", err)
+	}
+}
+
+// A Store writes its SSH wrapper again when a temp cleaner removes it, as one
+// can under a long-running daemon, and removes it on Close.
+func TestSSHWrapperLastsUntilClose(t *testing.T) {
+	gittest.IsolatePrompts(t)
+	fakeSSHOnPath(t)
+	tmp := t.TempDir()
+	gitDir, _, _ := partialClone(t, tmp, "blob:none")
+	run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", "ssh://git@example.invalid/repo.git")
+	report := filepath.Join(tmp, "ssh-session")
+	t.Setenv(sshSessionReportEnv, report)
+	store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store.gitRetryDelays = nil
+	defer store.Close()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}}
+	fetch := func() {
+		t.Helper()
+		if err := os.Remove(report); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if err := store.FetchNonInteractive(t.Context(), cfg); err == nil {
+			t.Fatal("fetched through an SSH command that fails")
+		}
+		for _, contact := range readSSHContacts(t, report) {
+			if !contact.batchMode {
+				t.Fatal("ssh ran without BatchMode=yes")
+			}
+		}
+	}
+	fetch()
+	if err := os.RemoveAll(store.sshWrapperDir); err != nil {
+		t.Fatal(err)
+	}
+	fetch()
+	dir := store.sshWrapperDir
+	store.Close()
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Close left the SSH wrapper's directory: %v", err)
+	}
+}
+
 // An SSH program the environment names runs as the user set it, without
 // BatchMode added.
 func TestNetworkGitKeepsTheEnvironmentsSSHProgram(t *testing.T) {
@@ -343,7 +416,9 @@ func TestBlobToCacheCancellationClosesEscapedDescriptorPipes(t *testing.T) {
 
 func TestStreamTreeRecordsCancellationClosesEscapedDescriptorPipes(t *testing.T) {
 	assertEscapedGitCancellationIsBounded(t, func(ctx context.Context) error {
-		return streamTreeRecords(ctx, t.TempDir(), strings.Repeat("a", 40), func(string) {})
+		store := New(nil)
+		defer store.Close()
+		return store.streamTreeRecords(ctx, t.TempDir(), strings.Repeat("a", 40), func(string) {})
 	})
 }
 
@@ -372,7 +447,7 @@ func assertEscapedGitCancellationIsBounded(t *testing.T, call func(context.Conte
 	}
 	marker := filepath.Join(tmp, "escaped")
 	finished := filepath.Join(tmp, "escaped-finished")
-	script := gittest.FakeGitScript("\"$AFS_TEST_BINARY\" -test.run '^TestRunGitEscapedDescriptorHelper$' &\nwait\n")
+	script := "#!/bin/sh\n\"$AFS_TEST_BINARY\" -test.run '^TestRunGitEscapedDescriptorHelper$' &\nwait\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
