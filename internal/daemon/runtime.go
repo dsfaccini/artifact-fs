@@ -119,6 +119,8 @@ type repoRuntime struct {
 	mfs         fusefs.MountedFS
 	abandoned   fusefs.AbandonedMount
 	headChanges chan struct{}
+	// watcher polls HEAD for headChanges; nil for a fixed base.
+	watcher *watcher.Poller
 	// joinDone closes when the join of the runtime's last mount ends.
 	joinDone chan struct{}
 	// drained closes once a stop finds the runtime's workers and server done.
@@ -593,7 +595,9 @@ func (s *Service) startRepoBackground(rt *repoRuntime) {
 		workerCount = 1
 	} else {
 		rt.headChanges = make(chan struct{}, 1)
+		rt.watcher = watcher.New()
 	}
+	w := rt.watcher
 	rt.workers.Add(workerCount)
 	s.mu.Unlock()
 
@@ -608,10 +612,15 @@ func (s *Service) startRepoBackground(rt *repoRuntime) {
 			s.headReconcileLoop(rt)
 		}()
 
-		w := watcher.New(500 * time.Millisecond)
 		go func() {
 			defer rt.workers.Done()
-			w.Watch(rt.ctx, gitDir, func() {
+			ticks := s.headPollTicks
+			if ticks == nil {
+				ticker := time.NewTicker(headPollInterval)
+				defer ticker.Stop()
+				ticks = ticker.C
+			}
+			w.Watch(rt.ctx, gitDir, ticks, func() {
 				s.signalHEADReconcile(rt)
 			})
 		}()

@@ -52,6 +52,43 @@ func TestResolveHEADAndBuildTreeIndex(t *testing.T) {
 	}
 }
 
+// A HEAD write between ResolveHEAD's reads must not pair one state's commit
+// with the other state's ref.
+func TestResolveHEADPairsTheCommitWithItsRef(t *testing.T) {
+	t.Parallel()
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", "--initial-branch", "main", repo)
+	commit := func(message string) string {
+		t.Helper()
+		run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", message)
+		return strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	}
+	mainOID := commit("main")
+	featureOID := commit("feature")
+	run(t, "git", "-C", repo, "update-ref", "refs/heads/feature", featureOID)
+	run(t, "git", "-C", repo, "update-ref", "refs/heads/main", mainOID)
+
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
+	store := New(nil)
+	switched := false
+	store.testHookBetweenHEADReads = func() {
+		if !switched {
+			switched = true
+			run(t, "git", "-C", repo, "symbolic-ref", "HEAD", "refs/heads/feature")
+		}
+	}
+	oid, ref, err := store.ResolveHEAD(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("ResolveHEAD: %v", err)
+	}
+	if !switched {
+		t.Fatal("ResolveHEAD never ran the hook between its reads")
+	}
+	if oid != featureOID || ref != "feature" {
+		t.Fatalf("ResolveHEAD = %q, %q; want %q, feature (main is %q)", oid, ref, featureOID, mainOID)
+	}
+}
+
 func TestBuildTreeIndexPropagatesBatchCancellation(t *testing.T) {
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "bin")
