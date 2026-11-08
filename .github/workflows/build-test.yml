@@ -97,7 +97,7 @@ jobs:
         # user's mount does.
         user: [root, non-root]
         # TEMPORARY: hang demos and GitConcurrentReads repro shards.
-        mode: [hang-demo-fast, repro-1, repro-2, repro-3, repro-4, repro-5, repro-6]
+        mode: [repro-1, repro-2, repro-3, repro-4, repro-5, repro-6]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
