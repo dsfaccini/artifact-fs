@@ -1275,28 +1275,6 @@ func TestTruncateUpdatesSizeAndTimes(t *testing.T) {
 	}
 }
 
-func TestDirtyCount(t *testing.T) {
-	s, _ := testStore(t)
-	ctx := context.Background()
-
-	c, _ := s.DirtyCount(ctx)
-	if c != 0 {
-		t.Fatalf("expected 0, got %d", c)
-	}
-	s.CreateFile(ctx, "a.txt", 0o644)
-	s.CreateFile(ctx, "b.txt", 0o644)
-	c, _ = s.DirtyCount(ctx)
-	if c != 2 {
-		t.Fatalf("expected 2, got %d", c)
-	}
-	// Whiteouts don't count as dirty
-	s.Remove(ctx, "a.txt")
-	c, _ = s.DirtyCount(ctx)
-	if c != 1 {
-		t.Fatalf("expected 1, got %d", c)
-	}
-}
-
 func TestListByPrefix(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()

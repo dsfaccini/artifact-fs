@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -57,10 +58,12 @@ func persistedStatus(ctx context.Context, cfg model.RepoConfig, rec model.RepoRu
 	if !rec.LastFetchAt.IsZero() || rec.LastFetchResult != "" {
 		st.LastFetchAt, st.LastFetchResult = rec.LastFetchAt, rec.LastFetchResult
 	}
+	var snap *snapshot.Store
 	if cfg.MetaDBPath != "" {
-		if snap, err := snapshot.New(ctx, cfg.MetaDBPath); err == nil {
+		if s, err := snapshot.New(ctx, cfg.MetaDBPath); err == nil {
+			snap = s
+			defer snap.Close()
 			st.PublishedHEADOID, st.PublishedHEADRef, st.PublishedGeneration, _ = snap.ReadState(ctx)
-			snap.Close()
 		}
 	}
 	st.CurrentHEADOID, st.CurrentHEADRef, st.SnapshotGeneration = st.PublishedHEADOID, st.PublishedHEADRef, st.PublishedGeneration
@@ -70,9 +73,8 @@ func persistedStatus(ctx context.Context, cfg model.RepoConfig, rec model.RepoRu
 	if cfg.OverlayDBPath != "" {
 		if _, statErr := os.Stat(cfg.OverlayDBPath); statErr == nil {
 			if db, err := meta.OpenDB(cfg.OverlayDBPath); err == nil {
-				var count int64
-				if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM overlay_entries WHERE kind <> 'delete'`).Scan(&count); err == nil {
-					st.DirtyOverlay = count > 0
+				if dirty, err := overlayDirty(ctx, db, snap, st.SnapshotGeneration); err == nil {
+					st.DirtyOverlay = dirty
 				}
 				db.Close()
 			}
@@ -117,4 +119,34 @@ func applyHydrationStats(st *model.RepoRuntimeState, cacheDir string) {
 	stats, _ := blobcache.ReadStats(cacheDir)
 	st.HydratedBlobCount = stats.Blobs
 	st.HydratedBlobBytes = stats.Bytes
+}
+
+// overlayDirty reports whether the overlay in db changes generation gen of
+// snap: whether it holds an entry that is not a delete, or a delete of a path
+// gen has. Every unlink records a delete, also of a path only the overlay
+// held, such as an editor's swap file, and such a delete changes nothing.
+// Without snap or gen, every delete counts.
+func overlayDirty(ctx context.Context, db *sql.DB, snap *snapshot.Store, gen int64) (bool, error) {
+	var changed bool
+	if err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM overlay_entries WHERE kind <> ?)`, model.OverlayKindDelete).Scan(&changed); err != nil || changed {
+		return changed, err
+	}
+	rows, err := db.QueryContext(ctx, `SELECT path FROM overlay_entries WHERE kind = ?`, model.OverlayKindDelete)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if snap == nil || gen == 0 {
+			return true, nil
+		}
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return false, err
+		}
+		if _, ok, err := snap.LookupNode(ctx, gen, path); err != nil || ok {
+			return ok, err
+		}
+	}
+	return false, rows.Err()
 }
