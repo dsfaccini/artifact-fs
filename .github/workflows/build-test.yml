@@ -87,7 +87,7 @@ jobs:
         run: go test -race -count=1 ./...
 
   fuse-e2e:
-    name: fuse-e2e (${{ matrix.user }}, ${{ matrix.mode }})
+    name: fuse-e2e (${{ matrix.user }})
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
@@ -96,8 +96,6 @@ jobs:
         # As non-root, the mount goes through the setuid fusermount3, as a
         # user's mount does.
         user: [root, non-root]
-        # TEMPORARY: hang demos and GitConcurrentReads repro shards.
-        mode: [repro-1, repro-2, repro-3, repro-4, repro-5, repro-6]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -150,27 +148,18 @@ jobs:
           go test -race -c -o "$RUNNER_TEMP/artifact-fs-e2e.test" .
           as_user=()
           if [ "${{ matrix.user }}" = root ]; then
-            as_user=(sudo --preserve-env=AFS_RUN_E2E_TESTS,AFS_TEMPORARY_HANG)
+            as_user=(sudo --preserve-env=AFS_RUN_E2E_TESTS)
           fi
           # A hang can stop the binary's -test.timeout panic from printing, so a
           # watchdog dumps every goroutine a minute after that timeout. The job
           # timeout must leave room for both.
-          bin=$RUNNER_TEMP/artifact-fs-e2e.test
-          case "${{ matrix.mode }}" in
-          hang-demo-fast)
-            export AFS_TEMPORARY_HANG=1
-            "${as_user[@]}" .github/scripts/run-with-hang-dump.sh 120 "$bin" \
-              -test.count=1 -test.run '^TestE2ETemporaryHang$' -test.timeout=1m -test.v
-            ;;
-          hang-demo)
-            export AFS_TEMPORARY_HANG=1
-            "${as_user[@]}" .github/scripts/run-with-hang-dump.sh 180 "$bin" \
-              -test.count=1 -test.run '^TestFUSEMountSmoke$' -test.timeout=2m -test.v
-            "${as_user[@]}" .github/scripts/run-with-hang-dump.sh 1260 "$bin" \
-              -test.count=1 -test.run '^TestE2ETemporaryHang$' -test.timeout=20m -test.v
-            ;;
-          repro-*)
-            "${as_user[@]}" .github/scripts/run-with-hang-dump.sh 660 "$bin" \
-              -test.count=60 -test.run '^TestE2ESharedMount$/^(GitCleanState|GitConcurrentReads)$' -test.timeout=10m -test.v
-            ;;
-          esac
+          "${as_user[@]}" .github/scripts/run-with-hang-dump.sh 180 "$RUNNER_TEMP/artifact-fs-e2e.test" \
+            -test.count=1 \
+            -test.run '^TestFUSEMountSmoke$' \
+            -test.timeout=2m \
+            -test.v
+          "${as_user[@]}" .github/scripts/run-with-hang-dump.sh 1260 "$RUNNER_TEMP/artifact-fs-e2e.test" \
+            -test.count=1 \
+            -test.run '^TestE2E' \
+            -test.timeout=20m \
+            -test.v
