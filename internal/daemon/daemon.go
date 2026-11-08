@@ -18,6 +18,7 @@ const DefaultHydrationConcurrency = 4
 
 const (
 	defaultPrepareTimeout    = 30 * time.Minute
+	headPollInterval         = 500 * time.Millisecond
 	headReconcileMinBackoff  = time.Second
 	headReconcileMaxBackoff  = 30 * time.Second
 	prepareStateWriteTimeout = 5 * time.Second
@@ -154,6 +155,9 @@ type Service struct {
 	// syncInterval is how often Start polls the registry; zero means
 	// registrySyncInterval.
 	syncInterval time.Duration
+	// headPollTicks, when set, times each HEAD watcher's polls in place of a
+	// ticker every headPollInterval.
+	headPollTicks <-chan time.Time
 	// records holds what recordRuntime last wrote for each repo. recordMu
 	// serializes the writes, and is taken before mu.
 	recordMu sync.Mutex

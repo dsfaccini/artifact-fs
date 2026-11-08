@@ -5,7 +5,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 func TestLinkedWorktreeLooseAndPackedReferences(t *testing.T) {
@@ -38,7 +37,7 @@ func TestLinkedWorktreeLooseAndPackedReferences(t *testing.T) {
 			packed := filepath.Join(common, "packed-refs")
 			write(head, "ref: refs/heads/main\n")
 			write(loose, "commit-1\n")
-			poller := New(time.Second)
+			poller := New()
 			if poller.headChanged(head) {
 				t.Fatal("startup must prime state")
 			}
@@ -100,7 +99,7 @@ func TestLinkedWorktreeLooseAndPackedReferences(t *testing.T) {
 		git("-C", primary, "branch", "other")
 		git("-C", primary, "worktree", "add", "-q", "-b", "topic", linked)
 		head := filepath.Join(primary, ".git", "worktrees", "linked", "HEAD")
-		poller := New(time.Second)
+		poller := New()
 		if poller.headChanged(head) {
 			t.Fatal("startup must prime state")
 		}
@@ -148,7 +147,7 @@ func TestLinkedWorktreePrivateReferenceNamespace(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	poller := New(time.Second)
+	poller := New()
 	head := filepath.Join(gitDir, "HEAD")
 	if poller.headChanged(head) {
 		t.Fatal("startup must prime state")

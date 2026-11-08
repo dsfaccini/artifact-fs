@@ -27,10 +27,12 @@ func TestWatchTriggersOnHeadChange(t *testing.T) {
 	}
 
 	synctest.Test(t, func(t *testing.T) {
-		p := New(5 * time.Millisecond)
+		p := New()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
 		ctx := t.Context()
 		changed := make(chan struct{}, 1)
-		go p.Watch(ctx, gitDir, func() {
+		go p.Watch(ctx, gitDir, ticker.C, func() {
 			select {
 			case changed <- struct{}{}:
 			default:
@@ -69,10 +71,12 @@ func TestWatchTriggersOnCurrentBranchAdvance(t *testing.T) {
 	}
 
 	synctest.Test(t, func(t *testing.T) {
-		p := New(5 * time.Millisecond)
+		p := New()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
 		ctx := t.Context()
 		changed := make(chan struct{}, 1)
-		go p.Watch(ctx, gitDir, func() {
+		go p.Watch(ctx, gitDir, ticker.C, func() {
 			select {
 			case changed <- struct{}{}:
 			default:
@@ -114,7 +118,7 @@ func TestHeadChangedPrimesNewBranchRef(t *testing.T) {
 		t.Fatalf("write feature ref: %v", err)
 	}
 
-	p := New(5 * time.Millisecond)
+	p := New()
 	if p.headChanged(headPath) {
 		t.Fatal("initial poll should only prime state")
 	}
@@ -149,7 +153,7 @@ func TestHeadChangedTreatsFirstLooseRefAppearanceAsChange(t *testing.T) {
 		t.Fatalf("write main ref: %v", err)
 	}
 
-	p := New(5 * time.Millisecond)
+	p := New()
 	if p.headChanged(headPath) {
 		t.Fatal("initial poll should only prime state")
 	}
@@ -180,7 +184,7 @@ func TestHeadChangedTreatsPackedStartupRefAppearanceAsChange(t *testing.T) {
 		t.Fatalf("write HEAD: %v", err)
 	}
 
-	p := New(5 * time.Millisecond)
+	p := New()
 	if p.headChanged(headPath) {
 		t.Fatal("initial poll should only prime state")
 	}
@@ -210,7 +214,7 @@ func TestHeadChangedDetectsRefContentChangeWithSameMtime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := New(time.Second)
+	p := New()
 	if p.headChanged(headPath) {
 		t.Fatal("initial poll should prime state")
 	}
@@ -237,10 +241,12 @@ func TestWatchIgnoresIndexOnlyChanges(t *testing.T) {
 	}
 
 	synctest.Test(t, func(t *testing.T) {
-		p := New(5 * time.Millisecond)
+		p := New()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
 		ctx := t.Context()
 		changed := make(chan struct{}, 1)
-		go p.Watch(ctx, gitDir, func() {
+		go p.Watch(ctx, gitDir, ticker.C, func() {
 			select {
 			case changed <- struct{}{}:
 			default:
