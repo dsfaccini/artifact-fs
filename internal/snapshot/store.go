@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 
 	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -107,12 +108,23 @@ func (s *Store) PublishGeneration(ctx context.Context, headOID string, ref strin
 	return gen, nil
 }
 
-func (s *Store) PruneGenerations(ctx context.Context, keepFrom int64) error {
+// PruneGenerations deletes the generations below keepFrom, except those in
+// keep.
+func (s *Store) PruneGenerations(ctx context.Context, keepFrom int64, keep ...int64) error {
 	if keepFrom <= 1 {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM base_nodes WHERE generation < ?`, keepFrom)
-	return err
+	from := int64(0)
+	for _, kept := range append(slices.Sorted(slices.Values(keep)), keepFrom) {
+		to := min(kept, keepFrom)
+		if from < to {
+			if _, err := s.db.ExecContext(ctx, `DELETE FROM base_nodes WHERE generation >= ? AND generation < ?`, from, to); err != nil {
+				return err
+			}
+		}
+		from = max(from, to+1)
+	}
+	return nil
 }
 
 func (s *Store) CurrentGeneration(ctx context.Context) (int64, error) {
