@@ -160,7 +160,8 @@ type InodeRef struct {
 	Overlay   bool
 	// Stale says the inode is retired: its path came back changed, another
 	// inode took it, or an op through the mount removed it. Ops on it return
-	// ESTALE.
+	// ESTALE, except what the content its handles hold serves: a getattr, a
+	// read, and a write or setattr of their own copy.
 	Stale bool
 	// CreateOpenPending says a CreateFile made the inode and no OpenFile or
 	// write has reached it since. The next OpenFile skips the permission
@@ -1393,7 +1394,7 @@ func (fs *ArtifactFuse) setInodeAttributes(ctx context.Context, op *fuseops.SetI
 	return fs.sharedUnlessUnmapped(ctx, func(ctx context.Context, b *Blobs, exclusive bool) error {
 		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 		if err != nil {
-			return err
+			return fs.setPinnedAttributes(op, checkPermissions)
 		}
 		if ref.Path == ".git" {
 			return syscall.EPERM
@@ -1433,6 +1434,87 @@ func (fs *ArtifactFuse) setInodeAttributes(ctx context.Context, op *fuseops.SetI
 		op.AttributesExpiration = attrExpiry(CacheTTL)
 		return nil
 	})
+}
+
+// setPinnedAttributes changes the attributes of a retired inode whose handles
+// an unlink or a rename over its path pinned to their own copy. POSIX applies
+// an ftruncate, fchmod or futimens through a descriptor to its open file, so
+// a size truncates the copy, an mtime becomes the copy's, and permission bits
+// go to InodeRef.Mode, where heldAttrs reads them. It answers with heldAttrs,
+// and returns ESTALE for an inode with no pinned handle, whose handles read
+// content no setattr may change. checkPermissions is as in setInodeAttributes.
+func (fs *ArtifactFuse) setPinnedAttributes(op *fuseops.SetInodeAttributesOp, checkPermissions bool) error {
+	fs.mu.RLock()
+	ref := fs.inodes[op.Inode]
+	var mode uint32
+	if ref != nil {
+		mode = ref.Mode
+	}
+	var pinned []*FileHandle
+	for _, fh := range fs.fileHandles {
+		fh.mu.Lock()
+		if fh.inode.ID == op.Inode && fh.detached && fh.pinned && fh.cacheFile != nil {
+			pinned = append(pinned, fh)
+		}
+		fh.mu.Unlock()
+	}
+	fs.mu.RUnlock()
+	if ref == nil || len(pinned) == 0 {
+		return syscall.ESTALE
+	}
+	if op.Size != nil && checkPermissions && !fs.handleWritable(op.Handle) {
+		if err := checkOwnerAccess(mode, ownerWrite); err != nil {
+			return err
+		}
+	}
+	for _, fh := range pinned {
+		if err := fh.setCopyAttributes(op.Size, op.Mtime); err != nil {
+			return err
+		}
+	}
+	if op.Mode != nil {
+		fs.mu.Lock()
+		ref.Mode = ref.Mode&^0o777 | uint32(op.Mode.Perm())
+		fs.mu.Unlock()
+	}
+	attrs, ok := fs.heldAttrs(op.Inode)
+	if !ok {
+		return syscall.ESTALE
+	}
+	op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
+	op.AttributesExpiration = attrExpiry(CacheTTL)
+	return nil
+}
+
+// setCopyAttributes truncates fh's own copy to size and sets its mtime, each
+// unless nil. No reply reports the copy's atime, so it takes the mtime too.
+// The copy keeps the mtime to the microsecond. A handle released meanwhile
+// holds no copy, and gets no change.
+func (fh *FileHandle) setCopyAttributes(size *uint64, mtime *time.Time) error {
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	f := fh.cacheFile
+	if f == nil {
+		return nil
+	}
+	if size != nil {
+		if err := f.Truncate(int64(*size)); err != nil {
+			return err
+		}
+	}
+	if mtime == nil {
+		return nil
+	}
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	tv := syscall.NsecToTimeval(mtime.UnixNano())
+	var futimesErr error
+	if err := rc.Control(func(fd uintptr) { futimesErr = syscall.Futimes(int(fd), []syscall.Timeval{tv, tv}) }); err != nil {
+		return err
+	}
+	return futimesErr
 }
 
 func (fs *ArtifactFuse) ForgetInode(_ context.Context, op *fuseops.ForgetInodeOp) error {

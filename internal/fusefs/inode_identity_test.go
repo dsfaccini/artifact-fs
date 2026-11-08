@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/dsfaccini/fuse/fuseops"
@@ -1722,6 +1723,132 @@ func TestGetattrOfHeldInodeAnswersFromItsContent(t *testing.T) {
 			t.Fatalf("getattr of the unlinked file = size %d, %v; want %d, the size of its own copy", op.Attributes.Size, err, len(data))
 		}
 	})
+}
+
+// POSIX applies ftruncate, fchmod and futimens through a descriptor to its
+// open file. After an unlink of an open file's path, or a rename over it,
+// through the mount, the file's handles hold their own copy, so a setattr of
+// the retired inode changes that copy, and a getattr and a read through the
+// handle show the change. Linux sends the handle only with an ftruncate.
+func TestSetattrOfUnlinkedOpenFileChangesItsCopy(t *testing.T) {
+	size := uint64(4)
+	mode := os.FileMode(0o600)
+	mtime := time.Unix(1_700_000_000, 123_456_000)
+	for _, removal := range []string{"unlink", "rename over"} {
+		for _, c := range []struct {
+			name    string
+			op      fuseops.SetInodeAttributesOp
+			handle  bool
+			attr    func(fuseops.InodeAttributes) any
+			want    any
+			content string
+		}{
+			{"ftruncate", fuseops.SetInodeAttributesOp{Size: &size}, true, func(a fuseops.InodeAttributes) any { return a.Size }, size, "blob"},
+			{"fchmod", fuseops.SetInodeAttributesOp{Mode: &mode}, false, func(a fuseops.InodeAttributes) any { return a.Mode.Perm() }, mode, "blob-AAAA"},
+			{"futimens", fuseops.SetInodeAttributesOp{Atime: &mtime, Mtime: &mtime}, false, func(a fuseops.InodeAttributes) any { return a.Mtime.UnixNano() }, mtime.UnixNano(), "blob-AAAA"},
+		} {
+			t.Run(removal+"/"+c.name, func(t *testing.T) {
+				f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644))
+				held := f.lookup(fuseops.RootInodeID, "file.txt")
+				open := f.open(held)
+				var err error
+				if removal == "unlink" {
+					err = f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"})
+				} else {
+					create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "other.txt", Mode: 0o644}
+					if err := f.fs.CreateFile(f.ctx, create); err != nil {
+						t.Fatal(err)
+					}
+					if err := f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+						t.Fatal(err)
+					}
+					err = f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "other.txt", NewParent: fuseops.RootInodeID, NewName: "file.txt"})
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				op := c.op
+				op.Inode = held
+				if c.handle {
+					op.Handle = &open.Handle
+				}
+				if err := f.fs.SetInodeAttributes(f.ctx, &op); err != nil {
+					t.Fatalf("%s of the open file after the %s = %v", c.name, removal, err)
+				}
+				get := &fuseops.GetInodeAttributesOp{Inode: held}
+				if err := f.fs.GetInodeAttributes(f.ctx, get); err != nil {
+					t.Fatalf("getattr of the open file after the %s = %v", c.name, err)
+				}
+				if got := c.attr(op.Attributes); got != c.want {
+					t.Fatalf("%s replied %v, want %v", c.name, got, c.want)
+				}
+				if got := c.attr(get.Attributes); got != c.want {
+					t.Fatalf("getattr after the %s = %v, want %v", c.name, got, c.want)
+				}
+				if got := mustReadHandle(t, f, held, open.Handle); got != c.content || get.Attributes.Size != uint64(len(got)) {
+					t.Fatalf("after the %s, the handle reads %q and getattr reports size %d; want %q", c.name, got, get.Attributes.Size, c.content)
+				}
+			})
+		}
+	}
+}
+
+// On an FSKit mount, artifact-fs checks permissions itself. A truncate of an
+// unlinked open file whose copy a chmod made 0444 fails with EACCES when it
+// does not come through a handle that may write, as it does for a file a path
+// names.
+func TestTruncateOfReadOnlyUnlinkedCopyChecksPermissions(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	open := f.open(held)
+	if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	checking := permissionCheckingFS{f.fs}
+	ro := os.FileMode(0o444)
+	if err := checking.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: held, Mode: &ro}); err != nil {
+		t.Fatalf("fchmod of the unlinked open file = %v", err)
+	}
+	zero := uint64(0)
+	if got := kernelErrno(checking.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: held, Handle: &open.Handle, Size: &zero})); got != syscall.EACCES {
+		t.Fatalf("ftruncate through the read-only handle = errno %v, want EACCES", got)
+	}
+	if got := mustReadHandle(t, f, held, open.Handle); got != "blob-AAAA" {
+		t.Fatalf("the handle reads %q, want blob-AAAA kept", got)
+	}
+}
+
+// A retired inode whose handles hold no copy of their own, such as one whose
+// path came back changed, keeps what its handles read: a setattr of it
+// returns ESTALE and changes neither its content nor its attributes.
+func TestSetattrOfRetiredInodeWithoutOwnCopyReturnsESTALE(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	open := f.open(held)
+	mustReadHandle(t, f, held, open.Handle)
+	for _, nodes := range [][]model.BaseNode{nil, {baseFile("file.txt", "blob-BBBBBBBB", 0o100644)}} {
+		f.switchTo(nodes...)
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	size := uint64(2)
+	mode := os.FileMode(0o600)
+	for name, op := range map[string]*fuseops.SetInodeAttributesOp{
+		"ftruncate": {Inode: held, Handle: &open.Handle, Size: &size},
+		"fchmod":    {Inode: held, Mode: &mode},
+	} {
+		if got := kernelErrno(f.fs.SetInodeAttributes(f.ctx, op)); got != syscall.ESTALE {
+			t.Errorf("%s of the retired inode = errno %v, want ESTALE", name, got)
+		}
+	}
+	get := &fuseops.GetInodeAttributesOp{Inode: held}
+	if err := f.fs.GetInodeAttributes(f.ctx, get); err != nil || get.Attributes.Mode.Perm() != 0o644 {
+		t.Fatalf("getattr of the retired inode = mode %v, %v; want 0644", get.Attributes.Mode.Perm(), err)
+	}
+	if got := mustReadHandle(t, f, held, open.Handle); got != "blob-AAAA" {
+		t.Fatalf("the handle reads %q, want blob-AAAA", got)
+	}
 }
 
 // An unlink of a path, or a rename over it, can arrive with no lookup first
