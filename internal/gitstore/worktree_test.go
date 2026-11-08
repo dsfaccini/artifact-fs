@@ -47,8 +47,9 @@ func TestConfigureStatusOptimizationDoesNotWriteIndex(t *testing.T) {
 	}
 }
 
-// A daemon configures the hook again while Git may run it. The new hook
-// replaces the file by rename, so the file a Git opened stays whole.
+// A daemon configures the hook again while Git may run it. The new hook goes
+// to a file beside it and replaces it by rename, so until the rename the hook
+// path is the whole old hook, which a Git can exec, and after it the new one.
 func TestReconfiguringTheFSMonitorHookLeavesTheOpenHookWhole(t *testing.T) {
 	tmp := t.TempDir()
 	repo := filepath.Join(tmp, "repo")
@@ -75,8 +76,21 @@ func TestReconfiguringTheFSMonitorHookLeavesTheOpenHookWhole(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	renaming := false
+	store.testHookBeforeHookRename = func(path string) {
+		renaming = true
+		current, err := os.Stat(path)
+		if err != nil {
+			t.Errorf("hook path before the rename: %v", err)
+		} else if !os.SameFile(before, current) {
+			t.Error("the hook path left the old hook before the new one was renamed over it")
+		}
+	}
 	if err := store.ConfigureFSMonitorHook(t.Context(), cfg, tmp); err != nil {
 		t.Fatal(err)
+	}
+	if !renaming {
+		t.Fatal("reconfiguring wrote the hook without a rename over it")
 	}
 	after, err := os.Stat(hookPath)
 	if err != nil {
