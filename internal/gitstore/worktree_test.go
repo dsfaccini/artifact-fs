@@ -445,6 +445,47 @@ func TestBootstrapCleanIndexForFSMonitorMarksItsHookQuery(t *testing.T) {
 	}
 }
 
+// The bootstrap makes the private worktree whose hooks Git runs under the
+// Store's temp directory, not in the system temp directory.
+func TestBootstrapCleanIndexForFSMonitorKeepsItsWorktreeInTheStoreTempDir(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	oid := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	run(t, "git", "-C", repo, "read-tree", "HEAD")
+	dir := t.TempDir()
+	shared, private := filepath.Join(dir, "shared"), filepath.Join(dir, "private")
+	if err := errors.Join(os.Mkdir(shared, 0o777), os.Chmod(shared, 0o777), os.Mkdir(private, 0o700)); err != nil {
+		t.Fatal(err)
+	}
+	sharedListing, privateListing, hook := filepath.Join(dir, "shared-listing"), filepath.Join(dir, "private-listing"), filepath.Join(dir, "fsmonitor")
+	// The hook runs while the bootstrap's private worktree exists.
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nls -A \"$TMPDIR\" > '"+sharedListing+"'\nls -A '"+private+"' > '"+privateListing+"'\nprintf 'token\\0/\\0'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "config", "core.fsmonitor", hook)
+	t.Setenv("TMPDIR", shared)
+	store := New(nil)
+	store.SetTempDir(private)
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}}
+	if bootstrapped, err := store.BootstrapCleanIndexForFSMonitor(t.Context(), cfg, oid, nil); err != nil || !bootstrapped {
+		t.Fatalf("BootstrapCleanIndexForFSMonitor = %v, %v; want true, nil", bootstrapped, err)
+	}
+	if got, err := os.ReadFile(sharedListing); err != nil || len(got) != 0 {
+		t.Fatalf("the system temp directory held %q during the bootstrap, %v; want nothing", got, err)
+	}
+	got, err := os.ReadFile(privateListing)
+	if name, ok := strings.CutSuffix(string(got), "\n"); err != nil || !ok || !strings.HasPrefix(name, "artifact-fs-index-worktree-") || strings.Contains(name, "\n") {
+		t.Fatalf("the Store's temp directory held %q during the bootstrap, %v; want one private worktree", got, err)
+	}
+}
+
 func TestBootstrapCleanIndexForFSMonitorSkipsConversionAttributes(t *testing.T) {
 	t.Parallel()
 	for _, attribute := range []string{"eol=crlf", "crlf", "filter=convert", "ident", "working-tree-encoding=UTF-16"} {

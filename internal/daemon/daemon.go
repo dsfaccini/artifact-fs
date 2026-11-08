@@ -212,9 +212,10 @@ func newCore(ctx context.Context, root string, logger *slog.Logger) (*core, erro
 	if err != nil {
 		return nil, err
 	}
-	c := &core{root: root, logger: logger, registry: reg, git: gitstore.New(logger)}
-	c.git.SetBatchPoolSize(DefaultHydrationConcurrency)
-	return c, nil
+	git := gitstore.New(logger)
+	git.SetTempDir(filepath.Join(root, "config", "tmp"))
+	git.SetBatchPoolSize(DefaultHydrationConcurrency)
+	return &core{root: root, logger: logger, registry: reg, git: git}, nil
 }
 
 // Close releases the controller's registry and git processes.

@@ -132,9 +132,10 @@ kill $DAEMON_PID
 ArtifactFS creates the state root and its subdirectories with mode `0700`, and
 narrows existing subdirectories to `0700`. It refuses a state root, or one of
 its subdirectories, that another user owns or that group or others can write:
-the state root holds the hydrated blobs that reads serve, and the fsmonitor
-hook of each clone in its default git dir, which Git runs on every
-`git status`. A state root may be a symlink the current user owns. ArtifactFS
+the state root holds the hydrated blobs that reads serve, the fsmonitor hook of
+each clone in its default git dir, which Git runs on every `git status`, and,
+in `config/tmp`, the SSH wrapper and other files that ArtifactFS's Git commands
+run. A state root may be a symlink the current user owns. ArtifactFS
 resolves it at startup and builds the paths of repos it registers from the
 resolved path. Repos registered before that keep the paths they stored.
 

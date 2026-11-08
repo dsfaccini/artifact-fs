@@ -258,8 +258,8 @@ func TestCloneKeepsAnIncludedCoreSSHCommand(t *testing.T) {
 	}
 }
 
-// A Store writes its SSH wrapper again when a temp cleaner removes it, as one
-// can under a long-running daemon, and removes it on Close.
+// A Store writes its SSH wrapper again when something removes it, as a temp
+// cleaner can in the system temp directory, and removes it on Close.
 func TestSSHWrapperLastsUntilClose(t *testing.T) {
 	gittest.IsolatePrompts(t)
 	fakeSSHOnPath(t)

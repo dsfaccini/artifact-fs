@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"golang.org/x/sys/unix"
 )
@@ -91,6 +92,41 @@ func TestStateRootDirectoriesArePrivate(t *testing.T) {
 		if !visited[filepath.FromSlash(dir)] {
 			t.Errorf("state directory %s was not created", dir)
 		}
+	}
+}
+
+// The SSH wrapper that Git runs lives under the state root, which
+// ensureStateRoot checks, and not in the system temp directory.
+func TestSSHWrapperLivesUnderTheStateRoot(t *testing.T) {
+	gittest.IsolatePrompts(t)
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	runCmd(t, "git", "init", "--initial-branch", "main", remote)
+	commitFile(t, remote, "README.md", "main\n")
+	bin, shared := filepath.Join(tmp, "bin"), filepath.Join(tmp, "shared")
+	if err := errors.Join(os.Mkdir(bin, 0o700), os.WriteFile(filepath.Join(bin, "ssh"), []byte("#!/bin/sh\nexit 255\n"), 0o700), os.Mkdir(shared, 0o777), os.Chmod(shared, 0o777)); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TMPDIR", shared)
+	ctl, err := NewController(t.Context(), filepath.Join(tmp, "state"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctl.Close()
+	if err := ctl.AddRepo(t.Context(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main"}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("the system temp directory holds %s; want nothing", entries[0].Name())
+	}
+	wrappers, err := filepath.Glob(filepath.Join(ctl.root, "config", "tmp", "artifact-fs-ssh-*", "ssh"))
+	if err != nil || len(wrappers) != 1 {
+		t.Fatalf("SSH wrappers under the state root = %q, %v; want one", wrappers, err)
 	}
 }
 
