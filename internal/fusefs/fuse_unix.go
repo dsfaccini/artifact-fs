@@ -2251,7 +2251,7 @@ type mountedFSWrapper struct {
 func (m *mountedFSWrapper) Backend() string { return m.backend }
 
 func (m *mountedFSWrapper) InvalidateChanged() error {
-	return m.fs.invalidateChanged(m.backend != BackendFSKit && os.Getenv("AFS_E2E_PROOF_NO_INVALIDATION") == "")
+	return m.fs.invalidateChanged(m.backend != BackendFSKit)
 }
 
 // fuseMount is fuse.MountContext. Package tests replace it so they cannot mount.
