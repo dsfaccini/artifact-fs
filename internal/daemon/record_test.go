@@ -144,8 +144,8 @@ func TestStatusReportsAnExitedFUSEServer(t *testing.T) {
 	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
-	// The join records the serve failure, then the runtime's state in a
-	// second write, so the test reads status once the join ended.
+	// The join records the serve failure on its own goroutine, so the test
+	// reads status once the join ended.
 	joined := make(chan struct{})
 	var joinOnce sync.Once
 	svc.joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
@@ -156,6 +156,33 @@ func TestStatusReportsAnExitedFUSEServer(t *testing.T) {
 	<-joined
 	if st := requireFailure(t, ctl, phaseServe, "lost"); st.State != repoStateDegraded {
 		t.Fatalf("state = %q, want degraded", st.State)
+	}
+}
+
+// The join records a lost connection with the state it leaves in one write,
+// so no status shows the failure with the state from before it.
+func TestStatusShowsALostConnectionWithTheStateItLeaves(t *testing.T) {
+	t.Parallel()
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("connection lost")}
+	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
+		return mfs, nil
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	recorded := make(chan model.RepoRuntimeState, 1)
+	svc.joinRecorded = func() {
+		st, err := ctl.Status(ctx, "repo")
+		if err != nil {
+			t.Error(err)
+		}
+		recorded <- st
+	}
+	close(mfs.exit)
+	if st := <-recorded; st.LastErrorPhase != phaseServe || st.State != repoStateDegraded || st.Phase != phaseMount {
+		t.Fatalf("status once the lost connection was recorded = %+v, want degraded in the mount phase with the serve failure", st)
 	}
 }
 
@@ -389,7 +416,8 @@ func TestStatusKeepsAConnectionFailureAtStart(t *testing.T) {
 	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
-	// The daemon records the started runtime only after the connection failed.
+	// The runtime finishes starting only after the join recorded the
+	// failed connection.
 	svc.runtimeStarted = func() {
 		waitFor(t, nil, func() bool {
 			svc.mu.Lock()
@@ -407,6 +435,26 @@ func TestStatusKeepsAConnectionFailureAtStart(t *testing.T) {
 	}
 	if st.State != repoStateDegraded || st.LastErrorPhase != phaseServe || st.MountError != "connection lost" {
 		t.Fatalf("status after the connection failed at start = %+v, want degraded with the serve failure", st)
+	}
+}
+
+// Status reports a mount once the mount serves, before the runtime finishes
+// starting: the mount point serves while the daemon configures Git.
+func TestStatusReportsAMountBeforeTheRuntimeFinishesStarting(t *testing.T) {
+	t.Parallel()
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	var st model.RepoRuntimeState
+	var stErr error
+	svc.runtimeStarted = func() { st, stErr = ctl.Status(ctx, "repo") }
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if stErr != nil {
+		t.Fatal(stErr)
+	}
+	if st.State != repoStateMounted || st.Phase != phaseServe || st.ServedGeneration == 0 {
+		t.Fatalf("status while the mounted runtime starts = %+v, want mounted and serving", st)
 	}
 }
 

@@ -1237,9 +1237,8 @@ func TestFailedPreparationStaysFailedWhenItsMountEnds(t *testing.T) {
 	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
-	// The join records the serve failure, then the runtime's state in a
-	// second write. A status between the two shows the failure with the
-	// phase before it, so the test reads status once the join ended.
+	// The join records the serve failure on its own goroutine, so the test
+	// reads status once the join ended.
 	joined := make(chan struct{})
 	var joinOnce sync.Once
 	svc.joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
@@ -1591,5 +1590,117 @@ func TestRuntimeStartResetsTheMountBackoff(t *testing.T) {
 	st := requireFailure(t, ctl, phaseMount, "refused")
 	if delay := st.NextRetryAt.Sub(st.LastErrorAt); delay > mountRetryMin+time.Second {
 		t.Fatalf("mount retry delay after the runtime started = %s, want %s", delay, mountRetryMin)
+	}
+}
+
+// byPathMountTable stands in for the kernel's mount table at one mount point
+// and for the fuse library's mounts there. A mount's Unmount unmounts the
+// mount point by path, as fuse.MountedFileSystem.Unmount does, so it unmounts
+// whichever mount the mount point holds then.
+type byPathMountTable struct {
+	mu     sync.Mutex
+	held   *byPathMount
+	mounts int
+	calls  []string
+}
+
+// byPathMount is a mount in a byPathMountTable. Its connection fails once
+// fail closes, and its server exits once it is unmounted.
+type byPathMount struct {
+	table      *byPathMountTable
+	n          int
+	fail, gone chan struct{}
+}
+
+func (t *byPathMountTable) mount(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.mounts++
+	t.held = &byPathMount{table: t, n: t.mounts, fail: make(chan struct{}), gone: make(chan struct{})}
+	t.calls = append(t.calls, "mount "+strconv.Itoa(t.held.n))
+	return t.held, nil
+}
+
+func (t *byPathMountTable) mountPointEntry(string) (mountEntry, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return mountEntry{}, t.held != nil
+}
+
+// current is the mount the mount point holds.
+func (t *byPathMountTable) current() *byPathMount {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.held
+}
+
+func (t *byPathMountTable) recorded() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return slices.Clone(t.calls)
+}
+
+func (m *byPathMount) Backend() string          { return "fake" }
+func (m *byPathMount) InvalidateChanged() error { return nil }
+
+func (m *byPathMount) Join(ctx context.Context) error {
+	select {
+	case <-m.fail:
+		return errors.New("readMessage: transport failed")
+	case <-m.gone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *byPathMount) Unmount(context.Context) error {
+	t := m.table
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.held == nil {
+		return &os.PathError{Op: "unmount", Path: "/mnt/repo", Err: syscall.EINVAL}
+	}
+	t.calls = append(t.calls, "unmount "+strconv.Itoa(t.held.n))
+	close(t.held.gone)
+	t.held = nil
+	return nil
+}
+
+// A sync that finds a failed connection's mount mounts again only after the
+// join's unmount of the dead mount, which unmounts the mount point by path.
+// So that unmount never takes down the remount.
+func TestFailedConnectionsUnmountLeavesTheRemount(t *testing.T) {
+	t.Parallel()
+	svc, _ := newSyncedDaemon(t)
+	ctx := context.Background()
+	table := &byPathMountTable{}
+	svc.mount = table.mount
+	svc.mountPointEntry = table.mountPointEntry
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	unmountsDone := func() bool {
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		return len(svc.unmounting) == 0
+	}
+	resynced := make(chan struct{})
+	var once sync.Once
+	svc.joinRecorded = func() {
+		once.Do(func() {
+			// A sync finds the mount failed and no unmount of it running.
+			waitFor(t, nil, unmountsDone)
+			if err := svc.syncRepos(ctx); err != nil {
+				t.Error(err)
+			}
+			close(resynced)
+		})
+	}
+	close(table.current().fail)
+	<-resynced
+	waitFor(t, nil, unmountsDone)
+	if got, want := table.recorded(), []string{"mount 1", "unmount 1", "mount 2"}; !slices.Equal(got, want) {
+		t.Fatalf("mount table calls = %q, want %q: the dead mount's unmount took down the remount", got, want)
 	}
 }

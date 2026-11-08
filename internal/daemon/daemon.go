@@ -113,13 +113,15 @@ type Service struct {
 	// mountTimeout bounds the wait for one FUSE mount; zero means mountTimeout.
 	mountTimeout         time.Duration
 	hydrationConcurrency int
-	// Test hooks, nil in production. runtimeStarted runs between starting a
-	// runtime and recording it. mountReleased runs in a join goroutine after
-	// it released a FUSE mount whose server exited cleanly, before it records
-	// the exit. joinFinished runs as a join goroutine ends. readyRecorded runs
+	// Test hooks, nil in production. runtimeStarted runs as startRuntime
+	// returns, after the runtime's first mount attempt. mountReleased runs in
+	// a join goroutine after it released a FUSE mount whose server exited
+	// cleanly, before it records the exit. joinRecorded runs in a join
+	// goroutine once it recorded how the connection ended and released
+	// recordMu. joinFinished runs as a join goroutine ends. readyRecorded runs
 	// after an async preparation persisted ready, before it activates the
 	// runtime.
-	runtimeStarted, mountReleased, joinFinished, readyRecorded func()
+	runtimeStarted, mountReleased, joinRecorded, joinFinished, readyRecorded func()
 	// headReconcileBackoff is the first retry delay after a failed HEAD
 	// reconcile; zero means headReconcileMinBackoff.
 	headReconcileBackoff time.Duration
