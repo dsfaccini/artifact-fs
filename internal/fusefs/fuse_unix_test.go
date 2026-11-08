@@ -6,10 +6,14 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -40,26 +44,10 @@ type localOverlayFuseFixture struct {
 func newLocalOverlayFuseFixture(t *testing.T) localOverlayFuseFixture {
 	t.Helper()
 	ctx := context.Background()
-	tmp := t.TempDir()
-	repo := model.RepoPaths{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
-	store, err := overlaystore.New(ctx, repo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	for _, path := range []string{"src", "src/nested"} {
-		if err := store.Mkdir(ctx, path, 0o755); err != nil {
-			t.Fatalf("Mkdir(%q): %v", path, err)
-		}
-	}
-	if _, err := store.CreateFile(ctx, "src/nested/value.txt", 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.WriteFile(ctx, "src/nested/value.txt", 0, []byte("overlay content")); err != nil {
-		t.Fatal(err)
-	}
-	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{}, kids: map[string][]model.BaseNode{}}, Overlay: store}
-	resolver.SetGeneration(1)
+	store := newOverlay(t, "src/", "src/nested/")
+	writeOverlayFile(t, store, "src/nested/value.txt", "overlay content")
+	repo := model.RepoPaths{ID: "repo"}
+	resolver := newResolver(&fakeSnapshot{}, store)
 	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: store}
 	fs := NewArtifactFuse(repo, engine)
 	lookup := func(parent fuseops.InodeID, name string) fuseops.InodeID {
@@ -209,18 +197,6 @@ func TestCanceledContextRenamesOverlayDirectory(t *testing.T) {
 	}
 }
 
-type cancelAtRenameTreeOverlay struct {
-	model.OverlayStore
-	cancel context.CancelFunc
-	called bool
-}
-
-func (o *cancelAtRenameTreeOverlay) RenameTree(ctx context.Context, oldPath, newPath string, sourceBasePaths, destinationBasePaths []string) error {
-	o.called = true
-	o.cancel()
-	return o.OverlayStore.RenameTree(ctx, oldPath, newPath, sourceBasePaths, destinationBasePaths)
-}
-
 type failingLookupOverlay struct {
 	model.OverlayStore
 	err error
@@ -228,218 +204,6 @@ type failingLookupOverlay struct {
 
 func (o *failingLookupOverlay) Lookup(context.Context, string) (model.OverlayEntry, bool, error) {
 	return model.OverlayEntry{}, false, o.err
-}
-
-func TestCanceledDuringRenameTreeKeepsNamespaceAndHandlesInSync(t *testing.T) {
-	f := newLocalOverlayFuseFixture(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	overlay := &cancelAtRenameTreeOverlay{OverlayStore: f.store, cancel: cancel}
-	f.resolver.Overlay = overlay
-	f.engine.Overlay = overlay
-	fileOpen := &fuseops.OpenFileOp{Inode: f.fileInode}
-	if err := f.fs.OpenFile(context.Background(), fileOpen); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: fileOpen.Handle})
-	})
-	dirOpen := &fuseops.OpenDirOp{Inode: f.nestInode}
-	if err := f.fs.OpenDir(context.Background(), dirOpen); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = f.fs.ReleaseDirHandle(context.Background(), &fuseops.ReleaseDirHandleOp{Handle: dirOpen.Handle})
-	})
-	op := &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "src", NewParent: fuseops.RootInodeID, NewName: "dst"}
-	if err := f.fs.Rename(ctx, op); err != nil {
-		t.Fatalf("Rename: %v", err)
-	}
-	if !overlay.called || !errors.Is(ctx.Err(), context.Canceled) {
-		t.Fatalf("RenameTree called=%t, ctx.Err()=%v", overlay.called, ctx.Err())
-	}
-	if _, err := f.resolver.ResolvePath("src"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("source resolve error = %v, want not exist", err)
-	}
-	if _, err := f.resolver.ResolvePath("dst/nested/value.txt"); err != nil {
-		t.Fatalf("destination resolve: %v", err)
-	}
-	if ref, err := f.fs.requireInode(f.srcInode, syscall.ESTALE); err != nil || ref.Path != "dst" {
-		t.Fatalf("source inode = %+v, err = %v", ref, err)
-	}
-	if ref, err := f.fs.requireInode(f.fileInode, syscall.ESTALE); err != nil || ref.Path != "dst/nested/value.txt" {
-		t.Fatalf("file inode = %+v, err = %v", ref, err)
-	}
-	fileHandle, err := f.fs.fileHandle(fileOpen.Handle)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fileHandle.mu.Lock()
-	handlePath := fileHandle.path
-	fileHandle.mu.Unlock()
-	if handlePath != "dst/nested/value.txt" {
-		t.Fatalf("file handle path = %q", handlePath)
-	}
-	dirHandle, err := f.fs.dirHandle(dirOpen.Handle)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if dirHandle.inode.Path != "dst/nested" {
-		t.Fatalf("directory handle path = %q", dirHandle.inode.Path)
-	}
-}
-
-func TestCanceledHydrationInterruptsRenameBeforeMutation(t *testing.T) {
-	tmp := t.TempDir()
-	repo := model.RepoPaths{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
-	store, err := overlaystore.New(context.Background(), repo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	base := model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 4}
-	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{base.Path: base}}, Overlay: store}
-	resolver.SetGeneration(1)
-	hydrator := &blockingRenameHydrator{
-		fakeBatchHydrator: &fakeBatchHydrator{},
-		started:           make(chan struct{}),
-		proceed:           make(chan struct{}),
-	}
-	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: store, Hydrator: hydrator}
-	fs := NewArtifactFuse(repo, engine)
-	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: base.Path}
-	if err := fs.LookUpInode(context.Background(), lookup); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- fs.Rename(ctx, &fuseops.RenameOp{
-			OldParent: fuseops.RootInodeID, OldName: "file.txt",
-			NewParent: fuseops.RootInodeID, NewName: "renamed.txt",
-		})
-	}()
-	<-hydrator.started
-	cancel()
-	if err := <-done; kernelErrno(err) != syscall.EINTR {
-		t.Fatalf("Rename after canceled hydration = %v, want EINTR", err)
-	}
-	if _, err := resolver.ResolvePath("file.txt"); err != nil {
-		t.Fatalf("source resolve after interrupted rename: %v", err)
-	}
-	if _, err := resolver.ResolvePath("renamed.txt"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("destination resolve after interrupted rename = %v, want not exist", err)
-	}
-	entries, err := store.ListAll(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("interrupted rename left overlay entries: %+v", entries)
-	}
-	if got := fs.pathToInode["file.txt"]; got != lookup.Entry.Child {
-		t.Fatalf("source inode mapping = %d, want %d", got, lookup.Entry.Child)
-	}
-	if _, ok := fs.pathToInode["renamed.txt"]; ok {
-		t.Fatal("interrupted rename allocated a destination inode mapping")
-	}
-}
-
-func TestCanceledDestinationHydrationInterruptsRenameBeforeMutation(t *testing.T) {
-	tmp := t.TempDir()
-	repo := model.RepoPaths{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
-	store, err := overlaystore.New(context.Background(), repo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	sourceBlob := filepath.Join(tmp, "source-blob")
-	if err := os.WriteFile(sourceBlob, []byte("data"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	source := model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "source-blob", SizeState: "known", SizeBytes: 4}
-	destination := model.BaseNode{RepoID: repo.ID, Path: "renamed.txt", Type: "file", Mode: 0o100644, ObjectOID: "destination-blob", SizeState: "known", SizeBytes: 4}
-	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{source.Path: source, destination.Path: destination}}, Overlay: store}
-	resolver.SetGeneration(1)
-	destinationBlob := filepath.Join(tmp, "destination-blob")
-	if err := os.WriteFile(destinationBlob, []byte("dest"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	hydrator := &fakeBatchHydrator{pathsByOID: map[string]string{source.ObjectOID: sourceBlob, destination.ObjectOID: destinationBlob}}
-	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: store, Hydrator: hydrator}
-	fs := NewArtifactFuse(repo, engine)
-	// A handle open on the destination makes Rename copy the destination into the overlay.
-	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: destination.Path}
-	if err := fs.LookUpInode(context.Background(), lookup); err != nil {
-		t.Fatal(err)
-	}
-	open := &fuseops.OpenFileOp{Inode: lookup.Entry.Child}
-	if err := fs.OpenFile(context.Background(), open); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: open.Handle})
-	})
-	// The source blob is cached; the destination fetch observes the canceled request.
-	hydrator.errorsByOID = map[string]error{destination.ObjectOID: context.Canceled}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	err = fs.Rename(ctx, &fuseops.RenameOp{
-		OldParent: fuseops.RootInodeID, OldName: source.Path,
-		NewParent: fuseops.RootInodeID, NewName: destination.Path,
-	})
-	if kernelErrno(err) != syscall.EINTR {
-		t.Fatalf("Rename after canceled destination hydration = %v, want EINTR", err)
-	}
-	for _, path := range []string{source.Path, destination.Path} {
-		if n, err := resolver.ResolvePath(path); err != nil || n.FromOverlay {
-			t.Fatalf("%s after interrupted rename = (%+v, %v), want base entry", path, n, err)
-		}
-	}
-	entries, err := store.ListAll(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("interrupted rename left overlay entries: %+v", entries)
-	}
-}
-
-func TestCanceledHydrationInterruptsOpenFile(t *testing.T) {
-	tmp := t.TempDir()
-	repo := model.RepoPaths{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
-	store, err := overlaystore.New(context.Background(), repo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	base := model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 4}
-	resolver := &Resolver{Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{base.Path: base}}, Overlay: store}
-	resolver.SetGeneration(1)
-	hydrator := &blockingRenameHydrator{
-		fakeBatchHydrator: &fakeBatchHydrator{},
-		started:           make(chan struct{}),
-		proceed:           make(chan struct{}),
-	}
-	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: store, Hydrator: hydrator}
-	fs := NewArtifactFuse(repo, engine)
-	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: base.Path}
-	if err := fs.LookUpInode(context.Background(), lookup); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	err = fs.OpenFile(ctx, &fuseops.OpenFileOp{Inode: lookup.Entry.Child})
-	if kernelErrno(err) != syscall.EINTR {
-		t.Fatalf("OpenFile after canceled hydration = %v, want EINTR", err)
-	}
-	select {
-	case <-hydrator.started:
-	default:
-		t.Fatal("OpenFile did not reach hydration")
-	}
-	if len(fs.fileHandles) != 0 {
-		t.Fatalf("canceled OpenFile allocated handles: %+v", fs.fileHandles)
-	}
 }
 
 func TestCanceledContextDoesNotHideOverlayStorageFailure(t *testing.T) {
@@ -456,31 +220,55 @@ func TestCanceledContextDoesNotHideOverlayStorageFailure(t *testing.T) {
 	}
 }
 
-func TestInodeAttrsPreservesSeparateTimes(t *testing.T) {
+// A base entry's times are the HEAD commit's, or the generation's while the
+// commit time is unknown. An overlay entry keeps its mtime and ctime apart,
+// and an overlay directory chmodded to 0 keeps permission bits 0.
+func TestGetInodeAttributesReportsEachEntrysTimesAndMode(t *testing.T) {
+	f := newCacheFixture(t, baseFile("base.txt", "base", 0o100644))
+	var root fuseops.InodeID = fuseops.RootInodeID
+	getattr := func(inode fuseops.InodeID) fuseops.InodeAttributes {
+		t.Helper()
+		op := &fuseops.GetInodeAttributesOp{Inode: inode}
+		if err := f.fs.GetInodeAttributes(f.ctx, op); err != nil {
+			t.Fatal(err)
+		}
+		return op.Attributes
+	}
+	base := f.lookup(root, "base.txt")
+	for commitTime, want := range map[int64]time.Time{0: time.Unix(f.resolver.Generation(), 0), 1_700_000_000: time.Unix(1_700_000_000, 0)} {
+		f.resolver.SetCommitTime(commitTime)
+		if got := getattr(base); !got.Mtime.Equal(want) || !got.Ctime.Equal(want) {
+			t.Fatalf("base.txt at commit time %d: mtime %v, ctime %v; want both %v", commitTime, got.Mtime, got.Ctime, want)
+		}
+	}
+
+	create := &fuseops.CreateFileOp{Parent: root, Name: "new.txt", Mode: 0o644}
+	if err := f.fs.CreateFile(f.ctx, create); err != nil {
+		t.Fatal(err)
+	}
 	mtime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
-	ctime := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+	if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Mtime: &mtime}); err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := lookupOverlay(t, f.resolver.Overlay, "new.txt")
+	if !ok {
+		t.Fatal("new.txt is not in the overlay")
+	}
+	ctime := time.Unix(0, entry.CtimeUnixNs)
+	if got := getattr(create.Entry.Child); !got.Mtime.Equal(mtime) || !got.Atime.Equal(mtime) || !got.Ctime.Equal(ctime) || ctime.Equal(mtime) {
+		t.Fatalf("new.txt: atime %v, mtime %v, ctime %v; want atime and mtime %v and the overlay's ctime %v", got.Atime, got.Mtime, got.Ctime, mtime, ctime)
+	}
 
-	attr := inodeAttrs(0o644, 12, "file", mtime, ctime)
-	if !attr.Atime.Equal(mtime) {
-		t.Fatalf("atime = %v, want %v", attr.Atime, mtime)
+	mkdir := &fuseops.MkDirOp{Parent: root, Name: "dir", Mode: os.ModeDir | 0o755}
+	if err := f.fs.MkDir(f.ctx, mkdir); err != nil {
+		t.Fatal(err)
 	}
-	if !attr.Mtime.Equal(mtime) {
-		t.Fatalf("mtime = %v, want %v", attr.Mtime, mtime)
+	noAccess := os.ModeDir
+	if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: mkdir.Entry.Child, Mode: &noAccess}); err != nil {
+		t.Fatal(err)
 	}
-	if !attr.Ctime.Equal(ctime) {
-		t.Fatalf("ctime = %v, want %v", attr.Ctime, ctime)
-	}
-}
-
-func TestInodeAttrsPreservesExplicitZeroDirMode(t *testing.T) {
-	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
-
-	attr := inodeAttrs(0, 4096, "dir", now, now)
-	if attr.Mode.Perm() != 0 {
-		t.Fatalf("mode perms = %#o, want 0", attr.Mode.Perm())
-	}
-	if !attr.Mode.IsDir() {
-		t.Fatalf("expected directory mode, got %#o", attr.Mode)
+	if got := getattr(mkdir.Entry.Child).Mode; got != os.ModeDir {
+		t.Fatalf("dir mode after chmod 0 = %v, want a directory with permission bits 0", got)
 	}
 }
 
@@ -540,69 +328,6 @@ func TestSyntheticAttributesRemainStable(t *testing.T) {
 	}
 }
 
-func TestDetachedFileHandleRemainsReadableWritableAndSyncable(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "unlinked")
-	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	fh := &FileHandle{path: "file.txt", cacheFile: f, cacheGeneration: -1, detached: true, pinned: true}
-	fs := &ArtifactFuse{fileHandles: map[fuseops.HandleID]*FileHandle{1: fh}}
-
-	write := &fuseops.WriteFileOp{Handle: 1, Offset: 0, Data: []byte("after!")}
-	if err := fs.WriteFile(context.Background(), write); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	read := &fuseops.ReadFileOp{Handle: 1, Offset: 0, Size: 6}
-	if err := fs.ReadFile(context.Background(), read); err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	if got := string(read.Data[0]); got != "after!" {
-		t.Fatalf("read = %q, want after!", got)
-	}
-	if err := fs.SyncFile(context.Background(), &fuseops.SyncFileOp{Handle: 1}); err != nil {
-		t.Fatalf("SyncFile: %v", err)
-	}
-	if err := fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: 1}); err != nil {
-		t.Fatalf("ReleaseFileHandle: %v", err)
-	}
-}
-
-func TestWriteThroughOpenedBaseHandlePromotesAndWrites(t *testing.T) {
-	cachePath := filepath.Join(t.TempDir(), "blob")
-	if err := os.WriteFile(cachePath, []byte("base"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	repo := model.RepoPaths{ID: "repo"}
-	base := model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "file", Mode: 0o644, ObjectOID: "blob", SizeState: "known", SizeBytes: 4}
-	snap := &fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": base}}
-	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
-	resolver := newResolver(snap, ov)
-	h := &fakeLookupHydrator{size: 4, path: cachePath}
-	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: ov, Hydrator: h}
-	fs := NewArtifactFuse(repo, engine)
-	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "file.txt"}
-	if err := fs.LookUpInode(context.Background(), lookup); err != nil {
-		t.Fatal(err)
-	}
-	open := &fuseops.OpenFileOp{Inode: lookup.Entry.Child}
-	if err := fs.OpenFile(context.Background(), open); err != nil {
-		t.Fatal(err)
-	}
-	if err := fs.WriteFile(context.Background(), &fuseops.WriteFileOp{Inode: lookup.Entry.Child, Handle: open.Handle, Data: []byte("local")}); err != nil {
-		t.Fatal(err)
-	}
-	if ov.writes != 1 || string(ov.data) != "local" {
-		t.Fatalf("overlay writes = %d, data = %q", ov.writes, ov.data)
-	}
-}
-
 func TestSetInodeAttributesAppliesExecutableBit(t *testing.T) {
 	cachePath := filepath.Join(t.TempDir(), "blob")
 	if err := os.WriteFile(cachePath, []byte("base"), 0o644); err != nil {
@@ -610,9 +335,9 @@ func TestSetInodeAttributesAppliesExecutableBit(t *testing.T) {
 	}
 	repo := model.RepoPaths{ID: "repo"}
 	base := model.BaseNode{RepoID: repo.ID, Path: "script.sh", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 4}
-	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	ov := newOverlay(t)
 	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{base.Path: base}}, ov)
-	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: ov, Hydrator: &fakeLookupHydrator{size: 4, path: cachePath}}
+	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: ov, Hydrator: &fakeHydrator{size: 4, path: cachePath}}
 	fs := NewArtifactFuse(repo, engine)
 	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: base.Path}
 	if err := fs.LookUpInode(context.Background(), lookup); err != nil {
@@ -626,7 +351,7 @@ func TestSetInodeAttributesAppliesExecutableBit(t *testing.T) {
 	if op.Attributes.Mode.Perm() != 0o755 {
 		t.Fatalf("returned mode = %#o, want 0755", op.Attributes.Mode.Perm())
 	}
-	entry, ok := ov.entries[base.Path]
+	entry, ok := lookupOverlay(t, ov, base.Path)
 	if !ok || entry.Mode != 0o100755 {
 		t.Fatalf("overlay entry = %+v, want promoted executable file", entry)
 	}
@@ -634,7 +359,7 @@ func TestSetInodeAttributesAppliesExecutableBit(t *testing.T) {
 
 func TestCreateAndReadOverlaySymlink(t *testing.T) {
 	repo := model.RepoPaths{ID: "repo"}
-	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	ov := newOverlay(t)
 	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{}}, ov)
 	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: ov}
 	fs := NewArtifactFuse(repo, engine)
@@ -655,6 +380,13 @@ func TestCreateAndReadOverlaySymlink(t *testing.T) {
 	}
 	if read.Target != create.Target {
 		t.Fatalf("target = %q, want %q", read.Target, create.Target)
+	}
+	long := &fuseops.CreateSymlinkOp{Parent: fuseops.RootInodeID, Name: "long-link", Target: strings.Repeat("x", model.MaxSymlinkTargetBytes+1)}
+	if err := fs.CreateSymlink(context.Background(), long); kernelErrno(err) != syscall.ENAMETOOLONG {
+		t.Fatalf("CreateSymlink of a %d-byte target = %v, want ENAMETOOLONG", len(long.Target), err)
+	}
+	if _, ok := lookupOverlay(t, ov, "long-link"); ok {
+		t.Fatal("the refused symlink reached the overlay")
 	}
 }
 
@@ -748,7 +480,7 @@ func TestRenameReturnsNativeErrorsBeforeMutatingOverlay(t *testing.T) {
 		"src-file":      {Path: "src-file", Type: "file", Mode: 0o100644},
 		"dst-dir":       {Path: "dst-dir", Type: "dir", Mode: 0o40000},
 	}}
-	overlay := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	overlay := newOverlay(t)
 	resolver := newResolver(snapshot, overlay)
 	engine := &Engine{Resolver: resolver, Overlay: overlay}
 	fs := NewArtifactFuse(model.RepoPaths{ID: "repo"}, engine)
@@ -798,39 +530,39 @@ func TestRenameReturnsNativeErrorsBeforeMutatingOverlay(t *testing.T) {
 	if err := fs.Rename(context.Background(), selfDescendant); kernelErrno(err) != syscall.EINVAL {
 		t.Fatalf("Rename into descendant error = %v, want EINVAL", err)
 	}
-	if len(overlay.entries) != 0 {
-		t.Fatalf("rejected renames mutated overlay: %+v", overlay.entries)
+	if entries, err := overlay.ListAll(context.Background()); err != nil || len(entries) != 0 {
+		t.Fatalf("rejected renames mutated overlay: %+v, %v", entries, err)
 	}
 }
 
 func TestInodeAndHandleCreationWaitForNamespaceMutation(t *testing.T) {
 	for _, test := range []struct {
-		name string
+		op   string
 		call func(*ArtifactFuse) error
 	}{
-		{name: "lookup", call: func(fs *ArtifactFuse) error {
+		{"LookUpInode", func(fs *ArtifactFuse) error {
 			return fs.LookUpInode(context.Background(), &fuseops.LookUpInodeOp{})
 		}},
-		{name: "opendir", call: func(fs *ArtifactFuse) error {
+		{"OpenDir", func(fs *ArtifactFuse) error {
 			return fs.OpenDir(context.Background(), &fuseops.OpenDirOp{})
 		}},
-		{name: "readdirplus", call: func(fs *ArtifactFuse) error {
+		{"ReadDirPlus", func(fs *ArtifactFuse) error {
 			return fs.ReadDirPlus(context.Background(), &fuseops.ReadDirPlusOp{})
 		}},
-		{name: "open", call: func(fs *ArtifactFuse) error {
+		{"OpenFile", func(fs *ArtifactFuse) error {
 			return fs.OpenFile(context.Background(), &fuseops.OpenFileOp{})
 		}},
-		{name: "setattr", call: func(fs *ArtifactFuse) error {
+		{"SetInodeAttributes", func(fs *ArtifactFuse) error {
 			return fs.SetInodeAttributes(context.Background(), &fuseops.SetInodeAttributesOp{})
 		}},
-		{name: "mkdir", call: func(fs *ArtifactFuse) error {
+		{"MkDir", func(fs *ArtifactFuse) error {
 			return fs.MkDir(context.Background(), &fuseops.MkDirOp{})
 		}},
-		{name: "rmdir", call: func(fs *ArtifactFuse) error {
+		{"RmDir", func(fs *ArtifactFuse) error {
 			return fs.RmDir(context.Background(), &fuseops.RmDirOp{})
 		}},
 	} {
-		t.Run(test.name, func(t *testing.T) {
+		t.Run(test.op, func(t *testing.T) {
 			fs := &ArtifactFuse{}
 			fs.handleOps.Lock()
 			done := make(chan struct{})
@@ -838,10 +570,8 @@ func TestInodeAndHandleCreationWaitForNamespaceMutation(t *testing.T) {
 				_ = test.call(fs)
 				close(done)
 			}()
-			select {
-			case <-done:
+			if !waitParked(done, "sync.(*RWMutex).", "(*Engine).Do", "(*ArtifactFuse)."+test.op) {
 				t.Fatal("operation did not wait for namespace mutation")
-			case <-time.After(25 * time.Millisecond):
 			}
 			fs.handleOps.Unlock()
 			<-done
@@ -857,7 +587,7 @@ func TestRootInodeAttributesUseStableResolverAttrsWhenReady(t *testing.T) {
 			Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{
 				".": {Path: ".", Type: "dir", Mode: 0o755, SizeBytes: 4096},
 			}},
-			Overlay: &fakeOverlay{entries: map[string]model.OverlayEntry{}},
+			Overlay: newOverlay(t),
 		}
 		resolver.SetGeneration(7)
 		resolver.SetCommitTime(1_700_000_000)
@@ -883,35 +613,6 @@ func TestRootInodeAttributesUseStableResolverAttrsWhenReady(t *testing.T) {
 	})
 }
 
-func TestLookUpInodeHydratesUnknownSizeBaseFileAttributes(t *testing.T) {
-	repo := model.RepoPaths{ID: "repo"}
-	base := model.BaseNode{
-		RepoID:    repo.ID,
-		Path:      "file.txt",
-		Type:      "file",
-		Mode:      0o100644,
-		ObjectOID: "blob",
-		SizeState: "unknown",
-	}
-	r := newResolver(
-		&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": base}},
-		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
-	)
-	h := &fakeLookupHydrator{size: 12}
-	fs := NewArtifactFuse(repo, &Engine{Resolver: r, Repo: repo, Hydrator: h})
-	op := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "file.txt"}
-
-	if err := fs.LookUpInode(context.Background(), op); err != nil {
-		t.Fatalf("LookUpInode: %v", err)
-	}
-	if op.Entry.Attributes.Size != uint64(h.size) {
-		t.Fatalf("lookup size = %d, want hydrated size %d", op.Entry.Attributes.Size, h.size)
-	}
-	if h.calls != 1 {
-		t.Fatalf("EnsureHydrated calls = %d, want 1", h.calls)
-	}
-}
-
 func TestGetInodeAttributesHydratesUnknownSizeBaseFileAttributes(t *testing.T) {
 	repo := model.RepoPaths{ID: "repo"}
 	base := model.BaseNode{
@@ -924,9 +625,9 @@ func TestGetInodeAttributesHydratesUnknownSizeBaseFileAttributes(t *testing.T) {
 	}
 	r := newResolver(
 		&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": base}},
-		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
+		newOverlay(t),
 	)
-	h := &fakeLookupHydrator{size: 12}
+	h := &fakeHydrator{size: 12}
 	fs := NewArtifactFuse(repo, &Engine{Resolver: r, Repo: repo, Hydrator: h})
 	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "file.txt"}
 	if err := fs.LookUpInode(context.Background(), lookup); err != nil {
@@ -958,9 +659,9 @@ func TestGetInodeAttributesHydrationFailureReturnsEIO(t *testing.T) {
 	}
 	r := newResolver(
 		&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": base}},
-		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
+		newOverlay(t),
 	)
-	h := &fakeLookupHydrator{size: 12}
+	h := &fakeHydrator{size: 12}
 	fs := NewArtifactFuse(repo, &Engine{Resolver: r, Repo: repo, Hydrator: h})
 	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "file.txt"}
 	if err := fs.LookUpInode(context.Background(), lookup); err != nil {
@@ -979,7 +680,7 @@ func TestLookUpInodeResolvesUnknownBaseAttributeSizes(t *testing.T) {
 	tests := []struct {
 		name              string
 		base              model.BaseNode
-		overlay           map[string]model.OverlayEntry
+		overlay           string
 		want              uint64
 		wantHydrateCalls  int
 		wantReadBlobCalls int
@@ -990,12 +691,16 @@ func TestLookUpInodeResolvesUnknownBaseAttributeSizes(t *testing.T) {
 			want: 0,
 		},
 		{
-			name: "overlay file",
-			base: model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "unknown"},
-			overlay: map[string]model.OverlayEntry{
-				"file.txt": {Path: "file.txt", Kind: model.OverlayKindModify, Mode: 0o644, SizeBytes: 3},
-			},
-			want: 3,
+			name:             "unknown base file",
+			base:             model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "unknown"},
+			want:             12,
+			wantHydrateCalls: 1,
+		},
+		{
+			name:    "overlay file",
+			base:    model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "unknown"},
+			overlay: "abc",
+			want:    3,
 		},
 		{
 			name: "base dir",
@@ -1012,11 +717,12 @@ func TestLookUpInodeResolvesUnknownBaseAttributeSizes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r := newResolver(
-				&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": tt.base}},
-				&fakeOverlay{entries: tt.overlay},
-			)
-			h := &fakeLookupHydrator{size: 12, data: []byte("package.json")}
+			ov := newOverlay(t)
+			if tt.overlay != "" {
+				writeOverlayFile(t, ov, "file.txt", tt.overlay)
+			}
+			r := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": tt.base}}, ov)
+			h := &fakeHydrator{size: 12, data: []byte("package.json")}
 			fs := NewArtifactFuse(repo, &Engine{Resolver: r, Repo: repo, Hydrator: h})
 			op := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "file.txt"}
 
@@ -1139,12 +845,12 @@ func TestReadsPrefetchEachDirectoryOncePerGeneration(t *testing.T) {
 	}
 	a := model.BaseNode{Path: "src/a.go", Type: "file", Mode: 0o100644, ObjectOID: "a", SizeState: "unknown"}
 	b := model.BaseNode{Path: "src/b.go", Type: "file", Mode: 0o100644, ObjectOID: "b", SizeState: "unknown"}
-	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	ov := newOverlay(t)
 	r := newResolver(&fakeSnapshot{
 		nodes: map[string]model.BaseNode{"src": {Path: "src", Type: "dir", Mode: 0o40755}, a.Path: a, b.Path: b},
 		kids:  map[string][]model.BaseNode{"src": {a, b}},
 	}, ov)
-	h := &fakeBatchHydrator{path: cachePath}
+	h := &fakeHydrator{path: cachePath}
 	engine := &Engine{Resolver: r, Repo: model.RepoPaths{ID: "repo"}, Overlay: ov, Hydrator: h}
 	dst := make([]byte, 16)
 
@@ -1168,7 +874,7 @@ func TestReadsPrefetchEachDirectoryOncePerGeneration(t *testing.T) {
 
 // newPrefetchFixture serves src/a.go and src/b.go, whose sizes are unknown, from
 // a hydrator that records what is queued.
-func newPrefetchFixture(t *testing.T) (*ArtifactFuse, *Engine, *fakeBatchHydrator) {
+func newPrefetchFixture(t *testing.T) (*ArtifactFuse, *Engine, *fakeHydrator) {
 	t.Helper()
 	cachePath := filepath.Join(t.TempDir(), "blob")
 	if err := os.WriteFile(cachePath, []byte("content"), 0o644); err != nil {
@@ -1177,12 +883,12 @@ func newPrefetchFixture(t *testing.T) (*ArtifactFuse, *Engine, *fakeBatchHydrato
 	src := model.BaseNode{Path: "src", Type: "dir", Mode: 0o40755}
 	a := model.BaseNode{Path: "src/a.go", Type: "file", Mode: 0o100644, ObjectOID: "a", SizeState: "unknown"}
 	b := model.BaseNode{Path: "src/b.go", Type: "file", Mode: 0o100644, ObjectOID: "b", SizeState: "unknown"}
-	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	ov := newOverlay(t)
 	r := newResolver(&fakeSnapshot{
 		nodes: map[string]model.BaseNode{src.Path: src, a.Path: a, b.Path: b},
 		kids:  map[string][]model.BaseNode{".": {src}, "src": {a, b}},
 	}, ov)
-	h := &fakeBatchHydrator{path: cachePath}
+	h := &fakeHydrator{path: cachePath}
 	repo := model.RepoPaths{ID: "repo"}
 	engine := &Engine{Resolver: r, Repo: repo, Overlay: ov, Hydrator: h}
 	return NewArtifactFuse(repo, engine), engine, h
@@ -1258,7 +964,7 @@ func TestFirstReadHydratesItsBlobBeforeItPrefetches(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fs, engine, h := newPrefetchFixture(t)
-			rec := &queuedAtOpenHydrator{fakeBatchHydrator: h}
+			rec := &queuedAtOpenHydrator{fakeHydrator: h}
 			engine.Hydrator = rec
 			tt.read(t, fs, engine)
 			if len(h.tasks) != 2 {
@@ -1274,13 +980,13 @@ func TestFirstReadHydratesItsBlobBeforeItPrefetches(t *testing.T) {
 // queuedAtOpenHydrator records how many tasks were queued each time a blob
 // started to hydrate for an open.
 type queuedAtOpenHydrator struct {
-	*fakeBatchHydrator
+	*fakeHydrator
 	queuedAtOpen []int
 }
 
 func (h *queuedAtOpenHydrator) OpenHydrated(ctx context.Context, repo model.RepoPaths, node model.BaseNode) (*os.File, int64, error) {
 	h.queuedAtOpen = append(h.queuedAtOpen, len(h.tasks))
-	return h.fakeBatchHydrator.OpenHydrated(ctx, repo, node)
+	return h.fakeHydrator.OpenHydrated(ctx, repo, node)
 }
 
 // engineBaseCacheFile opens and closes path's base content at generation gen,
@@ -1372,28 +1078,137 @@ func packCount(t *testing.T, gitDir string) int {
 	return len(packs)
 }
 
-func TestReadDirPlusUsesReaddirMetadataWithoutHydration(t *testing.T) {
-	repo := model.RepoPaths{ID: "repo", GitDir: "/tmp/repo.git"}
-	r := newResolver(
-		&fakeSnapshot{kids: map[string][]model.BaseNode{
-			".": {{Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 42}},
-		}},
-		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
-	)
-	h := &fakeLookupHydrator{size: 12}
-	fs := NewArtifactFuse(repo, &Engine{Resolver: r, Repo: repo, Hydrator: h})
-	open := &fuseops.OpenDirOp{Inode: fuseops.RootInodeID}
+// kernelDirent is one entry of a ReadDir or ReadDirPlus reply as the kernel
+// decodes it. Only a ReadDirPlus entry carries the child's size and mode.
+type kernelDirent struct {
+	name   string
+	offset fuseops.DirOffset
+	size   uint64
+	mode   uint32
+}
+
+// decodeDirents decodes a ReadDir reply, or a ReadDirPlus reply when plus is
+// set. Each entry is a fuse_dirent and its name padded to 8 bytes, after a
+// fuse_entry_out for ReadDirPlus. macFUSE's fuse_attr carries crtime and
+// flags, so its mode lies further in and the struct is longer.
+func decodeDirents(buf []byte, plus bool) ([]kernelDirent, error) {
+	const entryOutHeader = 40 // nodeid, generation, and the entry and attribute timeouts
+	const direntHeader = 24   // ino, off, namelen and type
+	attrSize, modeOffset := 88, 60
+	if runtime.GOOS == "darwin" {
+		attrSize, modeOffset = 104, 72
+	}
+	var out []kernelDirent
+	for len(buf) > 0 {
+		var d kernelDirent
+		if plus {
+			if len(buf) < entryOutHeader+attrSize {
+				return out, fmt.Errorf("entry %d: %d bytes left, short of a fuse_entry_out", len(out), len(buf))
+			}
+			attr := buf[entryOutHeader:]
+			d.size = binary.NativeEndian.Uint64(attr[8:])
+			d.mode = binary.NativeEndian.Uint32(attr[modeOffset:])
+			buf = buf[entryOutHeader+attrSize:]
+		}
+		if len(buf) < direntHeader {
+			return out, fmt.Errorf("entry %d: %d bytes left, short of a fuse_dirent", len(out), len(buf))
+		}
+		d.offset = fuseops.DirOffset(binary.NativeEndian.Uint64(buf[8:]))
+		namelen := int(binary.NativeEndian.Uint32(buf[16:]))
+		size := (direntHeader + namelen + 7) &^ 7
+		if len(buf) < size {
+			return out, fmt.Errorf("entry %d: %d bytes left, short of its %d-byte name", len(out), len(buf), namelen)
+		}
+		d.name = string(buf[direntHeader : direntHeader+namelen])
+		buf = buf[size:]
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+// readDirPlus lists dir through ReadDirPlus from offset 0 and decodes the reply.
+func readDirPlus(t *testing.T, fs *ArtifactFuse, dir fuseops.InodeID) map[string]kernelDirent {
+	t.Helper()
+	open := &fuseops.OpenDirOp{Inode: dir}
 	if err := fs.OpenDir(context.Background(), open); err != nil {
 		t.Fatalf("OpenDir: %v", err)
 	}
-	op := &fuseops.ReadDirPlusOp{}
-	op.Handle = open.Handle
-	op.Dst = make([]byte, 4096)
+	op := &fuseops.ReadDirPlusOp{ReadDirOp: fuseops.ReadDirOp{Handle: open.Handle, Dst: make([]byte, 4096)}}
 	if err := fs.ReadDirPlus(context.Background(), op); err != nil {
 		t.Fatalf("ReadDirPlus: %v", err)
 	}
-	if op.BytesRead == 0 {
-		t.Fatal("ReadDirPlus wrote no entries")
+	entries, err := decodeDirents(op.Dst[:op.BytesRead], true)
+	if err != nil {
+		t.Fatalf("ReadDirPlus reply: %v", err)
+	}
+	out := map[string]kernelDirent{}
+	for _, d := range entries {
+		out[d.name] = d
+	}
+	return out
+}
+
+// A listing longer than one reply arrives in pieces, each read starting at
+// the offset of the last entry before it. Joined, the pieces hold each name
+// once.
+func TestReadDirPagesThroughAListingLongerThanItsBuffer(t *testing.T) {
+	var files []model.BaseNode
+	want := []string{".git"}
+	for i := range 20 {
+		files = append(files, baseFile(fmt.Sprintf("file-%02d.txt", i), fmt.Sprintf("blob-%02d", i), 0o100644))
+		want = append(want, files[i].Path)
+	}
+	f := newCacheFixture(t, files...)
+	for _, plus := range []bool{false, true} {
+		open := &fuseops.OpenDirOp{Inode: fuseops.RootInodeID}
+		if err := f.fs.OpenDir(f.ctx, open); err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		var offset fuseops.DirOffset
+		// The bound stops reads that keep restarting at an entry already read.
+		for range len(want) {
+			op := &fuseops.ReadDirPlusOp{ReadDirOp: fuseops.ReadDirOp{Handle: open.Handle, Offset: offset, Dst: make([]byte, 400)}}
+			read := func() error { return f.fs.ReadDir(f.ctx, &op.ReadDirOp) }
+			if plus {
+				read = func() error { return f.fs.ReadDirPlus(f.ctx, op) }
+			}
+			if err := read(); err != nil {
+				t.Fatal(err)
+			}
+			page, err := decodeDirents(op.Dst[:op.BytesRead], plus)
+			if err != nil {
+				t.Fatalf("reply at offset %d: %v", offset, err)
+			}
+			if len(page) == 0 {
+				break
+			}
+			for _, d := range page {
+				got = append(got, d.name)
+			}
+			offset = page[len(page)-1].offset
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("listing read in pieces (ReadDirPlus %t) = %v, want %v", plus, got, want)
+		}
+	}
+}
+
+func TestReadDirPlusUsesReaddirMetadataWithoutHydration(t *testing.T) {
+	repo := model.RepoPaths{ID: "repo", GitDir: "/tmp/repo.git"}
+	file := model.BaseNode{Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 42}
+	script := model.BaseNode{Path: "run.sh", Type: "file", Mode: 0o100755, ObjectOID: "script", SizeState: "known", SizeBytes: 7}
+	r := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{script.Path: script}, kids: map[string][]model.BaseNode{".": {file, script}}}, newOverlay(t))
+	h := &fakeHydrator{size: 12}
+	fs := NewArtifactFuse(repo, &Engine{Resolver: r, Repo: repo, Hydrator: h})
+	entries := readDirPlus(t, fs, fuseops.RootInodeID)
+	for name, want := range map[string]kernelDirent{
+		"file.txt": {name: "file.txt", offset: 2, size: 42, mode: syscall.S_IFREG | 0o644},
+		"run.sh":   {name: "run.sh", offset: 3, size: 7, mode: syscall.S_IFREG | 0o755},
+	} {
+		if got := entries[name]; got != want {
+			t.Fatalf("ReadDirPlus entry %s = %+v, want %+v", name, got, want)
+		}
 	}
 	if h.calls != 0 {
 		t.Fatalf("EnsureHydrated calls = %d, want 0", h.calls)
@@ -1401,31 +1216,30 @@ func TestReadDirPlusUsesReaddirMetadataWithoutHydration(t *testing.T) {
 	if fs.pathToInode["file.txt"] == 0 {
 		t.Fatal("ReadDirPlus did not allocate file inode")
 	}
+	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "run.sh"}
+	if err := fs.LookUpInode(context.Background(), lookup); err != nil {
+		t.Fatal(err)
+	}
+	if got := lookup.Entry.Attributes.Mode; got != 0o755 {
+		t.Fatalf("lookup mode of run.sh = %v, want -rwxr-xr-x", got)
+	}
 }
 
+// ReadDirPlus reports the size the snapshot knows, and 0 for one it does not
+// know, rather than hydrate the blob. MountRepoWithGate leaves READDIRPLUS
+// off, because the kernel would cache that 0.
 func TestReadDirPlusDoesNotHydrateUnknownSizeBaseFile(t *testing.T) {
 	repo := model.RepoPaths{ID: "repo", GitDir: "/tmp/repo.git"}
 	r := newResolver(
 		&fakeSnapshot{kids: map[string][]model.BaseNode{
 			".": {{Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "unknown"}},
 		}},
-		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
+		newOverlay(t),
 	)
-	h := &fakeLookupHydrator{size: 12}
+	h := &fakeHydrator{size: 12}
 	fs := NewArtifactFuse(repo, &Engine{Resolver: r, Repo: repo, Hydrator: h})
-	open := &fuseops.OpenDirOp{Inode: fuseops.RootInodeID}
-	if err := fs.OpenDir(context.Background(), open); err != nil {
-		t.Fatalf("OpenDir: %v", err)
-	}
-	op := &fuseops.ReadDirPlusOp{}
-	op.Handle = open.Handle
-	op.Dst = make([]byte, 4096)
-
-	if err := fs.ReadDirPlus(context.Background(), op); err != nil {
-		t.Fatalf("ReadDirPlus: %v", err)
-	}
-	if op.BytesRead == 0 {
-		t.Fatal("ReadDirPlus wrote no entries")
+	if got, ok := readDirPlus(t, fs, fuseops.RootInodeID)["file.txt"]; !ok || got.size != 0 {
+		t.Fatalf("ReadDirPlus entry file.txt = %+v, %t; want size 0", got, ok)
 	}
 	if h.calls != 0 {
 		t.Fatalf("EnsureHydrated calls = %d, want 0", h.calls)
@@ -1444,9 +1258,9 @@ func TestReadDirPlusContinuesInItsListingGeneration(t *testing.T) {
 			{Path: "d.txt", Type: "file", Mode: 0o100644, SizeState: "known", SizeBytes: 2},
 		}},
 	}}
-	r := &Resolver{Snapshot: snap, Overlay: &fakeOverlay{entries: map[string]model.OverlayEntry{}}}
+	r := &Resolver{Snapshot: snap, Overlay: newOverlay(t)}
 	r.SetGeneration(1)
-	fs := NewArtifactFuse(repo, &Engine{Resolver: r, Repo: repo, Hydrator: &fakeLookupHydrator{}})
+	fs := NewArtifactFuse(repo, &Engine{Resolver: r, Repo: repo, Hydrator: &fakeHydrator{}})
 	open := &fuseops.OpenDirOp{Inode: fuseops.RootInodeID}
 	if err := fs.OpenDir(context.Background(), open); err != nil {
 		t.Fatalf("OpenDir: %v", err)
@@ -1479,9 +1293,9 @@ func TestReadDirPlusDropsLookupWhenEntryDoesNotFit(t *testing.T) {
 		&fakeSnapshot{kids: map[string][]model.BaseNode{
 			".": {{Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 42}},
 		}},
-		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
+		newOverlay(t),
 	)
-	fs := NewArtifactFuse(repo, &Engine{Resolver: r, Repo: repo, Hydrator: &fakeLookupHydrator{}})
+	fs := NewArtifactFuse(repo, &Engine{Resolver: r, Repo: repo, Hydrator: &fakeHydrator{}})
 	open := &fuseops.OpenDirOp{Inode: fuseops.RootInodeID}
 	if err := fs.OpenDir(context.Background(), open); err != nil {
 		t.Fatalf("OpenDir: %v", err)
@@ -1498,42 +1312,6 @@ func TestReadDirPlusDropsLookupWhenEntryDoesNotFit(t *testing.T) {
 	if fs.inodes[fs.pathToInode[".git"]] != nil {
 		t.Fatal("inode lookup leaked for entry that did not fit")
 	}
-}
-
-type fakeLookupHydrator struct {
-	size          int64
-	calls         int
-	readBlobCalls int
-	err           error
-	path          string
-	data          []byte
-}
-
-func (f *fakeLookupHydrator) EnqueueBatch([]model.HydrationTask) {}
-
-func (f *fakeLookupHydrator) EnsureHydrated(_ context.Context, _ model.RepoPaths, _ model.BaseNode) (string, int64, error) {
-	f.calls++
-	if f.err != nil {
-		return "", 0, f.err
-	}
-	return f.path, f.size, nil
-}
-
-func (f *fakeLookupHydrator) OpenHydrated(ctx context.Context, repo model.RepoPaths, node model.BaseNode) (*os.File, int64, error) {
-	path, size, err := f.EnsureHydrated(ctx, repo, node)
-	if err != nil {
-		return nil, 0, err
-	}
-	file, err := os.Open(path)
-	return file, size, err
-}
-
-func (f *fakeLookupHydrator) ReadBlob(_ context.Context, _ model.RepoPaths, _ model.BaseNode, _ int64) ([]byte, error) {
-	f.readBlobCalls++
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.data, nil
 }
 
 func TestReleasingAReaderLeavesAnotherHandlesWritesCoalescing(t *testing.T) {
@@ -1810,17 +1588,6 @@ func TestReadOnlyHandleCannotTruncateReadOnlyFile(t *testing.T) {
 	if data, err := os.ReadFile(e.BackingPath); err != nil || string(data) != "abc" {
 		t.Fatalf("content = %q, %v; want abc kept", data, err)
 	}
-}
-
-// lookupCountingOverlay counts the overlay lookups an op makes.
-type lookupCountingOverlay struct {
-	model.OverlayStore
-	lookups int
-}
-
-func (o *lookupCountingOverlay) Lookup(ctx context.Context, path string) (model.OverlayEntry, bool, error) {
-	o.lookups++
-	return o.OverlayStore.Lookup(ctx, path)
 }
 
 // Only a size change an FSKit mount serves looks the entry's mode up for the

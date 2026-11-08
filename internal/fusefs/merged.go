@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -115,30 +114,6 @@ func (r *Resolver) resolvePath(path string) (ResolvedNode, error) {
 // imply, such as one a HEAD change removed while it held untracked files.
 func implicitDir(path string) model.BaseNode {
 	return model.BaseNode{Path: path, Type: "dir", Mode: 0o755, SizeState: "known"}
-}
-
-func (r *Resolver) Getattr(path string) (mode uint32, size int64, nodeType string, mtime time.Time, ctime time.Time, err error) {
-	r.transition.RLock()
-	defer r.transition.RUnlock()
-	n, err := r.resolvePath(path)
-	if err != nil {
-		return 0, 0, "", time.Time{}, time.Time{}, err
-	}
-	if n.FromOverlay {
-		typ := n.Overlay.NodeType()
-		mt := time.Unix(0, n.Overlay.MtimeUnixNs)
-		ct := time.Unix(0, n.Overlay.CtimeUnixNs)
-		return n.Overlay.Mode, n.Overlay.SizeBytes, typ, mt, ct, nil
-	}
-	mode = normalizeMode(n.Base.Mode, n.Base.Type)
-	// Base files use the HEAD commit timestamp for mtime so tools like
-	// make see a stable, meaningful value.
-	ct := r.CommitTime()
-	if ct == 0 {
-		ct = r.Generation() // fallback: commit time unavailable
-	}
-	mt := time.Unix(ct, 0)
-	return mode, n.Base.SizeBytes, n.Base.Type, mt, mt, nil
 }
 
 // normalizeMode ensures sane permission bits. Git tree entries have mode 040000
