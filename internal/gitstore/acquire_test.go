@@ -651,6 +651,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 		RepoSpec: model.RepoSpec{
 			RemoteURL:      "file://" + bare,
 			Branch:         "refs/heads/main",
+			FetchRef:       "refs/heads/main",
 			RequiredCommit: tip,
 			HistoryDepth:   1,
 		},
@@ -750,8 +751,10 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	if trackingCount != "1" {
 		t.Fatalf("tracking history count after refresh = %q, want 1", trackingCount)
 	}
-	if _, err := runGit(ctx, gitDir, "show-ref", "--verify", "refs/remotes/origin/side"); err == nil {
-		t.Fatal("verified source refresh fetched an unrelated branch")
+	for _, ref := range []string{"refs/remotes/origin/side", "refs/remotes/origin/main"} {
+		if _, err := runGit(ctx, gitDir, "show-ref", "--verify", ref); err == nil {
+			t.Fatalf("verified source refresh fetched %s; the source lands only in %s", ref, verifiedSourceTrackingRef)
+		}
 	}
 	cmd := exec.CommandContext(ctx, "git", "cat-file", "-e", blobOID)
 	cmd.Env = append(os.Environ(), "GIT_DIR="+gitDir, "GIT_NO_LAZY_FETCH=1")
@@ -1129,6 +1132,85 @@ func TestCloneBloblessUsesExactCanonicalTag(t *testing.T) {
 	}
 }
 
+// newFetchFixture is a remote with a main branch and a git dir whose origin
+// is that remote, with Git's default refspec for every branch.
+func newFetchFixture(t *testing.T, tmp string) (work, gitDir string) {
+	t.Helper()
+	bare := filepath.Join(tmp, "origin.git")
+	work = filepath.Join(tmp, "work")
+	gitDir = filepath.Join(tmp, "repo.git")
+	run(t, "git", "init", "--bare", "--initial-branch", "main", bare)
+	run(t, "git", "clone", "-q", bare, work)
+	commit(t, work, "README.md")
+	run(t, "git", "-C", work, "push", "-q", "origin", "HEAD:main")
+	run(t, "git", "init", "-q", "--bare", gitDir)
+	run(t, "git", "--git-dir", gitDir, "remote", "add", "origin", "file://"+bare)
+	return work, gitDir
+}
+
+// commit commits a file named name in work and returns the commit.
+func commit(t *testing.T, work, name string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(work, name), []byte(name+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", work, "add", name)
+	run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", name)
+	return strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
+}
+
+// A fetch ref that is a tag lands where preparation fetches it, also when
+// the tag moves.
+func TestFetchNonInteractiveFetchesATagFetchRef(t *testing.T) {
+	tmp := t.TempDir()
+	work, gitDir := newFetchFixture(t, tmp)
+	commit(t, work, "MOVED.md")
+	run(t, "git", "-C", work, "tag", "v1")
+	run(t, "git", "-C", work, "push", "-q", "origin", "v1")
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{Branch: "refs/heads/main", FetchRef: "refs/tags/v1"}}
+	if err := New(nil).FetchNonInteractive(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	moved := commit(t, work, "AGAIN.md")
+	run(t, "git", "-C", work, "tag", "-f", "v1")
+	run(t, "git", "-C", work, "push", "-q", "-f", "origin", "v1")
+	if err := New(nil).FetchNonInteractive(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", fetchedFullRefRemoteTrackingRef+"^{commit}")); got != moved {
+		t.Fatalf("%s = %s, want the moved tag's %s", fetchedFullRefRemoteTrackingRef, got, moved)
+	}
+}
+
+// With a fetch ref on another branch than the source ref, the fetch also
+// moves origin's source branch, which ComputeAheadBehind compares HEAD with,
+// and still no other branch.
+func TestFetchNonInteractiveFetchesTheSourceBranchOfAnotherFetchRef(t *testing.T) {
+	tmp := t.TempDir()
+	work, gitDir := newFetchFixture(t, tmp)
+	run(t, "git", "-C", work, "checkout", "-q", "-b", "feature")
+	feature := commit(t, work, "FEATURE.md")
+	run(t, "git", "-C", work, "push", "-q", "origin", "feature")
+	run(t, "git", "-C", work, "checkout", "-q", "-b", "other", "main")
+	commit(t, work, "OTHER.md")
+	run(t, "git", "-C", work, "push", "-q", "origin", "other")
+	run(t, "git", "-C", work, "checkout", "-q", "main")
+	main := commit(t, work, "MAIN.md")
+	run(t, "git", "-C", work, "push", "-q", "origin", "main")
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{Branch: "refs/heads/main", FetchRef: "refs/heads/feature"}}
+	if err := New(nil).FetchNonInteractive(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	for ref, want := range map[string]string{"refs/remotes/origin/feature": feature, "refs/remotes/origin/main": main} {
+		if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", ref)); got != want {
+			t.Fatalf("%s = %s, want %s", ref, got, want)
+		}
+	}
+	if _, err := runGit(context.Background(), gitDir, "show-ref", "--verify", "refs/remotes/origin/other"); err == nil {
+		t.Fatal("fetched branch other, which is neither the fetch ref nor the source ref")
+	}
+}
+
 func TestCloneAndFetchRefSkipTags(t *testing.T) {
 	tmp := t.TempDir()
 	bare := filepath.Join(tmp, "origin.git")
@@ -1216,7 +1298,7 @@ func TestFetchStartsBeforeRemoteLookupCompletes(t *testing.T) {
 	script := "#!/bin/sh\n" +
 		"case \"$*\" in\n" +
 		"  'remote get-url origin') sleep 60; : > \"$AFS_LOOKUP_FINISHED\";;\n" +
-		"  'fetch --no-tags origin') [ -f \"$AFS_LOOKUP_FINISHED\" ] || : > \"$AFS_FETCH_STARTED\"; printf '%s\\n' 'HTTP 503 transport failure' >&2; exit 1;;\n" +
+		"  'fetch --no-tags origin '*) [ -f \"$AFS_LOOKUP_FINISHED\" ] || : > \"$AFS_FETCH_STARTED\"; printf '%s\\n' 'HTTP 503 transport failure' >&2; exit 1;;\n" +
 		"esac\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -1228,7 +1310,7 @@ func TestFetchStartsBeforeRemoteLookupCompletes(t *testing.T) {
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	store.gitRetryDelays = nil
-	err := store.FetchNonInteractive(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: "/private/configured/repo.git"}})
+	err := store.FetchNonInteractive(context.Background(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: "/private/configured/repo.git", FetchRef: "refs/heads/main"}})
 	if err == nil {
 		t.Fatal("Fetch error = nil, want transport failure")
 	}

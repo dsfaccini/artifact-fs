@@ -469,6 +469,64 @@ func TestPreparedGitDirWithDepthMovesItsExistingBranch(t *testing.T) {
 // A fetch command or refresh fetches the remote-tracking branch a later
 // preparation moves the prepared branch to, so it must not mark it shallow
 // either.
+// The fetch command and the refresh fetch only the fetch ref, not every
+// branch the prepared git dir's refspec names, which a --depth git dir would
+// receive with its whole history.
+func TestFetchAndRefreshFetchOnlyTheFetchRef(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	work, gitDir := newPreparedGitDir(t, tmp)
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+	svc.mount = fakeMount
+	preparePreparedGitDir(t, svc, work, gitDir)
+	// push pushes a new branch, then a commit to master.
+	push := func(branch string) string {
+		t.Helper()
+		runCmd(t, "git", "-C", work, "checkout", "-q", "-b", branch, "master")
+		commitFile(t, work, branch+".md", branch+"\n")
+		runCmd(t, "git", "-C", work, "push", "-q", "origin", branch)
+		runCmd(t, "git", "-C", work, "checkout", "-q", "master")
+		master := commitFile(t, work, "after-"+branch+".md", branch+"\n")
+		runCmd(t, "git", "-C", work, "push", "-q", "origin", "master")
+		return master
+	}
+	requireFetched := func(master, branch string) {
+		t.Helper()
+		if got := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "rev-parse", "refs/remotes/origin/master")); got != master {
+			t.Fatalf("origin/master = %s, want %s", got, master)
+		}
+		if err := exec.Command("git", "--git-dir", gitDir, "show-ref", "--verify", "--quiet", "refs/remotes/origin/"+branch).Run(); err == nil {
+			t.Fatalf("fetched branch %s, which is not the fetch ref", branch)
+		}
+	}
+
+	master := push("before-fetch")
+	if err := svc.ctl().FetchNow(ctx, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	requireFetched(master, "before-fetch")
+
+	master = push("before-refresh")
+	if err := svc.ctl().SetRefresh(ctx, "repo", model.RefreshPolicy{RefreshInterval: 20 * time.Millisecond}); err != nil {
+		t.Fatal(err)
+	}
+	beforeRefresh := time.Now()
+	done := startService(t, svc)
+	var st model.RepoRuntimeState
+	waitFor(t, done, func() bool {
+		st, err = svc.ctl().Status(ctx, "repo")
+		return err == nil && st.BehindCount == 2
+	})
+	requireFetched(master, "before-refresh")
+	if st.AheadCount != 0 || !st.LastFetchAt.After(beforeRefresh) || st.LastFetchResult != "ok" {
+		t.Fatalf("status after the refresh = ahead %d, last fetch %s %q; want ahead 0 and a fetch after %s", st.AheadCount, st.LastFetchAt, st.LastFetchResult, beforeRefresh)
+	}
+}
+
 func TestPreparedGitDirWithDepthPreparesAgainAfterAFetch(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()

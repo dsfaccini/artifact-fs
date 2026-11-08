@@ -140,6 +140,7 @@ func TestNetworkGitRunsSSHWithoutTerminal(t *testing.T) {
 			return store.PrepareFetchedBranch(ctx, cfg, "main")
 		}},
 		{"refresh fetch", "blob:none", false, false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
+			cfg.FetchRef = "refs/heads/main"
 			return store.FetchNonInteractive(ctx, cfg)
 		}},
 		{"prepare fetch", "blob:none", false, false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
@@ -268,7 +269,7 @@ func TestSSHWrapperLastsUntilClose(t *testing.T) {
 	store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	store.gitRetryDelays = nil
 	defer store.Close()
-	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{FetchRef: "refs/heads/main"}}
 	fetch := func() {
 		t.Helper()
 		if err := os.Remove(report); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -320,7 +321,7 @@ func TestNetworkGitKeepsTheEnvironmentsSSHProgram(t *testing.T) {
 			t.Setenv(sshSessionReportEnv, report)
 			store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
 			store.gitRetryDelays = nil
-			if err := store.FetchNonInteractive(t.Context(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}}); err == nil {
+			if err := store.FetchNonInteractive(t.Context(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{FetchRef: "refs/heads/main"}}); err == nil {
 				t.Fatal("fetched through an SSH command that fails")
 			}
 			for _, contact := range readSSHContacts(t, report) {
