@@ -466,9 +466,6 @@ func TestPreparedGitDirWithDepthMovesItsExistingBranch(t *testing.T) {
 	preparePreparedGitDir(t, svc, work, gitDir)
 }
 
-// A fetch command or refresh fetches the remote-tracking branch a later
-// preparation moves the prepared branch to, so it must not mark it shallow
-// either.
 // The fetch command and the refresh fetch only the fetch ref, not every
 // branch the prepared git dir's refspec names, which a --depth git dir would
 // receive with its whole history.
@@ -527,6 +524,135 @@ func TestFetchAndRefreshFetchOnlyTheFetchRef(t *testing.T) {
 	}
 }
 
+// A --prepared-gitdir registered with only --fetch-ref keeps the default
+// --ref refs/heads/main, which its remote may lack. The fetch command still
+// fetches the fetch ref, and ahead/behind compares HEAD with it.
+func TestFetchNowOfAPreparedGitDirWithOnlyAFetchRef(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	work, gitDir := newPreparedGitDir(t, tmp)
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: gitDir}, RepoSpec: model.RepoSpec{PreparedGitDir: true, FetchRef: "master"}, Enabled: true}
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.prepareAsync(ctx, got, 1); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	moved := commitFile(t, work, "MORE.md", "more\n")
+	runCmd(t, "git", "-C", work, "push", "-q", "origin", "master")
+	if err := svc.ctl().FetchNow(ctx, "repo"); err != nil {
+		t.Fatalf("FetchNow: %v", err)
+	}
+	if head := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "rev-parse", "refs/remotes/origin/master")); head != moved {
+		t.Fatalf("origin/master = %s, want %s", head, moved)
+	}
+	if ahead, behind, diverged, err := svc.git.ComputeAheadBehind(ctx, got); err != nil || ahead != 0 || behind != 1 || diverged {
+		t.Fatalf("ahead/behind/diverged = %d/%d/%t, %v; want 0/1/false", ahead, behind, diverged, err)
+	}
+}
+
+// A clone's refspec names only --ref. With another fetch ref, the fetch
+// command fetches the fetch ref, which the clone serves, and leaves --ref's
+// branch alone; ahead/behind compares HEAD with the fetch ref.
+func TestFetchNowOfACloneWithAnotherFetchRef(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	newBranchedRemote(t, remote)
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main", FetchRef: "feature"}, Enabled: true}
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldMain := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", got.GitDir, "rev-parse", "refs/remotes/origin/main"))
+	runCmd(t, "git", "-C", remote, "checkout", "-q", "feature")
+	feature := commitFile(t, remote, "NEXT.md", "next\n")
+	runCmd(t, "git", "-C", remote, "checkout", "-q", "main")
+	commitFile(t, remote, "MAIN.md", "main\n")
+	if err := svc.ctl().FetchNow(ctx, "repo"); err != nil {
+		t.Fatalf("FetchNow: %v", err)
+	}
+	for ref, want := range map[string]string{"refs/remotes/origin/feature": feature, "refs/remotes/origin/main": oldMain} {
+		if head := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", got.GitDir, "rev-parse", ref)); head != want {
+			t.Fatalf("%s = %s, want %s", ref, head, want)
+		}
+	}
+	if ahead, behind, diverged, err := svc.git.ComputeAheadBehind(ctx, got); err != nil || ahead != 0 || behind != 1 || diverged {
+		t.Fatalf("ahead/behind/diverged = %d/%d/%t, %v; want 0/1/false", ahead, behind, diverged, err)
+	}
+}
+
+// With --depth, the fetch command does not fetch --ref's branch either, which
+// forks from the fetch ref below the shallow boundary and would arrive with
+// its whole history.
+func TestFetchNowWithDepthFetchesNoOtherBranch(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	bare := filepath.Join(tmp, "origin.git")
+	work := filepath.Join(tmp, "work")
+	gitDir := filepath.Join(tmp, "prepared.git")
+	runCmd(t, "git", "init", "-q", "--bare", bare)
+	runCmd(t, "git", "clone", "-q", bare, work)
+	runCmd(t, "git", "-C", work, "checkout", "-q", "-b", "master")
+	for i := range 8 {
+		commitFile(t, work, fmt.Sprintf("c%d.md", i), "c\n")
+	}
+	runCmd(t, "git", "-C", work, "push", "-q", "origin", "master")
+	runCmd(t, "git", "-C", work, "checkout", "-q", "-b", "main", "master~6")
+	for i := range 3 {
+		commitFile(t, work, fmt.Sprintf("m%d.md", i), "m\n")
+	}
+	runCmd(t, "git", "-C", work, "push", "-q", "origin", "main")
+	runCmd(t, "git", "init", "-q", "--separate-git-dir", gitDir, "--initial-branch", "master", filepath.Join(tmp, "prepared"))
+	runCmd(t, "git", "--git-dir", gitDir, "remote", "add", "origin", "file://"+bare)
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: gitDir}, RepoSpec: model.RepoSpec{Branch: "main", PreparedGitDir: true, FetchRef: "master", HistoryDepth: 1}, Enabled: true}
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.prepareAsync(ctx, got, 1); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	before := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "rev-list", "--all", "--count"))
+	if err := svc.ctl().FetchNow(ctx, "repo"); err != nil {
+		t.Fatalf("FetchNow: %v", err)
+	}
+	if after := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "rev-list", "--all", "--count")); after != before {
+		t.Fatalf("the git dir holds %s commits after the fetch, want the %s it held before", after, before)
+	}
+	if err := exec.Command("git", "--git-dir", gitDir, "show-ref", "--verify", "--quiet", "refs/remotes/origin/main").Run(); err == nil {
+		t.Fatal("fetched --ref's branch main, which is not the fetch ref")
+	}
+}
+
+// A fetch command or refresh fetches the remote-tracking branch a later
+// preparation moves the prepared branch to, so it must not mark it shallow
+// either.
 func TestPreparedGitDirWithDepthPreparesAgainAfterAFetch(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()

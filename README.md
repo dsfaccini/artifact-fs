@@ -159,7 +159,7 @@ Check the state of a mounted repo with `status`:
 | `published_commit` / `published_generation` | Commit and generation the snapshot store last published. After a failed overlay transition they run ahead of the served ones until the daemon's retry succeeds |
 | `phase` | The step the daemon's runtime for the repo is in: `prepare` (async preparation), `mount` (including retries of a FUSE mount that failed), `serve` (a mount is served) or `unmount`; `none` when no daemon runs or before it records one |
 | `remote_refresh` | Whether daemon and manual remote refreshes are enabled |
-| `ahead` / `behind` / `diverged` | Divergence of HEAD from origin's `--ref` branch at the daemon's last successful refresh |
+| `ahead` / `behind` / `diverged` | Divergence of HEAD, at the daemon's last successful refresh, from the ref that refresh fetched: the fetch ref's tracking ref, or a `--require-commit` repo's source ref. `0` when the git dir holds no common ancestor of the two, as with `--depth` once a tag fetch ref or a `--require-commit` source moves. Earlier builds compared with `--ref`'s branch, which gave other counts when the fetch ref differs from `--ref`, and reported `0` for a `--require-commit` repo |
 | `prepare_error` | Last redacted preparation error, if any |
 | `mount_error` | `last_error` when any step of mounting the repo failed last (phase `mount`: from cloning or fetching its source and building its snapshot to the FUSE mount itself, including unmounting a dead mount before a retry) or its FUSE connection failed or exited (phase `serve`); a mount that serves clears it |
 | `last_error` / `last_error_phase` / `last_error_at` | Last redacted failure the daemon retries, the phase that failed (`mount`, `serve`, `unmount`, `head_reconcile`, `fetch` or `registry_sync`) and when. `serve` is a FUSE connection that failed or exited. A success of that phase clears it |
@@ -348,9 +348,9 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
 
 `--ref` and `--fetch-ref` take a full ref name, a branch name, or `origin/<branch>`, and `add-repo` stores each as a full ref name. `origin/X` and `refs/remotes/origin/X` name branch `X`, so a branch literally named `origin/X` needs `--ref refs/heads/origin/X`. `--fetch-ref` defaults to `--ref`. Preparation fetches the fetch ref and serves it, also right after a fresh clone of `--ref`. With `--require-commit`, preparation fetches and verifies `--ref`, and `add-repo` rejects `--fetch-ref`.
 
-With `--depth`, a fetch transfers at most that many commits of a fetch ref whose branch the git dir does not hold yet, or of a fetch ref that is not a branch. A fetch onto a branch the git dir holds transfers only the new commits. So `prepare` and the remote refresh make a `--prepared-gitdir` git dir shallow when it lacks the fetch ref's branch, or when the fetch ref is not a branch.
+With `--depth`, a fetch transfers at most that many commits of a fetch ref whose branch the git dir does not hold yet, or of a fetch ref that is not a branch. A fetch onto a branch the git dir holds transfers only the new commits. So `prepare` and the remote refresh make a `--prepared-gitdir` git dir shallow when it lacks the fetch ref's branch, or when the fetch ref is not a branch. A git dir never holds a branch for a fetch ref that is not a branch, or for a `--require-commit` source, so each refresh of one passes `--depth`. Each new tip then has no history in common with HEAD, and `ahead` and `behind` report `0`.
 
-The remote refresh and the `fetch` command fetch what preparation fetches, into the same refs: the fetch ref, or the `--ref` of a repo with `--require-commit`. When `--ref` names a branch other than the fetch ref's, they also fetch that branch, which `ahead` and `behind` compare with. They do not update the git dir's other remote-tracking branches, even when its refspec names them, as earlier builds did. To update those, run `git fetch` in the git dir.
+The remote refresh and the `fetch` command fetch what preparation fetches, into the same ref: the fetch ref, or the `--ref` of a repo with `--require-commit`. They do not update the git dir's other remote-tracking branches, even when its refspec names them, as earlier builds did. To update those, run `git fetch` in the git dir.
 
 A prepared git dir whose remote-tracking branch an earlier build's refresh made shallow refuses its next preparation with `refusing non-fast-forward update`. Deepen it once in that git dir, with `git fetch --deepen=<n>` or `git fetch --unshallow`.
 
@@ -621,7 +621,7 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 | `git checkout` | Supported | Re-indexes tree and reconciles overlay; Git updates its own index |
 | `git merge --no-ff` | Supported | Publishes merge commits and reconciles the merged worktree |
 | `git rebase` | Supported | Reconciles rewritten commits and branch state |
-| `git fetch` | Supported | Background refresh loop fetches the fetch ref periodically |
+| `git fetch` | Supported | Background refresh loop fetches the fetch ref, or a `--require-commit` repo's `--ref`, periodically. Run `git fetch` in the git dir for other branches |
 | `git pull --ff-only` | Supported | Publishes the fast-forwarded snapshot and reconciles the overlay |
 | `git push` | Supported | Uses the configured upstream and ambient credentials |
 

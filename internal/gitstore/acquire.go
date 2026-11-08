@@ -333,14 +333,13 @@ func installGitDir(candidate string, destination string) error {
 }
 
 // FetchNonInteractive fetches, for the daemon's refresh and the fetch
-// command, what preparation fetches, into the same refs: a verified source's
-// ref, or else the fetch ref. ComputeAheadBehind compares HEAD with the source
-// ref's branch, so it also fetches that branch when it is not the fetch ref's.
-// It fetches no other branch the git dir's refspec names. Like every Git
-// command that contacts a remote, it runs through runNetworkGit, so a remote
-// that needs a prompt makes it fail.
+// command, what preparation fetches, into the same ref: a verified source's
+// ref, or else the fetch ref. It passes that refspec explicitly: the git dir's
+// configured refspec can name every branch, and a --depth git dir would get
+// each new one in full. Like every Git command that contacts a remote, it runs
+// through runNetworkGit, so a remote that needs a prompt makes it fail.
 func (s *Store) FetchNonInteractive(ctx context.Context, repo model.RepoConfig) error {
-	refspecs, err := refreshRefspecs(repo)
+	refspec, _, err := refreshTarget(repo)
 	if err != nil {
 		return err
 	}
@@ -348,7 +347,7 @@ func (s *Store) FetchNonInteractive(ctx context.Context, repo model.RepoConfig) 
 	if depth := fetchDepth(ctx, repo, model.BranchName(repo.FetchRef)); depth > 0 {
 		args = append(args, fmt.Sprintf("--depth=%d", depth))
 	}
-	args = append(append(args, "origin"), refspecs...)
+	args = append(args, "origin", refspec)
 	remotesForLogging, cancelLookup := s.startRemotesForLogging(ctx, repo)
 	defer cancelLookup()
 	return s.retryGitOperationForRemoteLookup(ctx, GitOperationFetch, repo.Name, remotesForLogging, func() error {
@@ -357,20 +356,18 @@ func (s *Store) FetchNonInteractive(ctx context.Context, repo model.RepoConfig) 
 	})
 }
 
-// refreshRefspecs returns the refspecs FetchNonInteractive fetches for repo.
-func refreshRefspecs(repo model.RepoConfig) ([]string, error) {
+// refreshTarget returns the refspec FetchNonInteractive fetches for repo and
+// the tracking ref it fetches into, which ComputeAheadBehind compares HEAD
+// with.
+func refreshTarget(repo model.RepoConfig) (refspec, trackingRef string, err error) {
 	if repo.RequiredCommit != "" {
-		return []string{"+" + repo.Branch + ":" + verifiedSourceTrackingRef}, nil
+		return "+" + repo.Branch + ":" + verifiedSourceTrackingRef, verifiedSourceTrackingRef, nil
 	}
 	target, err := fetchRefTarget(repo.FetchRef)
 	if err != nil {
-		return nil, err
+		return "", "", err
 	}
-	refspecs := []string{target.refspec()}
-	if source, err := fetchRefTarget(repo.Branch); err == nil && source.branch != "" && source.branch != target.branch {
-		refspecs = append(refspecs, source.refspec())
-	}
-	return refspecs, nil
+	return target.refspec(), target.remoteRef, nil
 }
 
 // fetchDepth returns the --depth of a fetch onto branch: repo's history depth

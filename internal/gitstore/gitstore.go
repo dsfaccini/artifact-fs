@@ -2,6 +2,7 @@ package gitstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -107,17 +108,26 @@ func (s *Store) CommitTimestamp(ctx context.Context, repo model.RepoConfig, oid 
 	return ts, nil
 }
 
+// ComputeAheadBehind compares HEAD with the tracking ref the refresh fetches
+// into. It reports 0/0 while that ref is missing, and when the git dir holds
+// no common ancestor of the two, as a --depth git dir does once the ref moves:
+// a fetch with --depth cuts the new tip off from the history below it.
 func (s *Store) ComputeAheadBehind(ctx context.Context, repo model.RepoConfig) (ahead int, behind int, diverged bool, err error) {
-	branch := model.BranchName(repo.Branch)
-	if branch == "" {
+	_, tracking, err := refreshTarget(repo)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if _, err := runGit(ctx, repo.GitDir, "rev-parse", "--verify", "--quiet", tracking+"^{commit}"); err != nil {
 		return 0, 0, false, nil
 	}
-	rangeSpec := fmt.Sprintf("HEAD...origin/%s", branch)
-	out, err := runGit(ctx, repo.GitDir, "rev-list", "--left-right", "--count", rangeSpec)
-	if err != nil {
-		if strings.Contains(err.Error(), "unknown revision") {
+	if _, err := runGit(ctx, repo.GitDir, "merge-base", "HEAD", tracking); err != nil {
+		if exitErr, ok := errors.AsType[*gitCommandError](err); ok && exitErr.exitCode == 1 {
 			return 0, 0, false, nil
 		}
+		return 0, 0, false, err
+	}
+	out, err := runGit(ctx, repo.GitDir, "rev-list", "--left-right", "--count", "HEAD..."+tracking)
+	if err != nil {
 		return 0, 0, false, err
 	}
 	parts := strings.Fields(out)
