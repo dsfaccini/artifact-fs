@@ -3,6 +3,7 @@
 package gitstore
 
 import (
+	"io/fs"
 	"os"
 	"os/exec"
 )
@@ -18,3 +19,7 @@ func terminateCommandProcessGroup(cmd *exec.Cmd) error {
 	}
 	return cmd.Process.Kill()
 }
+
+// privateToEUID reports true. Windows file modes carry no owner bits, and the
+// default temp directory lies in the user's profile.
+func privateToEUID(fs.FileInfo) bool { return true }
