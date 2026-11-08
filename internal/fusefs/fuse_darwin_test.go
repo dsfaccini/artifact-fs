@@ -76,20 +76,30 @@ func TestPlatformMountReachesFSKit(t *testing.T) {
 	}
 }
 
-// FSKit takes no invalidations, so a mount through it sends none. It still
-// retires the number of a path the switch removed.
+// FSKit takes no invalidations, so a mount through it sends none. Its switch
+// pass still retires the number of a path the switch removed, and retires a
+// held inode whose path a later switch brings back changed.
 func TestInvalidateChangedSendsNothingOnFSKit(t *testing.T) {
-	f := newCacheFixtureOn(t, BackendFSKit, baseFile("file.txt", "old", 0o100644))
-	held := f.lookup(fuseops.RootInodeID, "file.txt")
-	f.switchTo()
-	if err := f.mount.InvalidateChanged(); err != nil {
-		t.Fatal(err)
+	f := newCacheFixtureOn(t, BackendFSKit, baseFile("file.txt", "old", 0o100644), baseFile("held.txt", "blob-A", 0o100644))
+	forgotten := f.lookup(fuseops.RootInodeID, "file.txt")
+	held := f.lookup(fuseops.RootInodeID, "held.txt")
+	forget(t, f.fs, forgotten)
+	pass := func(nodes ...model.BaseNode) {
+		t.Helper()
+		f.switchTo(nodes...)
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
 	}
+	pass()
+	pass(baseFile("file.txt", "old", 0o100644), baseFile("held.txt", "blob-B", 0o100644))
 	if inodes, entries := f.notifier.recorded(); len(inodes) != 0 || len(entries) != 0 {
 		t.Fatalf("FSKit mount sent invalidations: inodes %v, entries %v", inodes, entries)
 	}
-	f.switchTo(baseFile("file.txt", "old", 0o100644))
-	if got := f.lookup(fuseops.RootInodeID, "file.txt"); got == held {
+	if got := openErrno(f, held); got != syscall.ESTALE {
+		t.Fatalf("open of inode %d, whose path came back with another blob, = errno %v, want ESTALE", held, got)
+	}
+	if got := f.lookup(fuseops.RootInodeID, "file.txt"); got == forgotten {
 		t.Fatalf("file.txt came back with inode %d, which it had before a switch removed it", got)
 	}
 }

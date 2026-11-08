@@ -3,6 +3,7 @@
 package fusefs
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -84,10 +86,10 @@ type ArtifactFuse struct {
 
 	mu sync.RWMutex
 	// handleOps keeps inode and handle bookkeeping consistent with the overlay:
-	// Unlink, RmDir and Rename hold it exclusively, and every op that creates
-	// or uses inodes and handles holds it shared. The switch pass's re-check,
-	// unmapStillMissing, holds it shared too. Engine.Do releases it before it
-	// hydrates a blob.
+	// Unlink, RmDir, Rename, and a write or setattr whose path does not map to
+	// its inode hold it exclusively, and every op that creates or uses inodes
+	// and handles holds it shared. The switch pass's re-check, unmapStillMissing, holds it
+	// shared too. Engine.Do releases it before it hydrates a blob.
 	handleOps sync.RWMutex
 	// inodes holds each inode the kernel holds.
 	inodes map[fuseops.InodeID]*InodeRef
@@ -96,7 +98,10 @@ type ArtifactFuse struct {
 	// its number while it exists. A mapping whose inode is not in inodes is
 	// dormant. An inode the kernel still holds after its path stopped
 	// existing is unmapped.
-	pathToInode  map[string]fuseops.InodeID
+	pathToInode map[string]fuseops.InodeID
+	// unmapped holds, by path, each inode the kernel holds whose path a HEAD
+	// change removed, until the path comes back or the inode is retired.
+	unmapped     map[string]fuseops.InodeID
 	nextInodeID  fuseops.InodeID
 	dirHandles   map[fuseops.HandleID]*DirHandle
 	fileHandles  map[fuseops.HandleID]*FileHandle
@@ -132,6 +137,10 @@ type InodeRef struct {
 	// Blob is the Attrs.Blob last reported for this inode. Type, Mode and Blob
 	// are the identity the kernel holds.
 	Blob string
+	// Size and Mtime are the size and modification time last reported for
+	// this inode. heldAttrs answers with them while the inode's path is away.
+	Size  int64
+	Mtime time.Time
 	// PageBlob is the base blob that the inode's last open served, while the
 	// kernel's cached pages can hold only that blob. It is empty otherwise.
 	PageBlob string
@@ -140,7 +149,10 @@ type InodeRef struct {
 	Refcnt    int64
 	IsRoot    bool
 	Overlay   bool
-	Stale     bool
+	// Stale says the inode is retired: its path came back changed, another
+	// inode took it, or an op through the mount removed it. Ops on it return
+	// ESTALE.
+	Stale bool
 	// CreateOpenPending says a CreateFile made the inode and no OpenFile or
 	// write has reached it since. The next OpenFile skips the permission
 	// check: on an FSKit mount the creator's descriptor can arrive as a
@@ -163,6 +175,7 @@ func (ref *InodeRef) report(attrs Attrs) {
 		ref.PageBlob = ""
 	}
 	ref.Type, ref.Mode, ref.Gen, ref.Blob = attrs.Type, attrs.Mode, attrs.Gen, attrs.Blob
+	ref.Size, ref.Mtime = attrs.Size, attrs.Mtime
 }
 
 func (ref *InodeRef) identity() Identity {
@@ -186,6 +199,9 @@ type FileHandle struct {
 	cacheGeneration int64
 	invalidateSeq   uint64
 	detached        bool
+	// pinned says an unlink or rename over the handle's path pointed
+	// cacheFile at the handle's own copy of the file, which writes may change.
+	pinned bool
 	// wrote says the handle created or wrote its file, so its flush commits
 	// the path's pending writes. A reader's close leaves them coalescing.
 	wrote bool
@@ -224,6 +240,7 @@ func NewArtifactFuse(repo model.RepoPaths, engine *Engine) *ArtifactFuse {
 		syntheticTime:  time.Now(),
 		inodes:         make(map[fuseops.InodeID]*InodeRef),
 		pathToInode:    make(map[string]fuseops.InodeID),
+		unmapped:       make(map[string]fuseops.InodeID),
 		nextInodeID:    fuseops.RootInodeID + 1,
 		dirHandles:     make(map[fuseops.HandleID]*DirHandle),
 		fileHandles:    make(map[fuseops.HandleID]*FileHandle),
@@ -238,9 +255,20 @@ func NewArtifactFuse(repo model.RepoPaths, engine *Engine) *ArtifactFuse {
 
 // allocInode returns the inode of path with one more lookup, and records attrs
 // as what the kernel last received for it. A path with a dormant mapping gets
-// its number back. Caller must hold fs.mu write lock.
+// its number back. An unmapped inode whose path came back with its identity
+// maps back to the path; one whose path came back as something else is
+// retired. Caller must hold fs.mu write lock.
 func (fs *ArtifactFuse) allocInode(path string, attrs Attrs) *InodeRef {
 	id, ok := fs.pathToInode[path]
+	if held, found := fs.unmapped[path]; !ok && found {
+		if fs.inodes[held].returnsAs(attrs.identity()) {
+			fs.mapLocked(held, path)
+			id, ok = held, true
+		} else {
+			fs.retireLocked(held)
+			delete(fs.unmapped, path)
+		}
+	}
 	if ref := fs.inodes[id]; ok && ref != nil {
 		ref.Refcnt++
 		ref.report(attrs)
@@ -267,19 +295,131 @@ func (fs *ArtifactFuse) allocEntry(parent fuseops.InodeID, name, path string, at
 
 // createEntry returns a new inode for the name in parent at path, which an op
 // just created. A created path never takes the number of the path that
-// existed there before, even while the kernel still holds that inode. Caller
-// must hold fs.mu write lock.
+// existed there before, and the inode the kernel still holds for that path is
+// retired. Caller must hold fs.mu write lock.
 func (fs *ArtifactFuse) createEntry(parent fuseops.InodeID, name, path string, attrs Attrs) *InodeRef {
-	delete(fs.pathToInode, path)
+	if id, ok := fs.pathToInode[path]; ok {
+		delete(fs.pathToInode, path)
+		fs.retireLocked(id)
+	}
+	if id, ok := fs.unmapped[path]; ok {
+		fs.retireLocked(id)
+	}
 	return fs.allocEntry(parent, name, path, attrs)
 }
 
-// unmapPath retires the inode number of path, which stopped existing. An
-// inode the kernel still holds keeps its number until its own FORGET.
+// unmapPath retires the inode number of path, which an op through the mount
+// removed, and retires the inode the kernel still holds for it, mapped or
+// unmapped: that inode never maps back, because its handles hold their own
+// copy. The inode keeps its number until its own FORGET.
 func (fs *ArtifactFuse) unmapPath(path string) {
 	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if id, ok := fs.pathToInode[path]; ok {
+		delete(fs.pathToInode, path)
+		fs.retireLocked(id)
+	}
+	if id, ok := fs.unmapped[path]; ok {
+		fs.retireLocked(id)
+	}
+}
+
+// unmapPathLocked unmaps path from id, whose path a HEAD change removed. An
+// inode the kernel still holds stays in unmapped until its path comes back or
+// another inode takes it. Caller must hold fs.mu write lock.
+func (fs *ArtifactFuse) unmapPathLocked(id fuseops.InodeID, path string) {
 	delete(fs.pathToInode, path)
-	fs.mu.Unlock()
+	if fs.inodes[id] != nil {
+		fs.unmapped[path] = id
+	}
+}
+
+// mapLocked maps path back to id, an unmapped inode whose path came back.
+// Caller must hold fs.mu write lock.
+func (fs *ArtifactFuse) mapLocked(id fuseops.InodeID, path string) {
+	fs.pathToInode[path] = id
+	delete(fs.unmapped, path)
+}
+
+// settleLocked decides id, unmapped at path, now that path exists with
+// identity current. It maps id back when no other inode holds the path and
+// returnsAs accepts current, and retires id otherwise. It reports whether id
+// got the path back. Caller must hold fs.mu write lock.
+func (fs *ArtifactFuse) settleLocked(id fuseops.InodeID, path string, current Identity) bool {
+	if _, mapped := fs.pathToInode[path]; !mapped && fs.inodes[id].returnsAs(current) {
+		fs.mapLocked(id, path)
+		return true
+	}
+	fs.retireLocked(id)
+	return false
+}
+
+// settleUnmappedBelow decides each unmapped inode at or below path whose path
+// exists again, with settleLocked, before an unlink or a rename reaches path.
+// A rename of path then moves such an inode as a mapped one, or not at all,
+// and an unlink or rename over path pins no handle of an inode whose path
+// came back as another file. An unmapped inode whose path is still missing
+// moves with a rename. The caller holds handleOps exclusively.
+func (fs *ArtifactFuse) settleUnmappedBelow(path string) error {
+	fs.mu.RLock()
+	var held []pathMapping
+	for p, id := range fs.unmapped {
+		if samePathOrDescendant(p, path) {
+			held = append(held, pathMapping{id, p})
+		}
+	}
+	fs.mu.RUnlock()
+	for _, m := range held {
+		current, exists, err := fs.engine.Identity(m.path)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		fs.mu.Lock()
+		if fs.unmapped[m.path] == m.id {
+			fs.settleLocked(m.id, m.path, current)
+		}
+		fs.mu.Unlock()
+	}
+	return nil
+}
+
+// returnsAs reports whether a path that comes back with identity current is
+// still ref's: a directory again for a directory, and for a file or symlink
+// the base type, permission bits and blob the kernel last received. A nil
+// ref returns false.
+func (ref *InodeRef) returnsAs(current Identity) bool {
+	if ref == nil {
+		return false
+	}
+	if ref.Type == "dir" {
+		return current.Type == "dir"
+	}
+	return ref.Gen != 0 && current == ref.identity()
+}
+
+// retireLocked retires id, whose path now belongs to another file or to
+// none. Ops on id return ESTALE, and its file handles are detached, so no read
+// or write through them reaches the path again. Caller must hold fs.mu write
+// lock.
+func (fs *ArtifactFuse) retireLocked(id fuseops.InodeID) {
+	ref := fs.inodes[id]
+	if ref == nil || ref.IsRoot {
+		return
+	}
+	ref.Stale = true
+	if fs.unmapped[ref.Path] == id {
+		delete(fs.unmapped, ref.Path)
+	}
+	for _, fh := range fs.fileHandles {
+		if fh.inode.ID == id {
+			fh.mu.Lock()
+			fh.detached = true
+			fh.mu.Unlock()
+		}
+	}
 }
 
 // pathMapping is a path and the inode number it maps to.
@@ -298,7 +438,7 @@ func (fs *ArtifactFuse) unmapLocked(ms []pathMapping, writeSeq uint64) {
 			continue
 		}
 		if fs.pathToInode[m.path] == m.id {
-			delete(fs.pathToInode, m.path)
+			fs.unmapPathLocked(m.id, m.path)
 		}
 	}
 }
@@ -354,6 +494,9 @@ func (fs *ArtifactFuse) dropLookups(id fuseops.InodeID, n uint64) {
 	ref.Refcnt -= int64(n)
 	if ref.Refcnt <= 0 && !ref.IsRoot {
 		delete(fs.inodes, id)
+		if fs.unmapped[ref.Path] == id {
+			delete(fs.unmapped, ref.Path)
+		}
 	}
 }
 
@@ -402,9 +545,9 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // mapped path that no longer exists, so a path made there later gets a new
 // number. When send is true it also tells the kernel what changed. Every inode
 // the kernel holds at a path gets the check for a name that vanished or
-// changed type. An inode the kernel holds after its path stopped existing gets
-// only the identity comparison, because getattr and reads on it resolve the
-// path again. An inode whose identity the kernel received from the base
+// changed type. An unmapped inode whose path came back maps back to the path
+// when the path has its identity, and is retired and invalidated otherwise.
+// An inode whose identity the kernel received from the base
 // snapshot gets the identity comparison. One the kernel last saw from the
 // overlay is invalidated when it now resolves to a base blob, whose bytes can
 // differ from what was written. An overlay entry itself changes only through
@@ -417,7 +560,11 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		entry    kernelEntry
 		reported Identity
 		base     bool
-		mapped   bool
+	}
+	// unmappedInode is an unmapped inode, whose path may have come back.
+	type unmappedInode struct {
+		pathMapping
+		ref InodeRef
 	}
 	now := time.Now()
 	fs.mu.RLock()
@@ -438,11 +585,12 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			existenceOnly = append(existenceOnly, pathMapping{id, path})
 			continue
 		}
-		inodes = append(inodes, known{pathMapping: pathMapping{id, path}, entry: kernelEntry{parent, filepath.Base(path)}, reported: ref.identity(), base: ref.Gen != 0, mapped: true})
+		inodes = append(inodes, known{pathMapping: pathMapping{id, path}, entry: kernelEntry{parent, filepath.Base(path)}, reported: ref.identity(), base: ref.Gen != 0})
 	}
-	for id, ref := range fs.inodes {
-		if send && !ref.IsRoot && !ref.Stale && ref.Path != ".git" && fs.pathToInode[ref.Path] != id {
-			inodes = append(inodes, known{pathMapping: pathMapping{id, ref.Path}, reported: ref.identity(), base: ref.Gen != 0})
+	var returning []unmappedInode
+	for path, id := range fs.unmapped {
+		if ref := fs.inodes[id]; ref != nil {
+			returning = append(returning, unmappedInode{pathMapping{id, path}, *ref})
 		}
 	}
 	for e, lapses := range fs.negatives {
@@ -469,16 +617,31 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		}
 		switch {
 		case !exists || current.Type != k.reported.Type:
-			// The name of an unmapped inode already left the kernel, through
-			// the op or the pass that unmapped it.
-			if k.mapped {
-				entries = append(entries, k.entry)
-			}
-			if k.mapped && !exists {
+			entries = append(entries, k.entry)
+			if !exists {
 				vanished = append(vanished, k.pathMapping)
 			}
 		case k.base && current != k.reported, !k.base && current.Blob != "":
 			changed = append(changed, k.id)
+		}
+	}
+	// The name of an unmapped inode already left the kernel, through the op
+	// or the pass that unmapped it, so a retired one needs only its inode
+	// invalidated.
+	var remap, retire []pathMapping
+	for _, u := range returning {
+		current, exists, err := fs.engine.Identity(u.path)
+		if err != nil {
+			failed(err, "resolve "+u.path)
+			continue
+		}
+		switch {
+		case !exists:
+		case u.ref.returnsAs(current):
+			remap = append(remap, u.pathMapping)
+		default:
+			retire = append(retire, u.pathMapping)
+			changed = append(changed, u.id)
 		}
 	}
 	paths := make([]string, len(existenceOnly))
@@ -497,6 +660,18 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		}
 	}
 	fs.mu.Lock()
+	// An op may have taken, moved or recreated a path since the check, which
+	// removes it from unmapped.
+	for _, m := range remap {
+		if _, mapped := fs.pathToInode[m.path]; !mapped && fs.unmapped[m.path] == m.id {
+			fs.mapLocked(m.id, m.path)
+		}
+	}
+	for _, m := range retire {
+		if fs.unmapped[m.path] == m.id {
+			fs.retireLocked(m.id)
+		}
+	}
 	overlapped := fs.renameSeq != renameSeq || renameSeq%2 != 0
 	if !overlapped {
 		fs.unmapLocked(vanished, writeSeq)
@@ -585,18 +760,83 @@ func (fs *ArtifactFuse) markWritten(id fuseops.InodeID, path string) {
 		ref.WrittenAt = fs.writeSeq
 		if _, mapped := fs.pathToInode[path]; !mapped && ref.Path == path && !ref.Stale {
 			fs.pathToInode[path] = id
+			if fs.unmapped[path] == id {
+				delete(fs.unmapped, path)
+			}
 		}
 	}
 	fs.mu.Unlock()
 }
 
-// setReported records attrs as what the kernel last received for id.
-func (fs *ArtifactFuse) setReported(id fuseops.InodeID, attrs Attrs) {
-	fs.mu.Lock()
-	if ref := fs.inodes[id]; ref != nil {
-		ref.report(attrs)
+// heldAttrs returns the attributes of the content that id's handles read,
+// for an inode whose path is away or that is retired. A detached handle reads
+// the file it holds, and an undetached one its overlay file, or else the base
+// content at InodeRef.Gen, whose attributes the kernel last received. When
+// handles read different content, the most recently opened handle that reads
+// any decides. A held file's size comes from a stat of the file it reads; a
+// base blob keeps the mtime last reported, its commit time. heldAttrs returns
+// false when no handle reads content and the inode holds no base content.
+func (fs *ArtifactFuse) heldAttrs(id fuseops.InodeID) (Attrs, bool) {
+	fs.mu.RLock()
+	ref := fs.inodes[id]
+	if ref == nil || ref.IsRoot {
+		fs.mu.RUnlock()
+		return Attrs{}, false
 	}
-	fs.mu.Unlock()
+	held := *ref
+	type openHandle struct {
+		id fuseops.HandleID
+		fh *FileHandle
+	}
+	var handles []openHandle
+	for hid, fh := range fs.fileHandles {
+		if fh.inode.ID == id {
+			handles = append(handles, openHandle{hid, fh})
+		}
+	}
+	fs.mu.RUnlock()
+	slices.SortFunc(handles, func(a, b openHandle) int { return cmp.Compare(b.id, a.id) })
+	base := Attrs{Type: held.Type, Mode: held.Mode, Size: held.Size, Mtime: held.Mtime, Ctime: held.Mtime, Gen: held.Gen, Blob: held.Blob}
+	for _, h := range handles {
+		h.fh.mu.Lock()
+		f, gen, detached := h.fh.cacheFile, h.fh.cacheGeneration, h.fh.detached
+		var st os.FileInfo
+		var err error
+		if f != nil && (detached || gen == -1) {
+			st, err = f.Stat()
+		}
+		h.fh.mu.Unlock()
+		switch {
+		case st != nil && err == nil && gen == -1:
+			return Attrs{Type: held.Type, Mode: held.Mode, Size: st.Size(), Mtime: st.ModTime(), Ctime: st.ModTime()}, true
+		case st != nil && err == nil:
+			base.Size = st.Size()
+			return base, true
+		case !detached && held.Gen != 0:
+			return base, true
+		}
+	}
+	return base, held.Gen != 0 && len(handles) == 0
+}
+
+// setReported records attrs as what the kernel last received for id. When
+// id is unmapped and attrs show its path back, setReported first decides id as
+// the switch pass does: it maps id back to the path, or retires id and
+// returns ESTALE when the path changed or another inode holds it. Recording a
+// changed identity on an unmapped inode would let the pass map the path back
+// to it.
+func (fs *ArtifactFuse) setReported(id fuseops.InodeID, attrs Attrs) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	ref := fs.inodes[id]
+	if ref == nil {
+		return nil
+	}
+	if fs.unmapped[ref.Path] == id && !fs.settleLocked(id, ref.Path, attrs.identity()) {
+		return syscall.ESTALE
+	}
+	ref.report(attrs)
+	return nil
 }
 
 func (fs *ArtifactFuse) moveInodePath(oldPath, newPath string) {
@@ -619,16 +859,37 @@ func (fs *ArtifactFuse) moveInodePath(oldPath, newPath string) {
 			movingIDs[id] = true
 		}
 	}
+	// An unmapped inode below oldPath moves too, so a write through it
+	// recreates its moved path.
+	var unmappedMoves []inodeMove
+	for path, id := range fs.unmapped {
+		if samePathOrDescendant(path, oldPath) {
+			unmappedMoves = append(unmappedMoves, inodeMove{id: id, oldPath: path, newPath: newPath + strings.TrimPrefix(path, oldPath)})
+			movingIDs[id] = true
+		}
+	}
 	for path, id := range fs.pathToInode {
 		if samePathOrDescendant(path, newPath) && !movingIDs[id] {
-			if replaced := fs.inodes[id]; replaced != nil {
-				replaced.Stale = true
-			}
+			fs.retireLocked(id)
 			delete(fs.pathToInode, path)
+		}
+	}
+	for path, id := range fs.unmapped {
+		if samePathOrDescendant(path, newPath) && !movingIDs[id] {
+			fs.retireLocked(id)
 		}
 	}
 	for _, move := range moves {
 		delete(fs.pathToInode, move.oldPath)
+	}
+	for _, move := range unmappedMoves {
+		delete(fs.unmapped, move.oldPath)
+	}
+	for _, move := range unmappedMoves {
+		fs.unmapped[move.newPath] = move.id
+		if ref := fs.inodes[move.id]; ref != nil {
+			ref.Path = move.newPath
+		}
 	}
 	for _, move := range moves {
 		fs.pathToInode[move.newPath] = move.id
@@ -736,12 +997,14 @@ func (fs *ArtifactFuse) hasOpenFile(path string) bool {
 	return false
 }
 
+// pinOpenFiles points the handles open on path at backingPath. A detached
+// handle no longer names path, so it keeps its own file.
 func (fs *ArtifactFuse) pinOpenFiles(path, backingPath string) error {
 	fs.mu.RLock()
 	var handles []*FileHandle
 	for _, fh := range fs.fileHandles {
 		fh.mu.Lock()
-		matches := fh.path == path
+		matches := fh.path == path && !fh.detached
 		fh.mu.Unlock()
 		if matches {
 			handles = append(handles, fh)
@@ -750,7 +1013,7 @@ func (fs *ArtifactFuse) pinOpenFiles(path, backingPath string) error {
 	fs.mu.RUnlock()
 	for _, fh := range handles {
 		fh.mu.Lock()
-		if fh.cacheFile == nil || fh.cacheGeneration != -1 {
+		if !fh.detached && (fh.cacheFile == nil || fh.cacheGeneration != -1) {
 			f, openErr := os.OpenFile(backingPath, os.O_RDWR, 0)
 			if openErr != nil {
 				f, openErr = os.Open(backingPath)
@@ -769,6 +1032,22 @@ func (fs *ArtifactFuse) pinOpenFiles(path, backingPath string) error {
 		fh.mu.Unlock()
 	}
 	return nil
+}
+
+// markPinned marks pinned each handle open on path that holds the path's
+// overlay file, once an unlink or a rename over path committed. The handle
+// then holds its own copy, which pinOpenFiles pointed it at. A failed unlink
+// or rename leaves its handles unpinned.
+func (fs *ArtifactFuse) markPinned(path string) {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	for _, fh := range fs.fileHandles {
+		fh.mu.Lock()
+		if fh.path == path && !fh.detached && fh.cacheFile != nil && fh.cacheGeneration == -1 {
+			fh.pinned = true
+		}
+		fh.mu.Unlock()
+	}
 }
 
 func (fs *ArtifactFuse) detachOpenHandles(path string) {
@@ -814,8 +1093,11 @@ func (fs *ArtifactFuse) moveOpenHandles(oldPath, newPath string) {
 func (fh *FileHandle) read(ctx context.Context, engine *Engine, b *Blobs, gen int64, off int64, dst []byte) ([]byte, error) {
 	fh.mu.Lock()
 	path := fh.path
-	if fh.detached && fh.cacheFile != nil {
+	if fh.detached {
 		defer fh.mu.Unlock()
+		if fh.cacheFile == nil {
+			return nil, syscall.ESTALE
+		}
 		return readFileChunkFrom(fh.cacheFile, off, dst)
 	}
 	fh.mu.Unlock()
@@ -952,8 +1234,12 @@ func isRequestCancellation(ctx context.Context, err error) bool {
 	return ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
 }
 
+// LookUpInode replies with the inode of a name. A lookup that finds a path
+// holding an unmapped inode can retire it, so it holds handleOps exclusively:
+// a write through that inode then finishes recreating the path first. A
+// lookup of a missing path runs shared, so polling it stalls no other op.
 func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInodeOp) error {
-	return fs.shared(ctx, func(_ context.Context, b *Blobs) error {
+	return fs.sharedUnlessUnmapped(ctx, func(_ context.Context, b *Blobs, exclusive bool) error {
 		parent, err := fs.requireInode(op.Parent, syscall.ENOENT)
 		if err != nil {
 			return err
@@ -983,6 +1269,9 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 		if err != nil {
 			return err
 		}
+		if _, unmapped := fs.heldAt(childPath); unmapped && !exclusive {
+			return errUnmappedPath
+		}
 
 		fs.mu.Lock()
 		ref := fs.allocEntry(op.Parent, op.Name, childPath, attrs)
@@ -995,11 +1284,21 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 	})
 }
 
+// GetInodeAttributes replies with an inode's attributes. An inode whose path
+// is away, or a retired one, gets the attributes of the content its handles
+// read, from heldAttrs. Linux fetches attributes before a read once they
+// expire, so a read through such a file needs a reply that is not an error.
 func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetInodeAttributesOp) error {
 	return fs.shared(ctx, func(_ context.Context, b *Blobs) error {
 		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 		if err != nil {
-			return err
+			held, ok := fs.heldAttrs(op.Inode)
+			if !ok {
+				return err
+			}
+			op.Attributes = inodeAttrs(held.Mode, uint64(held.Size), held.Type, held.Mtime, held.Ctime)
+			op.AttributesExpiration = attrExpiry(CacheTTL)
+			return nil
 		}
 
 		if ref.IsRoot {
@@ -1022,10 +1321,21 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 		}
 
 		attrs, err := fs.engine.Attrs(b, ref.Path)
+		if err == nil {
+			err = fs.setReported(op.Inode, attrs)
+		}
+		if errors.Is(err, iofs.ErrNotExist) || errors.Is(err, syscall.ESTALE) {
+			held, ok := fs.heldAttrs(op.Inode)
+			if !ok {
+				// ENOENT would make the macFUSE kernel extension revoke the
+				// vnode, though a write through it still recreates the path.
+				return syscall.ESTALE
+			}
+			attrs, err = held, nil
+		}
 		if err != nil {
 			return err
 		}
-		fs.setReported(op.Inode, attrs)
 		op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
 		op.AttributesExpiration = attrExpiry(CacheTTL)
 		return nil
@@ -1038,15 +1348,19 @@ func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetI
 
 // setInodeAttributes changes an inode's attributes. checkPermissions checks a
 // size change against the entry's owner write bit, unless it comes through a
-// handle whose access mode allows writes.
+// handle whose access mode allows writes. A change whose path does not map to
+// the inode holds handleOps exclusively, as a write does.
 func (fs *ArtifactFuse) setInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp, checkPermissions bool) error {
-	return fs.shared(ctx, func(ctx context.Context, b *Blobs) error {
+	return fs.sharedUnlessUnmapped(ctx, func(ctx context.Context, b *Blobs, exclusive bool) error {
 		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 		if err != nil {
 			return err
 		}
 		if ref.Path == ".git" {
 			return syscall.EPERM
+		}
+		if err := fs.reachPath(op.Inode, ref.Path, exclusive); err != nil {
+			return err
 		}
 		var size *int64
 		if op.Size != nil {
@@ -1073,7 +1387,9 @@ func (fs *ArtifactFuse) setInodeAttributes(ctx context.Context, op *fuseops.SetI
 		if err != nil {
 			return err
 		}
-		fs.setReported(op.Inode, attrs)
+		if err := fs.setReported(op.Inode, attrs); err != nil {
+			return err
+		}
 		op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
 		op.AttributesExpiration = attrExpiry(CacheTTL)
 		return nil
@@ -1160,8 +1476,11 @@ func (fs *ArtifactFuse) ReadDir(ctx context.Context, op *fuseops.ReadDirOp) erro
 	})
 }
 
+// ReadDirPlus replies with entries and their inodes. As in LookUpInode, a
+// listing that names a path holding an unmapped inode holds handleOps
+// exclusively.
 func (fs *ArtifactFuse) ReadDirPlus(ctx context.Context, op *fuseops.ReadDirPlusOp) error {
-	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+	return fs.sharedUnlessUnmapped(ctx, func(ctx context.Context, _ *Blobs, exclusive bool) error {
 		dh, err := fs.dirHandle(op.Handle)
 		if err != nil {
 			return err
@@ -1173,6 +1492,11 @@ func (fs *ArtifactFuse) ReadDirPlus(ctx context.Context, op *fuseops.ReadDirPlus
 		}
 
 		offset := int(op.Offset)
+		for i := offset; i < len(dh.entries) && !exclusive; i++ {
+			if _, unmapped := fs.heldAt(cleanChildPath(dh.inode.Path, dh.entries[i].Name)); unmapped {
+				return errUnmappedPath
+			}
+		}
 		for i := offset; i < len(dh.entries); i++ {
 			e := dh.entries[i]
 			childPath := cleanChildPath(dh.inode.Path, e.Name)
@@ -1281,14 +1605,31 @@ func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, ch
 			fh.cacheFile, fh.cacheGeneration = f, gen
 			op.KeepPageCache = fs.openedBlob(op.Inode, blob)
 		}
-		fs.mu.Lock()
-		handle := fs.nextHandleID
-		fs.nextHandleID++
-		fs.fileHandles[handle] = fh
-		fs.mu.Unlock()
+		// A create may have retired the inode during the open, after its
+		// retirement detached the handles already open.
+		handle, err := fs.addFileHandle(op.Inode, fh)
+		if err != nil {
+			if fh.cacheFile != nil {
+				_ = fh.cacheFile.Close()
+			}
+			return err
+		}
 		op.Handle = handle
 		return nil
 	})
+}
+
+// addFileHandle registers fh, a new handle on id, unless id is retired.
+func (fs *ArtifactFuse) addFileHandle(id fuseops.InodeID, fh *FileHandle) (fuseops.HandleID, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if ref := fs.inodes[id]; ref != nil && ref.Stale {
+		return 0, syscall.ESTALE
+	}
+	handle := fs.nextHandleID
+	fs.nextHandleID++
+	fs.fileHandles[handle] = fh
+	return handle, nil
 }
 
 func (fs *ArtifactFuse) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) error {
@@ -1330,57 +1671,153 @@ func (fs *ArtifactFuse) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) er
 	})
 }
 
-func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) error {
-	return fs.shared(ctx, func(ctx context.Context, b *Blobs) error {
-		fh, err := fs.fileHandle(op.Handle)
-		if err != nil {
-			return err
-		}
-		fh.mu.Lock()
-		if fh.path == ".git" {
-			fh.mu.Unlock()
-			return syscall.EPERM
-		}
-		if fh.detached {
-			f := fh.cacheFile
-			fh.mu.Unlock()
-			if f == nil {
-				return syscall.EIO
-			}
-			_, err := f.WriteAt(op.Data, op.Offset)
-			return err
-		}
-		path := fh.path
-		fh.wrote = true
-		fh.mu.Unlock()
-		// The creator has its descriptor once a write arrives.
-		fs.takeCreateOpenPending(op.Inode)
-		n, err := fs.engine.Write(ctx, b, path, op.Offset, op.Data)
-		// A handle that cached the base content before the write promoted the
-		// path, or while another write promoted it, would keep serving the
-		// base. Close those caches before the write returns, failed or not.
-		fs.closeCachedFilesForPath(path)
-		if err != nil {
-			return err
-		}
-		if n != len(op.Data) {
-			return syscall.EIO
-		}
-		fs.markWritten(op.Inode, path)
-		// A write recreates a path that vanished while the handle was open.
-		// No reply tells the kernel the name exists again.
-		if e, notifier, ok := fs.takeNegative(path); ok {
-			go func() { _ = notifier.InvalidateEntry(e.parent, e.name) }()
-		}
+// errUnmappedPath makes an op run again holding handleOps exclusively: its
+// path does not map to its inode, or the op can retire an inode that another
+// op reaches the path through.
+var errUnmappedPath = errors.New("path does not map to the inode")
+
+// sharedUnlessUnmapped runs op holding handleOps shared, and again holding it
+// exclusively when op returns errUnmappedPath, so no other op runs alongside
+// it. op learns which way it runs.
+func (fs *ArtifactFuse) sharedUnlessUnmapped(ctx context.Context, op func(ctx context.Context, b *Blobs, exclusive bool) error) error {
+	err := fs.shared(ctx, func(ctx context.Context, b *Blobs) error { return op(ctx, b, false) })
+	if errors.Is(err, errUnmappedPath) {
+		err = fs.exclusive(ctx, func(ctx context.Context, b *Blobs) error { return op(ctx, b, true) })
+	}
+	return err
+}
+
+// reachPath lets an op through id reach path. Holding handleOps shared, it
+// returns errUnmappedPath for a path that does not map to id. Holding it
+// exclusively, it settles the path with claimPath.
+func (fs *ArtifactFuse) reachPath(id fuseops.InodeID, path string, exclusive bool) error {
+	if exclusive {
+		return fs.claimPath(id, path)
+	}
+	if !fs.mapsTo(path, id) {
+		return errUnmappedPath
+	}
+	return nil
+}
+
+// claimPath decides whether an op through id may reach path, which did not map
+// to id when the op began. The caller holds handleOps exclusively. A path that
+// maps to id or is missing is id's: a write recreates it. A path that came
+// back with id's identity maps back to id. Any other path belongs to another
+// file, so id is retired and the op gets ESTALE.
+func (fs *ArtifactFuse) claimPath(id fuseops.InodeID, path string) error {
+	current, exists, err := fs.engine.Identity(path)
+	if err != nil {
+		return err
+	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	ref := fs.inodes[id]
+	if ref == nil || ref.Stale {
+		return syscall.ESTALE
+	}
+	mapped, ok := fs.pathToInode[path]
+	switch {
+	case ok && mapped == id, !ok && !exists:
 		return nil
+	case !ok && ref.returnsAs(current):
+		fs.mapLocked(id, path)
+		return nil
+	}
+	fs.retireLocked(id)
+	return syscall.ESTALE
+}
+
+// WriteFile writes through a handle. A write whose path does not map to the
+// handle's inode can recreate the path, so it holds handleOps exclusively.
+func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) error {
+	return fs.sharedUnlessUnmapped(ctx, func(ctx context.Context, b *Blobs, exclusive bool) error {
+		return fs.writeFile(ctx, b, op, exclusive)
 	})
 }
 
+// writeFile serves WriteFile. See reachPath for exclusive.
+func (fs *ArtifactFuse) writeFile(ctx context.Context, b *Blobs, op *fuseops.WriteFileOp, exclusive bool) error {
+	fh, err := fs.fileHandle(op.Handle)
+	if err != nil {
+		return err
+	}
+	fh.mu.Lock()
+	if fh.path == ".git" {
+		fh.mu.Unlock()
+		return syscall.EPERM
+	}
+	if fh.detached {
+		f, pinned := fh.cacheFile, fh.pinned
+		fh.mu.Unlock()
+		// Only a pinned copy is the handle's own. Any other file it holds
+		// is a blob or an overlay file that no path names any more.
+		if f == nil || !pinned {
+			return syscall.ESTALE
+		}
+		_, err := f.WriteAt(op.Data, op.Offset)
+		return err
+	}
+	path := fh.path
+	fh.mu.Unlock()
+	if err := fs.reachPath(op.Inode, path, exclusive); err != nil {
+		return err
+	}
+	fh.mu.Lock()
+	fh.wrote = true
+	fh.mu.Unlock()
+	// The creator has its descriptor once a write arrives.
+	fs.takeCreateOpenPending(op.Inode)
+	n, err := fs.engine.Write(ctx, b, path, op.Offset, op.Data)
+	// A handle that cached the base content before the write promoted the
+	// path, or while another write promoted it, would keep serving the
+	// base. Close those caches before the write returns, failed or not.
+	fs.closeCachedFilesForPath(path)
+	if err != nil {
+		return err
+	}
+	if n != len(op.Data) {
+		return syscall.EIO
+	}
+	fs.markWritten(op.Inode, path)
+	// A write recreates a path that vanished while the handle was open.
+	// No reply tells the kernel the name exists again.
+	if e, notifier, ok := fs.takeNegative(path); ok {
+		go func() { _ = notifier.InvalidateEntry(e.parent, e.name) }()
+	}
+	return nil
+}
+
+// heldAt reports whether path maps to an inode, and whether it holds an
+// unmapped one.
+func (fs *ArtifactFuse) heldAt(path string) (mapped, unmapped bool) {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	_, mapped = fs.pathToInode[path]
+	_, unmapped = fs.unmapped[path]
+	return mapped, unmapped
+}
+
+// mapsTo reports whether path maps to id.
+func (fs *ArtifactFuse) mapsTo(path string, id fuseops.InodeID) bool {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	mapped, ok := fs.pathToInode[path]
+	return ok && mapped == id
+}
+
+// CreateFile creates a file and opens it. A create of a path that maps to an
+// inode or holds an unmapped one retires that inode, so it holds handleOps
+// exclusively: a write through that inode that already reached the path then
+// finishes first, and does not land in the created file.
 func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp) error {
-	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+	return fs.sharedUnlessUnmapped(ctx, func(ctx context.Context, _ *Blobs, exclusive bool) error {
 		_, childPath, err := fs.childPath(op.Parent, op.Name)
 		if err != nil {
 			return err
+		}
+		if mapped, unmapped := fs.heldAt(childPath); (mapped || unmapped) && !exclusive {
+			return errUnmappedPath
 		}
 		if err := fs.engine.Create(ctx, childPath, uint32(op.Mode)); err != nil {
 			return err
@@ -1474,9 +1911,15 @@ func (fs *ArtifactFuse) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error 
 		if isGitfile(parent, op.Name) {
 			return syscall.EPERM
 		}
+		// Retire a held inode whose path came back as another file before
+		// pinOpenFiles points its handles at a copy of that file.
+		if err := fs.settleUnmappedBelow(childPath); err != nil {
+			return err
+		}
 		if err := fs.engine.Unlink(ctx, b, childPath, fs); err != nil {
 			return err
 		}
+		fs.markPinned(childPath)
 		fs.unmapPath(childPath)
 		fs.detachOpenHandles(childPath)
 		return nil
@@ -1499,12 +1942,19 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 		}
 		oldPath := cleanChildPath(oldParent.Path, op.OldName)
 		newPath := cleanChildPath(newParent.Path, op.NewName)
+		// A kernel that renames a name it cached sends no lookup first.
+		for _, path := range []string{oldPath, newPath} {
+			if err := fs.settleUnmappedBelow(path); err != nil {
+				return err
+			}
+		}
 		if err := fs.engine.Rename(ctx, b, oldPath, newPath, fs); err != nil {
 			return err
 		}
 		if oldPath == newPath {
 			return nil
 		}
+		fs.markPinned(newPath)
 		fs.mu.Lock()
 		// The kernel moves its dentry over any negative entry for the new name.
 		delete(fs.negatives, kernelEntry{op.NewParent, op.NewName})
@@ -1571,7 +2021,7 @@ func (fs *ArtifactFuse) SyncFile(ctx context.Context, op *fuseops.SyncFileOp) er
 			f := fh.cacheFile
 			fh.mu.Unlock()
 			if f == nil {
-				return syscall.EIO
+				return syscall.ESTALE
 			}
 			return f.Sync()
 		}
