@@ -61,18 +61,24 @@ func (s *Service) recordRuntimeLocked(id model.RepoID, update func(*model.RepoRu
 	}
 }
 
-// recordRuntimeState writes rt's state: what it serves, its fetch result and
-// its divergence from the remote. cleared names the phases that just
-// succeeded, whose recorded failure it clears. It reads the state under recordMu, so
-// the last write holds the latest state. It writes nothing of a runtime a
-// stop unmounted, which stays running until its stop finishes, so a late
-// write of its join or its preparation leaves the stop's record.
+// recordRuntimeState writes rt's state with the runtimeState update.
 func (s *Service) recordRuntimeState(rt *repoRuntime, cleared ...string) {
 	s.mu.Lock()
 	id := rt.cfg.ID
 	s.mu.Unlock()
-	s.recordRuntime(id, func(rec *model.RepoRuntimeRecord) {
-		if s.running[id] != rt || rt.mount == mountUnmounted {
+	s.recordRuntime(id, s.runtimeState(rt, cleared...))
+}
+
+// runtimeState is the record update that writes rt's state: what it serves,
+// its fetch result and its divergence from the remote. cleared names the
+// phases that just succeeded, whose recorded failure it clears. It reads the
+// state under recordMu, so the last write holds the latest state. It changes
+// nothing of a runtime a stop unmounted, which stays running until its stop
+// finishes, so a late write of its join or its preparation leaves the stop's
+// record.
+func (s *Service) runtimeState(rt *repoRuntime, cleared ...string) func(*model.RepoRuntimeRecord) {
+	return func(rec *model.RepoRuntimeRecord) {
+		if s.running[rt.cfg.ID] != rt || rt.mount == mountUnmounted {
 			return
 		}
 		rec.State = rt.reportedState()
@@ -89,7 +95,7 @@ func (s *Service) recordRuntimeState(rt *repoRuntime, cleared ...string) {
 		for _, phase := range cleared {
 			clearFailure(rec, phase)
 		}
-	})
+	}
 }
 
 // recordStopped records that the daemon serves cfg no more.
@@ -104,15 +110,17 @@ func (s *Service) recordStopped(cfg model.RepoConfig) {
 }
 
 // recordFailure records err, redacted, as a failure of phase that the daemon
-// retries at nextRetry. A zero nextRetry means nothing retries it.
-func (s *Service) recordFailure(cfg model.RepoConfig, phase string, err error, nextRetry time.Time) {
+// retries at nextRetry. A zero nextRetry means nothing retries it. updates
+// apply in the same write, so status never shows the failure without the
+// state it leaves.
+func (s *Service) recordFailure(cfg model.RepoConfig, phase string, err error, nextRetry time.Time, updates ...func(*model.RepoRuntimeRecord)) {
 	s.recordMu.Lock()
 	defer s.recordMu.Unlock()
-	s.recordFailureLocked(cfg, phase, err, nextRetry)
+	s.recordFailureLocked(cfg, phase, err, nextRetry, updates...)
 }
 
 // recordFailureLocked is recordFailure for a caller that holds recordMu.
-func (s *Service) recordFailureLocked(cfg model.RepoConfig, phase string, err error, nextRetry time.Time) {
+func (s *Service) recordFailureLocked(cfg model.RepoConfig, phase string, err error, nextRetry time.Time, updates ...func(*model.RepoRuntimeRecord)) {
 	msg := auth.RedactLogString(err.Error(), cfg.RemoteURL)
 	now := time.Now()
 	s.recordRuntimeLocked(cfg.ID, func(rec *model.RepoRuntimeRecord) {
@@ -122,14 +130,16 @@ func (s *Service) recordFailureLocked(cfg model.RepoConfig, phase string, err er
 			rec.Attempts = 1
 		}
 		rec.LastError, rec.LastErrorPhase, rec.LastErrorAt, rec.NextRetryAt = msg, phase, now, nextRetry
+		for _, update := range updates {
+			update(rec)
+		}
 	})
 }
 
 // recordMountFailure records a failure to mount cfg, which the daemon retries
 // at nextRetry, and the request it was carrying out.
 func (s *Service) recordMountFailure(cfg model.RepoConfig, state string, err error, nextRetry time.Time) {
-	s.recordFailure(cfg, phaseMount, err, nextRetry)
-	s.recordRuntime(cfg.ID, func(rec *model.RepoRuntimeRecord) {
+	s.recordFailure(cfg, phaseMount, err, nextRetry, func(rec *model.RepoRuntimeRecord) {
 		rec.State = state
 		rec.Phase = phaseMount
 		rec.MountRequest = cfg.MountRequest

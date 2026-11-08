@@ -216,10 +216,9 @@ func (s *Service) startRuntime(ctx context.Context, cfg model.RepoConfig, snap *
 	// registry sync retries a first mount that failed; later failures back off.
 	s.mountSucceeded(cfg.ID)
 	if _, err := s.attachMount(rt); err != nil {
-		s.recordFailure(cfg, phaseMount, err, time.Now().Add(registrySyncInterval))
+		s.recordFailure(cfg, phaseMount, err, time.Now().Add(registrySyncInterval), s.runtimeState(rt))
 	}
 	runHook(s.runtimeStarted)
-	s.recordRuntimeState(rt)
 	return rt
 }
 
@@ -243,7 +242,6 @@ func (s *Service) retryMount(rt *repoRuntime) {
 	}
 	if attached {
 		s.mountSucceeded(cfg.ID)
-		s.recordRuntimeState(rt)
 	}
 }
 
@@ -330,11 +328,14 @@ func (s *Service) attachMount(rt *repoRuntime) (bool, error) {
 	// Every later mount at the mount point is this daemon's.
 	delete(s.leftovers, cfg.ID)
 	s.mu.Unlock()
-	// A mount that serves ends the mount and connection failures before it.
-	// The new connection can fail at once, so the join starts after.
+	// A mount that serves ends the mount and connection failures before it,
+	// in the write that records it serving. The mount point serves already,
+	// so that write comes before anything else. The new connection can fail
+	// at once, so the join starts after.
 	s.recordRuntime(cfg.ID, func(rec *model.RepoRuntimeRecord) {
 		clearFailure(rec, phaseMount)
 		clearFailure(rec, phaseServe)
+		s.runtimeState(rt)(rec)
 	})
 	s.joinMount(rt, mfs)
 	if !isPendingOrFailedPrepareState(cfg.PrepareState) {
@@ -466,39 +467,40 @@ func (s *Service) joinMount(rt *repoRuntime, mfs fusefs.MountedFS) {
 		}
 		// The next registry sync mounts the runtime again.
 		nextRetry := time.Now().Add(registrySyncInterval)
-		// A retry may mount once a clean exit released mfs, and it clears
-		// the serve failure. Holding recordMu until the exit is recorded
-		// keeps that clear after it.
+		// A retry may mount once mfs is released, and it clears the serve
+		// failure. Holding recordMu until the end is recorded keeps that
+		// clear after it.
 		s.recordMu.Lock()
 		s.mu.Lock()
 		exited := !rt.stopping && rt.mfs == mfs && rt.mount == mountServing
 		failed := exited && connErr != nil
+		cfg := rt.cfg
 		switch {
 		case failed:
 			rt.mount = mountFailed
+			// mfs's Unmount unmounts the mount point by path, whichever
+			// mount holds it then. Starting the unmount in the s.mu section
+			// that marks the mount failed means a retry finds it running and
+			// leaves the mount to the next sync, so the unmount never
+			// reaches a remount.
+			// The sync loop waits for no unmount it did not start, so an
+			// unmount(2) that hangs on the dead mount stalls only this repo.
+			s.startUnmountLocked(cfg.ID, s.unmountHeld(cfg, mfs), func(err error) { s.releaseMount(rt, mfs, err, mountNone) })
 		case exited:
 			rt.mfs, rt.mount = nil, mountNone
 		}
-		cfg := rt.cfg
 		s.mu.Unlock()
 		close(done)
 		switch {
 		case failed:
 			s.logger.Error("fuse connection failed, unmounting", "repo", cfg.Name, "error", auth.RedactLogString(connErr.Error(), cfg.RemoteURL))
-			s.recordFailureLocked(cfg, phaseServe, connErr, nextRetry)
+			s.recordFailureLocked(cfg, phaseServe, connErr, nextRetry, s.runtimeState(rt))
 		case exited:
 			runHook(s.mountReleased)
-			s.recordFailureLocked(cfg, phaseServe, errFUSEServerExited, nextRetry)
+			s.recordFailureLocked(cfg, phaseServe, errFUSEServerExited, nextRetry, s.runtimeState(rt))
 		}
 		s.recordMu.Unlock()
-		if failed {
-			// The sync loop waits for no unmount it did not start, so an
-			// unmount(2) that hangs on the dead mount stalls only this repo.
-			s.startUnmount(cfg, s.unmountHeld(cfg, mfs), func(err error) { s.releaseMount(rt, mfs, err, mountNone) })
-		}
-		if exited {
-			s.recordRuntimeState(rt)
-		}
+		runHook(s.joinRecorded)
 		runHook(s.joinFinished)
 	}()
 }

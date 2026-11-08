@@ -358,12 +358,13 @@ func TestStatusCLIPrintsLastFetchInUTC(t *testing.T) {
 	if closeErr := reg.Close(); err != nil || closeErr != nil {
 		t.Fatalf("get repo: %v, close: %v", err, closeErr)
 	}
-	// A CLI fetch shows in status only through FETCH_HEAD's mtime.
+	// A CLI fetch shows in status only through the FETCH_HEAD it filled, at
+	// its mtime.
 	fetchHead := filepath.Join(cfg.GitDir, "FETCH_HEAD")
 	if err := os.MkdirAll(cfg.GitDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(fetchHead, nil, 0o600); err != nil {
+	if err := os.WriteFile(fetchHead, []byte(strings.Repeat("a", 40)+"\t\tbranch 'main' of https://github.com/example/repo\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	fetched := time.Date(2026, time.March, 31, 12, 34, 56, 0, time.UTC)

@@ -30,6 +30,9 @@ type Store struct {
 	// testHookSSHWrapperDirMade, when set, runs in batchModeSSH between
 	// making a wrapper's directory and writing the wrapper.
 	testHookSSHWrapperDirMade func(dir string)
+	// testHookBeforeHookRename, when set, runs in replaceExecutable between
+	// writing the new file and renaming it over path.
+	testHookBeforeHookRename func(path string)
 }
 
 func New(logger *slog.Logger) *Store {

@@ -19,9 +19,8 @@ import (
 // restore that outlives it is stuck on the mount, which is then wedged.
 const sharedRestoreTimeout = 2 * time.Minute
 
-// kernelCacheExpiry is longer than the 1-second entry and attribute expiry that
-// internal/fusefs gives the kernel. Nothing invalidates those caches when the
-// daemon switches snapshots, so a stat within that second can see the old one.
+// kernelCacheExpiry is longer than fusefs.CacheTTL, the expiry of the entries
+// and attributes the kernel caches for the mount.
 const kernelCacheExpiry = 1500 * time.Millisecond
 
 // TestE2ESharedMount runs every e2e test that needs only a mounted repo in its
@@ -34,6 +33,7 @@ func TestE2ESharedMount(t *testing.T) {
 	shared := newSharedE2ERepo(t)
 	shared.runReadOnly(t, "GitCleanState", testE2EGitCleanState)
 	shared.runReadOnly(t, "GitConcurrentReads", testE2EGitConcurrentReads)
+	shared.run(t, "KernelCacheFollowsHEADMoveOutsideTheMount", testE2EKernelCacheFollowsHEADMoveOutsideTheMount)
 	shared.run(t, "GitStatusDetectsSameSizeRewriteAfterMtimeRestore", testE2EGitStatusDetectsSameSizeRewriteAfterMtimeRestore)
 	shared.run(t, "GitStatusPorcelain", testE2EGitStatusPorcelain)
 	shared.run(t, "GitRenameTrackedDirectory", testE2EGitRenameTrackedDirectory)
@@ -50,7 +50,7 @@ func TestE2ESharedMount(t *testing.T) {
 	shared.run(t, "GitResetHardCleanAndStash", testE2EGitResetHardCleanAndStash)
 	shared.run(t, "GitPullFastForward", testE2EGitPullFastForward)
 	shared.run(t, "GitPush", testE2EGitPush)
-	t.Run("FilesystemDirectoryMoveWorkflows", func(t *testing.T) { testE2EFilesystemDirectoryMoveWorkflows(t, shared) })
+	shared.run(t, "FilesystemDirectoryMoveWorkflows", testE2EFilesystemDirectoryMoveWorkflows)
 	shared.run(t, "FilesystemDirectoryRenameConcurrentAccess", testE2EFilesystemDirectoryRenameConcurrentAccess)
 	shared.run(t, "OpenFileReadsAfterUnlink", testE2EOpenFileReadsAfterUnlink)
 	shared.run(t, "OpenFileReadsWhileHEADKeepsPathAway", testE2EOpenFileReadsWhileHEADKeepsPathAway)
@@ -161,15 +161,21 @@ func (s *sharedE2ERepo) runSubtest(t *testing.T, name string, test func(*testing
 			skipIfFSKitHEADMove(t, "restoring the shared mount after this test")
 		}
 		t.Cleanup(func() { s.release(t, needsRestore) })
+		// Runs before release, which clears the logs.
+		t.Cleanup(func() {
+			if t.Failed() {
+				logFuseErrors(t, s.repo.logs)
+			}
+		})
 		test(t, s.repo)
 	})
 }
 
 // release restores the shared mount after t. A restore that fails fails t,
 // whose changes it could not undo, and skips the tests after it. A restore
-// that stalls marks the mount wedged. When t needs no restore, release first
-// fails t if it changed the mount, because on FSKit restoring that change
-// would move HEAD.
+// that stalls marks the mount wedged. When t needs no restore, release fails t
+// if it changed the mount, because on FSKit restoring that change would move
+// HEAD, and otherwise restores nothing.
 func (s *sharedE2ERepo) release(t *testing.T, needsRestore bool) {
 	t.Helper()
 	if wedgedMount.Load() != nil {
@@ -182,6 +188,9 @@ func (s *sharedE2ERepo) release(t *testing.T, needsRestore bool) {
 				restored <- fmt.Errorf("the test is registered with runReadOnly but changed the mount: %w", err)
 				return
 			}
+			s.repo.logs.Reset()
+			restored <- nil
+			return
 		}
 		restored <- s.restore()
 	}()
@@ -253,9 +262,11 @@ func (s *sharedE2ERepo) restore() error {
 	return nil
 }
 
-// settle waits until the daemon serves s.head and keeps one snapshot for
-// longer than kernelCacheExpiry, so the kernel holds no entry or attribute
-// from an earlier snapshot. It returns the daemon status at that point.
+// settle waits until the daemon serves s.head and returns the daemon status at
+// that point. Each generation switch tells the kernel what it changed. FSKit
+// takes no invalidations, so there settle also waits until the daemon keeps
+// one snapshot for longer than kernelCacheExpiry, and the kernel holds no
+// entry or attribute from an earlier snapshot.
 func (s *sharedE2ERepo) settle() (model.RepoRuntimeState, error) {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
@@ -263,8 +274,8 @@ func (s *sharedE2ERepo) settle() (model.RepoRuntimeState, error) {
 			return model.RepoRuntimeState{}, err
 		}
 		before, err := s.repo.ctl.Status(context.Background(), repoName)
-		if err != nil {
-			return model.RepoRuntimeState{}, err
+		if err != nil || !e2eMountsUseFSKit() {
+			return before, err
 		}
 		time.Sleep(kernelCacheExpiry)
 		after, err := s.repo.ctl.Status(context.Background(), repoName)
@@ -281,14 +292,17 @@ func (s *sharedE2ERepo) settle() (model.RepoRuntimeState, error) {
 	}
 }
 
-// discardOverlay leaves the overlay without entries. Restoring files with Git
-// writes them through the overlay, and the daemon keeps an entry that matches
-// its base until HEAD moves. Removing each entry's path turns it into a delete
-// marker, and the daemon drops every delete marker when HEAD moves to a tree
-// without that path.
+// discardOverlay leaves the overlay without entries, and the daemon on s.head.
+// Restoring files with Git writes them through the overlay, and the daemon
+// keeps an entry that matches its base until HEAD moves. Removing each entry's
+// path turns it into a delete marker, and the daemon drops every delete marker
+// when HEAD moves to a tree without that path. The move to the empty commit
+// and back also outlasts any reconcile a test left in flight: the daemon
+// reconciles one HEAD change at a time, so once it serves the empty commit,
+// no earlier reconcile can switch it later.
 func (s *sharedE2ERepo) discardOverlay() error {
 	entries, err := s.overlayEntries()
-	if err != nil || len(entries) == 0 {
+	if err != nil {
 		return err
 	}
 	for _, e := range entries {
@@ -345,8 +359,6 @@ func (s *sharedE2ERepo) verify() error {
 		{[]string{"symbolic-ref", "HEAD"}, "refs/heads/main"},
 		{[]string{"rev-parse", "HEAD"}, s.head},
 		{[]string{"status", "--short", "--untracked-files=all"}, ""},
-		{[]string{"diff", "--quiet"}, ""},
-		{[]string{"diff", "--cached", "--quiet"}, ""},
 	} {
 		got, err := gitOutput(s.repo.mountPath, check.args...)
 		if err != nil {

@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/daemon"
-	"github.com/cloudflare/artifact-fs/internal/logging"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 )
@@ -155,7 +153,8 @@ func TestSharedMountReadOnlyTestChangesMountHelper(t *testing.T) {
 	remoteURL := createLocalTestRepo(t)
 	root := t.TempDir()
 	mountDir := t.TempDir()
-	svc, err := daemon.New(ctx, root, logging.NewJSONLogger(os.Stderr, slog.LevelWarn))
+	logs := &synchronizedBuffer{}
+	svc, err := daemon.New(ctx, root, newE2ELogger(logs))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +171,7 @@ func TestSharedMountReadOnlyTestChangesMountHelper(t *testing.T) {
 	// gitDir does not exist, so a restore that runs anyway fails without
 	// touching a repository.
 	s := &sharedE2ERepo{
-		repo:       &mountedE2ERepo{root: root, svc: svc, ctl: ctl},
+		repo:       &mountedE2ERepo{root: root, svc: svc, ctl: ctl, logs: logs},
 		gitDir:     filepath.Join(root, "missing-git"),
 		generation: st.SnapshotGeneration,
 	}

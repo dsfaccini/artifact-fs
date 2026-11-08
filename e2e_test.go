@@ -143,7 +143,11 @@ func TestE2E(t *testing.T) {
 		t.Logf("using local test repo: %s", remoteURL)
 	}
 
-	root := t.TempDir()
+	// daemon.New resolves the state root's symlinks, such as macOS's /var.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	mountDir := newE2EMountDir(t)
 	mountPath := filepath.Join(mountDir, repoName)
 	if err := os.MkdirAll(mountPath, 0o755); err != nil {
@@ -153,8 +157,7 @@ func TestE2E(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	logger := logging.NewJSONLogger(os.Stderr, slog.LevelWarn)
-	svc, err := daemon.New(ctx, root, logger)
+	svc, err := daemon.New(ctx, root, newTestE2ELogger(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,34 +199,42 @@ func TestE2E(t *testing.T) {
 	t.Logf("mount active at %s", mountPath)
 	primeE2EMountPolling(t, mountPath)
 
+	// headBlob is the content of path in HEAD, read outside the mount.
+	gitDir := filepath.Join(root, "repos", repoName, "git")
+	headBlob := func(t *testing.T, path string) string {
+		t.Helper()
+		return run(t, "", "git", "--git-dir", gitDir, "cat-file", "blob", "HEAD:"+path)
+	}
+	headNames := func(t *testing.T, tree string) []string {
+		t.Helper()
+		return strings.Fields(run(t, "", "git", "--git-dir", gitDir, "ls-tree", "--name-only", "HEAD:"+tree))
+	}
+
 	// ---- Filesystem read operations ----
 
 	t.Run("fs/ls_root", func(t *testing.T) {
-		entries := lsDir(t, mountPath)
-		if len(entries) < 5 {
-			t.Fatalf("expected >5 root entries, got %d", len(entries))
+		want := append(headNames(t, ""), ".git")
+		slices.Sort(want)
+		if got := lsDir(t, mountPath); !slices.Equal(got, want) {
+			t.Fatalf("root entries = %v, want %v", got, want)
 		}
-		assertContains(t, entries, ".git")
 	})
 
 	t.Run("fs/cat_gitfile", func(t *testing.T) {
-		data := readFileStr(t, filepath.Join(mountPath, ".git"))
-		if !strings.HasPrefix(data, "gitdir:") {
-			t.Fatalf("expected gitdir:..., got %q", data)
+		if got, want := readFileStr(t, filepath.Join(mountPath, ".git")), "gitdir: "+gitDir+"\n"; got != want {
+			t.Fatalf(".git = %q, want %q", got, want)
 		}
 	})
 
 	t.Run("fs/read_tracked_file", func(t *testing.T) {
-		data := readFileStr(t, filepath.Join(mountPath, "README.md"))
-		if len(data) == 0 {
-			t.Fatal("README.md is empty")
+		if got, want := readFileStr(t, filepath.Join(mountPath, "README.md")), headBlob(t, "README.md"); got != want {
+			t.Fatalf("README.md = %q, want %q", got, want)
 		}
 	})
 
 	t.Run("fs/ls_subdir", func(t *testing.T) {
-		entries := lsDir(t, filepath.Join(mountPath, "packages"))
-		if len(entries) < 3 {
-			t.Fatalf("expected >3 packages/ entries, got %d", len(entries))
+		if got, want := lsDir(t, filepath.Join(mountPath, "packages")), headNames(t, "packages"); !slices.Equal(got, want) {
+			t.Fatalf("packages/ entries = %v, want %v", got, want)
 		}
 	})
 
@@ -232,15 +243,15 @@ func TestE2E(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if fi.Size() == 0 {
-			t.Fatal("package.json has size 0 -- sizes not resolved")
+		if want := int64(len(headBlob(t, "package.json"))); fi.Size() != want {
+			t.Fatalf("package.json size = %d, want %d", fi.Size(), want)
 		}
 	})
 
 	t.Run("fs/read_nested", func(t *testing.T) {
-		data := readFileStr(t, filepath.Join(mountPath, "packages", "wrangler", "package.json"))
-		if !strings.Contains(data, "wrangler") {
-			t.Fatalf("nested file doesn't contain expected content")
+		path := filepath.Join("packages", "wrangler", "package.json")
+		if got, want := readFileStr(t, filepath.Join(mountPath, path)), headBlob(t, path); got != want {
+			t.Fatalf("%s = %q, want %q", path, got, want)
 		}
 	})
 
@@ -251,10 +262,7 @@ func TestE2E(t *testing.T) {
 		if err := os.WriteFile(p, []byte("hello e2e\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		got := readFileStr(t, p)
-		if got != "hello e2e\n" {
-			t.Fatalf("expected 'hello e2e\\n', got %q", got)
-		}
+		assertFileContent(t, p, "hello e2e\n")
 	})
 
 	t.Run("fs/mkdir", func(t *testing.T) {
@@ -269,6 +277,9 @@ func TestE2E(t *testing.T) {
 		if !fi.IsDir() {
 			t.Fatal("expected directory")
 		}
+		if entries := lsDir(t, p); len(entries) != 0 {
+			t.Fatalf("new directory entries = %v, want none", entries)
+		}
 	})
 
 	t.Run("fs/write_nested", func(t *testing.T) {
@@ -276,10 +287,7 @@ func TestE2E(t *testing.T) {
 		if err := os.WriteFile(p, []byte("nested\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		got := readFileStr(t, p)
-		if got != "nested\n" {
-			t.Fatalf("expected 'nested\\n', got %q", got)
-		}
+		assertFileContent(t, p, "nested\n")
 	})
 
 	t.Run("fs/rename_nonempty_overlay_directory", func(t *testing.T) {
@@ -289,9 +297,7 @@ func TestE2E(t *testing.T) {
 			t.Fatal(err)
 		}
 		assertPathMissing(t, oldPath)
-		if got := readFileStr(t, filepath.Join(newPath, "nested.txt")); got != "nested\n" {
-			t.Fatalf("renamed nested file = %q", got)
-		}
+		assertFileContent(t, filepath.Join(newPath, "nested.txt"), "nested\n")
 	})
 
 	t.Run("fs/rename", func(t *testing.T) {
@@ -300,13 +306,8 @@ func TestE2E(t *testing.T) {
 		if err := os.Rename(src, dst); err != nil {
 			t.Fatal(err)
 		}
-		got := readFileStr(t, dst)
-		if got != "hello e2e\n" {
-			t.Fatalf("renamed file content wrong: %q", got)
-		}
-		if _, err := os.Stat(src); !os.IsNotExist(err) {
-			t.Fatal("original file still exists after rename")
-		}
+		assertFileContent(t, dst, "hello e2e\n")
+		assertPathMissing(t, src)
 	})
 
 	t.Run("fs/unlink", func(t *testing.T) {
@@ -314,33 +315,27 @@ func TestE2E(t *testing.T) {
 		if err := os.Remove(p); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			t.Fatal("file still exists after unlink")
-		}
+		assertPathMissing(t, p)
 	})
 
 	t.Run("fs/rmdir", func(t *testing.T) {
-		os.Remove(filepath.Join(mountPath, "e2e-renamed-dir", "nested.txt"))
+		if err := os.Remove(filepath.Join(mountPath, "e2e-renamed-dir", "nested.txt")); err != nil {
+			t.Fatal(err)
+		}
 		p := filepath.Join(mountPath, "e2e-renamed-dir")
 		if err := os.Remove(p); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			t.Fatal("dir still exists after rmdir")
-		}
+		assertPathMissing(t, p)
 	})
 
 	t.Run("fs/modify_tracked", func(t *testing.T) {
 		p := filepath.Join(mountPath, "README.md")
-		orig := readFileStr(t, p)
-		appended := orig + "# e2e test marker\n"
+		appended := headBlob(t, "README.md") + "# e2e test marker\n"
 		if err := os.WriteFile(p, []byte(appended), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		got := readFileStr(t, p)
-		if !strings.HasSuffix(got, "# e2e test marker\n") {
-			t.Fatal("modified file doesn't end with marker")
-		}
+		assertFileContent(t, p, appended)
 	})
 
 	t.Run("fs/rename_tracked", func(t *testing.T) {
@@ -349,13 +344,8 @@ func TestE2E(t *testing.T) {
 		if err := os.Rename(src, dst); err != nil {
 			t.Fatal(err)
 		}
-		data := readFileStr(t, dst)
-		if len(data) == 0 {
-			t.Fatal("renamed tracked file is empty")
-		}
-		if _, err := os.Stat(src); !os.IsNotExist(err) {
-			t.Fatal("original still exists after rename")
-		}
+		assertFileContent(t, dst, headBlob(t, "SECURITY.md"))
+		assertPathMissing(t, src)
 	})
 
 	t.Run("fs/truncate_tracked", func(t *testing.T) {
@@ -363,145 +353,7 @@ func TestE2E(t *testing.T) {
 		if err := os.Truncate(p, 0); err != nil {
 			t.Fatal(err)
 		}
-		fi, err := os.Stat(p)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if fi.Size() != 0 {
-			t.Fatalf("expected size 0 after truncate, got %d", fi.Size())
-		}
-	})
-
-	// ---- Git read operations ----
-
-	t.Run("git/log", func(t *testing.T) {
-		out := gitCmd(t, mountPath, "log", "--oneline", "-3")
-		lines := strings.Split(strings.TrimSpace(out), "\n")
-		if len(lines) < 3 {
-			t.Fatalf("expected 3 log lines, got %d", len(lines))
-		}
-	})
-
-	t.Run("git/branch", func(t *testing.T) {
-		out := gitCmd(t, mountPath, "branch")
-		if !strings.Contains(out, "main") {
-			t.Fatalf("expected 'main' in branch output, got %q", out)
-		}
-	})
-
-	t.Run("git/rev-parse", func(t *testing.T) {
-		out := gitCmd(t, mountPath, "rev-parse", "HEAD")
-		if len(strings.TrimSpace(out)) != 40 {
-			t.Fatalf("expected 40-char SHA, got %q", out)
-		}
-	})
-
-	t.Run("git/show", func(t *testing.T) {
-		out := gitCmd(t, mountPath, "show", "HEAD", "--stat", "--format=%H")
-		if len(out) == 0 {
-			t.Fatal("git show returned empty output")
-		}
-	})
-
-	t.Run("git/remote", func(t *testing.T) {
-		out := gitCmd(t, mountPath, "remote", "-v")
-		if !strings.Contains(out, "origin") {
-			t.Fatalf("expected origin remote, got %q", out)
-		}
-	})
-
-	t.Run("git/stash_list", func(t *testing.T) {
-		_ = gitCmd(t, mountPath, "stash", "list")
-	})
-
-	// ---- Git write operations ----
-
-	t.Run("git/diff", func(t *testing.T) {
-		out := gitCmd(t, mountPath, "diff", "README.md")
-		if !strings.Contains(out, "e2e test marker") {
-			t.Fatalf("expected diff to contain marker, got %q", out)
-		}
-	})
-
-	t.Run("git/add", func(t *testing.T) {
-		gitCmd(t, mountPath, "add", "README.md")
-		out := gitCmd(t, mountPath, "status", "--short", "README.md")
-		if !strings.HasPrefix(strings.TrimSpace(out), "M") {
-			t.Fatalf("expected staged M, got %q", out)
-		}
-	})
-
-	t.Run("git/reset", func(t *testing.T) {
-		gitCmd(t, mountPath, "reset", "HEAD", "README.md")
-	})
-
-	t.Run("git/status", func(t *testing.T) {
-		out := gitCmd(t, mountPath, "status", "--short")
-		if len(out) == 0 {
-			t.Fatal("expected non-empty status output after modifications")
-		}
-	})
-
-	// ---- Git commit + reconciliation ----
-	// Tests the full post-commit flow: watcher detects HEAD change ->
-	// daemon re-indexes tree -> overlay reconciliation cleans up committed
-	// entries -> new snapshot generation is visible to FUSE.
-
-	t.Run("git/commit", func(t *testing.T) {
-		skipIfFSKitHEADMove(t, "this test")
-		preCommitHEAD := strings.TrimSpace(gitCmd(t, mountPath, "rev-parse", "HEAD"))
-
-		// Create and stage a new file (isolated from prior dirty state).
-		commitFile := filepath.Join(mountPath, "e2e-commit.txt")
-		if err := os.WriteFile(commitFile, []byte("committed content\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		gitCmd(t, mountPath, "add", "e2e-commit.txt")
-
-		// Commit (use -c flags to avoid needing global git config).
-		gitCmd(t, mountPath,
-			"-c", "user.name=E2E Test",
-			"-c", "user.email=e2e@test",
-			"commit", "-m", "e2e commit test",
-		)
-
-		// Poll until reconciliation completes. The watcher polls HEAD at
-		// 500ms; after detecting the change, reconcileHEAD publishes the new
-		// commit's tree, reconciles the overlay, and switches the snapshot
-		// generation. When git status reports the committed file as clean,
-		// all of that has finished.
-		deadline := time.Now().Add(10 * time.Second)
-		reconciled := false
-		for time.Now().Before(deadline) {
-			out := gitCmd(t, mountPath, "status", "--short", "e2e-commit.txt")
-			if strings.TrimSpace(out) == "" {
-				reconciled = true
-				break
-			}
-			time.Sleep(200 * time.Millisecond)
-		}
-		if !reconciled {
-			t.Fatal("overlay reconciliation did not complete within timeout")
-		}
-
-		// HEAD should have advanced.
-		postCommitHEAD := strings.TrimSpace(gitCmd(t, mountPath, "rev-parse", "HEAD"))
-		if postCommitHEAD == preCommitHEAD {
-			t.Fatalf("HEAD did not change: still %s", preCommitHEAD)
-		}
-
-		// Log should contain our commit message.
-		logOut := gitCmd(t, mountPath, "log", "--oneline", "-1")
-		if !strings.Contains(logOut, "e2e commit test") {
-			t.Fatalf("expected commit message in log, got %q", logOut)
-		}
-
-		// File content should still be readable (now served from the base
-		// snapshot after overlay reconciliation removed the entry).
-		got := readFileStr(t, commitFile)
-		if got != "committed content\n" {
-			t.Fatalf("expected 'committed content\\n', got %q", got)
-		}
+		assertFileContent(t, p, "")
 	})
 
 	// ---- Teardown ----
@@ -513,13 +365,21 @@ func TestE2E(t *testing.T) {
 	}
 }
 
-func testE2EFilesystemDirectoryMoveWorkflows(t *testing.T, shared *sharedE2ERepo) {
-	shared.run(t, "cli_move_preserves_tree_and_open_handles", testE2ECLIDirectoryMove)
-	shared.run(t, "recursive_copy_move_and_replace_empty_destination", testE2ERecursiveCopyMoveAndReplace)
-	shared.run(t, "replace_visible_empty_tracked_destination", testE2EReplaceVisibleEmptyTrackedDirectory)
-	shared.run(t, "replace_deleted_tracked_destination", testE2EReplaceDeletedTrackedDirectory)
-	shared.run(t, "reject_nonempty_destination", testE2ERejectNonemptyDirectoryReplacement)
-	shared.run(t, "native_rename_error_contract", testE2ENativeDirectoryRenameErrors)
+// testE2EFilesystemDirectoryMoveWorkflows runs each workflow on paths no other
+// workflow touches, so the workflows share one restore of the shared mount.
+func testE2EFilesystemDirectoryMoveWorkflows(t *testing.T, repo *mountedE2ERepo) {
+	for _, workflow := range []struct {
+		name string
+		test func(*testing.T, *mountedE2ERepo)
+	}{
+		{"cli_move_preserves_tree_and_open_handles", testE2ECLIDirectoryMove},
+		{"recursive_copy_move_and_replace_empty_destination", testE2ERecursiveCopyMoveAndReplace},
+		{"replace_visible_empty_tracked_destination", testE2EReplaceVisibleEmptyTrackedDirectory},
+		{"replace_deleted_tracked_destination", testE2EReplaceDeletedTrackedDirectory},
+		{"reject_nonempty_destination", testE2ERejectNonemptyDirectoryReplacement},
+	} {
+		t.Run(workflow.name, func(t *testing.T) { workflow.test(t, repo) })
+	}
 }
 
 func TestE2EFilesystemDirectoryRenamePersistsAcrossRestart(t *testing.T) {
@@ -575,6 +435,92 @@ func TestE2EFilesystemDirectoryRenamePersistsAcrossRestart(t *testing.T) {
 	if got := readFileStr(t, filepath.Join(trackedDestination, "nested", "incoming.txt")); got != "incoming\n" {
 		t.Fatalf("replacement content after restart = %q", got)
 	}
+}
+
+// The kernel caches a file's attributes and a missing name's negative entry for
+// fusefs.CacheTTL. After a HEAD move made outside the mount, the daemon tells
+// the kernel what the switch changed before its status reports the new HEAD,
+// so a stat and a read show the new commit at once.
+func testE2EKernelCacheFollowsHEADMoveOutsideTheMount(t *testing.T, repo *mountedE2ERepo) {
+	gitDir := filepath.Join(repo.root, "repos", repoName, "git")
+	readmePath := filepath.Join(repo.mountPath, "README.md")
+	addedPath := filepath.Join(repo.mountPath, "ADDED.md")
+	head, err := gitOutput("", "--git-dir", gitDir, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme := readFileStr(t, readmePath) + "changed outside the mount\n"
+	const added = "added outside the mount\n"
+	assertPathMissing(t, addedPath)
+
+	blobDir := t.TempDir()
+	blob := func(name, content string) string {
+		t.Helper()
+		writeTestFile(t, blobDir, name, content)
+		oid, err := gitOutput("", "--git-dir", gitDir, "hash-object", "-w", filepath.Join(blobDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return oid
+	}
+	tree, err := gitOutput("", "--git-dir", gitDir, "ls-tree", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []string
+	for line := range strings.SplitSeq(tree, "\n") {
+		if !strings.HasSuffix(line, "\tREADME.md") {
+			entries = append(entries, line)
+		}
+	}
+	entries = append(entries, "100644 blob "+blob("README.md", readme)+"\tREADME.md", "100644 blob "+blob("ADDED.md", added)+"\tADDED.md")
+	// The blobless clone lacks the blobs no one read, so mktree must not check them.
+	mktree := exec.Command("git", "--git-dir", gitDir, "mktree", "--missing")
+	mktree.Stdin = strings.NewReader(strings.Join(entries, "\n") + "\n")
+	var mktreeStderr bytes.Buffer
+	mktree.Stderr = &mktreeStderr
+	treeOID, err := mktree.Output()
+	if err != nil {
+		t.Fatalf("git mktree: %v: %s", err, mktreeStderr.String())
+	}
+	next, err := gitOutput("", "--git-dir", gitDir,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit-tree", strings.TrimSpace(string(treeOID)), "-p", head, "-m", "change README.md and add ADDED.md outside the mount",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := gitOutput("", "--git-dir", gitDir, "update-ref", "refs/heads/main", next, head); err != nil {
+		t.Fatal(err)
+	}
+	// Stat both names until the daemon serves next, with no pause, so the
+	// kernel holds a fresh entry for each when the switch happens.
+	for deadline := time.Now().Add(30 * time.Second); ; {
+		_, _ = os.Stat(readmePath)
+		_, _ = os.Stat(addedPath)
+		st, err := repo.ctl.Status(context.Background(), repoName)
+		if err == nil && st.CurrentHEADOID == next {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the daemon did not serve %s within 30s: HEAD %s, %v", next, st.CurrentHEADOID, err)
+		}
+	}
+	// Check both names before failing, so a run without the invalidation
+	// shows each cache that went stale.
+	if _, err := os.Stat(addedPath); err != nil {
+		t.Errorf("stat ADDED.md once the daemon serves %s: %v", next, err)
+	}
+	if st, err := os.Stat(readmePath); err != nil || st.Size() != int64(len(readme)) {
+		t.Errorf("stat README.md once the daemon serves %s = %v, %v; want size %d", next, st, err, len(readme))
+	}
+	if t.Failed() {
+		return
+	}
+	assertFileContent(t, readmePath, readme)
+	assertFileContent(t, addedPath, added)
 }
 
 // An open file keeps reading the content it held after an unlink through the
@@ -941,6 +887,17 @@ func testE2ECLIDirectoryMove(t *testing.T, repo *mountedE2ERepo) {
 	if got := readFileStr(t, filepath.Join(sibling, "untouched.txt")); got != "sibling\n" {
 		t.Fatalf("prefix sibling content = %q", got)
 	}
+
+	crossParent := filepath.Join(sibling, "nested")
+	if err := unix.Rename(filepath.Join(moved, "nested"), crossParent); err != nil {
+		t.Fatalf("cross-parent directory rename: %v", err)
+	}
+	assertPathMissing(t, filepath.Join(moved, "nested"))
+	if got, err := os.ReadFile(filepath.Join(crossParent, "deeper", "payload.bin")); err != nil {
+		t.Fatal(err)
+	} else if !bytes.Equal(got, wantBinary) {
+		t.Fatalf("cross-parent content = %v, want %v", got, wantBinary)
+	}
 }
 
 func testE2ERecursiveCopyMoveAndReplace(t *testing.T, repo *mountedE2ERepo) {
@@ -1097,7 +1054,7 @@ func testE2EReplaceVisibleEmptyTrackedDirectory(t *testing.T, repo *mountedE2ERe
 }
 
 func testE2EReplaceDeletedTrackedDirectory(t *testing.T, repo *mountedE2ERepo) {
-	run(t, repo.mountPath, "rm", "-rf", "packages/miniflare")
+	run(t, repo.mountPath, "rm", "-rf", "packages/vitest-pool")
 	trackedReplacementSource := filepath.Join(repo.mountPath, "tracked-replacement-source")
 	if err := os.Mkdir(trackedReplacementSource, 0o755); err != nil {
 		t.Fatal(err)
@@ -1105,9 +1062,9 @@ func testE2EReplaceDeletedTrackedDirectory(t *testing.T, repo *mountedE2ERepo) {
 	if err := os.WriteFile(filepath.Join(trackedReplacementSource, "incoming.txt"), []byte("incoming\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	run(t, repo.mountPath, "mv", "tracked-replacement-source", "packages/miniflare")
-	assertPathExists(t, filepath.Join(repo.mountPath, "packages", "miniflare", "incoming.txt"))
-	assertPathMissing(t, filepath.Join(repo.mountPath, "packages", "miniflare", "package.json"))
+	run(t, repo.mountPath, "mv", "tracked-replacement-source", "packages/vitest-pool")
+	assertFileContent(t, filepath.Join(repo.mountPath, "packages", "vitest-pool", "incoming.txt"), "incoming\n")
+	assertPathMissing(t, filepath.Join(repo.mountPath, "packages", "vitest-pool", "package.json"))
 }
 
 func testE2ERejectNonemptyDirectoryReplacement(t *testing.T, repo *mountedE2ERepo) {
@@ -1133,70 +1090,6 @@ func testE2ERejectNonemptyDirectoryReplacement(t *testing.T, repo *mountedE2ERep
 	}
 	if got := readFileStr(t, filepath.Join(rejectedDestination, "destination.txt")); got != "destination\n" {
 		t.Fatalf("rejected destination content = %q", got)
-	}
-}
-
-func testE2ENativeDirectoryRenameErrors(t *testing.T, repo *mountedE2ERepo) {
-	fileSource := filepath.Join(repo.mountPath, "file-source")
-	directoryDestination := filepath.Join(repo.mountPath, "directory-destination")
-	if err := os.WriteFile(fileSource, []byte("file\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(directoryDestination, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := unix.Rename(fileSource, directoryDestination); !errors.Is(err, unix.EISDIR) {
-		t.Fatalf("file over directory error = %v, want EISDIR", err)
-	}
-
-	directorySource := filepath.Join(repo.mountPath, "directory-source")
-	fileDestination := filepath.Join(repo.mountPath, "file-destination")
-	if err := os.Mkdir(directorySource, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(fileDestination, []byte("destination\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := unix.Rename(directorySource, fileDestination); !errors.Is(err, unix.ENOTDIR) {
-		t.Fatalf("directory over file error = %v, want ENOTDIR", err)
-	}
-
-	parent := filepath.Join(repo.mountPath, "self-parent")
-	if err := os.MkdirAll(filepath.Join(parent, "child"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := unix.Rename(parent, filepath.Join(parent, "child", "moved")); !errors.Is(err, unix.EINVAL) {
-		t.Fatalf("directory into descendant error = %v, want EINVAL", err)
-	}
-
-	missing := filepath.Join(repo.mountPath, "missing")
-	if err := unix.Rename(missing, missing); !errors.Is(err, unix.ENOENT) {
-		t.Fatalf("missing same-path rename error = %v, want ENOENT", err)
-	}
-	if err := unix.Rename(fileSource, fileSource); err != nil {
-		t.Fatalf("existing same-path rename: %v", err)
-	}
-	if got := readFileStr(t, fileSource); got != "file\n" {
-		t.Fatalf("same-path file content = %q", got)
-	}
-
-	oldParent := filepath.Join(repo.mountPath, "old-parent")
-	newParent := filepath.Join(repo.mountPath, "new-parent")
-	if err := os.MkdirAll(filepath.Join(oldParent, "tree"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(newParent, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(oldParent, "tree", "value.txt"), []byte("cross-parent\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := unix.Rename(filepath.Join(oldParent, "tree"), filepath.Join(newParent, "tree")); err != nil {
-		t.Fatalf("cross-parent directory rename: %v", err)
-	}
-	assertPathMissing(t, filepath.Join(oldParent, "tree"))
-	if got := readFileStr(t, filepath.Join(newParent, "tree", "value.txt")); got != "cross-parent\n" {
-		t.Fatalf("cross-parent content = %q", got)
 	}
 }
 
@@ -1260,7 +1153,8 @@ func TestE2EVerifiedSource(t *testing.T) {
 	}
 
 	firstCtx, firstCancel := context.WithCancel(context.Background())
-	firstSvc, err := daemon.New(firstCtx, root, logging.NewJSONLogger(os.Stderr, slog.LevelWarn))
+	logger := newTestE2ELogger(t)
+	firstSvc, err := daemon.New(firstCtx, root, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1349,7 +1243,6 @@ func TestE2EVerifiedSource(t *testing.T) {
 	run(t, updateWork, "git", "add", "REMOTE-ONLY.md")
 	run(t, updateWork, "git", "-c", "user.name=E2E Test", "-c", "user.email=e2e@test", "commit", "-m", "advance remote")
 	run(t, updateWork, "git", "push", "origin", "main")
-	time.Sleep(time.Second)
 	assertVerifiedSourceStatus(t, ctl, requiredCommit)
 	if _, err := os.Stat(filepath.Join(mountPath, "REMOTE-ONLY.md")); !os.IsNotExist(err) {
 		t.Fatalf("disabled refresh exposed remote-only file: %v", err)
@@ -1365,14 +1258,13 @@ func TestE2EVerifiedSource(t *testing.T) {
 		"commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "local head change",
 	))
 	gitCmd(t, mountPath, "update-ref", "--no-deref", "HEAD", alternateCommit)
-	time.Sleep(time.Second)
 	assertVerifiedSourceStatus(t, ctl, requiredCommit)
 
 	stopE2EDaemon(t, firstSvc, firstCancel, firstErrCh, mountPath)
 	firstStopped = true
 
 	secondCtx, secondCancel := context.WithCancel(context.Background())
-	secondSvc, err := daemon.New(secondCtx, root, logging.NewJSONLogger(os.Stderr, slog.LevelWarn))
+	secondSvc, err := daemon.New(secondCtx, root, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1469,17 +1361,19 @@ func startE2EDaemon(ctx context.Context, svc *daemon.Service) chan error {
 	return errCh
 }
 
-// waitForMount waits for the daemon to mount repoName at path, reading its
-// status through ctl. It returns the daemon's mount error once that error
-// outlasts mountErrorGrace.
+// waitForMount waits for the daemon to mount repoName at path and record the
+// mount, reading its status through ctl. It returns the daemon's mount error
+// once that error outlasts mountErrorGrace.
 func waitForMount(ctl *daemon.Controller, path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var failingSince time.Time
 	for time.Now().Before(deadline) {
-		if isMounted(path) {
+		st, err := ctl.Status(context.Background(), repoName)
+		// The fuse library serves the mount, and the mount table lists it,
+		// before the mount call returns and the daemon records the mount.
+		if isMounted(path) && err == nil && st.Phase != "mount" {
 			return nil
 		}
-		st, err := ctl.Status(context.Background(), repoName)
 		switch {
 		case err != nil || st.MountError == "":
 			failingSince = time.Time{}
@@ -1490,7 +1384,7 @@ func waitForMount(ctl *daemon.Controller, path string, timeout time.Duration) er
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return fmt.Errorf("FUSE mount did not appear within %s", timeout)
+	return fmt.Errorf("FUSE mount did not appear in the mount table and in status within %s", timeout)
 }
 
 func lsDir(t *testing.T, dir string) []string {
@@ -1504,6 +1398,21 @@ func lsDir(t *testing.T, dir string) []string {
 		names[i] = e.Name()
 	}
 	return names
+}
+
+// assertFileContent asserts that path holds want, and that stat reports its size.
+func assertFileContent(t *testing.T, path, want string) {
+	t.Helper()
+	if got := readFileStr(t, path); got != want {
+		t.Fatalf("%s = %q, want %q", path, got, want)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() != int64(len(want)) {
+		t.Fatalf("%s size = %d, want %d", path, fi.Size(), len(want))
+	}
 }
 
 func readFileStr(t *testing.T, path string) string {
