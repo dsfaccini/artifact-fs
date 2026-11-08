@@ -196,7 +196,7 @@ func TestRetryGitOperationCancellationRacePreservesBothCauses(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	transportErr := errors.New("HTTP 500 transport failure")
 	attempts := 0
-	err := New(nil).retryGitOperation(ctx, GitOperationClone, "repo", func() error {
+	err := New(nil).retryGitOperationForRemotes(ctx, GitOperationClone, "repo", nil, func() error {
 		attempts++
 		cancel()
 		return transportErr
@@ -221,7 +221,7 @@ func TestRetryGitOperationCancellationBeforeNextAttemptPreservesFailure(t *testi
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	store.gitRetryDelays = []time.Duration{0}
 	attempts := 0
-	err := store.retryGitOperation(ctx, GitOperationClone, "repo", func() error {
+	err := store.retryGitOperationForRemotes(ctx, GitOperationClone, "repo", nil, func() error {
 		attempts++
 		return transportErr
 	})
@@ -249,7 +249,7 @@ func TestRetryGitOperationLogsCancellationDuringBackoff(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		err := store.retryGitOperation(ctx, GitOperationFetch, "repo", func() error {
+		err := store.retryGitOperationForRemotes(ctx, GitOperationFetch, "repo", nil, func() error {
 			time.AfterFunc(20*time.Millisecond, cancel)
 			return errors.New("HTTP 503 transport failure")
 		})
@@ -312,7 +312,7 @@ func TestRetryGitOperationBoundedExhaustion(t *testing.T) {
 	store := New(nil)
 	store.gitRetryDelays = []time.Duration{0, 0}
 	attempts := 0
-	err := store.retryGitOperation(context.Background(), GitOperationClone, "repo", func() error {
+	err := store.retryGitOperationForRemotes(context.Background(), GitOperationClone, "repo", nil, func() error {
 		attempts++
 		return errors.New("HTTP 500 transport failure")
 	})
@@ -368,7 +368,7 @@ func TestRetryGitOperationPermanentFailures(t *testing.T) {
 			store := New(nil)
 			store.gitRetryDelays = []time.Duration{0, 0}
 			attempts := 0
-			err := store.retryGitOperation(context.Background(), GitOperationClone, "repo", func() error {
+			err := store.retryGitOperationForRemotes(context.Background(), GitOperationClone, "repo", nil, func() error {
 				attempts++
 				return errors.New(message)
 			})
