@@ -50,6 +50,7 @@ func TestConfigureStatusOptimizationDoesNotWriteIndex(t *testing.T) {
 // to a file beside it and replaces it by rename, so until the rename the hook
 // path is the whole old hook, which a Git can exec, and after it the new one.
 func TestReconfiguringTheFSMonitorHookLeavesTheOpenHookWhole(t *testing.T) {
+	t.Parallel()
 	tmp := t.TempDir()
 	repo := filepath.Join(tmp, "repo")
 	run(t, "git", "init", repo)
