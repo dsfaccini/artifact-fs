@@ -84,7 +84,11 @@ func persistedStatus(ctx context.Context, cfg model.RepoConfig, rec model.RepoRu
 	// before it contacts the remote and fills it once it has the remote's
 	// objects, so only a filled FETCH_HEAD newer than the daemon's last fetch
 	// is a later successful fetch. An empty one is a fetch still running or
-	// one that failed.
+	// one that failed. A fetch that matches no ref also succeeds with an empty
+	// FETCH_HEAD, but FetchNonInteractive passes one ref without a wildcard,
+	// which matches or fails the fetch. A fetch that has the objects and then
+	// fails a ref update still fills FETCH_HEAD, so it reads as a success
+	// until the daemon records a later fetch.
 	lastFetch := st.LastFetchAt
 	if rec.LastErrorPhase == phaseFetch && rec.LastErrorAt.After(lastFetch) {
 		lastFetch = rec.LastErrorAt
