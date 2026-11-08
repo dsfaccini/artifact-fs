@@ -1,6 +1,6 @@
 module github.com/cloudflare/artifact-fs
 
-go 1.26.0
+go 1.26.5
 
 require (
 	github.com/dsfaccini/fuse v0.0.0-20261107212632-a4a3c79ca373
