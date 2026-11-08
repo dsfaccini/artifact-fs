@@ -31,6 +31,10 @@ const kernelCacheExpiry = 1500 * time.Millisecond
 // on FSKit. On FSKit only the runReadOnly tests run.
 func TestE2ESharedMount(t *testing.T) {
 	shared := newSharedE2ERepo(t)
+	shared.runReadOnly(t, "ForcedEIOPrintsItsDaemonSideCause", func(t *testing.T, repo *mountedE2ERepo) {
+		_, err := os.Stat(filepath.Join(repo.mountPath, "forced-eio"))
+		t.Fatalf("stat forced-eio: %v", err)
+	})
 	shared.runReadOnly(t, "GitCleanState", testE2EGitCleanState)
 	shared.runReadOnly(t, "GitConcurrentReads", testE2EGitConcurrentReads)
 	shared.run(t, "KernelCacheFollowsHEADMoveOutsideTheMount", testE2EKernelCacheFollowsHEADMoveOutsideTheMount)
