@@ -4,8 +4,11 @@ on:
   schedule:
     - cron: '0 3 * * *'
   push:
-    # A release has a version tag, such as 1.0.0-rc.10 or v1.2.3.
+    # A version tag, such as 1.0.0-rc.10 or v1.2.3.
     tags: ["[0-9]*", "v[0-9]*"]
+  # A release made from a tag that already exists pushes no tag.
+  release:
+    types: [published]
   workflow_dispatch: {}
 
 permissions:
