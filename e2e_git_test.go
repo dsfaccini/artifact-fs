@@ -928,8 +928,10 @@ func testE2EGitPush(t *testing.T, repo *mountedE2ERepo) {
 }
 
 // assertGitStatus asserts git status in dir, and that the fsmonitor hook the
-// daemon installs answered it. Git falls back to a full scan when the hook
-// fails, so the status alone passes without the hook.
+// daemon installs answered it with the paths changed since the index's token.
+// Git falls back to a full scan when the hook fails, and the hook answers "/",
+// a full rescan, for a token it does not trust, so the status alone passes
+// without either answer.
 func assertGitStatus(t *testing.T, dir string, want map[string]string) {
 	t.Helper()
 	trace := filepath.Join(t.TempDir(), "trace2.json")
@@ -953,16 +955,17 @@ func assertGitStatus(t *testing.T, dir string, want map[string]string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(events, []byte(`"category":"fsm_hook","key":"query/response-length"`)) || bytes.Contains(events, []byte(`"category":"fsm_hook","key":"query/failed"`)) {
+	if !bytes.Contains(events, []byte(`"category":"fsm_hook","key":"query/response-length"`)) ||
+		bytes.Contains(events, []byte(`"category":"fsm_hook","key":"query/failed"`)) ||
+		bytes.Contains(events, []byte(`"category":"fsm_hook","key":"query/trivial-response"`)) {
 		var hookEvents []string
 		for line := range strings.SplitSeq(string(events), "\n") {
 			if strings.Contains(line, `"category":"fsm_hook"`) {
 				hookEvents = append(hookEvents, line)
 			}
 		}
-		t.Fatalf("git status got no answer from the fsmonitor hook; its fsm_hook trace2 events: %v", hookEvents)
+		t.Fatalf("git status got no answer, or only a full rescan, from the fsmonitor hook; its fsm_hook trace2 events: %v", hookEvents)
 	}
-	t.Logf("fsm_hook trivial=%v", bytes.Contains(events, []byte(`"category":"fsm_hook","key":"query/trivial-response"`)))
 }
 
 func waitForOverlayClean(t *testing.T, repo *mountedE2ERepo) {
