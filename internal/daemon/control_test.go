@@ -40,15 +40,15 @@ func shortTempDir(t *testing.T) string {
 
 func TestNewRefusesASecondDaemonOnOneRoot(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	first, err := New(ctx, root, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
 	// The second daemon waits out daemonLockWait, which the bubble's clock
 	// passes at once.
 	synctest.Test(t, func(t *testing.T) {
-		ctx := context.Background()
-		root := t.TempDir()
-		first, err := New(ctx, root, discardLogger())
-		if err != nil {
-			t.Fatal(err)
-		}
 		start := time.Now()
 		second, err := New(ctx, root, discardLogger())
 		if err == nil {
@@ -62,15 +62,17 @@ func TestNewRefusesASecondDaemonOnOneRoot(t *testing.T) {
 		if !strings.Contains(err.Error(), daemonLockPath(first.root)) {
 			t.Fatalf("error = %q, want it to name the daemon lock", err)
 		}
-		if err := first.Close(); err != nil {
-			t.Fatal(err)
-		}
-		third, err := New(ctx, root, discardLogger())
-		if err != nil {
-			t.Fatalf("daemon after the first stopped: %v", err)
-		}
-		third.Close()
 	})
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// A git that another test forks can share the lock until it execs, so
+	// this daemon waits for the lock on the real clock.
+	third, err := New(ctx, root, discardLogger())
+	if err != nil {
+		t.Fatalf("daemon after the first stopped: %v", err)
+	}
+	third.Close()
 }
 
 // A record counts only while a daemon holds the lock: a daemon that died left

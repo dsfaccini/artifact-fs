@@ -257,14 +257,38 @@ func TestStatusReportsAFailedRefresh(t *testing.T) {
 	if err := os.RemoveAll(cfg.RemoteURL); err != nil {
 		t.Fatal(err)
 	}
+	git := &pausedRefreshGit{GitStore: svc.git, retried: make(chan struct{})}
+	svc.git = git
 	done := startService(t, svc)
-	waitFor(t, done, func() bool {
-		st, err := ctl.Status(ctx, "repo")
-		return err == nil && st.LastErrorPhase == phaseFetch
-	})
+	select {
+	case <-git.retried:
+	case err := <-done:
+		t.Fatalf("Start returned before the refresh retried: %v", err)
+	}
 	if st := requireFailure(t, ctl, phaseFetch, "fetch"); st.LastFetchResult != string(fetchFailed) {
 		t.Fatalf("fetch result = %q, want %q", st.LastFetchResult, fetchFailed)
 	}
+}
+
+// pausedRefreshGit runs the first refresh fetch and pauses every later one
+// until its context ends. The refresh loop records a fetch's outcome before
+// it retries, so a paused retry closes retried once the first outcome is
+// recorded. A retry that ran would touch FETCH_HEAD before it failed, which
+// status reads as a later successful fetch.
+type pausedRefreshGit struct {
+	model.GitStore
+	fetches   atomic.Int32
+	retried   chan struct{}
+	retryOnce sync.Once
+}
+
+func (g *pausedRefreshGit) FetchNonInteractive(ctx context.Context, repo model.RepoConfig) error {
+	if g.fetches.Add(1) == 1 {
+		return g.GitStore.FetchNonInteractive(ctx, repo)
+	}
+	g.retryOnce.Do(func() { close(g.retried) })
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 // The daemon refreshes in the background, so a remote that asks for

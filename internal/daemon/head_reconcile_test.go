@@ -390,6 +390,7 @@ func (f *headReconcileFixture) commitToMain(message string) string {
 // Deleting a tracked file is dirty. A HEAD change that removes the file
 // makes the delete stale, and the reconcile prunes it.
 func TestStatusReportsATrackedDeleteDirtyUntilReconcilePrunesIt(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	f.unlink(f.engine(), "README.md")
 	if !f.overlayDirty() {
@@ -411,6 +412,7 @@ func TestStatusReportsATrackedDeleteDirtyUntilReconcilePrunesIt(t *testing.T) {
 // mount serves. After a failed overlay transition, the published generation
 // lacks the deleted path while the served one still has it.
 func TestStatusReadsDeletesAgainstTheServedGeneration(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	if err := f.svc.registry.AddRepo(f.ctx, f.rt.cfg); err != nil {
 		t.Fatal(err)
@@ -447,6 +449,7 @@ func TestStatusReadsDeletesAgainstTheServedGeneration(t *testing.T) {
 // A path the base never had, made and removed again, leaves the overlay
 // clean, as an editor's swap file or an rm -rf of build output does.
 func TestStatusReportsCleanAfterAnUntrackedPathComesAndGoes(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		name string
 		op   func(f *headReconcileFixture, e *fusefs.Engine) error
@@ -466,6 +469,7 @@ func TestStatusReportsCleanAfterAnUntrackedPathComesAndGoes(t *testing.T) {
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			f := newHeadReconcileFixture(t)
 			if err := tt.op(f, f.engine()); err != nil {
 				t.Fatal(err)
@@ -480,6 +484,7 @@ func TestStatusReportsCleanAfterAnUntrackedPathComesAndGoes(t *testing.T) {
 // A directory made, used as a rename's stop and removed again is gone: the
 // delete entries that rename chain leaves below it do not keep it listed.
 func TestRmdirOfARenameChainStopRemovesTheDirectory(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	e := f.engine()
 	rename := func(from, to string) {
@@ -508,6 +513,7 @@ func TestRmdirOfARenameChainStopRemovesTheDirectory(t *testing.T) {
 // does. A file written and deleted there stays deleted once the generation
 // catches up, as git status reports it.
 func TestDeleteBeforeTheServedGenerationCatchesUpStaysDeleted(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	if err := os.WriteFile(filepath.Join(f.workDir, "p.txt"), []byte("committed\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -537,6 +543,7 @@ func TestDeleteBeforeTheServedGenerationCatchesUpStaysDeleted(t *testing.T) {
 // Status stops at the first delete the served generation has, and finds
 // none among many deletes of paths it lacks.
 func TestStatusReportsManyUntrackedDeletesClean(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	// Ten thousand unlinks through the engine would make this test slow, so
 	// it writes the delete entries they leave in one transaction.
