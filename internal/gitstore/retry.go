@@ -70,9 +70,6 @@ func (s *Store) retryGitOperationForRemoteLookup(ctx context.Context, operation 
 			return nil
 		}
 		cause, contextErr, retryable := gitOperationCauses(err)
-		if contextErr == nil {
-			contextErr = ctx.Err()
-		}
 		if cause != nil {
 			remotes, complete := remotesForLogging()
 			message := "git command failed"
@@ -80,6 +77,10 @@ func (s *Store) retryGitOperationForRemoteLookup(ctx context.Context, operation 
 				message = auth.RedactLogString(cause.Error(), remotes...)
 			}
 			cause = &redactedCause{message: message, cause: cause}
+		}
+		// Read ctx after remotesForLogging, whose wait can end because ctx did.
+		if contextErr == nil {
+			contextErr = ctx.Err()
 		}
 		operationErr := &GitOperationError{
 			Operation:  operation,

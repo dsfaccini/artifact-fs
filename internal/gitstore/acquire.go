@@ -437,9 +437,12 @@ func (s *Store) fetchRef(ctx context.Context, repo model.RepoConfig, ref string,
 }
 
 // startRemotesForLogging looks up origin's URL in the background, for the
-// logs of the operation it runs beside. The returned stop cancels the lookup
-// and returns once its git has exited, at most about gitCommandWaitDelay
-// later, so no git the operation started outlives it.
+// logs of the operation it runs beside. The returned remotes func waits for
+// the lookup, so a failure that comes first still redacts against origin and
+// keeps its cause. When ctx ends first, it reports the remotes incomplete.
+// The returned stop cancels the lookup and returns once its git has exited,
+// at most about gitCommandWaitDelay later, so no git the operation started
+// outlives it.
 func (s *Store) startRemotesForLogging(ctx context.Context, repo model.RepoConfig) (func() ([]string, bool), func()) {
 	type lookupResult struct {
 		remote string
@@ -464,7 +467,7 @@ func (s *Store) startRemotesForLogging(ctx context.Context, repo model.RepoConfi
 				finished = true
 				known = lookup.err == nil
 				actualRemote = lookup.remote
-			default:
+			case <-ctx.Done():
 			}
 		}
 		remotes := []string{repo.RemoteURL}
