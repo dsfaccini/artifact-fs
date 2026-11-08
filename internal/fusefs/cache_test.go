@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -70,7 +71,7 @@ type cacheFixture struct {
 	fs       *ArtifactFuse
 	mount    MountedFS
 	notifier *recordingNotifier
-	blobs    *fakeBatchHydrator
+	blobs    *fakeHydrator
 }
 
 func baseFile(path, blob string, mode uint32) model.BaseNode {
@@ -102,7 +103,7 @@ func newCacheFixtureOn(t *testing.T, backend string, nodes ...model.BaseNode) *c
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ov.Close() })
-	f := &cacheFixture{t: t, ctx: ctx, snap: snap, resolver: &Resolver{Snapshot: snap, Overlay: ov}, blobs: &fakeBatchHydrator{pathsByOID: map[string]string{}}}
+	f := &cacheFixture{t: t, ctx: ctx, snap: snap, resolver: &Resolver{Snapshot: snap, Overlay: ov}, blobs: &fakeHydrator{pathsByOID: map[string]string{}}}
 	f.resolver.SetGeneration(f.publish(nodes...))
 	engine := &Engine{Resolver: f.resolver, Repo: repo, Overlay: ov, Hydrator: f.blobs}
 
@@ -347,22 +348,27 @@ func (o failingLookupOf) Lookup(ctx context.Context, path string) (model.Overlay
 	return o.OverlayStore.Lookup(ctx, path)
 }
 
-// A path whose identity cannot be resolved skips only its own invalidation.
-// The pass still invalidates every other changed inode, and returns the error.
+// A path whose identity cannot be resolved skips only its own invalidation,
+// and so does a negative entry whose name cannot be resolved. The pass still
+// invalidates every other changed inode, and returns the first error, which
+// here is the held inode's.
 func TestInvalidateChangedContinuesPastAResolveError(t *testing.T) {
 	f := newCacheFixture(t, baseFile("edited.txt", "edited-1", 0o100644), baseFile("broken.txt", "broken", 0o100644))
 	var root fuseops.InodeID = fuseops.RootInodeID
 	edited := f.lookup(root, "edited.txt")
 	f.lookup(root, "broken.txt")
+	if child := f.lookup(root, "missing.txt"); child != 0 {
+		t.Fatalf("lookup of missing.txt = inode %d", child)
+	}
 	f.switchTo(baseFile("edited.txt", "edited-2", 0o100644), baseFile("broken.txt", "broken", 0o100644))
-	f.resolver.Overlay = failingLookupOf{OverlayStore: f.resolver.Overlay, paths: []string{"broken.txt"}}
+	f.resolver.Overlay = failingLookupOf{OverlayStore: f.resolver.Overlay, paths: []string{"broken.txt", "missing.txt"}}
 
 	err := f.mount.InvalidateChanged()
-	if err == nil {
-		t.Fatal("InvalidateChanged hid the resolve error")
+	if err == nil || !strings.Contains(err.Error(), "broken.txt") {
+		t.Fatalf("InvalidateChanged = %v, want the first error, on broken.txt", err)
 	}
 	if inodes, _ := f.notifier.recorded(); !slices.Equal(inodes, []fuseops.InodeID{edited}) {
-		t.Fatalf("invalidated inodes = %v, want edited.txt (%d) despite the error on broken.txt", inodes, edited)
+		t.Fatalf("invalidated inodes = %v, want edited.txt (%d) despite the errors", inodes, edited)
 	}
 }
 

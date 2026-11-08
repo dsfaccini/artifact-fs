@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -297,8 +298,36 @@ func TestUnlinkKeepsOpenHandleContent(t *testing.T) {
 	if got := f.read(t, inode, handle); got != "FILE one" {
 		t.Fatalf("read after write = %q, want FILE one", got)
 	}
+	if err := f.fs.SyncFile(context.Background(), &fuseops.SyncFileOp{Inode: inode, Handle: handle}); err != nil {
+		t.Fatalf("SyncFile after unlink: %v", err)
+	}
 	if _, err := f.resolver.ResolvePath("file.txt"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("resolve after unlink = %v, want not exist", err)
+	}
+	if err := f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: handle}); err != nil {
+		t.Fatalf("ReleaseFileHandle after unlink: %v", err)
+	}
+}
+
+// Truncating a base file copies it into the overlay first, so the file keeps
+// the prefix of its base content.
+func TestTruncateOfBaseFileKeepsItsPrefix(t *testing.T) {
+	f := newTrackedFixture(t)
+	inode := f.lookup(t, fuseops.RootInodeID, "file.txt")
+	size := uint64(4)
+	setattr := &fuseops.SetInodeAttributesOp{Inode: inode, Size: &size}
+	if err := f.fs.SetInodeAttributes(context.Background(), setattr); err != nil {
+		t.Fatalf("SetInodeAttributes: %v", err)
+	}
+	getattr := &fuseops.GetInodeAttributesOp{Inode: inode}
+	if err := f.fs.GetInodeAttributes(context.Background(), getattr); err != nil {
+		t.Fatal(err)
+	}
+	if setattr.Attributes.Size != size || getattr.Attributes.Size != size {
+		t.Fatalf("size after a truncate to %d = %d, then %d", size, setattr.Attributes.Size, getattr.Attributes.Size)
+	}
+	if got := f.read(t, inode, f.open(t, inode)); got != "file" {
+		t.Fatalf("content after a truncate to %d = %q, want file", size, got)
 	}
 }
 
@@ -538,10 +567,34 @@ func TestCanceledHydrationReturnsEINTR(t *testing.T) {
 				return f.fs.Unlink(ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"})
 			}
 		}},
+		{"OpenFile", func(t *testing.T, f trackedFixture) func(context.Context) error {
+			inode := f.lookup(t, fuseops.RootInodeID, "file.txt")
+			return func(ctx context.Context) error {
+				return f.fs.OpenFile(ctx, &fuseops.OpenFileOp{Inode: inode})
+			}
+		}},
+		{"Rename", func(t *testing.T, f trackedFixture) func(context.Context) error {
+			f.lookup(t, fuseops.RootInodeID, "file.txt")
+			return func(ctx context.Context) error {
+				return f.fs.Rename(ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "file.txt", NewParent: fuseops.RootInodeID, NewName: "renamed.txt"})
+			}
+		}},
+		// A handle open on the destination makes Rename copy it first.
+		{"Rename over a destination with an open handle", func(t *testing.T, f trackedFixture) func(context.Context) error {
+			f.open(t, f.lookup(t, fuseops.RootInodeID, "file.txt"))
+			return func(ctx context.Context) error {
+				return f.fs.Rename(ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "other.txt", NewParent: fuseops.RootInodeID, NewName: "file.txt"})
+			}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newTrackedFixture(t)
 			op := tc.prepare(t, f)
+			overlay, err := f.store.ListAll(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			inodes, handles := maps.Clone(f.fs.pathToInode), len(f.fs.fileHandles)
 			started, _ := f.hydrator.arm()
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan error, 1)
@@ -557,6 +610,12 @@ func TestCanceledHydrationReturnsEINTR(t *testing.T) {
 			}
 			if n, err := f.resolver.ResolvePath("file.txt"); err != nil || n.FromOverlay {
 				t.Fatalf("file.txt after interrupted op = (%+v, %v), want base entry", n, err)
+			}
+			if after, err := f.store.ListAll(context.Background()); err != nil || !slices.Equal(after, overlay) {
+				t.Fatalf("overlay after interrupted op = %+v, %v; want %+v", after, err, overlay)
+			}
+			if !maps.Equal(f.fs.pathToInode, inodes) || len(f.fs.fileHandles) != handles {
+				t.Fatalf("interrupted op changed the inode mappings to %v or the %d open handles to %d", f.fs.pathToInode, handles, len(f.fs.fileHandles))
 			}
 		})
 	}

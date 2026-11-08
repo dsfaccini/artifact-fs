@@ -812,26 +812,31 @@ func hookOverlay(f *cacheFixture) *hookedOverlay {
 	return ov
 }
 
-// waitRecheck returns once done is closed, or once a goroutine waits for the
-// handleOps read lock in unmapStillMissing: the switch pass's re-check, which
-// a Rename op holds off until it has moved its mappings.
-func waitRecheck(done <-chan struct{}) {
+// waitParked polls the goroutine stacks until one waits for a sync.RWMutex
+// with fn on its stack, and reports whether one did before done closed. A
+// rename of fn leaves it polling until go test -timeout.
+func waitParked(done <-chan struct{}, fn string) bool {
 	buf := make([]byte, 1<<20)
 	for {
 		select {
 		case <-done:
-			return
+			return false
 		default:
 		}
 		n := runtime.Stack(buf, true)
 		for g := range strings.SplitSeq(string(buf[:n]), "\n\n") {
-			if strings.Contains(g, "[sync.RWMutex.RLock") && strings.Contains(g, "(*ArtifactFuse).unmapStillMissing") {
-				return
+			if strings.Contains(g, "[sync.RWMutex.") && strings.Contains(g, fn) {
+				return true
 			}
 		}
 		runtime.Gosched()
 	}
 }
+
+// waitRecheck returns once done is closed, or once a goroutine waits for the
+// handleOps read lock in unmapStillMissing: the switch pass's re-check, which
+// a Rename op holds off until it has moved its mappings.
+func waitRecheck(done <-chan struct{}) { waitParked(done, "(*ArtifactFuse).unmapStillMissing") }
 
 // newRenameFixture makes src/file.txt through the mount. The kernel holds
 // src and has forgotten file.txt.
