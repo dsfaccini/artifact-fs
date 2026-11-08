@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,10 +42,10 @@ type MountedFS interface {
 	// inode whose type, permission bits or blob changed, the entry of a name
 	// that vanished or changed type, and a negative entry whose name now
 	// exists. It also retires the inode number of each path that vanished,
-	// and closes each overlay file a handle holds that the switch's
-	// reconcile removed. Call it after a generation switch, holding no lock
-	// an op takes. FSKit takes no invalidations, so it only retires numbers
-	// and closes files there.
+	// and closes each overlay file that a handle that is not detached holds
+	// and the overlay no longer names for the handle's path. Call it after a
+	// generation switch, holding no lock an op takes. FSKit takes no
+	// invalidations, so it only retires numbers and closes files there.
 	InvalidateChanged() error
 }
 
@@ -123,10 +124,20 @@ type ArtifactFuse struct {
 	// detached. Such a write recreates its path, so the switch pass leaves
 	// mapped the path of an inode written since the pass read the table.
 	writeSeq uint64
+	// cacheCloses counts the calls that close the files handles cached:
+	// closeCachedFilesForPath and closeReconciledFiles. Each bumps it while it
+	// collects the handles, holding fs.mu. An open reads it before it opens
+	// its file, and addFileHandle registers the handle without that file
+	// when a close ran since, because the close could not see the handle.
+	cacheCloses atomic.Uint64
 
 	// notifier is nil when nothing should reach the kernel. fs.mu guards it:
 	// the mount publishes it after ops may have started.
 	notifier kernelNotifier
+
+	// testHookBeforeAddFileHandle, when set, runs in an open between its
+	// Engine.OpenFile and its addFileHandle.
+	testHookBeforeAddFileHandle func()
 }
 
 type InodeRef struct {
@@ -470,15 +481,15 @@ func (fs *ArtifactFuse) unmapLocked(ms []pathMapping, writeSeq uint64) {
 // removed after a commit. The handle's next read then resolves the path
 // through the inode's generation, as a handle opened since does. It holds
 // handleOps shared, so no unlink or rename is between pinning its handles and
-// detaching them. A detached handle keeps its file.
-//
-// An open that read the overlay before the reconcile, and registered its
-// handle only after this collected the handles, keeps the removed file until
-// the next pass.
+// detaching them. A detached handle keeps its file: no entry names its pinned
+// copy. A file it cannot check stays open, and it returns the first error.
+// An open that registers its handle after this collected the handles drops
+// its file, through cacheCloses.
 func (fs *ArtifactFuse) closeReconciledFiles() error {
 	fs.handleOps.RLock()
 	defer fs.handleOps.RUnlock()
 	fs.mu.RLock()
+	fs.cacheCloses.Add(1)
 	handles := slices.Collect(maps.Values(fs.fileHandles))
 	fs.mu.RUnlock()
 	var firstErr error
@@ -486,15 +497,19 @@ func (fs *ArtifactFuse) closeReconciledFiles() error {
 		fh.mu.Lock()
 		path := fh.path
 		var held os.FileInfo
+		var err error
 		overlayFile := !fh.detached && fh.cacheFile != nil && fh.cacheGeneration == -1
 		if overlayFile {
-			held, _ = fh.cacheFile.Stat()
+			held, err = fh.cacheFile.Stat()
 		}
 		fh.mu.Unlock()
 		if !overlayFile {
 			continue
 		}
-		named, err := fs.engine.IsOverlayFile(context.Background(), path, held)
+		named := false
+		if err == nil {
+			named, err = fs.engine.IsOverlayFile(context.Background(), path, held)
+		}
 		if err != nil {
 			firstErr = cmp.Or(firstErr, err)
 			continue
@@ -1056,6 +1071,7 @@ func (fs *ArtifactFuse) handleWritable(id *fuseops.HandleID) bool {
 
 func (fs *ArtifactFuse) closeCachedFilesForPath(path string) {
 	fs.mu.RLock()
+	fs.cacheCloses.Add(1)
 	var handles []*FileHandle
 	for _, fh := range fs.fileHandles {
 		fh.mu.Lock()
@@ -1808,6 +1824,7 @@ func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, ch
 			return err
 		}
 		fh := &FileHandle{inode: ref, path: ref.Path, writable: !op.OpenFlags.IsReadOnly()}
+		closes := fs.cacheCloses.Load()
 		if ref.Path != ".git" {
 			var access uint32
 			if checkPermissions && !created {
@@ -1829,9 +1846,15 @@ func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, ch
 			fh.cacheFile, fh.cacheGeneration = f, gen
 			op.KeepPageCache = fs.openedBlob(op.Inode, blob)
 		}
+		if fs.testHookBeforeAddFileHandle != nil {
+			fs.testHookBeforeAddFileHandle()
+		}
 		// A create may have retired the inode during the open, after its
 		// retirement detached the handles already open.
-		handle, err := fs.addFileHandle(op.Inode, fh)
+		handle, dropped, err := fs.addFileHandle(op.Inode, fh, closes)
+		if dropped != nil {
+			_ = dropped.Close()
+		}
 		if err != nil {
 			if fh.cacheFile != nil {
 				_ = fh.cacheFile.Close()
@@ -1844,16 +1867,24 @@ func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, ch
 }
 
 // addFileHandle registers fh, a new handle on id, unless id is retired.
-func (fs *ArtifactFuse) addFileHandle(id fuseops.InodeID, fh *FileHandle) (fuseops.HandleID, error) {
+// closes is the count of cacheCloses the open read before it opened fh's
+// file. When a close ran since, addFileHandle registers fh without that file,
+// which may be one the close removed or no longer serves, and returns it for
+// the caller to close. The handle's next read then resolves the path afresh.
+func (fs *ArtifactFuse) addFileHandle(id fuseops.InodeID, fh *FileHandle, closes uint64) (fuseops.HandleID, *os.File, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	if ref := fs.inodes[id]; ref != nil && ref.Stale {
-		return 0, syscall.ESTALE
+		return 0, nil, syscall.ESTALE
+	}
+	var dropped *os.File
+	if fh.cacheFile != nil && fs.cacheCloses.Load() != closes {
+		dropped, fh.cacheFile, fh.cacheGeneration = fh.cacheFile, nil, 0
 	}
 	handle := fs.nextHandleID
 	fs.nextHandleID++
 	fs.fileHandles[handle] = fh
-	return handle, nil
+	return handle, dropped, nil
 }
 
 func (fs *ArtifactFuse) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) error {

@@ -1874,15 +1874,7 @@ func TestPinnedHandlesOfOneFileShareOneCopy(t *testing.T) {
 			writeThroughHandle(t, f, held, "X")
 			older := f.openRW(held)
 			want := mustReadHandle(t, f, held, older.Handle)
-			committed := baseFile("file.txt", blobOID(want), 0o100644)
-			committed.SizeBytes = int64(len(want))
-			f.switchTo(committed)
-			if err := os.WriteFile(f.blobs.pathsByOID[committed.ObjectOID], []byte(want), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			if _, ok, err := f.fs.engine.Overlay.Lookup(f.ctx, "file.txt"); err != nil || ok {
-				t.Fatalf("overlay entry of file.txt after the commit = %t, %v; want it dropped", ok, err)
-			}
+			commitFile(t, f, want)
 			if write {
 				if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: older.Handle, Data: []byte("Y")}); err != nil {
 					t.Fatal(err)
@@ -1924,18 +1916,12 @@ func TestHandlesOfOneInodeReadOneContentAfterTheirOverlayFileIsReconciled(t *tes
 	held := f.lookup(fuseops.RootInodeID, "file.txt")
 	writeThroughHandle(t, f, held, "X")
 	older := f.open(held)
-	written := mustReadHandle(t, f, held, older.Handle)
-	committed := baseFile("file.txt", blobOID(written), 0o100644)
-	committed.SizeBytes = int64(len(written))
-	f.switchTo(committed)
-	if err := os.WriteFile(f.blobs.pathsByOID[committed.ObjectOID], []byte(written), 0o644); err != nil {
-		t.Fatal(err)
+	if got := mustReadHandle(t, f, held, older.Handle); got != "Xlob-AAAA" {
+		t.Fatalf("the older handle reads %q, want Xlob-AAAA", got)
 	}
+	commitFile(t, f, "Xlob-AAAA")
 	if err := f.mount.InvalidateChanged(); err != nil {
 		t.Fatal(err)
-	}
-	if _, ok, err := f.fs.engine.Overlay.Lookup(f.ctx, "file.txt"); err != nil || ok {
-		t.Fatalf("overlay entry of file.txt after the commit = %t, %v; want it dropped", ok, err)
 	}
 	f.switchTo(baseFile("file.txt", "blob-BBBB", 0o100644))
 	if err := f.mount.InvalidateChanged(); err != nil {
@@ -1949,6 +1935,99 @@ func TestHandlesOfOneInodeReadOneContentAfterTheirOverlayFileIsReconciled(t *tes
 		if got := mustReadHandle(t, f, held, h); got != "blob-BBBB" {
 			t.Fatalf("after the HEAD change, the %s handle reads %q, want blob-BBBB", name, got)
 		}
+	}
+}
+
+// commitFile switches to a generation whose file.txt holds content, so the
+// switch's reconcile drops the overlay entry of file.txt, which holds content,
+// and removes the entry's file. It runs no switch pass.
+func commitFile(t *testing.T, f *cacheFixture, content string) {
+	t.Helper()
+	if _, ok, err := f.fs.engine.Overlay.Lookup(f.ctx, "file.txt"); err != nil || !ok {
+		t.Fatalf("overlay entry of file.txt before the commit = %t, %v; want it recorded", ok, err)
+	}
+	committed := baseFile("file.txt", blobOID(content), 0o100644)
+	committed.SizeBytes = int64(len(content))
+	f.switchTo(committed)
+	if err := os.WriteFile(f.blobs.pathsByOID[committed.ObjectOID], []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := f.fs.engine.Overlay.Lookup(f.ctx, "file.txt"); err != nil || ok {
+		t.Fatalf("overlay entry of file.txt after the commit = %t, %v; want it dropped", ok, err)
+	}
+}
+
+// An open can read a file's overlay file before a commit's reconcile removes
+// it, and register its handle only after the switch pass closed the overlay
+// files that handles held. The handle must not keep the removed file. After a
+// later HEAD change, a read that comes before that change's pass would read
+// the removed file, while a handle opened since reads the new blob.
+func TestOpenOverlappingAReconcileDropsTheRemovedFile(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	writeThroughHandle(t, f, held, "X")
+	f.fs.testHookBeforeAddFileHandle = func() {
+		f.fs.testHookBeforeAddFileHandle = nil
+		commitFile(t, f, "Xlob-AAAA")
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	racing := f.open(held)
+	f.switchTo(baseFile("file.txt", "blob-BBBB", 0o100644))
+	if id := f.lookup(fuseops.RootInodeID, "file.txt"); id != held {
+		t.Fatalf("file.txt looks up as inode %d after the HEAD change, want %d", id, held)
+	}
+	newer := f.open(held)
+	for name, h := range map[string]fuseops.HandleID{"racing": racing.Handle, "newer": newer.Handle} {
+		if got := mustReadHandle(t, f, held, h); got != "blob-BBBB" {
+			t.Fatalf("after the HEAD change, the %s handle reads %q, want blob-BBBB", name, got)
+		}
+	}
+}
+
+// An open can read a file's base blob before a write through another handle
+// gives the path an overlay file, and register its handle only after the
+// write closed the files that handles held on the path. The handle must then
+// read the write, not the base blob.
+func TestOpenOverlappingAWriteReadsTheWrite(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	writer := f.openRW(held)
+	f.fs.testHookBeforeAddFileHandle = func() {
+		f.fs.testHookBeforeAddFileHandle = nil
+		if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: writer.Handle, Data: []byte("Y")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	racing := f.open(held)
+	if got := mustReadHandle(t, f, held, racing.Handle); got != "Ylob-AAAA" {
+		t.Fatalf("the handle opened during the write reads %q, want Ylob-AAAA", got)
+	}
+}
+
+// An unlink pins an open file's handle to its own copy and detaches it. No
+// overlay entry names that copy, so the switch pass must leave a detached
+// handle's file open: the handle still reads its writes after a HEAD change.
+func TestSwitchPassKeepsTheCopyOfAnUnlinkedOpenFile(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	open := f.openRW(held)
+	if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("X")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Offset: 1, Data: []byte("Z")}); err != nil {
+		t.Fatalf("write through the unlinked open file = %v", err)
+	}
+	f.switchTo(baseFile("file.txt", "blob-BBBB", 0o100644))
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustReadHandle(t, f, held, open.Handle); got != "XZob-AAAA" {
+		t.Fatalf("after the HEAD change, the unlinked file's handle reads %q, want XZob-AAAA", got)
 	}
 }
 
