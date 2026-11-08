@@ -862,7 +862,7 @@ func TestRenameBaseDirectoryDoesNotResurrectReplacedDestinationDescendants(t *te
 		Overlay:  ov,
 		Hydrator: &fakeBatchHydrator{},
 	}
-	if err := ov.Remove(context.Background(), "dst"); err != nil {
+	if err := ov.Remove(context.Background(), "dst", true); err != nil {
 		t.Fatal(err)
 	}
 

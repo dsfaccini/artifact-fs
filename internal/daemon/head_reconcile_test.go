@@ -339,37 +339,111 @@ func TestStatusReportsPublishedAndServedGenerationsAfterOverlayFailure(t *testin
 	}
 }
 
-// A delete-only overlay is dirty. A HEAD change that removes the deleted path
-// makes the delete stale, and the reconcile prunes it.
-func TestStatusReportsADeleteOnlyOverlayDirtyUntilReconcilePrunesIt(t *testing.T) {
-	f := newHeadReconcileFixture(t)
-	if err := f.svc.registry.AddRepo(f.ctx, f.rt.cfg); err != nil {
-		t.Fatal(err)
+// engine is the FUSE adapter's engine on f's runtime, without a mount.
+func (f *headReconcileFixture) engine() *fusefs.Engine {
+	return &fusefs.Engine{Resolver: f.rt.resolver, Repo: f.rt.cfg.RepoPaths, Overlay: f.rt.overlay}
+}
+
+func (f *headReconcileFixture) unlink(e *fusefs.Engine, path string) {
+	f.t.Helper()
+	if err := e.Do(f.ctx, nil, func(ctx context.Context, b *fusefs.Blobs) error { return e.Unlink(ctx, b, path, nil) }); err != nil {
+		f.t.Fatal(err)
 	}
-	if err := f.rt.overlay.Remove(f.ctx, "README.md"); err != nil {
-		t.Fatal(err)
+}
+
+// overlayDirty registers f's repo, if it is not yet, and reads its status.
+func (f *headReconcileFixture) overlayDirty() bool {
+	f.t.Helper()
+	if _, err := f.svc.registry.GetRepo(f.ctx, f.rt.cfg.Name); err != nil {
+		if err := f.svc.registry.AddRepo(f.ctx, f.rt.cfg); err != nil {
+			f.t.Fatal(err)
+		}
 	}
 	st, err := f.svc.ctl().Status(f.ctx, f.rt.cfg.Name)
 	if err != nil {
-		t.Fatal(err)
+		f.t.Fatal(err)
 	}
-	if !st.DirtyOverlay {
+	return st.DirtyOverlay
+}
+
+// commitToMain commits the work tree's changes on main and returns the commit.
+func (f *headReconcileFixture) commitToMain(message string) string {
+	f.t.Helper()
+	runCmd(f.t, "git", "-C", f.workDir, "add", "-A")
+	runCmd(f.t, "git", "-C", f.workDir, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", message)
+	return strings.TrimSpace(runCmdOutput(f.t, "git", "-C", f.workDir, "rev-parse", "HEAD"))
+}
+
+// Deleting a tracked file is dirty. A HEAD change that removes the file
+// makes the delete stale, and the reconcile prunes it.
+func TestStatusReportsATrackedDeleteDirtyUntilReconcilePrunesIt(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	f.unlink(f.engine(), "README.md")
+	if !f.overlayDirty() {
 		t.Fatal("status of a delete-only overlay reports it clean")
 	}
 	runCmd(t, "git", "-C", f.workDir, "rm", "-q", "-f", "README.md")
 	if err := os.WriteFile(filepath.Join(f.workDir, "other.txt"), []byte("other\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	runCmd(t, "git", "-C", f.workDir, "add", "other.txt")
-	runCmd(t, "git", "-C", f.workDir, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "drop README")
-	without := strings.TrimSpace(runCmdOutput(t, "git", "-C", f.workDir, "rev-parse", "HEAD"))
+	without := f.commitToMain("drop README")
 	f.signal()
 	f.waitForHead(without, "main", f.oldGen+1)
-	if st, err = f.svc.ctl().Status(f.ctx, f.rt.cfg.Name); err != nil {
+	if f.overlayDirty() {
+		t.Fatal("status reports the overlay dirty after the reconcile pruned its stale delete")
+	}
+}
+
+// A path the base never had, made and removed again, leaves the overlay
+// clean, as an editor's swap file or an rm -rf of build output does.
+func TestStatusReportsCleanAfterAnUntrackedPathComesAndGoes(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		op   func(f *headReconcileFixture, e *fusefs.Engine) error
+	}{
+		{"file", func(f *headReconcileFixture, e *fusefs.Engine) error {
+			if err := e.Create(f.ctx, "scratch.swp", 0o644); err != nil {
+				return err
+			}
+			f.unlink(e, "scratch.swp")
+			return nil
+		}},
+		{"directory", func(f *headReconcileFixture, e *fusefs.Engine) error {
+			if err := e.Mkdir(f.ctx, "build", 0o755); err != nil {
+				return err
+			}
+			return e.Rmdir(f.ctx, "build")
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newHeadReconcileFixture(t)
+			if err := tt.op(f, f.engine()); err != nil {
+				t.Fatal(err)
+			}
+			if f.overlayDirty() {
+				t.Fatal("status reports the overlay dirty after an untracked path came and went")
+			}
+		})
+	}
+}
+
+// Removing a path the base does not have leaves nothing that hides the path
+// when a later HEAD adds it.
+func TestUntrackedUnlinkDoesNotHideAFileHEADAddsLater(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	e := f.engine()
+	if err := e.Create(f.ctx, "later.txt", 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if st.DirtyOverlay {
-		t.Fatal("status reports the overlay dirty after the reconcile pruned its stale delete")
+	f.unlink(e, "later.txt")
+	if err := os.WriteFile(filepath.Join(f.workDir, "later.txt"), []byte("later\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	with := f.commitToMain("add later.txt")
+	f.signal()
+	f.waitForHead(with, "main", f.oldGen+1)
+	if _, err := f.rt.resolver.ResolvePath("later.txt"); err != nil {
+		t.Fatalf("later.txt after HEAD added it: %v", err)
 	}
 }
 

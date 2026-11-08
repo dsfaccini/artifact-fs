@@ -126,15 +126,11 @@ func (f *bootstrapFixture) bootstrap() error {
 	return f.svc.bootstrapCleanStatusIndex(context.Background(), f.cfg, f.headOID, f.gen, f.snap, f.ov)
 }
 
-// removeTracked records a delete of tracked.txt, the overlay's only entry.
+// removeTracked records a delete of tracked.txt.
 func (f *bootstrapFixture) removeTracked(t *testing.T) {
 	t.Helper()
-	ctx := context.Background()
-	if err := f.ov.Remove(ctx, "tracked.txt"); err != nil {
+	if err := f.ov.Remove(context.Background(), "tracked.txt", true); err != nil {
 		t.Fatal(err)
-	}
-	if dirty, err := f.ov.DirtyCount(ctx); err != nil || dirty != 1 {
-		t.Fatalf("delete-only dirty count = %d, %v; want one", dirty, err)
 	}
 }
 
@@ -519,7 +515,7 @@ func TestFSMonitorHookReturnsPathsChangedSinceToken(t *testing.T) {
 	if _, err := ov.CreateFile(ctx, "moved.txt", 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := ov.Remove(ctx, "deleted.txt"); err != nil {
+	if err := ov.Remove(ctx, "deleted.txt", true); err != nil {
 		t.Fatal(err)
 	}
 	_, token, paths := hookAnswer(t, svc, "other-hook:1")

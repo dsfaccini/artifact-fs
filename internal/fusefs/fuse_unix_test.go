@@ -1953,7 +1953,7 @@ func TestReadDirListsAtEnumerationStart(t *testing.T) {
 	if !bytes.Contains(read(0), []byte("added.txt\x00")) {
 		t.Fatal("rewound enumeration omitted the new file")
 	}
-	if err := f.store.Remove(ctx, "src/nested/value.txt"); err != nil {
+	if err := f.store.Remove(ctx, "src/nested/value.txt", true); err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Contains(read(0), []byte("value.txt\x00")) {
