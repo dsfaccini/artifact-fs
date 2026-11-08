@@ -3,6 +3,7 @@ package gitstore
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"os/exec"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
 )
+
+var errStoreClosed = errors.New("git store closed")
 
 // ValidateRemoteNotOption refuses a remote that git would parse as an option,
 // such as --upload-pack=<command>.
@@ -211,21 +214,25 @@ func (s *Store) lazyFetchEnv() ([]string, error) {
 // batchModeSSH returns a program named ssh, so that Git passes it OpenSSH's
 // options, that runs the ssh on PATH with BatchMode. It returns "" when PATH
 // has no ssh, because Git then reaches no SSH remote either. The Store writes
-// the program once, in a directory of its own that Close removes, and again
-// if a temp cleaner removed it.
+// the program in a directory of its own that Close removes. It reuses the
+// program only while the program and its directory have mode 0700, belong to
+// the effective uid, and are not symlinks. Otherwise it writes the program in
+// a new directory: a temp cleaner can remove the old one, and another local
+// user can then make one at its path. The check assumes a temp directory that
+// is sticky or private to the user. In one that others can write and that is
+// not sticky, another user can rename the program's directory away and make
+// one at its path after the check, before Git runs the program. batchModeSSH
+// holds s.mu only to read and set sshWrapperDir and closed, so a slow temp
+// directory stalls no other Store operation.
 func (s *Store) batchModeSSH() (string, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return "", errors.New("git store closed")
+	closed, dir := s.closed, s.sshWrapperDir
+	s.mu.Unlock()
+	if closed {
+		return "", errStoreClosed
 	}
-	if s.sshWrapperDir != "" {
-		wrapper := filepath.Join(s.sshWrapperDir, "ssh")
-		if _, err := os.Stat(wrapper); err == nil {
-			return wrapper, nil
-		}
-		_ = os.RemoveAll(s.sshWrapperDir)
-		s.sshWrapperDir = ""
+	if dir != "" && lstatPrivate(dir, fs.ModeDir) && lstatPrivate(filepath.Join(dir, "ssh"), 0) {
+		return filepath.Join(dir, "ssh"), nil
 	}
 	// LookPath refuses an ssh that a relative PATH entry finds, so the
 	// wrapper runs an absolute path, and never itself.
@@ -233,15 +240,45 @@ func (s *Store) batchModeSSH() (string, error) {
 	if err != nil {
 		return "", nil
 	}
-	dir, err := os.MkdirTemp("", "artifact-fs-ssh-")
+	created, err := os.MkdirTemp("", "artifact-fs-ssh-")
 	if err != nil {
 		return "", fmt.Errorf("create SSH wrapper: %w", err)
 	}
-	wrapper := filepath.Join(dir, "ssh")
+	if s.testHookSSHWrapperDirMade != nil {
+		s.testHookSSHWrapperDirMade(created)
+	}
+	wrapper := filepath.Join(created, "ssh")
 	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nexec "+shellScriptQuote(ssh)+" -o BatchMode=yes \"$@\"\n"), 0o700); err != nil {
-		_ = os.RemoveAll(dir)
+		_ = os.RemoveAll(created)
 		return "", fmt.Errorf("create SSH wrapper: %w", err)
 	}
-	s.sshWrapperDir = dir
+	s.mu.Lock()
+	closed, current := s.closed, s.sshWrapperDir
+	if !closed && current == dir {
+		s.sshWrapperDir = created
+	}
+	s.mu.Unlock()
+	switch {
+	case closed:
+		_ = os.RemoveAll(created)
+		return "", errStoreClosed
+	case current != dir:
+		// A concurrent call replaced dir first.
+		_ = os.RemoveAll(created)
+		return filepath.Join(current, "ssh"), nil
+	}
+	if dir != "" {
+		// RemoveAll follows a symlink only in the temp directory's own path,
+		// never at or below the old path, so it removes nothing outside the
+		// old path.
+		_ = os.RemoveAll(dir)
+	}
 	return wrapper, nil
+}
+
+// lstatPrivate reports whether path, unfollowed, has type typ and is private
+// to the effective uid, as privateToEUID decides.
+func lstatPrivate(path string, typ fs.FileMode) bool {
+	info, err := os.Lstat(path)
+	return err == nil && info.Mode().Type() == typ && privateToEUID(info)
 }

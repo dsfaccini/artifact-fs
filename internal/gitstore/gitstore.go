@@ -26,6 +26,9 @@ type Store struct {
 	// sshWrapperDir holds the wrapper batchModeSSH writes; Close removes it.
 	sshWrapperDir string
 	closed        bool
+	// testHookSSHWrapperDirMade, when set, runs in batchModeSSH between
+	// making a wrapper's directory and writing the wrapper.
+	testHookSSHWrapperDirMade func(dir string)
 }
 
 func New(logger *slog.Logger) *Store {
