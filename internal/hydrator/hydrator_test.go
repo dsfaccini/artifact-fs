@@ -2,12 +2,12 @@ package hydrator
 
 import (
 	"context"
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -177,32 +177,22 @@ func TestEnsureHydratedVerifiesUnknownCacheHitOnce(t *testing.T) {
 	tmp := t.TempDir()
 	payload := []byte("content")
 	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: tmp}
-	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
+	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: blobOID(payload), SizeState: "unknown"}
 	cachePath := cacheFile(t, tmp, node.ObjectOID)
 	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	releaseVerify := make(chan struct{})
-	verifyStarted := make(chan struct{})
-	fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true, verifyStarted: verifyStarted, verifyWait: releaseVerify}
+	fetcher := &fakeBlobFetcher{payload: payload, verifyWait: releaseVerify}
 	h := New(fetcher)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	const readers = 8
 	errCh := make(chan error, readers)
-	var wg sync.WaitGroup
-	for range readers {
-		wg.Go(func() {
-			_, _, err := h.EnsureHydrated(ctx, cfg, node)
-			errCh <- err
-		})
-	}
-	<-verifyStarted
-	runtime.Gosched()
+	done := hydrateConcurrently(t.Context(), h, cfg, node, readers, errCh)
+	waitForWaiters(t, h, &h.verifying, taskKey(cfg.ID, node.ObjectOID), readers, done)
 	close(releaseVerify)
-	wg.Wait()
+	<-done
 	close(errCh)
 	for err := range errCh {
 		if err != nil {
@@ -271,25 +261,18 @@ func TestEnsureHydratedJoinsActiveFetch(t *testing.T) {
 	h.Start(1, cfg)
 	defer h.Stop()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	const readers = 8
 	errCh := make(chan error, readers+1)
-	go func() {
-		_, _, err := h.EnsureHydrated(ctx, cfg, node)
-		errCh <- err
-	}()
+	first := hydrateConcurrently(t.Context(), h, cfg, node, 1, errCh)
 	<-fetchStarted
-	for range readers {
-		go func() {
-			_, _, err := h.EnsureHydrated(ctx, cfg, node)
-			errCh <- err
-		}()
-	}
-	runtime.Gosched()
+	joined := hydrateConcurrently(t.Context(), h, cfg, node, readers, errCh)
+	waitForWaiters(t, h, &h.wait, taskKey(cfg.ID, node.ObjectOID), readers+1, joined)
 	close(releaseFetch)
-	for range readers + 1 {
-		if err := <-errCh; err != nil {
+	<-first
+	<-joined
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
 			t.Fatalf("EnsureHydrated: %v", err)
 		}
 	}
@@ -590,7 +573,7 @@ func TestReadOfFetchingPrefetchBlobGoesAheadOfOtherPrefetch(t *testing.T) {
 		_, _, err := h.EnsureHydrated(context.Background(), cfg, model.BaseNode{RepoID: cfg.ID, Path: "a-0", ObjectOID: "a-0"})
 		done <- err
 	}()
-	waitForWaiter(t, h, taskKey(cfg.ID, "a-0"))
+	waitForWaiters(t, h, &h.wait, taskKey(cfg.ID, "a-0"), 1, nil)
 	h.EnqueueBatch(prefetchTasksFor(cfg.ID, PriorityLikelyText, "b-0", "b-1"))
 	release <- struct{}{}
 
@@ -629,7 +612,7 @@ func TestReadOfFetchedPrefetchBlobGoesAheadOfOtherPrefetch(t *testing.T) {
 		_, _, err := h.EnsureHydrated(context.Background(), cfg, model.BaseNode{RepoID: cfg.ID, Path: "a-0", ObjectOID: "a-0"})
 		done <- err
 	}()
-	waitForWaiter(t, h, taskKey(cfg.ID, "a-0"))
+	waitForWaiters(t, h, &h.wait, taskKey(cfg.ID, "a-0"), 1, nil)
 	release <- struct{}{}
 	if err := <-done; err != nil {
 		t.Fatalf("EnsureHydrated: %v", err)
@@ -1677,19 +1660,50 @@ func prefetchTasksFor(repoID model.RepoID, priority int, oids ...string) []model
 	return tasks
 }
 
-// waitForWaiter polls until a read waits on key; go test -timeout is its only
-// bound.
-func waitForWaiter(t *testing.T, h *Service, key string) {
+// hydrateConcurrently starts n EnsureHydrated calls of node, which send their
+// errors on errCh. The returned channel closes once every call returned.
+func hydrateConcurrently(ctx context.Context, h *Service, cfg model.RepoPaths, node model.BaseNode, n int, errCh chan<- error) <-chan struct{} {
+	var wg sync.WaitGroup
+	for range n {
+		wg.Go(func() {
+			_, _, err := h.EnsureHydrated(ctx, cfg, node)
+			errCh <- err
+		})
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return done
+}
+
+// waitForWaiters polls until at least n callers wait on key in waiters, one of
+// h's inflight maps, and fails t if done closes first. go test -timeout is its
+// only bound.
+func waitForWaiters[T any](t *testing.T, h *Service, waiters *inflight[T], key string, n int, done <-chan struct{}) {
 	t.Helper()
 	for {
 		h.mu.Lock()
-		n := len(h.wait[key])
+		waiting := len((*waiters)[key])
 		h.mu.Unlock()
-		if n > 0 {
+		if waiting >= n {
 			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-done:
+			t.Fatalf("callers returned while %d of %d waited on %s", waiting, n, key)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
+}
+
+// blobOID returns the git blob ID of data.
+func blobOID(data []byte) string {
+	h := sha1.New()
+	_, _ = fmt.Fprintf(h, "blob %d\x00", len(data))
+	_, _ = h.Write(data)
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 func (f *fakeBlobFetcher) Copied() []string {
@@ -1717,9 +1731,12 @@ func (f *fakeBlobFetcher) ReadBlob(_ context.Context, _ model.RepoPaths, _ strin
 	return f.payload, nil
 }
 
-func (f *fakeBlobFetcher) VerifyBlob(_ context.Context, _ model.RepoPaths, _ string, _ string) (bool, error) {
+// VerifyBlob reports verifyOK when it is set, and otherwise hashes the cache
+// file as gitstore.Store.VerifyBlob does.
+func (f *fakeBlobFetcher) VerifyBlob(_ context.Context, _ model.RepoPaths, objectOID string, cachePath string) (bool, error) {
 	f.mu.Lock()
 	f.verifyCalls++
+	verifyOK := f.verifyOK
 	f.mu.Unlock()
 	if f.verifyStarted != nil {
 		f.verifyOnce.Do(func() { close(f.verifyStarted) })
@@ -1730,7 +1747,10 @@ func (f *fakeBlobFetcher) VerifyBlob(_ context.Context, _ model.RepoPaths, _ str
 	if f.verifyErr != nil {
 		return false, f.verifyErr
 	}
-	return f.verifyOK, nil
+	if verifyOK {
+		return true, nil
+	}
+	return model.FileMatchesBlobOID(cachePath, objectOID)
 }
 
 func (f *fakeBlobFetcher) Calls() int {

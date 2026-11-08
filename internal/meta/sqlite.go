@@ -95,9 +95,17 @@ func Migrate(ctx context.Context, db *sql.DB, migrations []Migration) error {
 	return err
 }
 
+// testHookBeforeBegin, when set, runs in a migration step before it takes the
+// write lock. Keep the call before BEGIN IMMEDIATE: the test catches a call
+// that no longer runs, not a moved one.
+var testHookBeforeBegin func()
+
 // migrateNext applies the next migration, if any, and returns the version
 // the database reached.
 func migrateNext(ctx context.Context, conn *sql.Conn, migrations []Migration) (version int, err error) {
+	if testHookBeforeBegin != nil {
+		testHookBeforeBegin()
+	}
 	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
 		return 0, err
 	}

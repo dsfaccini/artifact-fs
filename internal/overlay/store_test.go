@@ -28,7 +28,9 @@ func testStore(t *testing.T) (*Store, model.RepoPaths) {
 		OverlayDBPath: filepath.Join(dir, "overlay", "meta.sqlite"),
 		BlobCacheDir:  filepath.Join(dir, "cache"),
 	}
-	os.MkdirAll(cfg.BlobCacheDir, 0o755)
+	if err := os.MkdirAll(cfg.BlobCacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	s, err := New(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -294,7 +296,9 @@ func TestWriteAndRead(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
 
-	s.CreateFile(ctx, "f.txt", 0o644)
+	if _, err := s.CreateFile(ctx, "f.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
 	created, _ := lookupEntry(t, s, "f.txt")
 	n, err := s.WriteFile(ctx, "f.txt", 0, []byte("hello"))
 	if err != nil {
@@ -324,7 +328,9 @@ func TestRemoveCreatesWhiteout(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
 
-	s.CreateFile(ctx, "del.txt", 0o644)
+	if _, err := s.CreateFile(ctx, "del.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.Remove(ctx, "del.txt"); err != nil {
 		t.Fatal(err)
 	}
@@ -393,6 +399,48 @@ func TestRenameDBFirst(t *testing.T) {
 	}
 	if got.CtimeUnixNs == before.CtimeUnixNs {
 		t.Fatalf("rename should bump ctime: before=%v after=%v", time.Unix(0, before.CtimeUnixNs), time.Unix(0, got.CtimeUnixNs))
+	}
+}
+
+// A rename onto an overlay file removes the replaced backing file, which no
+// entry names afterwards.
+func TestRenameOntoAnOverlayFileRemovesItsBackingFile(t *testing.T) {
+	for name, rename := range map[string]func(context.Context, *Store) error{
+		"Rename": func(ctx context.Context, s *Store) error {
+			return s.Rename(ctx, "src.txt", "dst.txt", false)
+		},
+		"RenameAndMarkModifiedFromBase": func(ctx context.Context, s *Store) error {
+			return s.RenameAndMarkModifiedFromBase(ctx, "src.txt", "dst.txt", "aaa", 0o644, false)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, _ := testStore(t)
+			createWithContent(t, s, "src.txt", "source")
+			createWithContent(t, s, "dst.txt", "replaced")
+			replaced, ok := lookupEntry(t, s, "dst.txt")
+			if !ok {
+				t.Fatal("dst.txt missing before the rename")
+			}
+
+			if err := rename(context.Background(), s); err != nil {
+				t.Fatal(err)
+			}
+
+			got, ok := lookupEntry(t, s, "dst.txt")
+			if !ok {
+				t.Fatal("dst.txt missing after the rename")
+			}
+			data, err := os.ReadFile(got.BackingPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) != "source" {
+				t.Fatalf("dst.txt = %q, want %q", data, "source")
+			}
+			if _, err := os.Stat(replaced.BackingPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("replaced backing file: %v, want it removed", err)
+			}
+		})
 	}
 }
 
@@ -1279,27 +1327,22 @@ func TestListByPrefix(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
 
-	s.CreateFile(ctx, "src/a.go", 0o644)
-	s.CreateFile(ctx, "src/b.go", 0o644)
-	s.CreateFile(ctx, "srclib/c.go", 0o644) // should NOT match src/ prefix
-	s.CreateFile(ctx, "readme.md", 0o644)
+	for _, p := range []string{"src/a.go", "src/b.go", "srclib/c.go", "readme.md"} {
+		if _, err := s.CreateFile(ctx, p, 0o644); err != nil {
+			t.Fatalf("CreateFile(%q): %v", p, err)
+		}
+	}
 
 	entries, err := s.ListByPrefix(ctx, "src")
 	if err != nil {
 		t.Fatal(err)
 	}
-	paths := map[string]bool{}
+	var got []string
 	for _, e := range entries {
-		paths[e.Path] = true
+		got = append(got, e.Path)
 	}
-	if !paths["src/a.go"] || !paths["src/b.go"] {
-		t.Fatalf("expected src/a.go and src/b.go, got %v", paths)
-	}
-	if paths["srclib/c.go"] {
-		t.Fatal("srclib/c.go should not match src/ prefix")
-	}
-	if paths["readme.md"] {
-		t.Fatal("readme.md should not match src/ prefix")
+	if want := []string{"src/a.go", "src/b.go"}; !slices.Equal(got, want) {
+		t.Fatalf("ListByPrefix(src) = %q, want %q", got, want)
 	}
 }
 
@@ -1354,14 +1397,27 @@ func TestReconcileAfterCommit(t *testing.T) {
 	// After commit, the base has foo.txt with a new OID ("bbb").
 	base := model.BaseNode{RepoID: cfg.ID, Path: "foo.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
 	cacheTestBlob(t, cfg, base.ObjectOID)
-	s.EnsureCopyOnWrite(ctx, cfg, "foo.txt", base)
-	s.WriteFile(ctx, "foo.txt", 0, []byte("modified"))
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "foo.txt", base); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, "foo.txt", 0, []byte("modified")); err != nil {
+		t.Fatal(err)
+	}
 
 	// Also create a new file that was committed.
-	s.CreateFile(ctx, "new.txt", 0o644)
+	if _, err := s.CreateFile(ctx, "new.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	// And a whiteout for a file that was deleted in the commit.
-	s.Remove(ctx, "gone.txt")
+	if err := s.Remove(ctx, "gone.txt"); err != nil {
+		t.Fatal(err)
+	}
+	for path, kind := range map[string]model.OverlayKind{"foo.txt": model.OverlayKindModify, "new.txt": model.OverlayKindCreate, "gone.txt": model.OverlayKindDelete} {
+		if e, ok := lookupEntry(t, s, path); !ok || e.Kind != kind {
+			t.Fatalf("%s before reconcile = %+v, %v; want a %s entry", path, e, ok, kind)
+		}
+	}
 
 	// Reconcile against a base where:
 	// - foo.txt exists with different OID (was committed)
@@ -1407,14 +1463,22 @@ func TestReconcileKeepsValidEntries(t *testing.T) {
 	// Modify foo.txt from base OID "aaa" -- but base hasn't changed.
 	base := model.BaseNode{RepoID: cfg.ID, Path: "foo.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
 	cacheTestBlob(t, cfg, base.ObjectOID)
-	s.EnsureCopyOnWrite(ctx, cfg, "foo.txt", base)
-	s.WriteFile(ctx, "foo.txt", 0, []byte("local change"))
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "foo.txt", base); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, "foo.txt", 0, []byte("local change")); err != nil {
+		t.Fatal(err)
+	}
 
 	// Create a file that doesn't exist in base.
-	s.CreateFile(ctx, "local-only.txt", 0o644)
+	if _, err := s.CreateFile(ctx, "local-only.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	// Whiteout a file that still exists in base.
-	s.Remove(ctx, "hidden.txt")
+	if err := s.Remove(ctx, "hidden.txt"); err != nil {
+		t.Fatal(err)
+	}
 
 	baseLookup := func(path string) (model.BaseNode, bool) {
 		switch path {
@@ -1447,7 +1511,9 @@ func TestSetMtime(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
 
-	s.CreateFile(ctx, "m.txt", 0o644)
+	if _, err := s.CreateFile(ctx, "m.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
 	target := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
 	if err := s.SetMtime(ctx, "m.txt", target); err != nil {
 		t.Fatal(err)

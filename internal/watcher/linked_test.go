@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -78,6 +79,57 @@ func TestLinkedWorktreeLooseAndPackedReferences(t *testing.T) {
 			}
 		})
 	}
+	// Git writes the files here, so this subtest also covers the layout Git
+	// itself leaves, which the ones above write by hand.
+	t.Run("git", func(t *testing.T) {
+		dir := t.TempDir()
+		primary := filepath.Join(dir, "primary")
+		linked := filepath.Join(dir, "linked")
+		git := func(args ...string) {
+			t.Helper()
+			if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v\n%s", args, err, out)
+			}
+		}
+		commit := func(worktree, message string) {
+			t.Helper()
+			git("-C", worktree, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", message)
+		}
+		git("init", "-q", "--initial-branch", "main", primary)
+		commit(primary, "main 1")
+		git("-C", primary, "branch", "other")
+		git("-C", primary, "worktree", "add", "-q", "-b", "topic", linked)
+		head := filepath.Join(primary, ".git", "worktrees", "linked", "HEAD")
+		poller := New(time.Second)
+		if poller.headChanged(head) {
+			t.Fatal("startup must prime state")
+		}
+		commit(linked, "topic 1")
+		if !poller.headChanged(head) {
+			t.Fatal("missed a commit in the linked worktree")
+		}
+		git("-C", primary, "pack-refs", "--all")
+		if poller.headChanged(head) {
+			t.Fatal("packing an unchanged ref must preserve the baseline")
+		}
+		commit(primary, "main 2")
+		if poller.headChanged(head) {
+			t.Fatal("a commit to another branch caused reconciliation")
+		}
+		commit(linked, "topic 2")
+		git("-C", primary, "pack-refs", "--all")
+		if !poller.headChanged(head) {
+			t.Fatal("missed a packed update of the checked-out branch")
+		}
+		git("-C", linked, "switch", "-q", "other")
+		if !poller.headChanged(head) {
+			t.Fatal("missed a switch to a packed branch")
+		}
+		commit(linked, "other 1")
+		if !poller.headChanged(head) {
+			t.Fatal("missed a commit after the switch")
+		}
+	})
 }
 
 func TestLinkedWorktreePrivateReferenceNamespace(t *testing.T) {
