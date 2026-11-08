@@ -364,3 +364,5 @@ type Hydrator interface {
 	OpenHydrated(ctx context.Context, repo RepoPaths, node BaseNode) (*os.File, int64, error)
 	ReadBlob(ctx context.Context, repo RepoPaths, node BaseNode, maxBytes int64) ([]byte, error)
 }
+
+// Go-only push probe for the Examples path filter.
