@@ -2020,6 +2020,60 @@ func TestReadAcrossAFlushShowsCompletedWrites(t *testing.T) {
 	}
 }
 
+// Reads copy the pending writes under pendingMu, because writes and flushes
+// change them from another goroutine. The race detector reports an unlocked
+// read. Most writes take the path that touches only pendingMu: every query
+// locks the database/sql pool's mutex, which orders the writer's earlier
+// accesses before the reader's later ones and hides them from the detector.
+func TestReadsCopyPendingWritesUnderTheLock(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	createWithContent(t, s, "d/f.txt", "x")
+	done := make(chan struct{})
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for off := int64(1); ; off += 100 {
+			for i := range int64(100) {
+				if _, err := s.WriteFile(ctx, "d/f.txt", off+i, []byte("y")); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+			if err := s.FlushFile(ctx, "d/f.txt"); err != nil {
+				t.Error(err)
+				return
+			}
+			if off == 1 {
+				close(started)
+			}
+			select {
+			case <-done:
+				return
+			default:
+			}
+		}
+	}()
+	defer func() {
+		close(done)
+		<-stopped
+	}()
+	select {
+	case <-started:
+	case <-stopped:
+		t.FailNow()
+	}
+	for range 50 {
+		if _, ok, err := s.Lookup(ctx, "d/f.txt"); err != nil || !ok {
+			t.Fatalf("Lookup(d/f.txt) = %v, %v; want the file", ok, err)
+		}
+		if entries, err := s.ListByPrefix(ctx, "d"); err != nil || len(entries) != 1 {
+			t.Fatalf("ListByPrefix(d) = %+v, %v; want d/f.txt", entries, err)
+		}
+	}
+}
+
 func TestListByPrefixShowsUnflushedWriteSize(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()

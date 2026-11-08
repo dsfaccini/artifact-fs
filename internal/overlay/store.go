@@ -202,11 +202,13 @@ func (s *Store) Close() error {
 }
 
 // testHookBetweenReads, when set, runs in a read between its two reads: the
-// pending writes and the committed entries.
+// pending writes and the committed entries. Keep each call between the two
+// reads: the test catches a call that no longer runs, not a moved one.
 var testHookBetweenReads func()
 
 // testHookBetweenCommitAndForget, when set, runs in a flush between its commit
-// of the pending writes and its forgetting them.
+// of the pending writes and its forgetting them. Keep each call between the
+// two steps: the test catches a call that no longer runs, not a moved one.
 var testHookBetweenCommitAndForget func()
 
 func runHook(hook func()) {
