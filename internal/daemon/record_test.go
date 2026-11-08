@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/metatest"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -256,6 +257,29 @@ func TestStatusReportsAFailedRefresh(t *testing.T) {
 	if st := requireFailure(t, ctl, phaseFetch, "fetch"); st.LastFetchResult != string(fetchFailed) {
 		t.Fatalf("fetch result = %q, want %q", st.LastFetchResult, fetchFailed)
 	}
+}
+
+// The daemon refreshes in the background, so a remote that asks for
+// credentials fails the refresh instead of prompting.
+func TestRefreshDoesNotPrompt(t *testing.T) {
+	askpassRuns := gittest.IsolatePrompts(t)
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "--git-dir", cfg.GitDir, "remote", "set-url", "origin", gittest.UnauthorizedRemote(t))
+	if err := ctl.SetRefresh(ctx, "repo", model.RefreshPolicy{RefreshInterval: 20 * time.Millisecond}); err != nil {
+		t.Fatal(err)
+	}
+	done := startService(t, svc)
+	waitFor(t, done, func() bool {
+		st, err := ctl.Status(ctx, "repo")
+		return err == nil && st.LastErrorPhase == phaseFetch
+	})
+	requireFailure(t, ctl, phaseFetch, "terminal prompts disabled")
+	gittest.RequireNoPrompt(t, askpassRuns)
 }
 
 // A failed unmount leaves its mount behind, but a later daemon on the root

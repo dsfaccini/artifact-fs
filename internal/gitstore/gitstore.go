@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +23,9 @@ type Store struct {
 	gitRetryDelays []time.Duration
 	// rollbackContext makes the context of one rollback. Tests replace it.
 	rollbackContext func(context.Context) (context.Context, context.CancelFunc)
-	closed          bool
+	// sshWrapperDir holds the wrapper batchModeSSH writes; Close removes it.
+	sshWrapperDir string
+	closed        bool
 }
 
 func New(logger *slog.Logger) *Store {
@@ -38,7 +41,8 @@ func New(logger *slog.Logger) *Store {
 	}
 }
 
-// Close shuts down all persistent batch processes.
+// Close shuts down all persistent batch processes and removes the SSH
+// wrapper.
 func (s *Store) Close() {
 	s.mu.Lock()
 	if s.closed {
@@ -51,9 +55,14 @@ func (s *Store) Close() {
 		pools = append(pools, p)
 		delete(s.pools, dir)
 	}
+	sshWrapperDir := s.sshWrapperDir
+	s.sshWrapperDir = ""
 	s.mu.Unlock()
 	for _, p := range pools {
 		p.closeAll()
+	}
+	if sshWrapperDir != "" {
+		_ = os.RemoveAll(sshWrapperDir)
 	}
 }
 

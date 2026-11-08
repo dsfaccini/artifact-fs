@@ -23,7 +23,7 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 	var blobOIDs []string
 	blobIndex := map[string][]int{} // oid -> indices into nodes
 	var parseErr error
-	if err := streamTreeRecords(ctx, repo.GitDir, headOID, func(line string) {
+	if err := s.streamTreeRecords(ctx, repo.GitDir, headOID, func(line string) {
 		n, typ, ok := parseTreeRecord(repo.ID, line)
 		if !ok {
 			if parseErr == nil {
@@ -62,12 +62,16 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 	return addImplicitDirs(repo.ID, nodes), nil
 }
 
-func streamTreeRecords(ctx context.Context, gitDir string, headOID string, fn func(string)) error {
+func (s *Store) streamTreeRecords(ctx context.Context, gitDir string, headOID string, fn func(string)) error {
+	env, err := s.lazyFetchEnv()
+	if err != nil {
+		return err
+	}
 	cmd := exec.CommandContext(ctx, "git", "ls-tree", "-r", "-t", "-z", headOID)
 	configureCancelableCommand(cmd)
 	// A treeless clone fetches missing trees here.
 	configureCommandSession(cmd)
-	cmd.Env = append(append(os.Environ(), "GIT_DIR="+gitDir), lazyFetchEnv()...)
+	cmd.Env = append(append(os.Environ(), "GIT_DIR="+gitDir), env...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err

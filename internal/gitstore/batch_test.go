@@ -7,8 +7,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -484,6 +482,7 @@ func TestBatchPoolBoundsConcurrentProcesses(t *testing.T) {
 	run(t, "git", "init", repo)
 	p := &batchPool{
 		gitDir:  filepath.Join(repo, ".git"),
+		env:     func() ([]string, error) { return nil, nil },
 		logger:  slog.Default(),
 		maxSize: 1,
 		all:     map[*batchCatFile]struct{}{},
@@ -508,10 +507,10 @@ func TestBatchPoolBoundsConcurrentProcesses(t *testing.T) {
 }
 
 func TestBlobToCacheLogsLazyFetchStderrWithoutPrompting(t *testing.T) {
-	askpassRuns := isolateLazyFetchEnv(t)
+	askpassRuns := gittest.IsolatePrompts(t)
 	tmp := t.TempDir()
 	gitDir, _, blobOID := partialClone(t, tmp, "blob:none")
-	run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", unauthorizedRemote(t))
+	run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", gittest.UnauthorizedRemote(t))
 
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
@@ -525,14 +524,14 @@ func TestBlobToCacheLogsLazyFetchStderrWithoutPrompting(t *testing.T) {
 	if !strings.Contains(logs.String(), `"msg":"git cat-file stderr"`) || !strings.Contains(logs.String(), "terminal prompts disabled") {
 		t.Fatalf("logs = %s, want the lazy fetch's non-interactive failure", logs.String())
 	}
-	assertAskpassDidNotRun(t, askpassRuns)
+	gittest.RequireNoPrompt(t, askpassRuns)
 }
 
 func TestBuildTreeIndexLazyTreeFetchDoesNotPrompt(t *testing.T) {
-	askpassRuns := isolateLazyFetchEnv(t)
+	askpassRuns := gittest.IsolatePrompts(t)
 	tmp := t.TempDir()
 	gitDir, commit, _ := partialClone(t, tmp, "tree:0")
-	run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", unauthorizedRemote(t))
+	run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", gittest.UnauthorizedRemote(t))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -540,55 +539,18 @@ func TestBuildTreeIndexLazyTreeFetchDoesNotPrompt(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "terminal prompts disabled") {
 		t.Fatalf("BuildTreeIndex error = %v, want the lazy tree fetch's non-interactive failure", err)
 	}
-	assertAskpassDidNotRun(t, askpassRuns)
+	gittest.RequireNoPrompt(t, askpassRuns)
 }
 
-func TestCloneBloblessNonInteractiveSkipsSSHAskpass(t *testing.T) {
-	askpassRuns := isolateLazyFetchEnv(t)
+func TestCloneBloblessSkipsSSHAskpass(t *testing.T) {
+	askpassRuns := gittest.IsolatePrompts(t)
 	tmp := t.TempDir()
-	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: unauthorizedRemote(t), Branch: "main"}}
-	err := New(slog.New(slog.NewTextHandler(io.Discard, nil))).CloneBloblessNonInteractive(context.Background(), cfg)
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: gittest.UnauthorizedRemote(t), Branch: "main"}}
+	err := New(slog.New(slog.NewTextHandler(io.Discard, nil))).CloneBlobless(context.Background(), cfg)
 	if err == nil || !strings.Contains(err.Error(), "terminal prompts disabled") {
-		t.Fatalf("CloneBloblessNonInteractive error = %v, want a non-interactive failure", err)
+		t.Fatalf("CloneBlobless error = %v, want a non-interactive failure", err)
 	}
-	assertAskpassDidNotRun(t, askpassRuns)
-}
-
-// isolateLazyFetchEnv keeps the machine's prompt programs and SSH settings out
-// of a test's Git commands; TestMain already isolates Git config. It sets
-// SSH_ASKPASS to a program that records each run in the returned file.
-func isolateLazyFetchEnv(t *testing.T) string {
-	t.Helper()
-	for _, key := range []string{"GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "SSH_ASKPASS_REQUIRE"} {
-		t.Setenv(key, "")
-		os.Unsetenv(key)
-	}
-	dir := t.TempDir()
-	runs := filepath.Join(dir, "askpass-runs")
-	askpass := filepath.Join(dir, "askpass")
-	if err := os.WriteFile(askpass, []byte("#!/bin/sh\necho \"$*\" >> '"+runs+"'\necho guessed\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("SSH_ASKPASS", askpass)
-	return runs
-}
-
-func assertAskpassDidNotRun(t *testing.T, runs string) {
-	t.Helper()
-	if data, err := os.ReadFile(runs); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("Git ran SSH_ASKPASS: %q, %v", data, err)
-	}
-}
-
-// unauthorizedRemote returns an HTTP remote that answers every request with 401.
-func unauthorizedRemote(t *testing.T) string {
-	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("WWW-Authenticate", `Basic realm="test"`)
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	t.Cleanup(server.Close)
-	return server.URL + "/repo.git"
+	gittest.RequireNoPrompt(t, askpassRuns)
 }
 
 // partialClone clones a one-file repository with filter into dir and returns

@@ -217,7 +217,11 @@ next registry poll, within 3 seconds.
 
 Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The first time a base file in a directory is opened for reading or read at a given snapshot generation, the mount also queues up to 256 of that directory's files, the opened one included, for background hydration, ranking code and manifests (`package.json`, `go.mod`, `README.md`) ahead of binary files. Listing or walking directories queues nothing. A blobless clone knows a file's size only once its blob is local, so the first `stat` of a file hydrates that one file. A worker takes up to 256 queued blobs, all reads or all prefetches, and fetches the missing ones with one `git fetch` from the promisor remote, so a blobless clone pays one fetch per batch, not one per blob. Queued reads go ahead of queued prefetches, and a blob a prefetch has already downloaded is copied into the cache before more prefetches download. With more than one worker, one worker takes only reads and those copies, so a read never waits for an unrelated prefetch download, though it can wait for one copy of a blob already on disk. With a single worker, a read can wait for a running prefetch download. A read of a file whose own prefetch is downloading waits for that download.
 
-For every repo, ArtifactFS reads blobs (`git cat-file --batch`) and trees (`git ls-tree`), and fetches queued blobs in batches (`git fetch --stdin`), without a controlling terminal, with `GIT_TERMINAL_PROMPT=0` and an empty `SSH_ASKPASS`. When a batch fetch runs, or a read lazily fetches a missing object, a remote that needs an interactive password or passphrase prompt makes the fetch fail instead of prompting. The repo's `core.sshCommand`, credential helpers, and any program set through `GIT_ASKPASS` or `core.askPass` still run. Git Credential Manager can still show its GUI prompt unless `GCM_INTERACTIVE=never` is set.
+For every repo, ArtifactFS reads blobs (`git cat-file --batch`) and trees (`git ls-tree`), and fetches queued blobs in batches (`git fetch --stdin`), without a controlling terminal, with `GIT_TERMINAL_PROMPT=0`, an empty `SSH_ASKPASS` and `SSH_ASKPASS_REQUIRE=never`. Unless `GIT_SSH` is set, ArtifactFS sets it to a wrapper that runs `ssh -o BatchMode=yes`, so SSH tries no passwords that a server could count as failed logins. Git runs `GIT_SSH` only when neither `GIT_SSH_COMMAND` nor a `core.sshCommand` applies, including one that an include sets for the repository being cloned, so the SSH command the user set wins. When a batch fetch runs, or a read lazily fetches a missing object, a remote that needs an interactive password or passphrase prompt makes the fetch fail instead of prompting. The SSH command the user set, credential helpers, and any program set through `GIT_ASKPASS` or `core.askPass` still run.
+
+Every other Git command ArtifactFS runs that can contact a remote runs the same way: without a controlling terminal, with `GIT_TERMINAL_PROMPT=0`, an empty `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE=never`, and BatchMode for plain `ssh`. These are the clones, `ls-remote` calls and fetches of `add-repo`, `prepare`, the daemon's preparation and remote refresh, and the `fetch` command, every `read-tree` that builds or moves a git dir's index, and the `diff-tree` and `diff-index` that check a failed move. In a git dir cloned with `--filter=tree:0`, those three fetch the trees it lacks. ArtifactFS's other Git commands read only commits and refs, or run with `GIT_NO_LAZY_FETCH=1`. A remote that needs a password, a passphrase or a new host key fails the command, and `status` reports a failed refresh. The SSH command the user set, credential helpers, and any program set through `GIT_ASKPASS` or `core.askPass` still run.
+
+Git Credential Manager can still show its GUI prompt unless `GCM_INTERACTIVE=never` is set. Other waits are not terminal prompts either, so these settings do not end them: an ssh-agent key added with `ssh-add -c`, a FIDO security key waiting for a touch, `ControlMaster ask` or `autoask`, and a `ProxyCommand` that waits for a browser login. Such a wait holds the command until its context ends: a remote refresh after 30 seconds, a preparation after 30 minutes, a hydration batch fetch after 2 minutes, and the `fetch` command until Ctrl-C.
 
 When the Git index matches the published snapshot and the overlay is empty, startup marks snapshot entries valid for Git's filesystem monitor before the mount serves the repo: before a prepared repo mounts, and before an async repo's gate opens. This lets the first `git status` use the daemon's change list instead of reading every tracked blob, and each later `git status` receives only the paths the overlay changed since Git's previous query, plus each file whose writes are not yet flushed. Paths with no `text` attribute, or under `text=auto`, `-text` or `binary`, are marked, unless `eol=lf` applies without `text=auto`. Paths under `text`, `text=input` or `eol=lf` without `text=auto` stay unmarked, because Git's check-in turns CRLF into LF and a blob that holds CRLF then differs from its file; Git compares those paths itself. `-text eol=lf` stays unmarked too, because `git check-attr` prints it like the literal `text=unset`, which Git converts under `eol=lf`. A `git status` that runs while the worktree is unmounted sees the empty mountpoint, so Git's next query gets a rescan. When startup marks the baseline again, its own query takes that rescan, and the first `git status` after the mount receives only the overlay's changes. ArtifactFS skips this baseline when the index or a `.gitattributes` blob is uncertain, when `core.attributesFile` is configured or `core.autocrlf` is set to anything but false, when an `eol=crlf`, `crlf`, `filter`, `ident` or `working-tree-encoding` attribute applies, or when staged work or overlay changes exist; Git then performs its normal status scan.
 
@@ -344,6 +348,12 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
 
 `--ref` and `--fetch-ref` take a full ref name, a branch name, or `origin/<branch>`, and `add-repo` stores each as a full ref name. `origin/X` and `refs/remotes/origin/X` name branch `X`, so a branch literally named `origin/X` needs `--ref refs/heads/origin/X`. `--fetch-ref` defaults to `--ref`. Preparation fetches the fetch ref and serves it, also right after a fresh clone of `--ref`. With `--require-commit`, preparation fetches and verifies `--ref`, and `add-repo` rejects `--fetch-ref`.
 
+With `--depth`, a fetch transfers at most that many commits of a fetch ref whose branch the git dir does not hold yet, or of a fetch ref that is not a branch. A fetch onto a branch the git dir holds transfers only the new commits. So `prepare` and the remote refresh make a `--prepared-gitdir` git dir shallow when it lacks the fetch ref's branch, or when the fetch ref is not a branch.
+
+The remote refresh and the `fetch` command fetch every branch of the git dir's configured refspec, and choose `--depth` from the fetch ref's branch alone. Once that branch exists, they pass no `--depth`. A `--prepared-gitdir` git dir with `--depth` and a refspec for several branches then receives a new or force-pushed upstream branch with its whole history. A clone that `add-repo` makes fetches only its branch, so the cost does not apply to it.
+
+A prepared git dir whose remote-tracking branch an earlier build's refresh made shallow refuses its next preparation with `refusing non-fast-forward update`. Deepen it once in that git dir, with `git fetch --deepen=<n>` or `git fetch --unshallow`.
+
 ## Adopting linked Git worktrees
 
 `--adopt-gitdir` registers an initialized linked worktree without cloning, fetching,
@@ -375,9 +385,9 @@ Adoption disables remote refresh and rejects acquisition options (`--remote`,
 watching remains active, including shared loose and packed branch refs, so
 commits and branch changes reconcile normally. Run ordinary Git fetch/push
 commands when needed; the worktree's original remote configuration is retained.
-If `origin` embeds credentials, adoption logs a warning that names no remote and proceeds:
-fetches of missing blobs and trees, Git's lazy fetches and the hydrator's batch
-fetches, use the promisor remote, usually `origin`.
+If `origin` or a promisor remote embeds credentials, adoption logs a warning that names no
+remote and proceeds: fetches of missing blobs and trees, Git's lazy fetches and the
+hydrator's batch fetches, use the promisor remotes, usually `origin`.
 
 ArtifactFS enables `extensions.worktreeConfig`, migrating shared `core.worktree`
 and `core.bare=true` settings into the primary worktree's config when necessary.
@@ -389,8 +399,12 @@ Stop the owning daemon and wait for process exit and actual unmount before
 restoring the saved gitfile, unlocking metadata or removing the worktree.
 `remove-repo` updates the registry and Git config and returns. The running daemon
 unmounts the repo at its next registry poll, so the return does not mean the live mount has stopped.
-It unsets the worktree's `core.fsmonitor` and keeps `extensions.worktreeConfig`,
-which sibling worktrees may rely on. Preserve a recovery ref before deleting a
+It unsets what adoption pinned in the worktree's config for the mount
+(`core.fsmonitor`, `fsmonitor.allowRemote`, `core.filemode`, `core.ignorecase`
+and `core.symlinks`), so the worktree inherits its repository's settings again.
+A value the worktree's own config held before adoption does not come back. It
+keeps the worktree's path pins and `extensions.worktreeConfig`, which sibling
+worktrees may rely on. Preserve a recovery ref before deleting a
 branch containing local commits.
 
 ## Verified shallow sources

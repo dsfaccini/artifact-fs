@@ -76,9 +76,9 @@ type preparation struct {
 	// nothing.
 	mode    string
 	attempt int64
-	// ambient makes git use only ambient credentials and never prompt, and
-	// rejects a remote URL with inline credentials. Otherwise a credential
-	// helper hands git the remote URL's inline credentials.
+	// ambient makes git use only ambient credentials, and rejects a remote
+	// URL with inline credentials. Otherwise a credential helper hands git the
+	// remote URL's inline credentials.
 	ambient bool
 	// fetch makes an existing clone fetch FetchRef and move its branch to it.
 	// Otherwise the pipeline takes the clone's HEAD as it is.
@@ -232,7 +232,7 @@ func (s *core) acquireSource(ctx context.Context, cfg model.RepoConfig, p prepar
 			return model.PreparedSource{}, source, withPreparationPhase(preparePhaseClone, err)
 		}
 		// Adoption runs once per prepare and once per mount.
-		s.git.WarnAdoptedOriginCredentials(ctx, cfg)
+		s.git.WarnAdoptedRemoteCredentials(ctx, cfg)
 	case cfg.RequiredCommit != "":
 		prepared, err := s.git.PrepareSource(ctx, cfg, model.SourceRequirement{
 			Ref:            cfg.Branch,
@@ -244,7 +244,7 @@ func (s *core) acquireSource(ctx context.Context, cfg model.RepoConfig, p prepar
 		if err := s.git.ValidatePreparedGitDir(ctx, cfg); err != nil {
 			return model.PreparedSource{}, source, withPreparationPhase(preparePhaseValidate, err)
 		}
-		if err := s.git.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
+		if err := s.git.FetchRefAmbient(ctx, cfg, cfg.FetchRef); err != nil {
 			return model.PreparedSource{}, source, withPreparationPhase(preparePhaseFetch, err)
 		}
 		if err := s.git.PrepareFetchedBranch(ctx, cfg, cfg.FetchRef); err != nil {
@@ -282,10 +282,8 @@ func (s *core) cloneSource(ctx context.Context, cfg model.RepoConfig, p preparat
 		if err := s.git.ValidateAmbientRemote(cfg); err != nil {
 			return withPreparationPhase(preparePhaseValidate, err)
 		}
-		if err := s.git.CloneBloblessNonInteractive(ctx, cfg); err != nil {
-			return withPreparationPhase(preparePhaseClone, err)
-		}
-	} else if err := s.git.CloneBlobless(ctx, cfg); err != nil {
+	}
+	if err := s.git.CloneBlobless(ctx, cfg); err != nil {
 		return withPreparationPhase(preparePhaseClone, err)
 	}
 	if cfg.FetchRef == cfg.Branch {
@@ -303,10 +301,10 @@ func (s *core) refreshClone(ctx context.Context, cfg model.RepoConfig, p prepara
 		if err := s.git.ValidateAmbientRemote(cfg); err != nil {
 			return withPreparationPhase(preparePhaseValidate, err)
 		}
-		if err := s.git.ConfigureRemoteNonInteractive(ctx, cfg); err != nil {
+		if err := s.git.ConfigureRemoteAmbient(ctx, cfg); err != nil {
 			return withPreparationPhase(preparePhaseConfigureRemote, err)
 		}
-		if err := s.git.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
+		if err := s.git.FetchRefAmbient(ctx, cfg, cfg.FetchRef); err != nil {
 			return withPreparationPhase(preparePhaseFetch, err)
 		}
 	} else {

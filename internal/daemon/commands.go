@@ -160,7 +160,7 @@ func (s *Controller) RemoveRepo(ctx context.Context, name string) error {
 			return registry.ErrRepoChanged
 		}
 		if latest.AdoptGitDir {
-			if err := s.git.RemoveAdoptedFSMonitorHook(ctx, latest); err != nil {
+			if err := s.git.ReleaseAdoptedWorktree(ctx, latest); err != nil {
 				return err
 			}
 		}
@@ -232,7 +232,7 @@ func (s *Controller) FetchNow(ctx context.Context, name string) error {
 	}
 	// Status reads the fetch from FETCH_HEAD. Ahead and behind come from the
 	// daemon's next refresh.
-	return s.git.Fetch(ctx, cfg)
+	return s.git.FetchNonInteractive(ctx, cfg)
 }
 
 // Prepare asks for a new preparation of name. A sync repo prepares in the
