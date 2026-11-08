@@ -31,14 +31,21 @@ jobs:
           cache: false
 
       - name: Fuzz redaction
+        env:
+          FUZZ_TARGET: FuzzRedactionHidesPassword
         run: |
           status=0
-          go test -run '^$' -fuzz '^FuzzRedactionHidesPassword$' -fuzztime 10m ./internal/auth \
+          go test -run '^$' -fuzz "^$FUZZ_TARGET\$" -fuzztime 10m ./internal/auth \
             >"$RUNNER_TEMP/fuzz.log" 2>&1 || status=$?
           # A failure message shows the input that leaked, and this log is
           # public. Print only the fuzzer's progress and the verdict.
           grep -E '^(fuzz: |--- FAIL|FAIL|ok |PASS$)' "$RUNNER_TEMP/fuzz.log" || true
           if [ "$status" -ne 0 ]; then
-            echo "::error::Redaction fuzzing failed. Its input stays out of this public log: rerun go test -fuzz '^FuzzRedactionHidesPassword$' ./internal/auth locally."
+            echo "::error::Redaction fuzzing failed. Its input stays out of this public log: rerun go test -fuzz '^$FUZZ_TARGET\$' ./internal/auth locally."
+            exit "$status"
           fi
-          exit "$status"
+          # go test passes when -fuzz matches no target, as after a rename.
+          if ! grep -qE '^fuzz: elapsed: .*execs:' "$RUNNER_TEMP/fuzz.log"; then
+            echo "::error::$FUZZ_TARGET did not fuzz. Check that -fuzz names a fuzz test in ./internal/auth."
+            exit 1
+          fi

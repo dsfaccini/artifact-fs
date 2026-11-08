@@ -74,8 +74,19 @@ if [ -n "$vet_targets" ]; then
 	go vet $vet_targets
 	# Keep the version in step with the modernize check in build-test.yml.
 	modernize=golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@v0.52.0
-	if ! go run "$modernize" $vet_targets; then
+	modernize_bin=$(mktemp -d)
+	trap 'rm -rf "$modernize_bin"' EXIT
+	if ! GOBIN=$modernize_bin go install "$modernize"; then
+		echo "pre-commit: could not fetch or build $modernize" >&2
+		exit 1
+	fi
+	# modernize exits 3 when it reports findings.
+	modernize_status=0
+	"$modernize_bin/modernize" $vet_targets || modernize_status=$?
+	if [ "$modernize_status" -eq 3 ]; then
 		echo "pre-commit: apply these fixes with: go run $modernize -fix" $vet_targets >&2
+	fi
+	if [ "$modernize_status" -ne 0 ]; then
 		exit 1
 	fi
 fi
