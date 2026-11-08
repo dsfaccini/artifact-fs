@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +12,6 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/daemon"
-	"github.com/cloudflare/artifact-fs/internal/logging"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -44,7 +42,7 @@ func TestE2EAdoptedWorktree(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	svc, err := daemon.New(ctx, root, logging.NewJSONLogger(os.Stderr, slog.LevelWarn))
+	svc, err := daemon.New(ctx, root, newTestE2ELogger(t))
 	if err != nil {
 		cancel()
 		t.Fatal(err)
