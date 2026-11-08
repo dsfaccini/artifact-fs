@@ -104,34 +104,62 @@ func TestInvalidateChangedSendsNothingOnFSKit(t *testing.T) {
 	}
 }
 
-// The FSKit switch pass retires the inode of a file held open whose path
-// changed type, so a write through it no longer reaches the path. The open
-// file keeps reading what it opened.
+// The FSKit switch pass retires the inode of every file held open whose path
+// changed type. That holds also for an inode whose identity a getattr updated
+// after an earlier switch, and for one the kernel last saw from the overlay.
+// When a later switch makes the path a file with another blob, a write through
+// the held file then reaches neither. The open file keeps reading what it
+// opened.
 func TestFSKitSwitchPassRetiresOpenFileWhosePathChangedType(t *testing.T) {
 	link := model.BaseNode{Path: "p", Type: "symlink", Mode: 0o120000, ObjectOID: "target", SizeState: "known", SizeBytes: 6}
-	for _, to := range [][]model.BaseNode{{link}, {baseDir("p", "tree-P"), baseFile("p/x.txt", "x", 0o100644)}} {
-		t.Run(to[0].Type, func(t *testing.T) {
-			f := newCacheFixtureOn(t, BackendFSKit, baseFile("p", "blob-P", 0o100644))
-			held := f.lookup(fuseops.RootInodeID, "p")
-			open := f.openRW(held)
-			f.switchTo(to...)
-			if err := f.mount.InvalidateChanged(); err != nil {
-				t.Fatal(err)
-			}
-			before, _, err := f.fs.engine.Identity("p")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("written")}); kernelErrno(err) != syscall.ESTALE {
-				t.Fatalf("write through the file held open after p became a %s = %v, want ESTALE", to[0].Type, err)
-			}
-			if after, _, err := f.fs.engine.Identity("p"); err != nil || after != before {
-				t.Fatalf("p after a write through the held file = %+v, %v, want %+v", after, err, before)
-			}
-			if got := mustReadHandle(t, f, held, open.Handle); got != "blob-P" {
-				t.Fatalf("read through the file held open after p became a %s = %q, want %q", to[0].Type, got, "blob-P")
-			}
-		})
+	for _, before := range []string{"none", "getattr of a new blob", "commit of a write"} {
+		for _, to := range [][]model.BaseNode{{link}, {baseDir("p", "tree-P"), baseFile("p/x.txt", "x", 0o100644)}} {
+			t.Run(before+"/"+to[0].Type, func(t *testing.T) {
+				f := newCacheFixtureOn(t, BackendFSKit, baseFile("p", "blob-P", 0o100644))
+				held := f.lookup(fuseops.RootInodeID, "p")
+				open := f.openRW(held)
+				pass := func() {
+					t.Helper()
+					if err := f.mount.InvalidateChanged(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				switch before {
+				case "getattr of a new blob":
+					f.switchTo(baseFile("p", "blob-Q", 0o100644))
+					pass()
+					f.getattr(held)
+				case "commit of a write":
+					if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("committed")}); err != nil {
+						t.Fatal(err)
+					}
+					f.switchTo(baseFile("p", blobOID("committed"), 0o100644))
+					if _, ok, err := f.resolver.Overlay.Lookup(f.ctx, "p"); err != nil || ok {
+						t.Fatalf("overlay holds p after its content was committed: %t, %v", ok, err)
+					}
+					pass()
+				}
+				f.switchTo(to...)
+				pass()
+				f.switchTo(baseFile("p", "blob-R", 0o100644))
+				pass()
+				current, _, err := f.fs.engine.Identity("p")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("written")}); kernelErrno(err) != syscall.ESTALE {
+					t.Fatalf("write through the file held open after p became a %s and then blob-R = %v, want ESTALE", to[0].Type, err)
+				}
+				if after, _, err := f.fs.engine.Identity("p"); err != nil || after != current {
+					t.Fatalf("p after a write through the held file = %+v, %v, want %+v", after, err, current)
+				}
+				if before == "none" {
+					if got := mustReadHandle(t, f, held, open.Handle); got != "blob-P" {
+						t.Fatalf("read through the file held open after p became a %s and then blob-R = %q, want %q", to[0].Type, got, "blob-P")
+					}
+				}
+			})
+		}
 	}
 }
 

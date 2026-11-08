@@ -2647,49 +2647,79 @@ func TestGetattrOfAwayInodeWithNoContentReturnsESTALE(t *testing.T) {
 // changes, and the macFUSE kernel extension revokes it, so a file held open
 // there would fail at once. The switch pass, a lookup or a getattr can see the
 // change first. A getattr keeps the held inode's type, and an open file keeps
-// reading what it opened. Once the pass ran, a setattr through the held inode
-// no longer reaches the path.
+// reading what it opened. A write or a chmod through the held inode never
+// reaches the path: before the pass, nor after a later switch that brings the
+// path back as its old type with another identity.
 func TestTypeChangeGivesThePathANewInode(t *testing.T) {
 	file := baseFile("p", "blob-P", 0o100644)
 	dir := []model.BaseNode{baseDir("p", "tree-P"), baseFile("p/x.txt", "x", 0o100644)}
 	link := model.BaseNode{Path: "p", Type: "symlink", Mode: 0o120000, ObjectOID: "target", SizeState: "known", SizeBytes: 6}
+	otherFile := []model.BaseNode{baseFile("p", "blob-R", 0o100644)}
+	otherDir := []model.BaseNode{baseDir("p", "tree-R"), baseFile("p/y.txt", "y", 0o100644)}
+	otherLink := []model.BaseNode{{Path: "p", Type: "symlink", Mode: 0o120000, ObjectOID: "target-R", SizeState: "known", SizeBytes: 8}}
 	for _, change := range []struct {
-		name     string
-		from, to []model.BaseNode
+		name           string
+		from, to, back []model.BaseNode
 	}{
-		{"file to dir", []model.BaseNode{file}, dir},
-		{"file to symlink", []model.BaseNode{file}, []model.BaseNode{link}},
-		{"dir to file", dir, []model.BaseNode{file}},
-		{"symlink to file", []model.BaseNode{link}, []model.BaseNode{file}},
+		{"file to dir", []model.BaseNode{file}, dir, otherFile},
+		{"file to symlink", []model.BaseNode{file}, []model.BaseNode{link}, otherFile},
+		{"dir to file", dir, []model.BaseNode{file}, otherDir},
+		{"symlink to file", []model.BaseNode{link}, []model.BaseNode{file}, otherLink},
 	} {
 		from, to := change.from[0].Type, change.to[0].Type
 		typeBits := func(typ string) os.FileMode { return inodeAttrs(0, 0, typ, time.Time{}, time.Time{}).Mode.Type() }
-		for _, first := range []string{"pass", "lookup", "getattr"} {
+		for _, first := range []string{"pass", "lookup", "getattr", "chmod", "write"} {
+			if first == "write" && from != "file" {
+				continue
+			}
 			t.Run(change.name+"/"+first, func(t *testing.T) {
 				f := newCacheFixture(t, change.from...)
 				var root fuseops.InodeID = fuseops.RootInodeID
 				held := f.lookup(root, "p")
 				var open *fuseops.OpenFileOp
 				if from == "file" {
-					open = f.open(held)
+					open = f.openRW(held)
 				}
 				f.switchTo(change.to...)
-				switch first {
-				case "pass":
-					if err := f.mount.InvalidateChanged(); err != nil {
-						t.Fatal(err)
-					}
+				// refused runs op through the held inode, which must return
+				// ESTALE and leave p as it is.
+				refused := func(what string, op func() error) {
+					t.Helper()
 					before, _, err := f.fs.engine.Identity("p")
 					if err != nil {
 						t.Fatal(err)
 					}
-					mode := os.FileMode(0o600)
-					if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: held, Mode: &mode}); kernelErrno(err) != syscall.ESTALE {
-						t.Fatalf("chmod through held %s inode %d after p became a %s = %v, want ESTALE", from, held, to, err)
+					if err := op(); kernelErrno(err) != syscall.ESTALE {
+						t.Fatalf("%s through held %s inode %d after p became a %s = %v, want ESTALE", what, from, held, to, err)
 					}
 					if after, _, err := f.fs.engine.Identity("p"); err != nil || after != before {
-						t.Fatalf("p after a chmod through the held %s inode = %+v, %v, want %+v", from, after, err, before)
+						t.Fatalf("p after a %s through the held %s inode = %+v, %v, want %+v", what, from, after, err, before)
 					}
+				}
+				chmod := func() error {
+					mode := os.FileMode(0o600)
+					return f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: held, Mode: &mode})
+				}
+				write := func() error {
+					return f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("written")})
+				}
+				pass := func() {
+					t.Helper()
+					if err := f.mount.InvalidateChanged(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				want := to
+				switch first {
+				case "pass":
+					pass()
+					f.switchTo(change.back...)
+					pass()
+					if open != nil {
+						refused("write", write)
+					}
+					refused("chmod", chmod)
+					want = from
 				case "getattr":
 					op := &fuseops.GetInodeAttributesOp{Inode: held}
 					if err := f.fs.GetInodeAttributes(f.ctx, op); err != nil {
@@ -2698,18 +2728,20 @@ func TestTypeChangeGivesThePathANewInode(t *testing.T) {
 					if got := op.Attributes.Mode.Type(); got != typeBits(from) {
 						t.Fatalf("getattr of held %s inode %d after p became a %s = type %v, want %v", from, held, to, got, typeBits(from))
 					}
+				case "chmod":
+					refused("chmod", chmod)
+				case "write":
+					refused("write", write)
 				}
 				op := &fuseops.LookUpInodeOp{Parent: root, Name: "p"}
 				if err := f.fs.LookUpInode(f.ctx, op); err != nil {
 					t.Fatal(err)
 				}
-				if op.Entry.Child == 0 || op.Entry.Child == held || op.Entry.Attributes.Mode.Type() != typeBits(to) {
-					t.Fatalf("lookup of p, a %s now, = inode %d of type %v, want a new inode, not %d, of type %v", to, op.Entry.Child, op.Entry.Attributes.Mode.Type(), held, typeBits(to))
+				if op.Entry.Child == 0 || op.Entry.Child == held || op.Entry.Attributes.Mode.Type() != typeBits(want) {
+					t.Fatalf("lookup of p, a %s now, = inode %d of type %v, want a new inode, not %d, of type %v", want, op.Entry.Child, op.Entry.Attributes.Mode.Type(), held, typeBits(want))
 				}
 				if first != "pass" {
-					if err := f.mount.InvalidateChanged(); err != nil {
-						t.Fatal(err)
-					}
+					pass()
 				}
 				if open != nil {
 					if got := mustReadHandle(t, f, held, open.Handle); got != "blob-P" {

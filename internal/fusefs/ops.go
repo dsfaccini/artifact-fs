@@ -312,15 +312,45 @@ func (e *Engine) ensureOverlay(ctx context.Context, b *Blobs, path string) error
 	if err != nil {
 		return err
 	}
-	if n.Base.ObjectOID == "" {
-		return e.copyOnWrite(ctx, path, n.Base, nil)
+	return e.copyBase(ctx, b, path, n.Base)
+}
+
+// ensureOverlayFile is ensureOverlay for a write through a file handle. It
+// refuses a base directory or symlink with errTypeChanged, before it changes
+// anything: the path changed type since the kernel looked it up. The caller
+// holds the transition read lock, so no switch lands between the check and
+// the copy.
+func (e *Engine) ensureOverlayFile(ctx context.Context, b *Blobs, path string) error {
+	if _, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
+		return err
+	} else if ok {
+		return nil
 	}
-	src, err := b.open(n.Base)
+	n, err := e.Resolver.resolvePath(path)
+	if err != nil {
+		return err
+	}
+	if n.Base.Type != "file" {
+		return errTypeChanged
+	}
+	return e.copyBase(ctx, b, path, n.Base)
+}
+
+// errTypeChanged refuses a write or an attribute change through an inode whose
+// path changed type since the kernel looked it up.
+var errTypeChanged = fmt.Errorf("%w: the path changed type", syscall.ESTALE)
+
+// copyBase copies base, a base node at path, into the overlay from its blob in b.
+func (e *Engine) copyBase(ctx context.Context, b *Blobs, path string, base model.BaseNode) error {
+	if base.ObjectOID == "" {
+		return e.copyOnWrite(ctx, path, base, nil)
+	}
+	src, err := b.open(base)
 	if err != nil {
 		return err
 	}
 	defer src.Close()
-	return e.copyOnWrite(ctx, path, n.Base, src)
+	return e.copyOnWrite(ctx, path, base, src)
 }
 
 // copyOnWrite copies base, whose blob src holds, into the overlay at path. A
@@ -479,7 +509,7 @@ func (e *Engine) openBase(ctx context.Context, b *Blobs, path string, gen int64)
 func (e *Engine) Write(ctx context.Context, b *Blobs, path string, off int64, data []byte) (int, error) {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
-	if err := e.ensureOverlay(ctx, b, path); err != nil {
+	if err := e.ensureOverlayFile(ctx, b, path); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return 0, err
 		}
@@ -893,11 +923,16 @@ var errAttrUnsupported = fmt.Errorf("%w: %w", syscall.ENOTSUP, fs.ErrInvalid)
 // SetAttributes applies each of size, mode, and mtime that is not nil to path,
 // then returns its attributes. Changing a base file copies it into the
 // overlay first. sizeAccess holds the owner permission bits to check a size
-// change against, none when the adapter does not check it.
-func (e *Engine) SetAttributes(ctx context.Context, b *Blobs, path string, size *int64, sizeAccess uint32, mode *uint32, mtime *time.Time) (Attrs, error) {
+// change against, none when the adapter does not check it. typ is the type of
+// the inode the change comes through: SetAttributes changes nothing and
+// returns errTypeChanged when path resolves to another type.
+func (e *Engine) SetAttributes(ctx context.Context, b *Blobs, path, typ string, size *int64, sizeAccess uint32, mode *uint32, mtime *time.Time) (Attrs, error) {
 	if err := func() error {
 		e.Resolver.transition.RLock()
 		defer e.Resolver.transition.RUnlock()
+		if n, err := e.Resolver.resolvePath(path); err == nil && n.nodeType() != typ {
+			return errTypeChanged
+		}
 		if size != nil {
 			if sizeAccess != 0 {
 				if ov, ok, err := e.Overlay.Lookup(ctx, path); err != nil {

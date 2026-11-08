@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"maps"
 	"os"
@@ -478,20 +477,24 @@ func TestSwitchPassInvalidatesInodeAReplyUpdatedFirst(t *testing.T) {
 }
 
 // A switch that turns a held file into a directory invalidates its entry and
-// its inode once. A lookup before the pass already gave the kernel the
-// directory under a new inode, so the pass sends nothing. A later switch that
-// keeps the directory sends nothing either.
+// its inode once, also when a getattr before the pass retired the inode. A
+// lookup before the pass already gave the kernel the directory under a new
+// inode, so the pass sends nothing. A later switch that keeps the directory
+// sends nothing either.
 func TestSwitchPassInvalidatesRetypedEntryOnce(t *testing.T) {
-	for _, lookupFirst := range []bool{false, true} {
-		t.Run(fmt.Sprint("lookup before the pass=", lookupFirst), func(t *testing.T) {
+	for _, first := range []string{"pass", "lookup", "getattr"} {
+		t.Run(first, func(t *testing.T) {
 			f := newCacheFixture(t, baseFile("swap", "blob-S", 0o100644))
 			held := f.lookup(fuseops.RootInodeID, "swap")
 			dir := []model.BaseNode{baseDir("swap", "t1"), baseFile("swap/x.txt", "x", 0o100644)}
 			f.switchTo(dir...)
 			wantInodes, wantEntries := []fuseops.InodeID{held}, []kernelEntry{{fuseops.RootInodeID, "swap"}}
-			if lookupFirst {
+			switch first {
+			case "lookup":
 				f.lookup(fuseops.RootInodeID, "swap")
 				wantInodes, wantEntries = nil, nil
+			case "getattr":
+				f.getattr(held)
 			}
 			if err := f.mount.InvalidateChanged(); err != nil {
 				t.Fatal(err)
