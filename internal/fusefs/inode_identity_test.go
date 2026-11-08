@@ -1859,12 +1859,13 @@ func TestWritableHandleOfUnlinkedFileKeepsWritingAfterFchmod(t *testing.T) {
 }
 
 // A handle that opened a file's overlay file keeps it after a commit, whose
-// reconcile drops the overlay entry and removes that file. An unlink then
-// copies the base for the handles open on the path. Every one of them,
-// the older one too, must hold that one copy, so a write or an ftruncate
-// through one shows through the others, as through two descriptors of one
-// file. A write through the older handle between the commit and the unlink
-// goes by path, so the copy holds it.
+// reconcile drops the overlay entry and removes that file, until the switch
+// pass closes it. The test runs no pass, as when the pass fails to look up the
+// path. An unlink then copies the base for the handles open on the path.
+// Every one of them, the older one too, must hold that one copy, so a write or
+// an ftruncate through one shows through the others, as through two
+// descriptors of one file. A write through the older handle between the
+// commit and the unlink goes by path, so the copy holds it.
 func TestPinnedHandlesOfOneFileShareOneCopy(t *testing.T) {
 	for _, write := range []bool{false, true} {
 		t.Run(fmt.Sprint("write after commit=", write), func(t *testing.T) {
@@ -1877,9 +1878,6 @@ func TestPinnedHandlesOfOneFileShareOneCopy(t *testing.T) {
 			committed.SizeBytes = int64(len(want))
 			f.switchTo(committed)
 			if err := os.WriteFile(f.blobs.pathsByOID[committed.ObjectOID], []byte(want), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			if err := f.mount.InvalidateChanged(); err != nil {
 				t.Fatal(err)
 			}
 			if _, ok, err := f.fs.engine.Overlay.Lookup(f.ctx, "file.txt"); err != nil || ok {
@@ -1914,6 +1912,43 @@ func TestPinnedHandlesOfOneFileShareOneCopy(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A handle that opened a file's overlay file must not keep it after a commit,
+// whose reconcile drops the overlay entry and removes that file. Otherwise,
+// after a later HEAD change, it reads the removed file while a handle of the
+// same inode opened after the change reads the new blob.
+func TestHandlesOfOneInodeReadOneContentAfterTheirOverlayFileIsReconciled(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	writeThroughHandle(t, f, held, "X")
+	older := f.open(held)
+	written := mustReadHandle(t, f, held, older.Handle)
+	committed := baseFile("file.txt", blobOID(written), 0o100644)
+	committed.SizeBytes = int64(len(written))
+	f.switchTo(committed)
+	if err := os.WriteFile(f.blobs.pathsByOID[committed.ObjectOID], []byte(written), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := f.fs.engine.Overlay.Lookup(f.ctx, "file.txt"); err != nil || ok {
+		t.Fatalf("overlay entry of file.txt after the commit = %t, %v; want it dropped", ok, err)
+	}
+	f.switchTo(baseFile("file.txt", "blob-BBBB", 0o100644))
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if id := f.lookup(fuseops.RootInodeID, "file.txt"); id != held {
+		t.Fatalf("file.txt looks up as inode %d after the HEAD change, want %d", id, held)
+	}
+	newer := f.open(held)
+	for name, h := range map[string]fuseops.HandleID{"older": older.Handle, "newer": newer.Handle} {
+		if got := mustReadHandle(t, f, held, h); got != "blob-BBBB" {
+			t.Fatalf("after the HEAD change, the %s handle reads %q, want blob-BBBB", name, got)
+		}
 	}
 }
 

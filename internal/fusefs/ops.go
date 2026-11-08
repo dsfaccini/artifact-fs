@@ -385,6 +385,17 @@ func (e *Engine) OpenFile(ctx context.Context, b *Blobs, path string, gen int64,
 	return f, gen, n.ObjectOID, nil
 }
 
+// IsOverlayFile reports whether held is path's overlay file. A file that a
+// reconcile removed no longer is.
+func (e *Engine) IsOverlayFile(ctx context.Context, path string, held os.FileInfo) (bool, error) {
+	ov, ok, err := e.Overlay.Lookup(ctx, model.CleanPath(path))
+	if err != nil || !ok || ov.IsDeleted() || ov.BackingPath == "" {
+		return false, err
+	}
+	backing, err := os.Stat(ov.BackingPath)
+	return err == nil && os.SameFile(held, backing), nil
+}
+
 // Read fills dst from path at off and returns the filled prefix of dst.
 func (e *Engine) Read(ctx context.Context, b *Blobs, path string, off int64, dst []byte) ([]byte, error) {
 	e.Resolver.transition.RLock()

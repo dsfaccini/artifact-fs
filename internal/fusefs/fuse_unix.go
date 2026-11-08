@@ -10,6 +10,7 @@ import (
 	iofs "io/fs"
 	"log"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -39,9 +40,11 @@ type MountedFS interface {
 	// and the merged view no longer matches: the attributes and pages of an
 	// inode whose type, permission bits or blob changed, the entry of a name
 	// that vanished or changed type, and a negative entry whose name now
-	// exists. It also retires the inode number of each path that vanished.
-	// Call it after a generation switch, holding no lock an op takes. FSKit
-	// takes no invalidations, so it only retires numbers there.
+	// exists. It also retires the inode number of each path that vanished,
+	// and closes each overlay file a handle holds that the switch's
+	// reconcile removed. Call it after a generation switch, holding no lock
+	// an op takes. FSKit takes no invalidations, so it only retires numbers
+	// and closes files there.
 	InvalidateChanged() error
 }
 
@@ -90,7 +93,8 @@ type ArtifactFuse struct {
 	// Unlink, RmDir, Rename, and a write or setattr whose path does not map to
 	// its inode hold it exclusively, and every op that creates or uses inodes
 	// and handles holds it shared. The switch pass's re-check, unmapStillMissing, holds it
-	// shared too. Engine.Do releases it before it hydrates a blob.
+	// shared too, and so does its closeReconciledFiles. Engine.Do releases it
+	// before it hydrates a blob.
 	handleOps sync.RWMutex
 	// inodes holds each inode the kernel holds.
 	inodes map[fuseops.InodeID]*InodeRef
@@ -461,6 +465,47 @@ func (fs *ArtifactFuse) unmapLocked(ms []pathMapping, writeSeq uint64) {
 	}
 }
 
+// closeReconciledFiles closes each overlay file that a handle holds and the
+// overlay no longer names for the handle's path, such as one a reconcile
+// removed after a commit. The handle's next read then resolves the path
+// through the inode's generation, as a handle opened since does. It holds
+// handleOps shared, so no unlink or rename is between pinning its handles and
+// detaching them. A detached handle keeps its file.
+//
+// An open that read the overlay before the reconcile, and registered its
+// handle only after this collected the handles, keeps the removed file until
+// the next pass.
+func (fs *ArtifactFuse) closeReconciledFiles() error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
+	fs.mu.RLock()
+	handles := slices.Collect(maps.Values(fs.fileHandles))
+	fs.mu.RUnlock()
+	var firstErr error
+	for _, fh := range handles {
+		fh.mu.Lock()
+		path := fh.path
+		var held os.FileInfo
+		overlayFile := !fh.detached && fh.cacheFile != nil && fh.cacheGeneration == -1
+		if overlayFile {
+			held, _ = fh.cacheFile.Stat()
+		}
+		fh.mu.Unlock()
+		if !overlayFile {
+			continue
+		}
+		named, err := fs.engine.IsOverlayFile(context.Background(), path, held)
+		if err != nil {
+			firstErr = cmp.Or(firstErr, err)
+			continue
+		}
+		if !named {
+			fh.closeCachedFile()
+		}
+	}
+	return firstErr
+}
+
 // unmapStillMissing checks the paths of vanished again and unmaps each one
 // still missing. It holds handleOps meanwhile, which keeps every Rename op
 // out, so a switch pass that a rename overlapped still makes progress.
@@ -561,7 +606,8 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 
 // invalidateChanged implements MountedFS.InvalidateChanged. It unmaps each
 // mapped path that no longer exists, so a path made there later gets a new
-// number. When send is true it also tells the kernel what changed. Every inode
+// number, and closes the overlay files that closeReconciledFiles finds
+// removed. When send is true it also tells the kernel what changed. Every inode
 // the kernel holds at a path gets the check for a name that vanished or
 // changed type. A name that changed type gets its entry and its inode
 // invalidated, and a vanished name only its entry. An unmapped inode whose
@@ -721,6 +767,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	if overlapped && len(vanished) > 0 {
 		failed(fs.unmapStillMissing(vanished, writeSeq), "check vanished paths again")
 	}
+	failed(fs.closeReconciledFiles(), "close reconciled overlay files")
 	if !send {
 		return firstErr
 	}
