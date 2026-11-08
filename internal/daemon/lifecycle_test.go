@@ -670,6 +670,145 @@ func TestDisabledRepoReleasesTheLeftoverClaim(t *testing.T) {
 	}
 }
 
+// claimedDisabledRepo is a daemon, not started, that claims a leftover at its
+// repo's mount point, with the repo disabled under request "off".
+func claimedDisabledRepo(t *testing.T, unmountErr error) (*Service, *Controller, model.RepoConfig, *recordingMountTable) {
+	t.Helper()
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := &recordingMountTable{path: cfg.MountPath, entry: ownMountEntry("repo"), held: true, unmountErr: unmountErr}
+	svc.mountPointEntry = table.mountPointEntry
+	svc.unmountPath = table.unmountPath
+	svc.mount = table.mount
+	svc.mu.Lock()
+	svc.leftovers[cfg.ID] = true
+	svc.mu.Unlock()
+	if err := svc.registry.RequestMount(ctx, cfg.ID, false, "off"); err != nil {
+		t.Fatal(err)
+	}
+	return svc, ctl, cfg, table
+}
+
+// A disabled repo whose leftover unmount fails keeps the claim and shows the
+// unmount failure.
+func TestDisabledRepoFailedReleaseKeepsTheClaimAndShowsTheFailure(t *testing.T) {
+	svc, ctl, cfg, _ := claimedDisabledRepo(t, errors.New("busy"))
+	ctx := context.Background()
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	requireFailure(t, ctl, phaseUnmount, "busy")
+	rec, _, err := ctl.registry.GetRuntime(ctx, cfg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rec.ClaimsLeftover || rec.MountRequest != "off" {
+		t.Fatalf("record = %+v; want the claim kept under request off", rec)
+	}
+}
+
+// A disabled repo's release that keeps failing backs off as a failed mount
+// does, and status keeps showing the failure meanwhile.
+func TestDisabledRepoFailedReleaseBacksOff(t *testing.T) {
+	svc, ctl, _, table := claimedDisabledRepo(t, errors.New("busy"))
+	ctx := context.Background()
+	for range 5 {
+		if err := svc.syncRepos(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := requireFailure(t, ctl, phaseUnmount, "busy")
+	unmounts := 0
+	for _, call := range table.recorded() {
+		if strings.HasPrefix(call, "unmount ") {
+			unmounts++
+		}
+	}
+	if unmounts != 1 {
+		t.Fatalf("%d unmounts in 5 back-to-back syncs, attempts %d; want one, then a backoff", unmounts, st.Attempts)
+	}
+}
+
+// A stopped repo whose record a stop wrote while it still held the claim
+// drops the claim from the record once its release succeeds.
+func TestReleasedClaimOfAStoppedRepoLeavesTheRecord(t *testing.T) {
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first lookup cannot read the table, which keeps the claim and lets
+	// the runtime start. Its own release of the leftover then fails.
+	table := &recordingMountTable{path: cfg.MountPath, entry: ownMountEntry("repo"), held: true, unreadable: 1, unmountErr: errors.New("busy")}
+	svc.mountPointEntry = table.mountPointEntry
+	svc.unmountPath = table.unmountPath
+	svc.mount = table.mount
+	svc.mu.Lock()
+	svc.leftovers[cfg.ID] = true
+	svc.mu.Unlock()
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.Lock()
+	_, running := svc.running[cfg.ID]
+	svc.mu.Unlock()
+	if !running {
+		t.Fatal("no runtime runs")
+	}
+	if err := svc.registry.RequestMount(ctx, cfg.ID, false, "off"); err != nil {
+		t.Fatal(err)
+	}
+	// The stop records the repo stopped, still claimed.
+	syncAndFinishStops(t, svc)
+	table.mu.Lock()
+	table.unmountErr = nil
+	table.mu.Unlock()
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rec, _, err := ctl.registry.GetRuntime(ctx, cfg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.ClaimsLeftover || rec.State != repoStateUnmounted {
+		t.Fatalf("record after the release = %+v; want unmounted without the claim (calls %q)", rec, table.recorded())
+	}
+}
+
+// A release that keeps the claim, as on a mount table it cannot read, leaves
+// a disabled repo's record alone: no sync after the first rewrites it.
+func TestKeptClaimOfADisabledRepoLeavesItsRecordAlone(t *testing.T) {
+	svc, ctl, cfg, table := claimedDisabledRepo(t, nil)
+	table.mu.Lock()
+	table.unreadable = 1000
+	table.mu.Unlock()
+	ctx := context.Background()
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := ctl.registry.GetRuntime(ctx, cfg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := svc.syncRepos(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	last, _, err := ctl.registry.GetRuntime(ctx, cfg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.ClaimsLeftover || first.State != repoStateUnmounted || !last.UpdatedAt.Equal(first.UpdatedAt) {
+		t.Fatalf("record after the first sync %+v, after three more %+v; want it stopped and claimed, and never rewritten", first, last)
+	}
+}
+
 // A repo added again under the name of a removed repo, and so its ID,
 // inherits none of the removed repo's leftover claim.
 func TestReaddedRepoInheritsNoLeftoverClaim(t *testing.T) {

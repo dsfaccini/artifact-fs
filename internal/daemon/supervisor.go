@@ -201,8 +201,8 @@ func (s *Service) syncRepos(ctx context.Context) error {
 // remount completes only once it mounted again. then, when set, runs before
 // a successful stop records it. A stop whose unmount has not returned in
 // time is recorded as failed while it keeps running. A disabled repo that
-// does not run releases its leftover claim, retried at the next sync while
-// the unmount of the leftover fails.
+// does not run releases its leftover claim; a failed release backs off as a
+// failed mount does, and the repo is recorded stopped meanwhile.
 func (s *Service) stopRepo(repo model.RepoConfig, stopped string, logMsg string, then func()) bool {
 	s.mu.Lock()
 	rt, running := s.running[repo.ID]
@@ -210,23 +210,33 @@ func (s *Service) stopRepo(repo model.RepoConfig, stopped string, logMsg string,
 	recorded := rec != nil && rec.State == repoStateUnmounted && rec.MountRequest == stopped
 	claimed := s.leftovers[repo.ID]
 	s.mu.Unlock()
-	failed := func(err error) {
-		s.logger.Error(logMsg, "repo", repo.Name, "error", auth.RedactLogString(err.Error(), repo.RemoteURL))
-		s.recordFailure(repo, phaseUnmount, err, time.Now().Add(registrySyncInterval))
-		s.recordRuntime(repo.ID, func(rec *model.RepoRuntimeRecord) { rec.MountRequest = repo.MountRequest })
-	}
 	if !running {
-		if claimed && !repo.Enabled {
+		released := false
+		if claimed && !repo.Enabled && s.mountDue(repo) {
 			if err := s.releaseLeftoverMount(repo); err != nil {
-				failed(err)
+				s.logger.Error(logMsg, "repo", repo.Name, "error", auth.RedactLogString(err.Error(), repo.RemoteURL))
+				s.recordFailure(repo, phaseUnmount, err, s.backoffMount(repo))
+				s.recordRuntime(repo.ID, func(rec *model.RepoRuntimeRecord) {
+					rec.State, rec.Phase, rec.MountRequest = repoStateUnmounted, phaseUnmount, stopped
+				})
 				return true
 			}
+			s.mu.Lock()
+			released = !s.leftovers[repo.ID]
+			s.mu.Unlock()
 		}
-		if claimed || !recorded {
+		// A claim the release kept, such as on a mount table it cannot read,
+		// changes nothing to record.
+		if released || !recorded {
 			repo.MountRequest = stopped
 			s.recordStopped(repo)
 		}
 		return true
+	}
+	failed := func(err error) {
+		s.logger.Error(logMsg, "repo", repo.Name, "error", auth.RedactLogString(err.Error(), repo.RemoteURL))
+		s.recordFailure(repo, phaseUnmount, err, time.Now().Add(registrySyncInterval))
+		s.recordRuntime(repo.ID, func(rec *model.RepoRuntimeRecord) { rec.MountRequest = repo.MountRequest })
 	}
 	s.recordPhase(repo, phaseUnmount)
 	op, started, err := s.stop(repo.ID, func(err error) {
