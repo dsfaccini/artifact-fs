@@ -144,6 +144,15 @@ type InodeRef struct {
 	// PageBlob is the base blob that the inode's last open served, while the
 	// kernel's cached pages can hold only that blob. It is empty otherwise.
 	PageBlob string
+	// Prior is the identity a base reply replaced while no switch pass had
+	// invalidated the inode since the kernel received Prior. The kernel's pages
+	// can still hold Prior's blob, and the macFUSE kernel extension ignores a
+	// lookup's attributes for an inode it holds, so the pass checks Prior too.
+	// Its Type is empty when no reply replaced an identity.
+	Prior Identity
+	// Invalidated says the switch pass invalidated the inode and no reply has
+	// been recorded since, so report keeps no Prior for the next reply.
+	Invalidated bool
 	// WrittenAt is the writeSeq of the last write through this inode.
 	WrittenAt uint64
 	Refcnt    int64
@@ -167,10 +176,17 @@ type InodeRef struct {
 // A reply computed before a generation switch can be recorded after a reply
 // computed after it. The switch's InvalidateInode makes the kernel discard
 // the older reply, so report keeps the newer generation.
+//
+// A base reply between a switch and its pass can change the identity before
+// the pass compares it, so report keeps the identity it replaced in Prior.
 func (ref *InodeRef) report(attrs Attrs) {
 	if attrs.Gen != 0 && ref.Gen > attrs.Gen {
 		return
 	}
+	if attrs.Gen != 0 && ref.Type != "" && !ref.Invalidated && ref.Prior.Type == "" && attrs.identity() != ref.identity() {
+		ref.Prior = ref.identity()
+	}
+	ref.Invalidated = false
 	if attrs.Blob != ref.Blob {
 		ref.PageBlob = ""
 	}
@@ -545,20 +561,25 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // mapped path that no longer exists, so a path made there later gets a new
 // number. When send is true it also tells the kernel what changed. Every inode
 // the kernel holds at a path gets the check for a name that vanished or
-// changed type. An unmapped inode whose path came back maps back to the path
-// when the path has its identity, and is retired and invalidated otherwise.
-// An inode whose identity the kernel received from the base
-// snapshot gets the identity comparison. One the kernel last saw from the
-// overlay is invalidated when it now resolves to a base blob, whose bytes can
-// differ from what was written. An overlay entry itself changes only through
-// the mount, which keeps the kernel's view of it current. A dormant mapping
-// gets no invalidation: the kernel holds nothing for it. A failure skips only
-// what it concerns, and the first one is returned.
+// changed type. A name that changed type gets its entry and its inode
+// invalidated, and a vanished name only its entry. An unmapped inode whose
+// path came back maps back to the path when the path has its identity, and
+// is retired and invalidated otherwise. An inode whose identity the kernel
+// received from the base snapshot gets the identity comparison. One the
+// kernel last saw from the overlay is invalidated when it now resolves to a
+// base blob, whose bytes can differ from what was written. An inode whose
+// identity a reply replaced since the last pass is invalidated too: the
+// kernel can still cache pages of the replaced identity, which report keeps
+// in InodeRef.Prior. An overlay entry itself changes only through the mount,
+// which keeps the kernel's view of it current. A dormant mapping gets no
+// invalidation: the kernel holds nothing for it. A failure skips only what it
+// concerns, and the first one is returned.
 func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	type known struct {
 		pathMapping
 		entry    kernelEntry
 		reported Identity
+		prior    Identity
 		base     bool
 	}
 	// unmappedInode is an unmapped inode, whose path may have come back.
@@ -585,7 +606,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			existenceOnly = append(existenceOnly, pathMapping{id, path})
 			continue
 		}
-		inodes = append(inodes, known{pathMapping: pathMapping{id, path}, entry: kernelEntry{parent, filepath.Base(path)}, reported: ref.identity(), base: ref.Gen != 0})
+		inodes = append(inodes, known{pathMapping: pathMapping{id, path}, entry: kernelEntry{parent, filepath.Base(path)}, reported: ref.identity(), prior: ref.Prior, base: ref.Gen != 0})
 	}
 	var returning []unmappedInode
 	for path, id := range fs.unmapped {
@@ -607,6 +628,14 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		}
 	}
 	var entries []kernelEntry
+	// changed holds each held inode the pass invalidates. An entry
+	// invalidation leaves the kernel's attributes and pages of the inode, so
+	// the inode of a name that changed type is in changed too. A vanished
+	// name gets only its entry invalidated, because its inode's content did
+	// not change: its handles keep reading what they read. The inode stays
+	// unmapped until an op or a later pass decides it: the pass, a lookup or
+	// a getattr when its path comes back, createEntry when a create takes
+	// the path, and settleUnmappedBelow before an unlink or a rename.
 	var changed []fuseops.InodeID
 	var vanished []pathMapping
 	for _, k := range inodes {
@@ -615,13 +644,18 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			failed(err, "resolve "+k.path)
 			continue
 		}
+		// A Prior is an identity the kernel can still cache: a reply between
+		// the switch and this pass replaced it.
+		hidden := k.prior.Type != ""
 		switch {
-		case !exists || current.Type != k.reported.Type:
+		case !exists || current.Type != k.reported.Type || hidden && current.Type != k.prior.Type:
 			entries = append(entries, k.entry)
 			if !exists {
 				vanished = append(vanished, k.pathMapping)
+			} else {
+				changed = append(changed, k.id)
 			}
-		case k.base && current != k.reported, !k.base && current.Blob != "":
+		case hidden, k.base && current != k.reported, !k.base && current.Blob != "":
 			changed = append(changed, k.id)
 		}
 	}
@@ -670,6 +704,11 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	for _, m := range retire {
 		if fs.unmapped[m.path] == m.id {
 			fs.retireLocked(m.id)
+		}
+	}
+	for _, id := range changed {
+		if ref := fs.inodes[id]; ref != nil {
+			ref.Invalidated, ref.Prior = true, Identity{}
 		}
 	}
 	overlapped := fs.renameSeq != renameSeq || renameSeq%2 != 0
