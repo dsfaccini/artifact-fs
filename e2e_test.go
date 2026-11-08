@@ -117,10 +117,7 @@ func writeTestFile(t *testing.T, dir, name, content string) {
 
 func run(t *testing.T, dir string, name string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command(name, args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
+	cmd := commandIn(dir, name, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -715,8 +712,7 @@ func testE2EFilesystemDirectoryRenameConcurrentAccess(t *testing.T, repo *mounte
 				return
 			default:
 			}
-			cmd := exec.Command("git", "status", "--porcelain=v1", "--untracked-files=all")
-			cmd.Dir = repo.mountPath
+			cmd := commandIn(repo.mountPath, "git", "status", "--porcelain=v1", "--untracked-files=all")
 			if output, err := cmd.CombinedOutput(); err != nil {
 				report(fmt.Errorf("git status during rename: %w: %s", err, output))
 				return
@@ -1426,8 +1422,7 @@ func readFileStr(t *testing.T, path string) string {
 
 func gitCmd(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", gitArgsWithSafeDirectory(dir, args...)...)
-	cmd.Dir = dir
+	cmd := commandIn(dir, "git", gitArgsWithSafeDirectory(dir, args...)...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

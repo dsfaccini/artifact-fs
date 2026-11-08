@@ -8,6 +8,11 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/auth"
 )
 
+// NewJSONLogger returns a logger that redacts every value of type string, every
+// error and every fmt.Stringer with auth.RedactString, at any group depth and
+// after a slog.LogValuer resolves. It leaves any other value as it is, such as
+// a named string type without a String method, a struct, a slice or a map: log
+// one only when none of its strings can hold a credential.
 func NewJSONLogger(w io.Writer, level slog.Level) *slog.Logger {
 	h := slog.NewJSONHandler(w, &slog.HandlerOptions{
 		Level: level,
