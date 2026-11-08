@@ -200,7 +200,9 @@ type mountEntry struct {
 // an artifact-fs daemon made for repo on goos. The Linux mount table lists
 // such a mount with the type fuse.artifact-fs and the source
 // artifact-fs:<repo>. macFUSE's FSKit lists the type macfuse and the source
-// macfuse://<UUID>, so on darwin any macFUSE mount counts.
+// macfuse://<UUID>, so on darwin any macFUSE mount counts. macFUSE documents
+// the type macfuse for its kernel extension too, and macfuse_<name> under the
+// fstypename option, which artifact-fs never sets.
 func ownsLeftover(goos string, entry mountEntry, repo string) bool {
 	if goos == "linux" {
 		return entry.fstype == "fuse."+fusefs.FSSubtype && entry.source == fusefs.FSName(repo)

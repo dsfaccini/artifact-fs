@@ -3,7 +3,7 @@ module github.com/cloudflare/artifact-fs
 go 1.26.0
 
 require (
-	github.com/dsfaccini/fuse v0.0.0-20261106184313-c00ace0b9f82
+	github.com/dsfaccini/fuse v0.0.0-20261107212632-a4a3c79ca373
 	github.com/urfave/cli/v3 v3.14.0
 	golang.org/x/sys v0.49.0
 	modernc.org/sqlite v1.61.0

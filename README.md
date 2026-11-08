@@ -95,11 +95,12 @@ records the failure, and mounts the repo again only once the stalled mount has
 ended. macOS treats an FSKit mount as a network volume, so
 `umount <path>` returns `Operation not permitted` unless the terminal app has
 the Network Volumes permission (Privacy & Security → Files & Folders). The daemon
-unmounts an FSKit mount it serves through `unmount(2)`, then through
-`diskutil unmount` when `unmount(2)` is refused. A mount it unmounts by its
-path, such as one an earlier daemon left or a late mount the fuse library could
-not unmount, gets no `diskutil` fallback. `diskutil unmount <path>`
-removes an FSKit mount that `umount` cannot.
+unmounts an FSKit mount through `unmount(2)`, then through `diskutil unmount`
+when `unmount(2)` is refused. That holds for a mount it serves and for one it
+unmounts by its path, such as one an earlier daemon left or a late mount the
+fuse library could not unmount: the mount table marks an FSKit volume, so the
+daemon tells one apart without touching it. `diskutil unmount <path>` removes
+an FSKit mount that `umount` cannot.
 
 Quick start against a public repo:
 
@@ -184,12 +185,18 @@ the outcome. They exit non-zero when the daemon failed, when no daemon runs on
 the state root, when a later `unmount` or `remount` replaced the request, or
 after two minutes without an outcome. The daemon retries a failed unmount or
 mount; `status` shows the retry. The daemon runs each unmount on its own
-thread. It waits at most 21 seconds for an unmount, and does not wait for the
-one it starts after a FUSE connection fails. An unmount that hangs, as one can
-on a dead FSKit volume, holds up the daemon's other repos for that one wait,
-then stalls only its own repo. While that unmount has not returned, `unmount`
-and `remount` of the repo fail at once with `an earlier unmount of the repo has
-not returned`, and `status` shows that error as `last_error`, with
+thread. A stop runs there whole, so it never holds up the daemon's other repos:
+it unmounts the repo, retrying a busy mount for up to 20 seconds, then waits up
+to 30 seconds for the repo's FUSE server and workers. A stop whose unmount has
+not returned after 21 seconds keeps waiting, and `status` shows `unmount has
+not returned after 21s` as `last_error`, with `last_error_phase` `unmount`.
+Before a mount, the daemon waits at most 21 seconds for an unmount it starts,
+and does not wait for the one it starts after a FUSE connection fails. An
+unmount that hangs, as one can on a dead FSKit volume, holds up the daemon's
+other repos for at most that one wait, then stalls only its own repo. While an
+unmount the daemon started outside a stop has not returned, `unmount` and
+`remount` of the repo fail at once with `an earlier unmount of the repo has not
+returned`, and `status` shows that error as `last_error`, with
 `last_error_phase` `unmount` while a stop waits for it and `mount` while a mount
 retry does.
 
@@ -256,12 +263,12 @@ The daemon logs at `INFO`, so it drops the `DEBUG` records. The library reports 
 
 A repo's FUSE connection can end while its mount stays in place: after an error fatal to the connection, such as a failed read from the kernel, or after the connection is aborted. The daemon then logs `fuse connection failed, unmounting`, records the connection's error as the repo's `mount_error` (for an abort, which carries no error, `fuse connection ended while the mount point still holds the mount`), unmounts the repo, and mounts it again. While that unmount fails and the mount table still lists the mount point, or the table, the path or the mount point cannot be read, each mount retry tries the unmount again instead of mounting. The daemon looks the mount point up in the kernel's mount table by its absolute path, with symlinks in the parent and a symlinked final component resolved. On macOS the lookup ignores case.
 
-A daemon that stops without unmounting, for example after a crash, leaves its mounts behind. A daemon that stops cleanly records each repo it unmounted as stopped, unless it still claims a mount an earlier daemon left at the repo's mount point. The next daemon on the same state root reads which repos the stopped daemon still ran from its last status records. Before it prepares or mounts such a repo, it unmounts the mount the table lists at the repo's mount point when that mount is one a daemon made for the repo, and logs `unmounting a mount an earlier daemon left`:
+A daemon that stops without unmounting, for example after a crash, leaves its mounts behind. A daemon that stops cleanly records each repo it unmounted as stopped. The next daemon on the same state root reads from the stopped daemon's last status records which repos it still ran, and which mounts an earlier daemon left that it still claimed. Before it prepares or mounts such a repo, it unmounts the mount the table lists at the repo's mount point when that mount is one a daemon made for the repo, and logs `unmounting a mount an earlier daemon left`:
 
 - On Linux, a mount of type `fuse.artifact-fs` whose source is `artifact-fs:<repo>`.
-- On macOS, any mount whose type starts with `macfuse`. FSKit lists every macFUSE mount with the type `macfuse` and a source `macfuse://<UUID>` that names no repo, so a macFUSE mount another tool made at the mount point after a crash is unmounted too.
+- On macOS, any mount whose type starts with `macfuse`. FSKit lists every macFUSE mount with the type `macfuse` and a source `macfuse://<UUID>` that names no repo, so a macFUSE mount another tool made at the mount point after a crash is unmounted too. The macFUSE kernel extension's source is closed, and no source code states the type it lists. macFUSE's [Mount Options](https://github.com/macfuse/macfuse/wiki/Mount-Options/5f8969079d1fe965a513685be6a28fe4cf49338e) page shows the type `macfuse`, and `macfuse_<name>` under the `fstypename` option, which artifact-fs never sets. The open-source [osxfuse extension](https://github.com/osxfuse/kext/blob/534773bd3135f04b7f6fb801faa2f8991daf4a6b/osxfuse/fuse_vfsops.c#L155) builds both names the same way, from its own name `osxfuse`.
 
-While that unmount fails, the daemon does not mount the repo and retries with the mount backoff. When that unmount fails before the daemon starts the repo's runtime, only that daemon retries it: it records the repo unmounted, so the next daemon no longer claims the leftover. It leaves every other mount alone, such as an `sshfs` mount on Linux, or any mount at the mount point of a repo the stopped daemon did not run or had stopped, including one of a daemon on another state root. This unmount has no `diskutil` fallback, so on FSKit it needs the Network Volumes permission.
+While that unmount fails, the daemon does not mount the repo and retries with the mount backoff. The daemon keeps its claim on the leftover until it unmounts it or finds no mount there that it would unmount. Each status record carries the claim, so a daemon that stops first leaves the claim to the next one, and `status` still shows a stopped repo `unmounted`. A repo that `unmount` disabled releases the claim too: the daemon unmounts the leftover then, and while that unmount fails, `status` shows it as an `unmount` failure that the daemon retries with the mount backoff. A running daemon ends a removed repo's claim at its next registry sync, so a repo added again under that name after the sync claims nothing. A repo removed and added again while no daemon runs keeps the claim. It leaves every other mount alone, such as an `sshfs` mount on Linux, or any mount at the mount point of a repo the stopped daemon did not run or had stopped, including one of a daemon on another state root. On FSKit this unmount falls back to `diskutil unmount`, as described above.
 
 A mount that does not finish within 30 seconds ends in the background. When the fuse library cannot unmount it once it completes, it stays at the mount point, and the daemon unmounts the mount point before it mounts the repo again.
 
