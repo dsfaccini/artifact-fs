@@ -216,10 +216,14 @@ func (s *Store) lazyFetchEnv() ([]string, error) {
 // has no ssh, because Git then reaches no SSH remote either. The Store writes
 // the program in a directory of its own that Close removes. It reuses the
 // program only while the program and its directory have mode 0700, belong to
-// the effective uid, and are no symlinks. Otherwise it writes the program in
+// the effective uid, and are not symlinks. Otherwise it writes the program in
 // a new directory: a temp cleaner can remove the old one, and another local
-// user can then make one at its path. s.mu guards only sshWrapperDir and
-// closed, so a slow temp directory stalls no other Store operation.
+// user can then make one at its path. The check assumes a temp directory that
+// is sticky or private to the user. In one that others can write and that is
+// not sticky, another user can rename the program's directory away and make
+// one at its path after the check, before Git runs the program. batchModeSSH
+// holds s.mu only to read and set sshWrapperDir and closed, so a slow temp
+// directory stalls no other Store operation.
 func (s *Store) batchModeSSH() (string, error) {
 	s.mu.Lock()
 	closed, dir := s.closed, s.sshWrapperDir
@@ -264,8 +268,9 @@ func (s *Store) batchModeSSH() (string, error) {
 		return filepath.Join(current, "ssh"), nil
 	}
 	if dir != "" {
-		// RemoveAll follows no symlink, so it removes nothing outside the old
-		// path.
+		// RemoveAll follows a symlink only in the temp directory's own path,
+		// never at or below the old path, so it removes nothing outside the
+		// old path.
 		_ = os.RemoveAll(dir)
 	}
 	return wrapper, nil

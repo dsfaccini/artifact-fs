@@ -126,6 +126,20 @@ jobs:
           # user_allow_other here.
           grep -v '^#' /etc/fuse.conf || true
 
+      - name: SSH wrapper owner check as root
+        if: matrix.user == 'root'
+        run: |
+          set -o pipefail
+          # Only root can give the SSH wrapper's directory another owner, so
+          # only this job runs that subtest.
+          go test -c -o "$RUNNER_TEMP/gitstore.test" ./internal/gitstore
+          sudo "$RUNNER_TEMP/gitstore.test" \
+            -test.count=1 \
+            -test.run '^TestSSHWrapperIsReusedOnlyWhilePrivate$' \
+            -test.timeout=2m \
+            -test.v | tee "$RUNNER_TEMP/gitstore-root.log"
+          grep -q -- '--- PASS: TestSSHWrapperIsReusedOnlyWhilePrivate/directory_owner' "$RUNNER_TEMP/gitstore-root.log"
+
       - name: FUSE end-to-end tests
         env:
           AFS_RUN_E2E_TESTS: "1"

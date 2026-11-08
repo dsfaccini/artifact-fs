@@ -298,11 +298,12 @@ func TestSSHWrapperLastsUntilClose(t *testing.T) {
 	}
 }
 
-// A Store reuses its SSH wrapper only while the wrapper and its directory are
-// private to the effective uid and neither is a symlink. A temp cleaner can
-// remove the directory, and another local user can then make one at its path
-// and put a program there. The Store writes a new wrapper elsewhere, and
-// nothing into what it found.
+// A Store reuses its SSH wrapper while the wrapper and its directory are
+// private to the effective uid and neither is a symlink, and only then. A
+// temp cleaner can remove the directory, and another local user can then make
+// one at its path and put a program there. The Store writes a new wrapper
+// elsewhere, and nothing into what it found. It removes nothing it did not
+// make.
 func TestSSHWrapperIsReusedOnlyWhilePrivate(t *testing.T) {
 	// plant writes a program named ssh in a new directory and returns the
 	// directory.
@@ -317,10 +318,15 @@ func TestSSHWrapperIsReusedOnlyWhilePrivate(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		root bool
+		// reused is whether the Store keeps the wrapper after replace.
+		reused bool
 		// replace changes the wrapper's directory dir and returns the
 		// directory that holds what dir/ssh now reaches.
 		replace func(t *testing.T, dir string) (string, error)
 	}{
+		{name: "unchanged", reused: true, replace: func(t *testing.T, dir string) (string, error) {
+			return dir, nil
+		}},
 		{name: "directory symlink", replace: func(t *testing.T, dir string) (string, error) {
 			planted := plant(t)
 			return planted, errors.Join(os.RemoveAll(dir), os.Symlink(planted, dir))
@@ -354,10 +360,19 @@ func TestSSHWrapperIsReusedOnlyWhilePrivate(t *testing.T) {
 				t.Fatal(err)
 			}
 			before := dirContents(t, watched)
-			if second := filepath.Dir(sshWrapper(t, store)); second == first {
+			second := filepath.Dir(sshWrapper(t, store))
+			switch {
+			case tt.reused && second != first:
+				t.Fatalf("wrote a new SSH wrapper in %s, though the one in %s was unchanged", second, first)
+			case !tt.reused && second == first:
 				t.Fatalf("reused the SSH wrapper in %s after a %s change", first, tt.name)
 			}
-			if after := dirContents(t, watched); after != nil && !maps.Equal(before, after) {
+			after := dirContents(t, watched)
+			// The Store may remove its own replaced directory, but nothing else.
+			if after == nil && (tt.reused || watched != first) {
+				t.Fatalf("removed %s", watched)
+			}
+			if after != nil && !maps.Equal(before, after) {
 				t.Fatalf("wrote into %s: %q became %q", watched, before, after)
 			}
 		})
