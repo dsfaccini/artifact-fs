@@ -54,6 +54,7 @@ func TestE2ESharedMount(t *testing.T) {
 	shared.run(t, "FilesystemDirectoryRenameConcurrentAccess", testE2EFilesystemDirectoryRenameConcurrentAccess)
 	shared.run(t, "OpenFileReadsAfterUnlink", testE2EOpenFileReadsAfterUnlink)
 	shared.run(t, "OpenFileReadsWhileHEADKeepsPathAway", testE2EOpenFileReadsWhileHEADKeepsPathAway)
+	shared.run(t, "OpenFileChangesAfterUnlink", testE2EOpenFileChangesAfterUnlink)
 }
 
 // sharedE2ERepo is a mounted repo that tests take turns on. After each test it

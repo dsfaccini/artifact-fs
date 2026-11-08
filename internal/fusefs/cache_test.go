@@ -172,9 +172,20 @@ func (f *cacheFixture) lookup(parent fuseops.InodeID, name string) fuseops.Inode
 
 func (f *cacheFixture) open(inode fuseops.InodeID) *fuseops.OpenFileOp {
 	f.t.Helper()
-	op := &fuseops.OpenFileOp{Inode: inode}
+	return f.openOp(&fuseops.OpenFileOp{Inode: inode})
+}
+
+// openRW opens inode for reading and writing. A kernel sends a write or an
+// ftruncate only through such a handle.
+func (f *cacheFixture) openRW(inode fuseops.InodeID) *fuseops.OpenFileOp {
+	f.t.Helper()
+	return f.openOp(&fuseops.OpenFileOp{Inode: inode, OpenFlags: syscall.O_RDWR})
+}
+
+func (f *cacheFixture) openOp(op *fuseops.OpenFileOp) *fuseops.OpenFileOp {
+	f.t.Helper()
 	if err := f.fs.OpenFile(f.ctx, op); err != nil {
-		f.t.Fatalf("OpenFile(%d): %v", inode, err)
+		f.t.Fatalf("OpenFile(%d): %v", op.Inode, err)
 	}
 	f.t.Cleanup(func() {
 		_ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: op.Handle})

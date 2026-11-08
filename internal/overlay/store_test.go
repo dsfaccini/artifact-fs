@@ -1601,6 +1601,28 @@ func TestReadChangesSinceDistrustsALogMissingATrigger(t *testing.T) {
 	}
 }
 
+// The FSMonitor hook reads the change log while the daemon writes the
+// overlay, so its read never waits for the write lock.
+func TestReadChangesSinceReadsWhileAWriterHoldsTheLock(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	if err := s.Mkdir(ctx, "dir", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.ExecContext(ctx, `ROLLBACK`)
+	if got, want := changesSince(t, cfg, 0).Paths, []string{"dir"}; !slices.Equal(got, want) {
+		t.Fatalf("changed paths = %q, want %q", got, want)
+	}
+}
+
 // Writes that land while a reconcile looks up the base must end as if they
 // had landed before it: none lost, none left classified against the old base.
 func TestReconcileClassifiesWritesThatLandDuringItsLookups(t *testing.T) {
