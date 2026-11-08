@@ -111,7 +111,10 @@ type Service struct {
 	// kernel's mount table.
 	mountPointEntry func(string) (mountEntry, bool)
 	// mountTimeout bounds the wait for one FUSE mount; zero means mountTimeout.
-	mountTimeout         time.Duration
+	mountTimeout time.Duration
+	// drainContext bounds a stop's wait for its runtime to drain; nil means
+	// drainTimeout.
+	drainContext         func() (context.Context, context.CancelFunc)
 	hydrationConcurrency int
 	// Test hooks, nil in production. runtimeStarted runs as startRuntime
 	// returns, after the runtime's first mount attempt. mountReleased runs in

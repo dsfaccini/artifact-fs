@@ -200,7 +200,8 @@ func (s *Service) syncRepos(ctx context.Context) error {
 // sync, and a stopped repo under stopped, the request the stop completes: a
 // remount completes only once it mounted again. then, when set, runs before
 // a successful stop records it. A stop whose unmount has not returned in
-// time is recorded as failed while it keeps running. A disabled repo that
+// time is recorded as failed while it keeps running. A stop whose drain
+// timed out is recorded as failed and unmounted. A disabled repo that
 // does not run releases its leftover claim; a failed release backs off as a
 // failed mount does, and the repo is recorded stopped meanwhile.
 func (s *Service) stopRepo(repo model.RepoConfig, stopped string, logMsg string, then func()) bool {
@@ -234,7 +235,12 @@ func (s *Service) stopRepo(repo model.RepoConfig, stopped string, logMsg string,
 	}
 	failed := func(err error) {
 		s.logger.Error(logMsg, "repo", repo.Name, "error", auth.RedactLogString(err.Error(), repo.RemoteURL))
-		s.recordFailure(repo, phaseUnmount, err, time.Now().Add(registrySyncInterval), func(rec *model.RepoRuntimeRecord) { rec.MountRequest = repo.MountRequest })
+		s.recordFailure(repo, phaseUnmount, err, time.Now().Add(registrySyncInterval), func(rec *model.RepoRuntimeRecord) {
+			rec.MountRequest = repo.MountRequest
+			if rt.mount == mountUnmounted {
+				rec.State, rec.Phase = repoStateUnmounted, phaseUnmount
+			}
+		})
 	}
 	s.recordPhase(repo, phaseUnmount)
 	op, started, err := s.stop(repo.ID, func(err error) {

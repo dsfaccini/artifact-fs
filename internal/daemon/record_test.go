@@ -243,7 +243,48 @@ func TestUnmountReportsTheDaemonsFailure(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "busy") || strings.Contains(err.Error(), "hunter2secret") {
 		t.Fatalf("Unmount = %v, want the daemon's redacted unmount failure", err)
 	}
-	requireFailure(t, ctl, phaseUnmount, "busy")
+	// A failed unmount leaves the repo mounted.
+	if st := requireFailure(t, ctl, phaseUnmount, "busy"); st.State != repoStateMounted {
+		t.Fatalf("status = %+v, want state %s", st, repoStateMounted)
+	}
+}
+
+// A stop whose drain timed out has unmounted the repo, so status reports the
+// repo unmounted in the write that records the failure.
+func TestUnmountReportsATimedOutDrainUnmounted(t *testing.T) {
+	t.Parallel()
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	// The FUSE server outlives its unmount, which holds the drain.
+	mfs := &exitingMount{exit: make(chan struct{})}
+	t.Cleanup(func() { close(mfs.exit) })
+	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
+		return mfs, nil
+	}
+	// The drain's deadline passes while the marker exists. Removing it lets
+	// the stop of Close drain once the server exits.
+	expired := filepath.Join(t.TempDir(), "drain-expired")
+	svc.drainContext = func() (context.Context, context.CancelFunc) {
+		return gittest.ExpireOnFile(context.Background(), expired)
+	}
+	done := startService(t, svc)
+	waitFor(t, done, func() bool {
+		st, err := ctl.Status(ctx, "repo")
+		return err == nil && st.State == repoStateMounted
+	})
+	if err := os.WriteFile(expired, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctl.Unmount(ctx, "repo"); err == nil || !strings.Contains(err.Error(), "timed out draining") {
+		t.Fatalf("Unmount = %v, want the drain timeout", err)
+	}
+	st := requireFailure(t, ctl, phaseUnmount, "timed out draining")
+	if st.State != repoStateUnmounted || st.Phase != phaseUnmount {
+		t.Fatalf("status = %+v, want state %s in phase %s", st, repoStateUnmounted, phaseUnmount)
+	}
+	if err := os.Remove(expired); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestStatusReportsAFailedRegistrySync(t *testing.T) {
