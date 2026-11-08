@@ -2006,13 +2006,16 @@ func TestOpenOverlappingAWriteReadsTheWrite(t *testing.T) {
 	}
 }
 
-// writeOtherOnEveryOpen makes each open of the fixture write other.txt
-// through writer between its Engine.OpenFile and its addFileHandle, so a
-// close of the files handles cached overlaps every attempt of the open.
-func writeOtherOnEveryOpen(t *testing.T, f *cacheFixture, other fuseops.InodeID) {
+// writeOtherDuringOpens writes other through a handle it opens, between the
+// Engine.OpenFile and the addFileHandle of each of the next attempts open
+// attempts, so a close of the files handles cached overlaps each of them.
+func writeOtherDuringOpens(t *testing.T, f *cacheFixture, other fuseops.InodeID, attempts int) {
 	t.Helper()
 	writer := f.openRW(other)
 	f.fs.testHookBeforeAddFileHandle = func() {
+		if attempts--; attempts == 0 {
+			f.fs.testHookBeforeAddFileHandle = nil
+		}
 		if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: other, Handle: writer.Handle, Data: []byte("Y")}); err != nil {
 			t.Error(err)
 		}
@@ -2025,9 +2028,8 @@ func writeOtherOnEveryOpen(t *testing.T, f *cacheFixture, other fuseops.InodeID)
 func TestFsyncOfAnOpenThatDroppedItsFileSucceeds(t *testing.T) {
 	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644), baseFile("other.txt", "blob-OTHER", 0o100644))
 	held := f.lookup(fuseops.RootInodeID, "file.txt")
-	writeOtherOnEveryOpen(t, f, f.lookup(fuseops.RootInodeID, "other.txt"))
+	writeOtherDuringOpens(t, f, f.lookup(fuseops.RootInodeID, "other.txt"), openAttempts)
 	open := f.openRW(held)
-	f.fs.testHookBeforeAddFileHandle = nil
 	if err := f.fs.SyncFile(f.ctx, &fuseops.SyncFileOp{Inode: held, Handle: open.Handle}); err != nil {
 		t.Fatalf("fsync through the handle = %v", err)
 	}
@@ -2062,12 +2064,7 @@ func TestOpenOverlappedOnceKeepsItsBlobPastAPrune(t *testing.T) {
 	other := baseFile("other.txt", "blob-OTHER", 0o100644)
 	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644), other)
 	held := f.lookup(fuseops.RootInodeID, "file.txt")
-	writeOtherOnEveryOpen(t, f, f.lookup(fuseops.RootInodeID, "other.txt"))
-	once := f.fs.testHookBeforeAddFileHandle
-	f.fs.testHookBeforeAddFileHandle = func() {
-		f.fs.testHookBeforeAddFileHandle = nil
-		once()
-	}
+	writeOtherDuringOpens(t, f, f.lookup(fuseops.RootInodeID, "other.txt"), 1)
 	open := f.open(held)
 	f.switchTo(other)
 	if err := f.mount.InvalidateChanged(); err != nil {

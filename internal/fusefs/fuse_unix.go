@@ -816,12 +816,11 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	return firstErr
 }
 
-// openedBlob records that an open of id serves blob, which is empty for an
-// overlay file. It reports whether the kernel may keep the inode's cached
-// pages: only when they can hold nothing but that same base blob.
-func (fs *ArtifactFuse) openedBlob(id fuseops.InodeID, blob string) bool {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
+// openedBlobLocked records that an open of id serves blob, which is empty for
+// an overlay file or an open that registers without its file. It reports
+// whether the kernel may keep the inode's cached pages: only when they can
+// hold nothing but that same base blob. The caller holds fs.mu.
+func (fs *ArtifactFuse) openedBlobLocked(id fuseops.InodeID, blob string) bool {
 	ref := fs.inodes[id]
 	if ref == nil {
 		return false
@@ -1839,21 +1838,21 @@ func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, ch
 		}
 		for attempt := 1; ; attempt++ {
 			closes := fs.cacheCloses.Load()
+			var blob string
 			if ref.Path != ".git" {
 				// An open for writing only reads nothing, so it prefetches nothing.
-				f, gen, blob, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen, !op.OpenFlags.IsWriteOnly(), access)
+				f, gen, opened, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen, !op.OpenFlags.IsWriteOnly(), access)
 				if err != nil {
 					return err
 				}
-				fh.cacheFile, fh.cacheGeneration = f, gen
-				op.KeepPageCache = fs.openedBlob(op.Inode, blob)
+				fh.cacheFile, fh.cacheGeneration, blob = f, gen, opened
 			}
 			if fs.testHookBeforeAddFileHandle != nil {
 				fs.testHookBeforeAddFileHandle()
 			}
 			// A create may have retired the inode during the open, after its
 			// retirement detached the handles already open.
-			handle, dropped, err := fs.addFileHandle(op.Inode, fh, closes, attempt == openAttempts)
+			handle, keep, dropped, err := fs.addFileHandle(op.Inode, fh, blob, closes, attempt == openAttempts)
 			if dropped != nil {
 				_ = dropped.Close()
 			}
@@ -1866,7 +1865,7 @@ func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, ch
 				}
 				return err
 			}
-			op.Handle = handle
+			op.Handle, op.KeepPageCache = handle, keep
 			return nil
 		}
 	})
@@ -1881,31 +1880,40 @@ const openAttempts = 3
 // handles cached ran since it began, and could not see its handle.
 var errCloseOverlapped = errors.New("a close of cached files overlapped the open")
 
-// addFileHandle registers fh, a new handle on id, unless id is retired.
-// closes is the count of cacheCloses the open read before it opened fh's
-// file. When a close ran since, the file may be one the close removed or no
-// longer serves. addFileHandle then returns the file for the caller to close,
-// and errCloseOverlapped unless last is set. With last, it registers fh
-// without the file, and the handle's next read resolves the path afresh. A
-// handle that keeps a descriptor of its blob still reads it after a prune of
-// its generation.
-func (fs *ArtifactFuse) addFileHandle(id fuseops.InodeID, fh *FileHandle, closes uint64, last bool) (fuseops.HandleID, *os.File, error) {
+// addFileHandle registers fh, a new handle on id, unless id is retired, and
+// reports whether the kernel may keep id's cached pages. blob is the blob
+// fh's file serves, empty for an overlay file. closes is the count of
+// cacheCloses the open read before it opened fh's file. When a close ran
+// since, the file may be one the close removed or no longer serves.
+// addFileHandle then returns the file for the caller to close, and
+// errCloseOverlapped unless last is set. With last, it registers fh without
+// the file, and the handle's next read resolves the path afresh. A handle
+// that keeps a descriptor of its blob still reads it after a prune of its
+// generation.
+//
+// It records blob as id's page blob only for the open that registers, under
+// the fs.mu hold of its count check. A write bumps cacheCloses before
+// markWritten clears the page blob, so a registration between the two sees
+// the moved count.
+func (fs *ArtifactFuse) addFileHandle(id fuseops.InodeID, fh *FileHandle, blob string, closes uint64, last bool) (fuseops.HandleID, bool, *os.File, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	if ref := fs.inodes[id]; ref != nil && ref.Stale {
-		return 0, nil, syscall.ESTALE
+		return 0, false, nil, syscall.ESTALE
 	}
 	var dropped *os.File
 	if fh.cacheFile != nil && fs.cacheCloses.Load() != closes {
 		dropped, fh.cacheFile, fh.cacheGeneration = fh.cacheFile, nil, 0
 		if !last {
-			return 0, dropped, errCloseOverlapped
+			return 0, false, dropped, errCloseOverlapped
 		}
+		blob = ""
 	}
+	keep := fs.openedBlobLocked(id, blob)
 	handle := fs.nextHandleID
 	fs.nextHandleID++
 	fs.fileHandles[handle] = fh
-	return handle, dropped, nil
+	return handle, keep, dropped, nil
 }
 
 func (fs *ArtifactFuse) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) error {
