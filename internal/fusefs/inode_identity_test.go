@@ -812,9 +812,10 @@ func hookOverlay(f *cacheFixture) *hookedOverlay {
 	return ov
 }
 
-// waitParked polls the goroutine stacks until one waits for a sync.RWMutex
-// with fn on its stack, and reports whether one did before done closed. A
-// rename of fn leaves it polling until go test -timeout.
+// waitParked polls the goroutine stacks until one waits for a lock with fn on
+// its stack, and reports whether one did before done closed. A second
+// RWMutex.Lock waits in the sync.Mutex inside the RWMutex. A rename of fn
+// leaves waitParked polling until go test -timeout.
 func waitParked(done <-chan struct{}, fn string) bool {
 	buf := make([]byte, 1<<20)
 	for {
@@ -825,7 +826,7 @@ func waitParked(done <-chan struct{}, fn string) bool {
 		}
 		n := runtime.Stack(buf, true)
 		for g := range strings.SplitSeq(string(buf[:n]), "\n\n") {
-			if strings.Contains(g, "[sync.RWMutex.") && strings.Contains(g, fn) {
+			if header, _, _ := strings.Cut(g, "\n"); strings.Contains(header, "Mutex.") && strings.Contains(g, fn) {
 				return true
 			}
 		}
