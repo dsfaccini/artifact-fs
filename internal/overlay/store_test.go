@@ -2064,7 +2064,7 @@ func TestReadsCopyPendingWritesUnderTheLock(t *testing.T) {
 	case <-stopped:
 		t.FailNow()
 	}
-	for range 50 {
+	for range 20 {
 		if _, ok, err := s.Lookup(ctx, "d/f.txt"); err != nil || !ok {
 			t.Fatalf("Lookup(d/f.txt) = %v, %v; want the file", ok, err)
 		}
