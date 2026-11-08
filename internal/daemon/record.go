@@ -64,13 +64,15 @@ func (s *Service) recordRuntimeLocked(id model.RepoID, update func(*model.RepoRu
 // recordRuntimeState writes rt's state: what it serves, its fetch result and
 // its divergence from the remote. cleared names the phases that just
 // succeeded, whose recorded failure it clears. It reads the state under recordMu, so
-// the last write holds the latest state.
+// the last write holds the latest state. It writes nothing of a runtime a
+// stop unmounted, which stays running until its stop finishes, so a late
+// write of its join or its preparation leaves the stop's record.
 func (s *Service) recordRuntimeState(rt *repoRuntime, cleared ...string) {
 	s.mu.Lock()
 	id := rt.cfg.ID
 	s.mu.Unlock()
 	s.recordRuntime(id, func(rec *model.RepoRuntimeRecord) {
-		if s.running[id] != rt {
+		if s.running[id] != rt || rt.mount == mountUnmounted {
 			return
 		}
 		rec.State = rt.reportedState()
