@@ -339,12 +339,12 @@ func installGitDir(candidate string, destination string) error {
 // each new one in full. Like every Git command that contacts a remote, it runs
 // through runNetworkGit, so a remote that needs a prompt makes it fail.
 func (s *Store) FetchNonInteractive(ctx context.Context, repo model.RepoConfig) error {
-	refspec, _, err := refreshTarget(repo)
+	refspec, tracking, err := refreshTarget(repo)
 	if err != nil {
 		return err
 	}
 	args := []string{"fetch", "--no-tags"}
-	if depth := fetchDepth(ctx, repo, model.BranchName(repo.FetchRef)); depth > 0 {
+	if depth := refreshDepth(ctx, repo, tracking); depth > 0 {
 		args = append(args, fmt.Sprintf("--depth=%d", depth))
 	}
 	args = append(args, "origin", refspec)
@@ -368,6 +368,23 @@ func refreshTarget(repo model.RepoConfig) (refspec, trackingRef string, err erro
 		return "", "", err
 	}
 	return target.refspec(), target.remoteRef, nil
+}
+
+// refreshDepth returns the --depth of FetchNonInteractive's fetch into
+// tracking: fetchDepth's, and none once tracking exists. A fetch onto the
+// tracking ref's history then transfers only the new commits and keeps them
+// connected to HEAD. A fetch with --depth would cut the new tip off from HEAD
+// and shorten HEAD's history to the depth. A verified source keeps
+// fetchDepth's depth, which bounds its history on every refresh.
+func refreshDepth(ctx context.Context, repo model.RepoConfig, tracking string) int {
+	depth := fetchDepth(ctx, repo, model.BranchName(repo.FetchRef))
+	if depth <= 0 || repo.RequiredCommit != "" {
+		return depth
+	}
+	if _, err := runGit(ctx, repo.GitDir, "rev-parse", "--verify", "--quiet", tracking); err == nil {
+		return 0
+	}
+	return depth
 }
 
 // fetchDepth returns the --depth of a fetch onto branch: repo's history depth

@@ -524,6 +524,37 @@ func TestFetchAndRefreshFetchOnlyTheFetchRef(t *testing.T) {
 	}
 }
 
+// requireRefreshedBehind starts svc with a short refresh interval and
+// checks the counts status reports after its first refresh: behind, and
+// neither ahead nor diverged.
+func requireRefreshedBehind(t *testing.T, svc *Service, behind int) {
+	t.Helper()
+	ctx := context.Background()
+	if err := svc.ctl().SetRefresh(ctx, "repo", model.RefreshPolicy{RefreshInterval: 20 * time.Millisecond}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := startService(t, svc)
+	// The record holds a refresh's counts once it holds its result.
+	waitFor(t, done, func() bool {
+		rec, _, err := svc.registry.GetRuntime(ctx, cfg.ID)
+		return err == nil && rec.LastFetchResult != "" && rec.LastFetchResult != string(fetchNever)
+	})
+	st, err := svc.ctl().Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LastFetchResult != string(fetchOK) {
+		t.Fatalf("refresh result = %q: %s", st.LastFetchResult, st.LastError)
+	}
+	if st.AheadCount != 0 || st.BehindCount != behind || st.Diverged {
+		t.Fatalf("status after a refresh = ahead %d, behind %d, diverged %t; want 0, %d, false", st.AheadCount, st.BehindCount, st.Diverged, behind)
+	}
+}
+
 // A --prepared-gitdir registered with only --fetch-ref keeps the default
 // --ref refs/heads/main, which its remote may lack. The fetch command still
 // fetches the fetch ref, and ahead/behind compares HEAD with it.
@@ -536,6 +567,7 @@ func TestFetchNowOfAPreparedGitDirWithOnlyAFetchRef(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = svc.Close() })
+	svc.mount = fakeMount
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: gitDir}, RepoSpec: model.RepoSpec{PreparedGitDir: true, FetchRef: "master"}, Enabled: true}
 	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
@@ -555,9 +587,7 @@ func TestFetchNowOfAPreparedGitDirWithOnlyAFetchRef(t *testing.T) {
 	if head := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "rev-parse", "refs/remotes/origin/master")); head != moved {
 		t.Fatalf("origin/master = %s, want %s", head, moved)
 	}
-	if ahead, behind, diverged, err := svc.git.ComputeAheadBehind(ctx, got); err != nil || ahead != 0 || behind != 1 || diverged {
-		t.Fatalf("ahead/behind/diverged = %d/%d/%t, %v; want 0/1/false", ahead, behind, diverged, err)
-	}
+	requireRefreshedBehind(t, svc, 1)
 }
 
 // A clone's refspec names only --ref. With another fetch ref, the fetch
@@ -573,6 +603,7 @@ func TestFetchNowOfACloneWithAnotherFetchRef(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = svc.Close() })
+	svc.mount = fakeMount
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main", FetchRef: "feature"}, Enabled: true}
 	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{}); err != nil {
 		t.Fatal(err)
@@ -594,9 +625,7 @@ func TestFetchNowOfACloneWithAnotherFetchRef(t *testing.T) {
 			t.Fatalf("%s = %s, want %s", ref, head, want)
 		}
 	}
-	if ahead, behind, diverged, err := svc.git.ComputeAheadBehind(ctx, got); err != nil || ahead != 0 || behind != 1 || diverged {
-		t.Fatalf("ahead/behind/diverged = %d/%d/%t, %v; want 0/1/false", ahead, behind, diverged, err)
-	}
+	requireRefreshedBehind(t, svc, 1)
 }
 
 // With --depth, the fetch command does not fetch --ref's branch either, which

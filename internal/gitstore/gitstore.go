@@ -109,22 +109,28 @@ func (s *Store) CommitTimestamp(ctx context.Context, repo model.RepoConfig, oid 
 }
 
 // ComputeAheadBehind compares HEAD with the tracking ref the refresh fetches
-// into. It reports 0/0 while that ref is missing, and when the git dir holds
-// no common ancestor of the two, as a --depth git dir does once the ref moves:
-// a fetch with --depth cuts the new tip off from the history below it.
+// into. It reports 0/0 while that ref is missing.
 func (s *Store) ComputeAheadBehind(ctx context.Context, repo model.RepoConfig) (ahead int, behind int, diverged bool, err error) {
 	_, tracking, err := refreshTarget(repo)
 	if err != nil {
 		return 0, 0, false, err
 	}
 	if _, err := runGit(ctx, repo.GitDir, "rev-parse", "--verify", "--quiet", tracking+"^{commit}"); err != nil {
-		return 0, 0, false, nil
-	}
-	if _, err := runGit(ctx, repo.GitDir, "merge-base", "HEAD", tracking); err != nil {
 		if exitErr, ok := errors.AsType[*gitCommandError](err); ok && exitErr.exitCode == 1 {
 			return 0, 0, false, nil
 		}
 		return 0, 0, false, err
+	}
+	// A verified source's refresh passes --depth, which cuts each new tip off
+	// from HEAD. Without a common ancestor, its counts would read as a
+	// divergence, so it reports 0/0.
+	if repo.RequiredCommit != "" {
+		if _, err := runGit(ctx, repo.GitDir, "merge-base", "HEAD", tracking); err != nil {
+			if exitErr, ok := errors.AsType[*gitCommandError](err); ok && exitErr.exitCode == 1 {
+				return 0, 0, false, nil
+			}
+			return 0, 0, false, err
+		}
 	}
 	out, err := runGit(ctx, repo.GitDir, "rev-list", "--left-right", "--count", "HEAD..."+tracking)
 	if err != nil {
