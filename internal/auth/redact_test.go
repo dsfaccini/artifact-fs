@@ -9,333 +9,79 @@ import (
 )
 
 func TestRedactRemoteURL(t *testing.T) {
-	in := "https://token123@github.com/org/repo.git?token=abc"
-	out := RedactRemoteURL(in)
-	if out == in {
-		t.Fatalf("expected redaction")
-	}
-	if containsAny(out, []string{"token123", "abc"}) {
-		t.Fatalf("token leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://github.com/org/repo.git?sig=s3cr3t")
-	if containsAny(out, []string{"sig", "s3cr3t"}) {
-		t.Fatalf("query secret leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://github.com/org/repo.git#access_token=ghp_secret")
-	if containsAny(out, []string{"access_token", "ghp_secret"}) {
-		t.Fatalf("fragment secret leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://ghp_secret%zz@github.com/org/repo.git")
-	if containsAny(out, []string{"ghp_secret", "%zz"}) {
-		t.Fatalf("malformed userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://user:pa#ss@example.com/org/repo.git")
-	if containsAny(out, []string{"user", "pa", "ss"}) {
-		t.Fatalf("malformed userinfo with fragment delimiter leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://ghp_secret#@github.com/org/repo.git")
-	if containsAny(out, []string{"ghp_secret"}) {
-		t.Fatalf("malformed username-only userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://user:pa/ss@example.com/org/repo.git")
-	if containsAny(out, []string{"user", "pa", "ss"}) {
-		t.Fatalf("malformed userinfo with path delimiter leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://ghp_secret%zz:password=abc@example.com/org/repo.git")
-	if containsAny(out, []string{"ghp_secret", "%zz", "abc"}) {
-		t.Fatalf("malformed userinfo with token-like password leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("git@github.com:org/repo.git?sig=s3cr3t")
-	if containsAny(out, []string{"sig", "s3cr3t"}) {
-		t.Fatalf("scp-style query secret leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://ghp_secret/@github.com/org/repo.git")
-	if containsAny(out, []string{"ghp_secret"}) {
-		t.Fatalf("malformed https userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https:/user:ghp_secret@github.com/org/repo.git")
-	if containsAny(out, []string{"ghp_secret", "user"}) {
-		t.Fatalf("missing-slash https userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://user:123/ss@example.com/org/repo.git")
-	if containsAny(out, []string{"user", "123", "ss"}) {
-		t.Fatalf("numeric-prefix https userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://user:123/dir/ss@example.com/org/repo.git")
-	if containsAny(out, []string{"user", "123", "ss"}) {
-		t.Fatalf("multi-segment https userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://user.name:pa/ss@example.com/org/repo.git")
-	if containsAny(out, []string{"user.name", "pa", "ss"}) {
-		t.Fatalf("dotted malformed https userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://user.name:123/dir/ss@example.com/org/repo.git")
-	if containsAny(out, []string{"user.name", "123", "ss"}) {
-		t.Fatalf("dotted numeric malformed https userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://first.last:123/dir/ss@example.com/org/repo.git")
-	if containsAny(out, []string{"first.last", "123", "ss"}) {
-		t.Fatalf("dotted name numeric malformed https userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://john.doe:123/ghp_secret@example.com/org/repo.git")
-	if containsAny(out, []string{"john.doe", "123", "ghp_secret"}) {
-		t.Fatalf("dotted name token malformed https userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://ghp_secret/part@example.com/org/repo.git")
-	if containsAny(out, []string{"ghp_secret", "part"}) {
-		t.Fatalf("path-split username-only malformed https userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://ghp_secret/part?x@example.com/org/repo.git")
-	if containsAny(out, []string{"ghp_secret", "part"}) {
-		t.Fatalf("query-split username-only malformed https userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://ghp_secret/part@example.com")
-	if containsAny(out, []string{"ghp_secret", "part"}) {
-		t.Fatalf("single-label path username-only malformed https userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://ghp_secret:8443/part@example.com")
-	if containsAny(out, []string{"ghp_secret", "8443", "part"}) {
-		t.Fatalf("ported single-label path username-only malformed https userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://git.example.com/team/repo@2026/archive.git")
-	if out != "https://git.example.com/team/repo@2026/archive.git" {
-		t.Fatalf("real-host path with at sign and continuation was redacted: %s", out)
-	}
-
-	out = RedactRemoteURL("file:///tmp/repo@2026.git")
-	if out != "file:///tmp/repo@2026.git" {
-		t.Fatalf("file URL path with at sign was redacted: %s", out)
-	}
-
-	out = RedactRemoteURL("https://ghp.secret/part@example.com/org/repo.git")
-	if containsAny(out, []string{"ghp.secret", "part"}) {
-		t.Fatalf("dotted path-split username-only malformed https userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https//ghp_secret@github.com/org/repo.git")
-	if containsAny(out, []string{"ghp_secret"}) {
-		t.Fatalf("missing-colon https userinfo leaked in output: %s", out)
-	}
-
-	out = RedactString("fatal: https://ghp_secret%zz:password=abc@example.com/org/repo.git failed")
-	if containsAny(out, []string{"ghp_secret", "%zz", "abc"}) {
-		t.Fatalf("redacted string leaked malformed credentials: %s", out)
-	}
-
-	out = RedactString("fatal: unable to access 'https://user:pass@example.com/org/repo.git/': failed")
-	if containsAny(out, []string{"user", "pass"}) {
-		t.Fatalf("quoted URL leaked credentials: %s", out)
-	}
-
-	out = RedactString("fatal: git@github.com:org/repo.git?sig=s3cr3t failed")
-	if containsAny(out, []string{"sig", "s3cr3t"}) {
-		t.Fatalf("scp-style query leaked in redacted string: %s", out)
-	}
-
-	out = RedactRemoteURL("ssh://git:sec%zzret@example.com/org/repo.git")
-	if containsAny(out, []string{"sec", "%zz", "ret"}) {
-		t.Fatalf("malformed ssh userinfo leaked in output: %s", out)
-	}
-
-	out = RedactString("fatal: ssh:/git:pa/ss@github.com/org/repo.git failed")
-	if containsAny(out, []string{"pa/ss"}) {
-		t.Fatalf("malformed ssh-style userinfo leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: remote=ssh:/git:pa/ss@github.com/org/repo.git failed")
-	if containsAny(out, []string{"pa/ss"}) {
-		t.Fatalf("prefixed malformed ssh-style userinfo leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: https:/user:ghp_secret@github.com/org/repo.git failed")
-	if containsAny(out, []string{"ghp_secret", "user"}) {
-		t.Fatalf("http-like typo leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: remote=https:/user:ghp_secret@github.com/org/repo.git failed")
-	if containsAny(out, []string{"ghp_secret", "user"}) {
-		t.Fatalf("prefixed http-like typo leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: remote=https//ghp_secret@github.com/org/repo.git failed")
-	if containsAny(out, []string{"ghp_secret"}) {
-		t.Fatalf("prefixed missing-colon typo leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("remotes=ssh://git@github.com/org/repo.git,https://ghp_secret@example.com/private.git")
-	if containsAny(out, []string{"ghp_secret"}) {
-		t.Fatalf("second URL credential leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("remotes=https://git.example.com:8443/team/repo.git,https://ghp_secret@example.com/private.git")
-	if containsAny(out, []string{"ghp_secret"}) {
-		t.Fatalf("second URL credential after ported URL leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("remotes=https://git:8443/team/repo.git,https://ghp_secret@example.com/private.git")
-	if containsAny(out, []string{"ghp_secret"}) {
-		t.Fatalf("second URL credential after single-label ported URL leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("remotes=https://git.example.com/repo.git,alice:ghp_secret@github.com:org/repo.git")
-	if containsAny(out, []string{"alice", "ghp_secret"}) {
-		t.Fatalf("scheme-less second URL credential leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("remotes=https://git.example.com/repo.git;alice:ghp_secret@github.com:org/repo.git")
-	if containsAny(out, []string{"alice", "ghp_secret"}) {
-		t.Fatalf("scheme-less second URL credential after semicolon leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: https://github.com/org/repo.git?sig=abc,def failed")
-	if containsAny(out, []string{"abc", "def"}) {
-		t.Fatalf("query value leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: https://user:pa,ss@example.com/org/repo.git failed")
-	if containsAny(out, []string{"user", "pa", "ss"}) {
-		t.Fatalf("comma-containing userinfo leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: https://user:pa;http:ss@example.com/org/repo.git failed")
-	if containsAny(out, []string{"user", "pa", "ss"}) {
-		t.Fatalf("semicolon-containing userinfo leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: https://user:pa,http:ss?x@example.com/org/repo.git failed")
-	if containsAny(out, []string{"user", "pa", "ss"}) {
-		t.Fatalf("comma/query malformed userinfo leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: https://user:pa,https://ss@example.com/org/repo.git failed")
-	if containsAny(out, []string{"user", "pa", "ss"}) {
-		t.Fatalf("comma/url-marker malformed userinfo leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: https://user:pa/ss,https://x@example.com/org/repo.git failed")
-	if containsAny(out, []string{"user", "pa/ss"}) {
-		t.Fatalf("slash comma/url-marker malformed userinfo leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: https://user:pa/ss;https://x@example.com/org/repo.git failed")
-	if containsAny(out, []string{"user", "pa/ss"}) {
-		t.Fatalf("slash semicolon/url-marker malformed userinfo leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: https://use,r:pass@example.com/org/repo.git failed")
-	if containsAny(out, []string{"use", "pass"}) {
-		t.Fatalf("comma-split username leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: https://use;r:pass@example.com/org/repo.git failed")
-	if containsAny(out, []string{"use", "pass"}) {
-		t.Fatalf("semicolon-split username leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: https://user:pa;http:ss#x@example.com/org/repo.git failed")
-	if containsAny(out, []string{"user", "pa", "ss"}) {
-		t.Fatalf("semicolon/fragment malformed userinfo leaked in redacted string: %s", out)
-	}
-
-	out = RedactRemoteURL("https://user:pa/ss?x@example.com/org/repo.git")
-	if containsAny(out, []string{"user", "pa/ss"}) {
-		t.Fatalf("slash query malformed userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("https://user:pa/ss#x@example.com/org/repo.git")
-	if containsAny(out, []string{"user", "pa/ss"}) {
-		t.Fatalf("slash fragment malformed userinfo leaked in output: %s", out)
-	}
-
-	out = RedactString("fatal: https://user:8443/ss,https://x@example.com/org/repo.git failed")
-	if containsAny(out, []string{"user", "8443/ss"}) {
-		t.Fatalf("numeric slash comma malformed userinfo leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: https://user:8443/ss;https://x@example.com/org/repo.git failed")
-	if containsAny(out, []string{"user", "8443/ss"}) {
-		t.Fatalf("numeric slash semicolon malformed userinfo leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: what? failed issue#123")
-	if out != "fatal: what? failed issue#123" {
-		t.Fatalf("ordinary punctuation was redacted: %s", out)
-	}
-
-	out = RedactString("contact dev@example.com? issue#123")
-	if out != "contact dev@example.com? issue#123" {
-		t.Fatalf("ordinary email punctuation was redacted: %s", out)
-	}
-
-	out = RedactString("fatal: https//ghp_secret,http:ss?x@example.com/org/repo.git failed")
-	if containsAny(out, []string{"ghp_secret", "ss"}) {
-		t.Fatalf("missing-colon comma/query malformed userinfo leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: https//ghp_secret;http:ss#x@example.com/org/repo.git failed")
-	if containsAny(out, []string{"ghp_secret", "ss"}) {
-		t.Fatalf("missing-colon semicolon/fragment malformed userinfo leaked in redacted string: %s", out)
-	}
-
-	out = RedactRemoteURL("https://github.com/%zz?access_token=abc@def")
-	if containsAny(out, []string{"abc", "def"}) {
-		t.Fatalf("malformed query with at sign leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("alice:ghp_secret@github.com:org/repo.git")
-	if containsAny(out, []string{"alice", "ghp_secret"}) {
-		t.Fatalf("scheme-less malformed userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("x-token-auth:secret@bitbucket.org/org/repo.git")
-	if containsAny(out, []string{"x-token-auth", "secret"}) {
-		t.Fatalf("scheme-less token userinfo leaked in output: %s", out)
-	}
-
-	out = RedactRemoteURL("alice:ghp_secret#@github.com:org/repo.git")
-	if containsAny(out, []string{"alice", "ghp_secret"}) {
-		t.Fatalf("scheme-less delimiter-split userinfo leaked in output: %s", out)
-	}
-
-	out = RedactString("fatal: unable to access 'jane@example.com:https:user:ghp_secret@example.com/org/repo.git': HTTP 401")
-	if containsAny(out, []string{"ghp_secret"}) {
-		t.Fatalf("typo-scheme userinfo after an at-sign prefix leaked in redacted string: %s", out)
-	}
-
-	out = RedactString("fatal: unable to access 'https:/example.com/a://user:ghp_secret?q@z': HTTP 401")
-	if containsAny(out, []string{"ghp_secret"}) {
-		t.Fatalf("userinfo ending at a query after a later scheme separator leaked in redacted string: %s", out)
-	}
-
-	const helperPath = "gcrypt::https://github.com/org/repo@v1.git"
-	if out = RedactRemoteURL(helperPath); out != helperPath {
-		t.Fatalf("remote helper URL without userinfo changed to %s", out)
-	}
-
-	out = RedactRemoteURL("gcrypt::https://host.example.com:8443/a://u:pwzq@h")
-	if containsAny(out, []string{"pwzq"}) {
-		t.Fatalf("userinfo after a further separator behind a remote helper leaked in output: %s", out)
+	redactors := map[string]func(string) string{"RedactRemoteURL": RedactRemoteURL, "RedactString": RedactString}
+	for _, tt := range []struct {
+		name, redactor, in, want string
+	}{
+		{"userinfo and query", "RedactRemoteURL", "https://token123@github.com/org/repo.git?token=abc", "https://REDACTED@github.com/org/repo.git?REDACTED"},
+		{"query secret", "RedactRemoteURL", "https://github.com/org/repo.git?sig=s3cr3t", "https://github.com/org/repo.git?REDACTED"},
+		{"fragment secret", "RedactRemoteURL", "https://github.com/org/repo.git#access_token=ghp_secret", "https://github.com/org/repo.git#REDACTED"},
+		{"malformed userinfo", "RedactRemoteURL", "https://ghp_secret%zz@github.com/org/repo.git", "https://REDACTED@github.com/org/repo.git"},
+		{"malformed userinfo with fragment delimiter", "RedactRemoteURL", "https://user:pa#ss@example.com/org/repo.git", "https://REDACTED#REDACTED"},
+		{"malformed username-only userinfo", "RedactRemoteURL", "https://ghp_secret#@github.com/org/repo.git", "https://REDACTED#REDACTED"},
+		{"malformed userinfo with path delimiter", "RedactRemoteURL", "https://user:pa/ss@example.com/org/repo.git", "https://REDACTED@example.com/org/repo.git"},
+		{"malformed userinfo with token-like password", "RedactRemoteURL", "https://ghp_secret%zz:password=abc@example.com/org/repo.git", "https://REDACTED@example.com/org/repo.git"},
+		{"scp-style query secret", "RedactRemoteURL", "git@github.com:org/repo.git?sig=s3cr3t", "git@github.com:org/repo.git?REDACTED"},
+		{"malformed https userinfo", "RedactRemoteURL", "https://ghp_secret/@github.com/org/repo.git", "https://REDACTED@github.com/org/repo.git"},
+		{"missing-slash https userinfo", "RedactRemoteURL", "https:/user:ghp_secret@github.com/org/repo.git", "REDACTED@github.com/org/repo.git"},
+		{"numeric-prefix https userinfo", "RedactRemoteURL", "https://user:123/ss@example.com/org/repo.git", "https://REDACTED@example.com/org/repo.git"},
+		{"multi-segment https userinfo", "RedactRemoteURL", "https://user:123/dir/ss@example.com/org/repo.git", "https://REDACTED@example.com/org/repo.git"},
+		{"dotted malformed https userinfo", "RedactRemoteURL", "https://user.name:pa/ss@example.com/org/repo.git", "https://REDACTED@example.com/org/repo.git"},
+		{"dotted numeric malformed https userinfo", "RedactRemoteURL", "https://user.name:123/dir/ss@example.com/org/repo.git", "https://REDACTED@example.com/org/repo.git"},
+		{"dotted name numeric malformed https userinfo", "RedactRemoteURL", "https://first.last:123/dir/ss@example.com/org/repo.git", "https://REDACTED@example.com/org/repo.git"},
+		{"dotted name token malformed https userinfo", "RedactRemoteURL", "https://john.doe:123/ghp_secret@example.com/org/repo.git", "https://REDACTED@example.com/org/repo.git"},
+		{"path-split username-only malformed https userinfo", "RedactRemoteURL", "https://ghp_secret/part@example.com/org/repo.git", "https://REDACTED@example.com/org/repo.git"},
+		{"query-split username-only malformed https userinfo", "RedactRemoteURL", "https://ghp_secret/part?x@example.com/org/repo.git", "https://REDACTED?REDACTED"},
+		{"single-label path username-only malformed https userinfo", "RedactRemoteURL", "https://ghp_secret/part@example.com", "https://REDACTED@example.com"},
+		{"ported single-label path username-only malformed https userinfo", "RedactRemoteURL", "https://ghp_secret:8443/part@example.com", "https://REDACTED@example.com"},
+		{"real-host path with at sign and continuation", "RedactRemoteURL", "https://git.example.com/team/repo@2026/archive.git", "https://git.example.com/team/repo@2026/archive.git"},
+		{"file URL path with at sign", "RedactRemoteURL", "file:///tmp/repo@2026.git", "file:///tmp/repo@2026.git"},
+		{"dotted path-split username-only malformed https userinfo", "RedactRemoteURL", "https://ghp.secret/part@example.com/org/repo.git", "https://REDACTED@example.com/org/repo.git"},
+		{"missing-colon https userinfo", "RedactRemoteURL", "https//ghp_secret@github.com/org/repo.git", "https//REDACTED@github.com/org/repo.git"},
+		{"malformed userinfo in a line", "RedactString", "fatal: https://ghp_secret%zz:password=abc@example.com/org/repo.git failed", "fatal: https://REDACTED@example.com/org/repo.git failed"},
+		{"quoted URL", "RedactString", "fatal: unable to access 'https://user:pass@example.com/org/repo.git/': failed", "fatal: unable to access 'https://REDACTED@example.com/org/repo.git/': failed"},
+		{"scp-style query", "RedactString", "fatal: git@github.com:org/repo.git?sig=s3cr3t failed", "fatal: git@github.com:org/repo.git?REDACTED failed"},
+		{"malformed ssh userinfo", "RedactRemoteURL", "ssh://git:sec%zzret@example.com/org/repo.git", "ssh://REDACTED@example.com/org/repo.git"},
+		{"malformed ssh-style userinfo", "RedactString", "fatal: ssh:/git:pa/ss@github.com/org/repo.git failed", "fatal: REDACTED@github.com/org/repo.git failed"},
+		{"prefixed malformed ssh-style userinfo", "RedactString", "fatal: remote=ssh:/git:pa/ss@github.com/org/repo.git failed", "fatal: remote=REDACTED@github.com/org/repo.git failed"},
+		{"http-like typo", "RedactString", "fatal: https:/user:ghp_secret@github.com/org/repo.git failed", "fatal: REDACTED@github.com/org/repo.git failed"},
+		{"prefixed http-like typo", "RedactString", "fatal: remote=https:/user:ghp_secret@github.com/org/repo.git failed", "fatal: remote=REDACTED@github.com/org/repo.git failed"},
+		{"prefixed missing-colon typo", "RedactString", "fatal: remote=https//ghp_secret@github.com/org/repo.git failed", "fatal: remote=https//REDACTED@github.com/org/repo.git failed"},
+		{"second URL credential", "RedactString", "remotes=ssh://git@github.com/org/repo.git,https://ghp_secret@example.com/private.git", "remotes=ssh://REDACTED@github.com/org/repo.git,https://REDACTED@example.com/private.git"},
+		{"second URL credential after ported URL", "RedactString", "remotes=https://git.example.com:8443/team/repo.git,https://ghp_secret@example.com/private.git", "remotes=https://git.example.com:8443/team/repo.git,https://REDACTED@example.com/private.git"},
+		{"second URL credential after single-label ported URL", "RedactString", "remotes=https://git:8443/team/repo.git,https://ghp_secret@example.com/private.git", "remotes=https://git:8443/team/repo.git,https://REDACTED@example.com/private.git"},
+		{"scheme-less second URL credential", "RedactString", "remotes=https://git.example.com/repo.git,alice:ghp_secret@github.com:org/repo.git", "remotes=https://git.example.com/repo.git,REDACTED@github.com:org/repo.git"},
+		{"scheme-less second URL credential after semicolon", "RedactString", "remotes=https://git.example.com/repo.git;alice:ghp_secret@github.com:org/repo.git", "remotes=https://git.example.com/repo.git;REDACTED@github.com:org/repo.git"},
+		{"query value", "RedactString", "fatal: https://github.com/org/repo.git?sig=abc,def failed", "fatal: https://github.com/org/repo.git?REDACTED failed"},
+		{"comma-containing userinfo", "RedactString", "fatal: https://user:pa,ss@example.com/org/repo.git failed", "fatal: https://REDACTED@example.com/org/repo.git failed"},
+		{"semicolon-containing userinfo", "RedactString", "fatal: https://user:pa;http:ss@example.com/org/repo.git failed", "fatal: https://REDACTED@example.com/org/repo.git failed"},
+		{"comma/query malformed userinfo", "RedactString", "fatal: https://user:pa,http:ss?x@example.com/org/repo.git failed", "fatal: https://REDACTED?REDACTED failed"},
+		{"comma/url-marker malformed userinfo", "RedactString", "fatal: https://user:pa,https://ss@example.com/org/repo.git failed", "fatal: https://REDACTED@example.com/org/repo.git failed"},
+		{"slash comma/url-marker malformed userinfo", "RedactString", "fatal: https://user:pa/ss,https://x@example.com/org/repo.git failed", "fatal: https://REDACTED@example.com/org/repo.git failed"},
+		{"slash semicolon/url-marker malformed userinfo", "RedactString", "fatal: https://user:pa/ss;https://x@example.com/org/repo.git failed", "fatal: https://REDACTED@example.com/org/repo.git failed"},
+		{"comma-split username", "RedactString", "fatal: https://use,r:pass@example.com/org/repo.git failed", "fatal: https://REDACTED@example.com/org/repo.git failed"},
+		{"semicolon-split username", "RedactString", "fatal: https://use;r:pass@example.com/org/repo.git failed", "fatal: https://REDACTED@example.com/org/repo.git failed"},
+		{"semicolon/fragment malformed userinfo", "RedactString", "fatal: https://user:pa;http:ss#x@example.com/org/repo.git failed", "fatal: https://REDACTED#REDACTED failed"},
+		{"slash query malformed userinfo", "RedactRemoteURL", "https://user:pa/ss?x@example.com/org/repo.git", "https://REDACTED?REDACTED"},
+		{"slash fragment malformed userinfo", "RedactRemoteURL", "https://user:pa/ss#x@example.com/org/repo.git", "https://REDACTED#REDACTED"},
+		{"numeric slash comma malformed userinfo", "RedactString", "fatal: https://user:8443/ss,https://x@example.com/org/repo.git failed", "fatal: https://REDACTED@example.com/org/repo.git failed"},
+		{"numeric slash semicolon malformed userinfo", "RedactString", "fatal: https://user:8443/ss;https://x@example.com/org/repo.git failed", "fatal: https://REDACTED@example.com/org/repo.git failed"},
+		{"ordinary punctuation", "RedactString", "fatal: what? failed issue#123", "fatal: what? failed issue#123"},
+		{"ordinary email punctuation", "RedactString", "contact dev@example.com? issue#123", "contact dev@example.com? issue#123"},
+		{"missing-colon comma/query malformed userinfo", "RedactString", "fatal: https//ghp_secret,http:ss?x@example.com/org/repo.git failed", "fatal: https//REDACTED?REDACTED failed"},
+		{"missing-colon semicolon/fragment malformed userinfo", "RedactString", "fatal: https//ghp_secret;http:ss#x@example.com/org/repo.git failed", "fatal: https//REDACTED#REDACTED failed"},
+		{"malformed query with at sign", "RedactRemoteURL", "https://github.com/%zz?access_token=abc@def", "https://github.com/%zz?REDACTED"},
+		{"scheme-less malformed userinfo", "RedactRemoteURL", "alice:ghp_secret@github.com:org/repo.git", "REDACTED@github.com:org/repo.git"},
+		{"scheme-less token userinfo", "RedactRemoteURL", "x-token-auth:secret@bitbucket.org/org/repo.git", "REDACTED@bitbucket.org/org/repo.git"},
+		{"scheme-less delimiter-split userinfo", "RedactRemoteURL", "alice:ghp_secret#@github.com:org/repo.git", "REDACTED#REDACTED"},
+		{"typo-scheme userinfo after an at-sign prefix", "RedactString", "fatal: unable to access 'jane@example.com:https:user:ghp_secret@example.com/org/repo.git': HTTP 401", "fatal: unable to access 'jane@example.com:REDACTED@example.com/org/repo.git': HTTP 401"},
+		{"userinfo ending at a query after a later scheme separator", "RedactString", "fatal: unable to access 'https:/example.com/a://user:ghp_secret?q@z': HTTP 401", "fatal: unable to access 'https:/example.com/a://REDACTED?REDACTED': HTTP 401"},
+		{"remote helper URL without userinfo", "RedactRemoteURL", "gcrypt::https://github.com/org/repo@v1.git", "gcrypt::https://github.com/org/repo@v1.git"},
+		{"userinfo after a further separator behind a remote helper", "RedactRemoteURL", "gcrypt::https://host.example.com:8443/a://u:pwzq@h", "gcrypt::https://REDACTED@h"},
+	} {
+		if got := redactors[tt.redactor](tt.in); got != tt.want {
+			t.Errorf("%s: %s(%q) = %q, want %q", tt.name, tt.redactor, tt.in, got, tt.want)
+		}
 	}
 }
 
@@ -940,22 +686,4 @@ func onlyRunes(s string, extra string) bool {
 		}
 	}
 	return true
-}
-
-func containsAny(s string, needles []string) bool {
-	for _, n := range needles {
-		if n != "" && len(s) >= len(n) && stringContains(s, n) {
-			return true
-		}
-	}
-	return false
-}
-
-func stringContains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }

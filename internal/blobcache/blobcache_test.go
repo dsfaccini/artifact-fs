@@ -193,3 +193,15 @@ func TestEvictStopsMovingFlatBlobsWhenContextEnds(t *testing.T) {
 		t.Fatalf("stats file = %d bytes, %v; want no counters written", len(data), err)
 	}
 }
+
+// Installing a blob over a cached copy replaces the copy in the counters.
+func TestInstallOverACachedBlobCountsItOnce(t *testing.T) {
+	dir := t.TempDir()
+	oid := strings.Repeat("a", 40)
+	now := time.Now()
+	install(t, dir, oid, 10, now)
+	requireStats(t, dir, Stats{Blobs: 1, Bytes: 10})
+
+	install(t, dir, oid, 4, now)
+	requireStats(t, dir, Stats{Blobs: 1, Bytes: 4})
+}

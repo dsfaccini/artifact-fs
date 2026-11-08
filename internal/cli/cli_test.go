@@ -237,10 +237,20 @@ func TestAddRepoCLIRejectsOptionRemoteBeforeGit(t *testing.T) {
 	}
 }
 
-// The repo name becomes part of the mount's fsname option, so add-repo must
-// refuse it before registration rather than leave the daemon a mount that fails.
-func TestAddRepoCLIRejectsMountOptionSeparatorsInName(t *testing.T) {
-	for _, name := range []string{"repo,name", "repo=name"} {
+// The repo name becomes a component of the repo's state and mount paths, and
+// part of the mount's fsname option, so add-repo must refuse a name that
+// escapes those paths or splits that option before it registers anything.
+func TestAddRepoCLIRejectsUnsafeNames(t *testing.T) {
+	const pathRejection = "must not contain path separators or '..'"
+	const optionRejection = "must not contain ',' or '='"
+	for name, rejection := range map[string]string{
+		"a/b":       pathRejection,
+		`a\b`:       pathRejection,
+		"..":        pathRejection,
+		"a..b":      pathRejection,
+		"repo,name": optionRejection,
+		"repo=name": optionRejection,
+	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
 			var stdout, stderr bytes.Buffer
@@ -248,8 +258,8 @@ func TestAddRepoCLIRejectsMountOptionSeparatorsInName(t *testing.T) {
 			if code := Run(context.Background(), args, &stdout, &stderr); code == 0 {
 				t.Fatalf("add-repo unexpectedly succeeded, stdout=%q", stdout.String())
 			}
-			if !strings.Contains(stderr.String(), "must not contain ',' or '='") {
-				t.Fatalf("stderr = %q, want the mount option separator rejection", stderr.String())
+			if !strings.Contains(stderr.String(), rejection) {
+				t.Fatalf("stderr = %q, want %q", stderr.String(), rejection)
 			}
 			stdout.Reset()
 			if code := Run(context.Background(), []string{"list-repos"}, &stdout, &stderr); code != 0 {
@@ -259,6 +269,101 @@ func TestAddRepoCLIRejectsMountOptionSeparatorsInName(t *testing.T) {
 				t.Fatalf("list-repos = %q, want no registered repo", stdout.String())
 			}
 		})
+	}
+}
+
+// registeredRepo reads name's stored config from the registry under root.
+func registeredRepo(t *testing.T, root, name string) model.RepoConfig {
+	t.Helper()
+	ctx := context.Background()
+	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := reg.GetRepo(ctx, name)
+	if closeErr := reg.Close(); err != nil || closeErr != nil {
+		t.Fatalf("get repo: %v, close: %v", err, closeErr)
+	}
+	return cfg
+}
+
+// set-refresh stores the policy it prints, and a stored "never" reads back
+// with no interval.
+func TestSetRefreshCLIStoresThePolicy(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ARTIFACT_FS_ROOT", root)
+	if _, stderr, code := runCLI(t, "add-repo", "--name", "repo", "--remote", "https://github.com/example/repo.git", "--async"); code != 0 {
+		t.Fatalf("add-repo exit = %d, stderr=%q", code, stderr)
+	}
+	for _, step := range []struct {
+		interval string
+		stdout   string
+		want     model.RefreshPolicy
+	}{
+		{"5m", "updated refresh repo 5m0s\n", model.RefreshPolicy{RefreshInterval: 5 * time.Minute}},
+		{"never", "updated refresh repo never\n", model.RefreshPolicy{RemoteRefreshDisabled: true}},
+		{"90s", "updated refresh repo 1m30s\n", model.RefreshPolicy{RefreshInterval: 90 * time.Second}},
+	} {
+		stdout, stderr, code := runCLI(t, "set-refresh", "--name", "repo", "--interval", step.interval)
+		if code != 0 {
+			t.Fatalf("set-refresh --interval %s exit = %d, stderr=%q", step.interval, code, stderr)
+		}
+		if stdout != step.stdout {
+			t.Fatalf("set-refresh --interval %s stdout = %q, want %q", step.interval, stdout, step.stdout)
+		}
+		if got := registeredRepo(t, root, "repo").RefreshPolicy; got != step.want {
+			t.Fatalf("after set-refresh --interval %s, stored policy = %+v, want %+v", step.interval, got, step.want)
+		}
+	}
+	for interval, rejection := range map[string]string{
+		"0s":   "refresh interval must be positive",
+		"soon": `invalid refresh interval "soon"`,
+	} {
+		if _, stderr, code := runCLI(t, "set-refresh", "--name", "repo", "--interval", interval); code == 0 || !strings.Contains(stderr, rejection) {
+			t.Fatalf("set-refresh --interval %s exit = %d, stderr=%q; want a failure naming %q", interval, code, stderr, rejection)
+		}
+	}
+	if got, want := registeredRepo(t, root, "repo").RefreshPolicy, (model.RefreshPolicy{RefreshInterval: 90 * time.Second}); got != want {
+		t.Fatalf("after refused intervals, stored policy = %+v, want %+v", got, want)
+	}
+}
+
+// remove-repo drops the repo from the registry, and fails for a name that is
+// not registered.
+func TestRemoveRepoCLIUnregistersTheRepo(t *testing.T) {
+	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+	for _, name := range []string{"repo", "other"} {
+		if _, stderr, code := runCLI(t, "add-repo", "--name", name, "--remote", "https://github.com/example/"+name+".git", "--async"); code != 0 {
+			t.Fatalf("add-repo %s exit = %d, stderr=%q", name, code, stderr)
+		}
+	}
+	listed, stderr, code := runCLI(t, "list-repos")
+	if code != 0 {
+		t.Fatalf("list-repos exit = %d, stderr=%q", code, stderr)
+	}
+	lines := strings.SplitAfter(listed, "\n")
+	if len(lines) != 3 || !strings.HasPrefix(lines[0], "other\t") || !strings.HasPrefix(lines[1], "repo\t") {
+		t.Fatalf("list-repos = %q, want other and repo", listed)
+	}
+
+	stdout, stderr, code := runCLI(t, "remove-repo", "--name", "repo")
+	if code != 0 {
+		t.Fatalf("remove-repo exit = %d, stderr=%q", code, stderr)
+	}
+	if stdout != "removed repo\n" {
+		t.Fatalf("stdout = %q, want %q", stdout, "removed repo\n")
+	}
+	stdout, stderr, code = runCLI(t, "list-repos")
+	if code != 0 {
+		t.Fatalf("list-repos exit = %d, stderr=%q", code, stderr)
+	}
+	if stdout != lines[0] {
+		t.Fatalf("list-repos = %q, want only %q", stdout, lines[0])
+	}
+
+	stdout, stderr, code = runCLI(t, "remove-repo", "--name", "repo")
+	if code == 0 || stdout != "" || stderr != "repo not found\n" {
+		t.Fatalf("second remove-repo = exit %d, stdout %q, stderr %q; want a failure naming the missing repo", code, stdout, stderr)
 	}
 }
 
