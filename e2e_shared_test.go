@@ -31,6 +31,10 @@ const kernelCacheExpiry = 1500 * time.Millisecond
 // on FSKit. On FSKit only the runReadOnly tests run.
 func TestE2ESharedMount(t *testing.T) {
 	shared := newSharedE2ERepo(t)
+	t.Setenv("AFS_E2E_PROOF_NO_INVALIDATION", "1")
+	if _, err := gitOutput(shared.repo.mountPath, "update-index", "--no-fsmonitor"); err != nil {
+		t.Fatal(err)
+	}
 	shared.runReadOnly(t, "GitCleanState", testE2EGitCleanState)
 	shared.runReadOnly(t, "GitConcurrentReads", testE2EGitConcurrentReads)
 	shared.run(t, "KernelCacheFollowsHEADMoveOutsideTheMount", testE2EKernelCacheFollowsHEADMoveOutsideTheMount)
