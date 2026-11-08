@@ -1542,23 +1542,40 @@ func TestRenameOfReturnedPathWithoutLookupKeepsHeldInode(t *testing.T) {
 	}
 }
 
-// An unlink of a path that came back unchanged for a held inode, with no
-// lookup first, retires that inode as an unlink of a mapped path does.
+// An unlink or rmdir of a path that came back unchanged for a held inode,
+// with no lookup first, retires that inode as an unlink of a mapped path does.
 func TestUnlinkOfReturnedPathWithoutLookupRetiresHeldInode(t *testing.T) {
-	f := newCacheFixtureOn(t, BackendFSKit, baseFile("file.txt", "blob-A", 0o100644))
-	held := f.lookup(fuseops.RootInodeID, "file.txt")
-	f.open(held)
-	f.switchTo()
-	if err := f.mount.InvalidateChanged(); err != nil {
-		t.Fatal(err)
-	}
-	f.switchTo(baseFile("file.txt", "blob-A", 0o100644))
-	if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"}); err != nil {
-		t.Fatal(err)
-	}
-	if got := openErrno(f, held); got != syscall.ESTALE {
-		t.Fatalf("open of the inode whose path an unlink removed = errno %v, want ESTALE", got)
-	}
+	t.Run("unlink", func(t *testing.T) {
+		f := newCacheFixtureOn(t, BackendFSKit, baseFile("file.txt", "blob-A", 0o100644))
+		held := f.lookup(fuseops.RootInodeID, "file.txt")
+		f.open(held)
+		f.switchTo()
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
+		f.switchTo(baseFile("file.txt", "blob-A", 0o100644))
+		if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"}); err != nil {
+			t.Fatal(err)
+		}
+		if got := openErrno(f, held); got != syscall.ESTALE {
+			t.Fatalf("open of the inode whose path an unlink removed = errno %v, want ESTALE", got)
+		}
+	})
+	t.Run("rmdir", func(t *testing.T) {
+		f := newCacheFixtureOn(t, BackendFSKit, baseDir("d", "d1"))
+		held := f.lookup(fuseops.RootInodeID, "d")
+		f.switchTo()
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
+		f.switchTo(baseDir("d", "d1"))
+		if err := f.fs.RmDir(f.ctx, &fuseops.RmDirOp{Parent: fuseops.RootInodeID, Name: "d"}); err != nil {
+			t.Fatal(err)
+		}
+		if got := kernelErrno(f.fs.OpenDir(f.ctx, &fuseops.OpenDirOp{Inode: held})); got != syscall.ESTALE {
+			t.Fatalf("opendir of the directory an rmdir removed = errno %v, want ESTALE", got)
+		}
+	})
 }
 
 // failingRemoveOverlay fails every Remove.
@@ -1737,6 +1754,10 @@ func TestGetattrSizeMatchesWhatTheHandleReads(t *testing.T) {
 		f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
 		held := f.lookup(fuseops.RootInodeID, "file.txt")
 		open := f.open(held)
+		before := &fuseops.GetInodeAttributesOp{Inode: held}
+		if err := f.fs.GetInodeAttributes(f.ctx, before); err != nil {
+			t.Fatal(err)
+		}
 		if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"}); err != nil {
 			t.Fatal(err)
 		}
@@ -1745,6 +1766,13 @@ func TestGetattrSizeMatchesWhatTheHandleReads(t *testing.T) {
 		}
 		if got, size := mustReadHandle(t, f, held, open.Handle), getattrSize(t, f, held); size != uint64(len(got)) {
 			t.Fatalf("getattr size %d, the handle reads %q", size, got)
+		}
+		after := &fuseops.GetInodeAttributesOp{Inode: held}
+		if err := f.fs.GetInodeAttributes(f.ctx, after); err != nil {
+			t.Fatal(err)
+		}
+		if !after.Attributes.Mtime.After(before.Attributes.Mtime) {
+			t.Fatalf("getattr mtime %v after a write to the own copy, want later than the base file's %v", after.Attributes.Mtime, before.Attributes.Mtime)
 		}
 	})
 	t.Run("path came back changed", func(t *testing.T) {
