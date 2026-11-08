@@ -17,6 +17,7 @@ import (
 )
 
 func TestStateRootDirectoriesArePrivate(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	remote := filepath.Join(tmp, "remote")
@@ -94,6 +95,7 @@ func TestStateRootDirectoriesArePrivate(t *testing.T) {
 }
 
 func TestNewRefusesStateRootOthersCanWrite(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		name string
 		dir  string
@@ -104,6 +106,7 @@ func TestNewRefusesStateRootOthersCanWrite(t *testing.T) {
 		{"world-writable config", "config", 0o777},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			root := filepath.Join(t.TempDir(), "state")
 			if err := os.MkdirAll(filepath.Join(root, tt.dir), 0o700); err != nil {
 				t.Fatal(err)
@@ -127,6 +130,7 @@ func TestNewRefusesStateRootOthersCanWrite(t *testing.T) {
 }
 
 func TestNewRefusesStateRootOwnedByAnotherUser(t *testing.T) {
+	t.Parallel()
 	if os.Geteuid() == 0 {
 		t.Skip("root owns /")
 	}
@@ -141,6 +145,7 @@ func TestNewRefusesStateRootOwnedByAnotherUser(t *testing.T) {
 }
 
 func TestNewKeepsResolvedStateRootAfterLinkRetarget(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	original, attacker := filepath.Join(tmp, "original"), filepath.Join(tmp, "attacker")
@@ -188,6 +193,7 @@ func TestNewKeepsResolvedStateRootAfterLinkRetarget(t *testing.T) {
 }
 
 func TestNewNarrowsExistingStateDirectories(t *testing.T) {
+	t.Parallel()
 	root := filepath.Join(t.TempDir(), "state")
 	// Earlier versions created the root and its subdirectories 0755.
 	if err := os.MkdirAll(filepath.Join(root, "config"), 0o755); err != nil {

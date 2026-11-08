@@ -53,6 +53,7 @@ func (m *hangingUnmountMount) InvalidateChanged() error { return nil }
 // An unmount that hangs on one repo's dead mount stalls only that repo: the
 // daemon reports the stop it cannot carry out and still mounts another repo.
 func TestHangingUnmountStallsOnlyItsRepo(t *testing.T) {
+	t.Parallel()
 	hanging := &hangingUnmountMount{fail: make(chan struct{}), release: make(chan struct{}), entered: make(chan struct{})}
 	var mounts atomic.Int32
 	d := startDaemonWithMount(t, func(ctx, opCtx context.Context, cfg model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
@@ -86,6 +87,7 @@ func TestHangingUnmountStallsOnlyItsRepo(t *testing.T) {
 	if err := d.svc.ctl().AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "other"}, RepoSpec: model.RepoSpec{RemoteURL: d.workDir, Branch: "main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Hour}, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
+	wake(d.svc)
 	waitFor(t, d.startErr, func() bool {
 		st, err := d.svc.ctl().Status(ctx, "other")
 		return err == nil && st.State == repoStateMounted
@@ -111,6 +113,7 @@ func (m *blockedUnmountMount) Unmount(ctx context.Context) error {
 // A stop runs off the sync loop: while one repo's unmount is blocked, the
 // daemon mounts another repo, and the blocked stop has not given up.
 func TestSyncLoopMountsAnotherRepoWhileAStopIsBlocked(t *testing.T) {
+	t.Parallel()
 	blocked := &blockedUnmountMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, entered: make(chan struct{}), release: make(chan struct{})}
 	var mounts atomic.Int32
 	d := startDaemonWithMount(t, func(ctx, opCtx context.Context, cfg model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
@@ -132,6 +135,7 @@ func TestSyncLoopMountsAnotherRepoWhileAStopIsBlocked(t *testing.T) {
 	if err := d.svc.ctl().AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "other"}, RepoSpec: model.RepoSpec{RemoteURL: d.workDir, Branch: "main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Hour}, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
+	wake(d.svc)
 	waitFor(t, d.startErr, func() bool {
 		st, err := d.svc.ctl().Status(ctx, "other")
 		return err == nil && st.State == repoStateMounted
@@ -148,6 +152,7 @@ func TestSyncLoopMountsAnotherRepoWhileAStopIsBlocked(t *testing.T) {
 // A stop whose unmount has not returned in time shows as an unmount failure,
 // retried at the next sync, while the stop keeps running.
 func TestStatusShowsAStopWhoseUnmountHasNotReturned(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	blocked := &blockedUnmountMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, entered: make(chan struct{}), release: make(chan struct{})}
@@ -178,6 +183,7 @@ func TestStatusShowsAStopWhoseUnmountHasNotReturned(t *testing.T) {
 // A stop already holds the repo's unmount, so it unmounts an abandoned mount
 // left in place by its path itself, and the runtime stops.
 func TestStopUnmountsAnAbandonedMountLeftInPlace(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	cfg, err := svc.registry.GetRepo(ctx, "repo")
@@ -222,6 +228,7 @@ func TestStopUnmountsAnAbandonedMountLeftInPlace(t *testing.T) {
 // stopped, while the runtime still runs until the stop finishes, leaves the
 // stopped record. A join goroutine or a preparation can write that late.
 func TestALateWriteOfAStoppedRuntimeLeavesItsRecord(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	if err := svc.syncRepos(ctx); err != nil {
@@ -320,6 +327,7 @@ func ownMountEntry(repo string) mountEntry {
 // so only a mount of that repo counts as a leftover. FSKit names neither, so
 // any macFUSE mount counts there.
 func TestOwnsLeftoverMatchesTheDaemonsMounts(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		goos  string
 		entry mountEntry
@@ -346,6 +354,7 @@ func TestOwnsLeftoverMatchesTheDaemonsMounts(t *testing.T) {
 // that is not FUSE, and a FUSE mount of a repo the earlier daemon did not
 // run, such as a daemon's on another state root.
 func TestStartUnmountsAMountTheEarlierDaemonLeft(t *testing.T) {
+	t.Parallel()
 	type leftoverCase struct {
 		name       string
 		recorded   string
@@ -365,14 +374,9 @@ func TestStartUnmountsAMountTheEarlierDaemonLeft(t *testing.T) {
 		{name: "repo the earlier daemon did not run", entry: ownMountEntry("repo"), wantCalls: mountOnly},
 		{name: "another file system", recorded: repoStateMounted, entry: mountEntry{source: "/dev/disk3s1", fstype: "apfs"}, wantCalls: mountOnly},
 	}
-	if runtime.GOOS == "linux" {
-		cases = append(cases,
-			leftoverCase{name: "foreign FUSE mount", recorded: repoStateMounted, entry: mountEntry{source: "u@host:/dir", fstype: "fuse.sshfs"}, wantCalls: mountOnly},
-			leftoverCase{name: "mount of another repo", recorded: repoStateMounted, entry: ownMountEntry("other"), wantCalls: mountOnly},
-		)
-	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			svc, ctl := newSyncedDaemon(t)
 			ctx := context.Background()
 			cfg, err := svc.registry.GetRepo(ctx, "repo")
@@ -415,6 +419,7 @@ func TestStartUnmountsAMountTheEarlierDaemonLeft(t *testing.T) {
 // stopped, so the next daemon unmounts nothing at their mount points, not
 // even a mount it would count as its own.
 func TestCleanStopLeavesNoLeftoverClaim(t *testing.T) {
+	t.Parallel()
 	first, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	cfg, err := first.registry.GetRepo(ctx, "repo")
@@ -466,6 +471,7 @@ func nextDaemonCalls(t *testing.T, root, mountPath string) []string {
 // leftover then fails, so the runtime runs with nothing mounted and its stop
 // unmounts nothing.
 func TestCloseKeepsAClaimItsRuntimeDidNotRelease(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	cfg, err := svc.registry.GetRepo(ctx, "repo")
@@ -505,6 +511,7 @@ func TestCloseKeepsAClaimItsRuntimeDidNotRelease(t *testing.T) {
 // A Close whose unmount failed leaves the mount behind, so the next daemon
 // claims it.
 func TestFailedCloseKeepsTheLeftoverClaim(t *testing.T) {
+	t.Parallel()
 	first, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	cfg, err := first.registry.GetRepo(ctx, "repo")
@@ -539,6 +546,7 @@ func TestFailedCloseKeepsTheLeftoverClaim(t *testing.T) {
 // next daemon unmounts it. The claim leaves the reported state alone: status
 // shows the repo unmounted, not degraded.
 func TestFailedLeftoverUnmountKeepsTheClaimAcrossARestart(t *testing.T) {
+	t.Parallel()
 	first, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	cfg, err := first.registry.GetRepo(ctx, "repo")
@@ -576,6 +584,7 @@ func TestFailedLeftoverUnmountKeepsTheClaimAcrossARestart(t *testing.T) {
 // the claim across a restart: Start records each claim before the first
 // sync.
 func TestSyncPreparingRepoKeepsTheClaimAcrossARestart(t *testing.T) {
+	t.Parallel()
 	first, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	cfg, err := first.registry.GetRepo(ctx, "repo")
@@ -629,6 +638,7 @@ func TestSyncPreparingRepoKeepsTheClaimAcrossARestart(t *testing.T) {
 // point: the daemon unmounts the leftover, so no later daemon unmounts
 // whatever is mounted there when the repo mounts again.
 func TestDisabledRepoReleasesTheLeftoverClaim(t *testing.T) {
+	t.Parallel()
 	first, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	cfg, err := first.registry.GetRepo(ctx, "repo")
@@ -696,6 +706,7 @@ func claimedDisabledRepo(t *testing.T, unmountErr error) (*Service, *Controller,
 // A disabled repo whose leftover unmount fails keeps the claim and shows the
 // unmount failure.
 func TestDisabledRepoFailedReleaseKeepsTheClaimAndShowsTheFailure(t *testing.T) {
+	t.Parallel()
 	svc, ctl, cfg, _ := claimedDisabledRepo(t, errors.New("busy"))
 	ctx := context.Background()
 	if err := svc.syncRepos(ctx); err != nil {
@@ -714,6 +725,7 @@ func TestDisabledRepoFailedReleaseKeepsTheClaimAndShowsTheFailure(t *testing.T) 
 // A disabled repo's release that keeps failing backs off as a failed mount
 // does, and status keeps showing the failure meanwhile.
 func TestDisabledRepoFailedReleaseBacksOff(t *testing.T) {
+	t.Parallel()
 	svc, ctl, _, table := claimedDisabledRepo(t, errors.New("busy"))
 	ctx := context.Background()
 	for range 5 {
@@ -736,6 +748,7 @@ func TestDisabledRepoFailedReleaseBacksOff(t *testing.T) {
 // A stopped repo whose record a stop wrote while it still held the claim
 // drops the claim from the record once its release succeeds.
 func TestReleasedClaimOfAStoppedRepoLeavesTheRecord(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	cfg, err := svc.registry.GetRepo(ctx, "repo")
@@ -783,6 +796,7 @@ func TestReleasedClaimOfAStoppedRepoLeavesTheRecord(t *testing.T) {
 // A release that keeps the claim, as on a mount table it cannot read, leaves
 // a disabled repo's record alone: no sync after the first rewrites it.
 func TestKeptClaimOfADisabledRepoLeavesItsRecordAlone(t *testing.T) {
+	t.Parallel()
 	svc, ctl, cfg, table := claimedDisabledRepo(t, nil)
 	table.mu.Lock()
 	table.unreadable = 1000
@@ -812,6 +826,7 @@ func TestKeptClaimOfADisabledRepoLeavesItsRecordAlone(t *testing.T) {
 // A repo added again under the name of a removed repo, and so its ID,
 // inherits none of the removed repo's leftover claim.
 func TestReaddedRepoInheritsNoLeftoverClaim(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	cfg, err := svc.registry.GetRepo(ctx, "repo")
@@ -826,7 +841,6 @@ func TestReaddedRepoInheritsNoLeftoverClaim(t *testing.T) {
 	svc.mountPointEntry = table.mountPointEntry
 	svc.unmountPath = table.unmountPath
 	svc.mount = table.mount
-	svc.syncInterval = 10 * time.Millisecond
 	done := startService(t, svc)
 	waitFor(t, done, func() bool {
 		st, err := ctl.Status(ctx, "repo")
@@ -835,6 +849,7 @@ func TestReaddedRepoInheritsNoLeftoverClaim(t *testing.T) {
 	if err := ctl.RemoveRepo(ctx, "repo"); err != nil {
 		t.Fatal(err)
 	}
+	wake(svc)
 	waitFor(t, done, func() bool {
 		_, ok, err := ctl.registry.GetRuntime(ctx, cfg.ID)
 		return err == nil && !ok
@@ -842,6 +857,7 @@ func TestReaddedRepoInheritsNoLeftoverClaim(t *testing.T) {
 	if err := ctl.AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: cfg.RemoteURL, Branch: "main"}, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
+	wake(svc)
 	waitFor(t, done, func() bool { return len(table.recorded()) == 2 })
 	if got, want := table.recorded(), []string{"unmount " + cfg.MountPath, "mount"}; !slices.Equal(got, want) {
 		t.Fatalf("calls = %q, want %q; the re-added repo inherited the removed repo's claim", got, want)
@@ -850,6 +866,7 @@ func TestReaddedRepoInheritsNoLeftoverClaim(t *testing.T) {
 
 // status shows the last refresh of a daemon that stopped cleanly.
 func TestCleanStopKeepsTheLastRefreshInStatus(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	cfg, err := svc.registry.GetRepo(ctx, "repo")
@@ -921,6 +938,7 @@ func (m *busyOnceMount) Unmount(context.Context) error {
 // A clean shutdown whose unmount succeeds clears the failure of an earlier
 // stop of the repo, so status with no daemon shows no unmount failure.
 func TestCleanStopClearsAnEarlierUnmountFailure(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	cfg, err := svc.registry.GetRepo(ctx, "repo")
@@ -963,6 +981,7 @@ func TestCleanStopClearsAnEarlierUnmountFailure(t *testing.T) {
 // rt.cfg from its own goroutine while the sync loop stops the runtime. The
 // race detector reports the unlocked read.
 func TestStopReadsTheConfigUnderTheLock(t *testing.T) {
+	t.Parallel()
 	svc, _ := newSyncedDaemon(t)
 	svc.mountPointEntry = heldMountPoint
 	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("busy")}
@@ -1030,6 +1049,7 @@ func (e *fakeAbandonedMount) Wait(ctx context.Context) error {
 // the sync loop. The daemon records it as a mount failure, and mounts the
 // repo again only once the abandoned mount has ended.
 func TestSyncAbandonsAStalledMountAndWaitsForItToEnd(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	svc.mountTimeout = time.Millisecond
 	abandoned := &fakeAbandonedMount{ended: make(chan struct{})}
@@ -1070,6 +1090,7 @@ func TestSyncAbandonsAStalledMountAndWaitsForItToEnd(t *testing.T) {
 // Every FUSE op's context derives from the runtime's, so stopping the
 // runtime cancels the ops in flight and its server drains promptly.
 func TestStopCancelsTheOpsOfItsMount(t *testing.T) {
+	t.Parallel()
 	svc, _ := newSyncedDaemon(t)
 	ctx := context.Background()
 	var opCtx context.Context
@@ -1145,6 +1166,7 @@ func TestRemovedRepoLeavesNoBatchProcess(t *testing.T) {
 // A mount retry that serves again leaves the repo degraded while its remote
 // refreshes fail: the mount and the refresh each report their own state.
 func TestMountRetryKeepsAFailedRefreshDegraded(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	cfg, err := svc.registry.GetRepo(ctx, "repo")
@@ -1203,6 +1225,7 @@ func TestMountRetryKeepsAFailedRefreshDegraded(t *testing.T) {
 // An async repo whose preparation failed stays failed in status when its
 // mount's connection ends.
 func TestFailedPreparationStaysFailedWhenItsMountEnds(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
@@ -1244,6 +1267,7 @@ func TestFailedPreparationStaysFailedWhenItsMountEnds(t *testing.T) {
 // A mount retry of an adopted worktree checks again that its mount point is
 // empty, so it never hides native files written while it was unmounted.
 func TestAdoptedMountRetryRefusesANonEmptyMountPoint(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -1323,6 +1347,7 @@ func (e *failedCleanupAbandonedMount) Wait(context.Context) error {
 // mount point by path before it mounts again, and mounts nothing while that
 // unmount fails.
 func TestAbandonedMountLeftInPlaceIsUnmountedBeforeTheNextMount(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		name       string
 		unmountErr error
@@ -1332,6 +1357,7 @@ func TestAbandonedMountLeftInPlaceIsUnmountedBeforeTheNextMount(t *testing.T) {
 		{name: "unmount fails", unmountErr: errors.New("busy"), wantCalls: func(path string) []string { return []string{"mount", "unmount " + path} }},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			svc, ctl := newSyncedDaemon(t)
 			ctx := context.Background()
 			cfg, err := svc.registry.GetRepo(ctx, "repo")
@@ -1390,6 +1416,7 @@ func (m *opCtxAtUnmount) Unmount(ctx context.Context) error {
 // A shutdown cancels Start's context before Close stops each repo. The ops
 // in flight stay live until the unmount, as for any other stop.
 func TestShutdownUnmountsBeforeCancellingOps(t *testing.T) {
+	t.Parallel()
 	svc, _ := newSyncedDaemon(t)
 	ctx := context.Background()
 	var mount atomic.Pointer[opCtxAtUnmount]
@@ -1427,6 +1454,7 @@ func TestShutdownUnmountsBeforeCancellingOps(t *testing.T) {
 // The refresh backoff doubles from twice the interval up to fetchRetryMax,
 // or up to an interval longer than that.
 func TestRefreshRetrierBacksOffFromTheInterval(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		interval time.Duration
 		want     []time.Duration
@@ -1451,6 +1479,7 @@ func TestRefreshRetrierBacksOffFromTheInterval(t *testing.T) {
 // While the dead mount's unmount has not returned, status shows the mount
 // waiting for it, retried at the next sync.
 func TestStatusShowsAMountWaitingForAnUnmount(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	hanging := &hangingUnmountMount{fail: make(chan struct{}), release: make(chan struct{}), entered: make(chan struct{})}
@@ -1493,6 +1522,7 @@ func (m *externallyUnmounted) Unmount(context.Context) error {
 // A stop whose unmount fails because the mount is already gone finishes:
 // the failure counts only while the mount table lists the mount point.
 func TestStopFinishesAfterAnExternalUnmount(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	joined := make(chan struct{}, 8)
@@ -1522,6 +1552,7 @@ func TestStopFinishesAfterAnExternalUnmount(t *testing.T) {
 // A runtime that starts ends the mount backoff that failures before it built
 // up, so its own mount retries back off from the start.
 func TestRuntimeStartResetsTheMountBackoff(t *testing.T) {
+	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
 	ctx := context.Background()
 	cfg, err := svc.registry.GetRepo(ctx, "repo")

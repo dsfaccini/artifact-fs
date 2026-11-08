@@ -112,6 +112,7 @@ func publishedHead(t *testing.T, cfg model.RepoConfig) (string, string) {
 // while an async preparation activates its runtime must not leave the registry
 // ready while the runtime's gate holds every FUSE op.
 func TestSetRefreshDuringPrepareActivationOpensGate(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	gitDir := createPreparedGitDir(t, tmp)
@@ -163,12 +164,14 @@ func TestSetRefreshDuringPrepareActivationOpensGate(t *testing.T) {
 // runtime that serves it, which stays mounted, also when the daemon mounted
 // the repo ready after a restart.
 func TestPrepareOnReadyVerifiedRepoKeepsItsMount(t *testing.T) {
+	t.Parallel()
 	for _, restart := range []bool{false, true} {
 		name := "same daemon"
 		if restart {
 			name = "after restart"
 		}
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			ctx := context.Background()
 			tmp := t.TempDir()
 			remote := filepath.Join(tmp, "remote")
@@ -253,6 +256,7 @@ func TestPrepareOnReadyVerifiedRepoKeepsItsMount(t *testing.T) {
 // prepare on a sync repo the daemon serves runs in the CLI while the mount
 // keeps serving, and the daemon then serves the commit it prepared.
 func TestPrepareOnServedSyncRepoKeepsItsMount(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	svc, ctl := newSyncedDaemonIn(t, tmp)
@@ -321,6 +325,7 @@ func TestAddRepoStoresAbsolutePaths(t *testing.T) {
 // A source ref named origin/<branch> names that branch on the remote, as a
 // fetch ref does.
 func TestAddRepoReadsOriginPrefixedRefAsBranch(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	remote := filepath.Join(tmp, "remote")
@@ -348,6 +353,7 @@ func TestAddRepoReadsOriginPrefixedRefAsBranch(t *testing.T) {
 // A sync add-repo serves its fetch ref also when it clones, as an async one
 // does.
 func TestAddRepoSyncFreshCloneServesFetchRef(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	remote := filepath.Join(tmp, "remote")
@@ -372,6 +378,7 @@ func TestAddRepoSyncFreshCloneServesFetchRef(t *testing.T) {
 // --depth bounds the history every preparation transfers, also when it
 // fetches a fetch ref other than the source ref.
 func TestSyncPreparationFetchRefKeepsHistoryDepth(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	remote := filepath.Join(tmp, "remote")
@@ -454,6 +461,7 @@ func preparePreparedGitDir(t *testing.T, svc *Service, work, gitDir string) {
 // tip's parent. The check that a prepared git dir's branch only moves forward
 // then cannot see the old tip below the new one.
 func TestPreparedGitDirWithDepthMovesItsExistingBranch(t *testing.T) {
+	t.Parallel()
 	tmp := t.TempDir()
 	work, gitDir := newPreparedGitDir(t, tmp)
 	commitFile(t, work, "MORE.md", "more\n")
@@ -583,6 +591,7 @@ func TestPrepareCancelsTheAsyncPreparationItSupersedes(t *testing.T) {
 // also after the daemon restarts, and status shows the prepare error with the
 // commit the daemon serves.
 func TestFailedSyncPrepareKeepsServingAcrossRestart(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	svc, ctl := newSyncedDaemonIn(t, tmp)
@@ -630,6 +639,7 @@ func TestFailedSyncPrepareKeepsServingAcrossRestart(t *testing.T) {
 // A sync repo whose first preparation failed after its clone stays unmounted:
 // no preparation ever published a snapshot of it.
 func TestMountRefusesASyncRepoWhoseFirstPrepareFailed(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	remote := filepath.Join(tmp, "remote")
@@ -752,6 +762,7 @@ func preparationsEnded(svc *Service, name string) <-chan error {
 
 // A stop's drain outlasts the rollback of the preparation it cancels.
 func TestDrainOutlastsTheRollbackOfACanceledPreparation(t *testing.T) {
+	t.Parallel()
 	if gitstore.RollbackBound >= drainTimeout {
 		t.Fatalf("gitstore.RollbackBound = %v, want below drainTimeout %v", gitstore.RollbackBound, drainTimeout)
 	}

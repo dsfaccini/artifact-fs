@@ -68,10 +68,12 @@ func startDaemonWithRepo(t *testing.T) *startedDaemon {
 
 // startDaemonWithMount starts a daemon that mounts the repo at mountPath
 // through mount. An empty mountPath mounts it under the test's mount root.
+// The daemon never polls the registry, and retries a failed HEAD reconcile
+// after a millisecond.
 func startDaemonWithMount(t *testing.T, mount mountFunc, mountPath string) *startedDaemon {
 	t.Helper()
 	ctx := context.Background()
-	tmp := t.TempDir()
+	tmp := shortTempDir(t)
 	d := &startedDaemon{
 		mounts:  &resolverMount{next: mount},
 		logs:    &lockedBuffer{},
@@ -88,6 +90,8 @@ func startDaemonWithMount(t *testing.T, mount mountFunc, mountPath string) *star
 	}
 	d.svc = svc
 	svc.mount = d.mounts.mount
+	svc.syncInterval = time.Hour
+	svc.headReconcileBackoff = time.Millisecond
 	// A remote refresh never runs during the test, so only the HEAD watcher can start a reconcile.
 	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", MountPath: mountPath}, RepoSpec: model.RepoSpec{RemoteURL: d.workDir, Branch: "main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Hour}, Enabled: true}); err != nil {
 		_ = svc.Close()
@@ -162,6 +166,7 @@ func (d *startedDaemon) blobOID(t *testing.T, commit, path string) string {
 }
 
 func TestStartWatchesHEADAndServesReconciledSnapshot(t *testing.T) {
+	t.Parallel()
 	d := startDaemonWithRepo(t)
 	initial := d.status(t)
 
@@ -178,6 +183,7 @@ func TestStartWatchesHEADAndServesReconciledSnapshot(t *testing.T) {
 }
 
 func TestStartRetriesHEADReconcileAfterSnapshotLock(t *testing.T) {
+	t.Parallel()
 	d := startDaemonWithRepo(t)
 	initial := d.status(t)
 
@@ -226,15 +232,24 @@ type connFailureMounts struct {
 	// remote is the repo's remote, which the failed connection's error names.
 	// Set it before closing fail.
 	remote string
+	// joined receives when a join goroutine ends.
+	joined chan struct{}
 }
 
 // startConnFailureDaemon starts a daemon whose repo, mounted at mountPath,
 // mounts through a connFailureMounts.
 func startConnFailureDaemon(t *testing.T, unmountFails int, mountPath string) (*startedDaemon, *connFailureMounts) {
 	t.Helper()
-	m := &connFailureMounts{fail: make(chan struct{}), release: make(chan struct{}), unmountFails: unmountFails}
+	m := &connFailureMounts{fail: make(chan struct{}), release: make(chan struct{}), unmountFails: unmountFails, joined: make(chan struct{}, 1)}
 	d := startDaemonWithMount(t, m.mount, mountPath)
 	m.remote = d.workDir
+	// The failed connection's join reads the hook only after fail closes.
+	d.svc.joinFinished = func() {
+		select {
+		case m.joined <- struct{}{}:
+		default:
+		}
+	}
 	// Runs before the daemon's cleanup, which waits for a remount.
 	t.Cleanup(m.releaseRemount)
 	return d, m
@@ -291,16 +306,36 @@ func (f *failedConnectionMount) Unmount(context.Context) error {
 	return nil
 }
 
+// failConnection fails the mounted repo's connection and wakes the sync loop
+// once the connection's join goroutine ended and the unmount it started
+// returned. A sync before that would race the join for the failed mount.
+func failConnection(t *testing.T, d *startedDaemon, m *connFailureMounts) {
+	t.Helper()
+	close(m.fail)
+	select {
+	case <-m.joined:
+	case err := <-d.startErr:
+		t.Fatalf("Start returned before the failed connection's join ended: %v", err)
+	}
+	waitFor(t, d.startErr, func() bool {
+		d.svc.mu.Lock()
+		defer d.svc.mu.Unlock()
+		return len(d.svc.unmounting) == 0
+	})
+	wake(d.svc)
+}
+
 // failConnectionUntilRemount fails the mounted repo's connection and returns
 // the mount calls up to the remount, with the remount still in progress.
 func failConnectionUntilRemount(t *testing.T, d *startedDaemon, m *connFailureMounts) []string {
 	t.Helper()
-	close(m.fail)
+	failConnection(t, d, m)
 	waitFor(t, d.startErr, func() bool { return slices.Contains(m.recorded()[1:], "mount") })
 	return m.recorded()
 }
 
 func TestStartUnmountsFailedConnectionBeforeRemount(t *testing.T) {
+	t.Parallel()
 	d, m := startConnFailureDaemon(t, 0, "")
 
 	calls := failConnectionUntilRemount(t, d, m)
@@ -319,6 +354,7 @@ func TestStartUnmountsFailedConnectionBeforeRemount(t *testing.T) {
 }
 
 func TestStartRemountsAfterFailedUnmountWhenNothingIsMounted(t *testing.T) {
+	t.Parallel()
 	// Nothing is mounted under the test's mount root, so the failed unmount leaves no mount behind.
 	d, m := startConnFailureDaemon(t, 1, "")
 
@@ -329,6 +365,7 @@ func TestStartRemountsAfterFailedUnmountWhenNothingIsMounted(t *testing.T) {
 }
 
 func TestStartRemountsWithoutUnmountWhenConnectionEndsUnmounted(t *testing.T) {
+	t.Parallel()
 	// Nothing is mounted under the test's mount root, as after an external unmount.
 	d, m := startConnFailureDaemon(t, 0, "")
 	m.abort = true
@@ -340,6 +377,7 @@ func TestStartRemountsWithoutUnmountWhenConnectionEndsUnmounted(t *testing.T) {
 }
 
 func TestStartRetriesFailedConnectionUnmountBeforeRemount(t *testing.T) {
+	t.Parallel()
 	// "/" is always in the mount table, so the failed unmount leaves a mount behind.
 	d, m := startConnFailureDaemon(t, 1, "/")
 
@@ -350,6 +388,7 @@ func TestStartRetriesFailedConnectionUnmountBeforeRemount(t *testing.T) {
 }
 
 func TestStartUnmountsAbortedConnectionBeforeRemount(t *testing.T) {
+	t.Parallel()
 	// "/" is always in the mount table, so the aborted connection's mount stays in place.
 	d, m := startConnFailureDaemon(t, 0, "/")
 	m.abort = true
@@ -364,16 +403,17 @@ func TestStartUnmountsAbortedConnectionBeforeRemount(t *testing.T) {
 }
 
 func TestRemoveRepoUnmountsFailedConnectionLeftMounted(t *testing.T) {
+	t.Parallel()
 	d, m := startConnFailureDaemon(t, 2, "/")
-	close(m.fail)
 	// The daemon unmounts once after the failure and once more in the
 	// supervisor's retry, which then backs off.
+	failConnection(t, d, m)
 	waitFor(t, d.startErr, func() bool { return len(m.recorded()) >= 3 })
 
 	// A remount after the retry's backoff returns at once, so it fails the
-	// call sequence below instead of blocking the daemon's poll.
+	// call sequence below instead of blocking the daemon's sync loop.
 	m.releaseRemount()
-	// remove-repo runs in its own process, so the daemon's registry poll stops the runtime.
+	// remove-repo runs in its own process, so the daemon's next registry sync stops the runtime.
 	ctx := context.Background()
 	cliSvc, err := NewController(ctx, d.root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -383,6 +423,7 @@ func TestRemoveRepoUnmountsFailedConnectionLeftMounted(t *testing.T) {
 	if closeErr := cliSvc.Close(); err != nil || closeErr != nil {
 		t.Fatalf("CLI remove-repo: %v, close: %v", err, closeErr)
 	}
+	wake(d.svc)
 	waitFor(t, d.startErr, func() bool {
 		d.svc.mu.Lock()
 		defer d.svc.mu.Unlock()
@@ -443,6 +484,7 @@ func TestMountPointHeld(t *testing.T) {
 // library error line that names it, such as a failed lazy fetch's, never logs
 // it. The remote here is a local path, which only the remote itself matches.
 func TestStartMountRedactsTheRemoteFromFuseErrors(t *testing.T) {
+	t.Parallel()
 	d := startDaemonWithRepo(t)
 	line := fmt.Sprintf("Op 0x00000002 *fuseops.ReadFileOp] -> Error: %q", "fetch "+d.workDir+": exit status 128")
 	if got := d.mounts.redactor()(line); strings.Contains(got, d.workDir) || !strings.Contains(got, "REDACTED_REMOTE") {

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -15,35 +16,67 @@ import (
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
+// requireControlSocket fails t unless root's control socket path fits
+// sun_path, so a daemon on root takes CLI nudges.
+func requireControlSocket(t *testing.T, root string) {
+	t.Helper()
+	if path := controlSocketPath(root); !controlSocketFits(path) {
+		t.Fatalf("control socket path %s does not fit sun_path", path)
+	}
+}
+
+// shortTempDir is a TempDir short enough for a state root whose control
+// socket path fits sun_path. A t.TempDir() on macOS lies under /var/folders,
+// and the daemon there skips the socket, so a CLI nudge never reaches it.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	tmp, err := os.MkdirTemp("/tmp", "afs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmp) })
+	return tmp
+}
+
 func TestNewRefusesASecondDaemonOnOneRoot(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	first, err := New(ctx, root, discardLogger())
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := New(ctx, root, discardLogger())
-	if err == nil {
-		second.Close()
-		first.Close()
-		t.Fatal("a second daemon started on a root whose daemon is running")
-	}
-	if !strings.Contains(err.Error(), daemonLockPath(first.root)) {
-		t.Fatalf("error = %q, want it to name the daemon lock", err)
-	}
-	if err := first.Close(); err != nil {
-		t.Fatal(err)
-	}
-	third, err := New(ctx, root, discardLogger())
-	if err != nil {
-		t.Fatalf("daemon after the first stopped: %v", err)
-	}
-	third.Close()
+	t.Parallel()
+	// The second daemon waits out daemonLockWait, which the bubble's clock
+	// passes at once.
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		root := t.TempDir()
+		first, err := New(ctx, root, discardLogger())
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		second, err := New(ctx, root, discardLogger())
+		if err == nil {
+			second.Close()
+			first.Close()
+			t.Fatal("a second daemon started on a root whose daemon is running")
+		}
+		if waited := time.Since(start); waited < daemonLockWait {
+			t.Fatalf("second daemon gave up after %s, want it to wait %s for the lock", waited, daemonLockWait)
+		}
+		if !strings.Contains(err.Error(), daemonLockPath(first.root)) {
+			t.Fatalf("error = %q, want it to name the daemon lock", err)
+		}
+		if err := first.Close(); err != nil {
+			t.Fatal(err)
+		}
+		third, err := New(ctx, root, discardLogger())
+		if err != nil {
+			t.Fatalf("daemon after the first stopped: %v", err)
+		}
+		third.Close()
+	})
 }
 
 // A record counts only while a daemon holds the lock: a daemon that died left
 // its last record behind.
 func TestStatusTrustsTheRecordOnlyWhileADaemonRuns(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	ctl, err := NewController(ctx, root, discardLogger())
@@ -81,7 +114,10 @@ func TestStatusTrustsTheRecordOnlyWhileADaemonRuns(t *testing.T) {
 }
 
 func TestUnmountAndRemountApplyThroughTheRunningDaemon(t *testing.T) {
+	t.Parallel()
 	d := startDaemonWithRepo(t)
+	// The daemon never polls, so only the nudge carries out the requests.
+	requireControlSocket(t, d.root)
 	ctx := context.Background()
 	ctl, err := NewController(ctx, d.root, discardLogger())
 	if err != nil {
@@ -124,17 +160,9 @@ func TestUnmountAndRemountApplyThroughTheRunningDaemon(t *testing.T) {
 
 // A daemon that never polls carries out an unmount only through the nudge.
 func TestUnmountNudge(t *testing.T) {
-	// The socket path must fit sun_path, which a test's TempDir can exceed.
-	tmp, err := os.MkdirTemp("/tmp", "afs")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(tmp) })
-	svc, ctl := newSyncedDaemonIn(t, tmp)
-	if !controlSocketFits(controlSocketPath(svc.root)) {
-		t.Fatalf("control socket path %s does not fit sun_path", controlSocketPath(svc.root))
-	}
-	svc.syncInterval = time.Hour
+	t.Parallel()
+	svc, ctl := newSyncedDaemon(t)
+	requireControlSocket(t, svc.root)
 	done := startService(t, svc)
 	ctx := context.Background()
 	waitFor(t, done, func() bool {
@@ -148,6 +176,7 @@ func TestUnmountNudge(t *testing.T) {
 
 // Remounting a repo the daemon serves replaces its mount.
 func TestRemountReplacesAServedMount(t *testing.T) {
+	t.Parallel()
 	d := startDaemonWithRepo(t)
 	ctx := context.Background()
 	ctl, err := NewController(ctx, d.root, discardLogger())
@@ -212,6 +241,7 @@ func newRegisteredController(t *testing.T) *Controller {
 // A request the daemon has not carried out when the wait ends stays in the
 // registry, and the error says so.
 func TestUnmountReportsATimeoutThatLeavesTheRequestPending(t *testing.T) {
+	t.Parallel()
 	ctl := newRegisteredController(t)
 	heldDaemonLock(t, ctl)
 	// The wait starts after the intent is written, so expiring it at once
@@ -231,6 +261,7 @@ func TestUnmountReportsATimeoutThatLeavesTheRequestPending(t *testing.T) {
 }
 
 func TestUnmountReportsASupersedingRequest(t *testing.T) {
+	t.Parallel()
 	ctl := newRegisteredController(t)
 	heldDaemonLock(t, ctl)
 	ctx := context.Background()
@@ -251,14 +282,10 @@ func TestUnmountReportsASupersedingRequest(t *testing.T) {
 // The control socket only wakes the daemon early, so a socket path the daemon
 // cannot take over leaves it on the registry poll.
 func TestStartRunsWithoutTheControlSocket(t *testing.T) {
-	// The socket path must fit sun_path, or the daemon skips it before the
-	// step under test.
-	tmp, err := os.MkdirTemp("/tmp", "afs")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(tmp) })
-	svc, ctl := newSyncedDaemonIn(t, tmp)
+	t.Parallel()
+	svc, ctl := newSyncedDaemon(t)
+	// Otherwise the daemon skips the socket before the step under test.
+	requireControlSocket(t, svc.root)
 	// A directory that is not empty cannot be removed to make room for the socket.
 	if err := os.MkdirAll(filepath.Join(controlSocketPath(svc.root), "keep"), 0o700); err != nil {
 		t.Fatal(err)

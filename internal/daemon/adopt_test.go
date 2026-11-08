@@ -16,6 +16,7 @@ import (
 )
 
 func TestAdoptGitDirPreservesGitStateAndScopesConfig(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -116,6 +117,7 @@ func TestAdoptGitDirPreservesGitStateAndScopesConfig(t *testing.T) {
 }
 
 func TestRemoveRepoStopsAdoptedFSMonitor(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -191,6 +193,7 @@ func TestRemoveRepoStopsAdoptedFSMonitor(t *testing.T) {
 }
 
 func TestAdoptGitDirRejectsAcquisitionOptions(t *testing.T) {
+	t.Parallel()
 	ctl, err := NewController(t.Context(), t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -216,6 +219,7 @@ func TestAdoptGitDirRejectsAcquisitionOptions(t *testing.T) {
 }
 
 func TestAdoptGitDirWarnsAboutCredentialedOriginOncePerPrepare(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -290,6 +294,7 @@ func TestAdoptGitDirWarnsAboutCredentialedOriginOncePerPrepare(t *testing.T) {
 // Missing blobs and trees come from the promisor remote, so adoption warns
 // when that remote embeds credentials, also when origin does not.
 func TestAdoptGitDirWarnsAboutCredentialedPromisorRemote(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -331,6 +336,7 @@ func TestAdoptGitDirWarnsAboutCredentialedPromisorRemote(t *testing.T) {
 // remove-repo hands the worktree back to native Git, so the filesystem
 // settings adoption pinned for the mount go too.
 func TestRemoveRepoRestoresAdoptedWorktreeFilesystemConfig(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -386,6 +392,7 @@ func TestRemoveRepoRestoresAdoptedWorktreeFilesystemConfig(t *testing.T) {
 // remove-repo unsets only the values adoption pins, so an adoption that
 // failed before it wrote any leaves the worktree's own config.worktree alone.
 func TestRemoveRepoAfterFailedAdoptionKeepsWorktreeConfig(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {

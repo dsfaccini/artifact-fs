@@ -217,6 +217,7 @@ func (f *headReconcileFixture) waitForHead(oid, ref string, generation int64) {
 }
 
 func TestHeadReconcileRetriesTransientResolveFailureWithoutAnotherSignal(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	f.updateMain(f.nextOID)
 	unavailable := f.rt.cfg.GitDir + ".unavailable"
@@ -238,6 +239,7 @@ func TestHeadReconcileRetriesTransientResolveFailureWithoutAnotherSignal(t *test
 }
 
 func TestHeadReconcileRetriesTransientSnapshotPublishFailureWithoutAnotherSignal(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	f.updateMain(f.nextOID)
 	snapshotPath := filepath.Join(filepath.Dir(f.rt.cfg.OverlayDir), "snapshot.sqlite")
@@ -259,6 +261,7 @@ func TestHeadReconcileRetriesTransientSnapshotPublishFailureWithoutAnotherSignal
 }
 
 func TestHeadReconcileRetriesTransientTreeBuildFailureWithoutAnotherSignal(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	f.updateMain(f.nextOID)
 	objectPath := filepath.Join(f.rt.cfg.GitDir, "objects", f.nextOID[:2], f.nextOID[2:])
@@ -281,6 +284,7 @@ func TestHeadReconcileRetriesTransientTreeBuildFailureWithoutAnotherSignal(t *te
 }
 
 func TestHeadReconcileRetriesTransientOverlayFailureWithoutRepublishing(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	f.updateMain(f.nextOID)
 	if err := f.rt.overlay.Close(); err != nil {
@@ -311,6 +315,7 @@ func TestHeadReconcileRetriesTransientOverlayFailureWithoutRepublishing(t *testi
 // After a failed overlay transition the snapshot store holds the new
 // generation while the mount still serves the old one.
 func TestStatusReportsPublishedAndServedGenerationsAfterOverlayFailure(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	if err := f.svc.registry.AddRepo(f.ctx, f.rt.cfg); err != nil {
 		t.Fatal(err)
@@ -340,6 +345,7 @@ func TestStatusReportsPublishedAndServedGenerationsAfterOverlayFailure(t *testin
 }
 
 func TestHeadReconcileRestoresPersistedStateWhenHEADReturnsAfterOverlayFailure(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	f.updateMain(f.nextOID)
 	if err := f.rt.overlay.Close(); err != nil {
@@ -377,6 +383,7 @@ func TestHeadReconcileRestoresPersistedStateWhenHEADReturnsAfterOverlayFailure(t
 }
 
 func TestHeadReconcilePersistsSameOIDRefBeforeUpdatingRuntime(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	runCmd(t, "git", "-C", f.workDir, "branch", "alias", f.oldOID)
 	runCmd(t, "git", "-C", f.workDir, "symbolic-ref", "HEAD", "refs/heads/alias")
@@ -413,6 +420,7 @@ func TestHeadReconcilePersistsSameOIDRefBeforeUpdatingRuntime(t *testing.T) {
 }
 
 func TestHeadReconcileCoalescesSignalsAndPublishesLatestHEAD(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	unavailable := f.rt.cfg.GitDir + ".unavailable"
 	if err := os.Rename(f.rt.cfg.GitDir, unavailable); err != nil {
@@ -445,6 +453,7 @@ func TestHeadReconcileCoalescesSignalsAndPublishesLatestHEAD(t *testing.T) {
 }
 
 func TestHeadReconcileBackoffStopsOnCancellation(t *testing.T) {
+	t.Parallel()
 	// Only cancellation can end an hour-long backoff before go test -timeout.
 	f := newHeadReconcileFixtureWithBackoff(t, time.Hour)
 	unavailable := f.rt.cfg.GitDir + ".unavailable"
@@ -464,6 +473,7 @@ func TestHeadReconcileBackoffStopsOnCancellation(t *testing.T) {
 }
 
 func TestHeadReconcileResumesAfterUnmountFailure(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	mfs := &delayedUnmountFailure{
 		started: make(chan struct{}),
@@ -493,6 +503,7 @@ func TestHeadReconcileResumesAfterUnmountFailure(t *testing.T) {
 }
 
 func TestHeadReconcileServesReadsMatchingReportedSize(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	repo := f.rt.cfg
 	repo.BlobCacheDir = t.TempDir()
@@ -565,6 +576,7 @@ func (m *invalidatingMount) InvalidateChanged() error {
 }
 
 func TestHeadReconcileInvalidatesKernelCacheAfterSwitch(t *testing.T) {
+	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	mount := &invalidatingMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, resolver: f.rt.resolver, gens: make(chan int64, 1)}
 	f.svc.mu.Lock()
@@ -582,6 +594,7 @@ func TestHeadReconcileInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 // switches inside the retention window. Once the window lapses, the next
 // switch prunes it.
 func TestHeadReconcileKeepsRetiredGenerationReadable(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		name      string
 		retention time.Duration
@@ -591,6 +604,7 @@ func TestHeadReconcileKeepsRetiredGenerationReadable(t *testing.T) {
 		{name: "after retention", retention: time.Nanosecond, want: "last\n"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			f := newHeadReconcileFixture(t)
 			f.svc.generationRetention = tt.retention
 			repo := f.rt.cfg
