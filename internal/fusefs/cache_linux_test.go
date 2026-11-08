@@ -1,6 +1,7 @@
 package fusefs
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/dsfaccini/fuse/fuseops"
@@ -77,16 +78,26 @@ func TestOpenKeepsPageCacheOnlyForTheBlobItLastServed(t *testing.T) {
 // A write through a handle fills the kernel's pages with the written bytes.
 // After a commit of them and a switch back to the blob the handle's open
 // served, at the same size and with no reply in between, the next open must
-// not keep those pages.
+// not keep those pages. A write to another path that overlaps that open's
+// first attempt makes it open again, and must not let the second attempt
+// keep them.
 func TestOpenAfterAWriteDropsThePageCache(t *testing.T) {
-	f := newCacheFixture(t, baseFile("file.txt", "blob-a", 0o100644))
-	inode := f.lookup(fuseops.RootInodeID, "file.txt")
-	if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: inode, Handle: f.open(inode).Handle, Data: []byte("xxxxxx")}); err != nil {
-		t.Fatal(err)
-	}
-	f.switchTo(baseFile("file.txt", blobOID("xxxxxx"), 0o100644))
-	f.switchTo(baseFile("file.txt", "blob-a", 0o100644))
-	if f.open(inode).KeepPageCache {
-		t.Fatal("open after the write kept pages that hold the written bytes, not blob-a")
+	for _, overlapped := range []bool{false, true} {
+		t.Run(fmt.Sprint("overlapped=", overlapped), func(t *testing.T) {
+			other := baseFile("other.txt", "blob-other", 0o100644)
+			f := newCacheFixture(t, baseFile("file.txt", "blob-a", 0o100644), other)
+			inode := f.lookup(fuseops.RootInodeID, "file.txt")
+			if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: inode, Handle: f.open(inode).Handle, Data: []byte("xxxxxx")}); err != nil {
+				t.Fatal(err)
+			}
+			f.switchTo(baseFile("file.txt", blobOID("xxxxxx"), 0o100644), other)
+			f.switchTo(baseFile("file.txt", "blob-a", 0o100644), other)
+			if overlapped {
+				writeOtherDuringOpens(t, f, f.lookup(fuseops.RootInodeID, "other.txt"), 1)
+			}
+			if f.open(inode).KeepPageCache {
+				t.Fatal("open after the write kept pages that hold the written bytes, not blob-a")
+			}
+		})
 	}
 }

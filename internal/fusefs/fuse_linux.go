@@ -15,7 +15,7 @@ const setXattrErrno = syscall.ENOSYS
 const negativeLookupEntries = true
 
 // keepBasePageCache lets the kernel keep a base file's cached pages across
-// opens. See ArtifactFuse.openedBlob for when it does.
+// opens. See ArtifactFuse.openedBlobLocked for when it does.
 const keepBasePageCache = true
 
 func platformMountConfig(cfg *fuse.MountConfig) {

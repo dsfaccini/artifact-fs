@@ -385,6 +385,21 @@ func (e *Engine) OpenFile(ctx context.Context, b *Blobs, path string, gen int64,
 	return f, gen, n.ObjectOID, nil
 }
 
+// IsOverlayFile reports whether held is path's overlay file. A file that a
+// reconcile removed no longer is. It returns the error of a backing file it
+// cannot stat: held may then be the only copy of path's content.
+func (e *Engine) IsOverlayFile(ctx context.Context, path string, held os.FileInfo) (bool, error) {
+	ov, ok, err := e.Overlay.Lookup(ctx, model.CleanPath(path))
+	if err != nil || !ok || ov.IsDeleted() || ov.BackingPath == "" {
+		return false, err
+	}
+	backing, err := os.Stat(ov.BackingPath)
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(held, backing), nil
+}
+
 // Read fills dst from path at off and returns the filled prefix of dst.
 func (e *Engine) Read(ctx context.Context, b *Blobs, path string, off int64, dst []byte) ([]byte, error) {
 	e.Resolver.transition.RLock()
@@ -483,9 +498,15 @@ func (e *Engine) Flush(ctx context.Context, path string) error {
 	return e.Overlay.FlushFile(ctx, path)
 }
 
+// Sync makes path's overlay file and its recorded size and times durable. A
+// path the overlay does not hold serves base content, which never changes, so
+// it has nothing to sync.
 func (e *Engine) Sync(ctx context.Context, path string) error {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
+	if _, ok, err := e.Overlay.Lookup(ctx, path); err != nil || !ok {
+		return err
+	}
 	return e.Overlay.SyncFile(ctx, path)
 }
 
