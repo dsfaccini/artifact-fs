@@ -418,14 +418,10 @@ func TestStatusKeepsAConnectionFailureAtStart(t *testing.T) {
 	}
 	// The runtime finishes starting only after the join recorded the
 	// failed connection.
-	svc.runtimeStarted = func() {
-		waitFor(t, nil, func() bool {
-			svc.mu.Lock()
-			defer svc.mu.Unlock()
-			rec := svc.records["repo"]
-			return rec != nil && rec.State == repoStateDegraded
-		})
-	}
+	joined := make(chan struct{})
+	var joinOnce sync.Once
+	svc.joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
+	svc.runtimeStarted = func() { <-joined }
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -517,13 +513,16 @@ func TestRetryClearsAConnectionFailure(t *testing.T) {
 	svc.mu.Lock()
 	rt := svc.running["repo"]
 	svc.mu.Unlock()
+	joined := make(chan struct{})
+	var joinOnce sync.Once
+	svc.joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
 	close(first.exit)
-	// The failed mount is unmounted and its failure recorded.
+	// The failure is recorded and the failed mount unmounted.
+	<-joined
 	waitFor(t, nil, func() bool {
 		svc.mu.Lock()
 		defer svc.mu.Unlock()
-		rec := svc.records["repo"]
-		return rt.mount == mountNone && rec != nil && rec.State == repoStateDegraded
+		return rt.mount == mountNone
 	})
 	requireFailure(t, ctl, phaseServe, "connection lost")
 	if err := svc.syncRepos(ctx); err != nil {
@@ -547,16 +546,14 @@ func TestStatusReportsACleanFUSEExit(t *testing.T) {
 	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
+	joined := make(chan struct{})
+	var joinOnce sync.Once
+	svc.joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
 	if err := svc.syncRepos(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	close(mfs.exit)
-	waitFor(t, nil, func() bool {
-		svc.mu.Lock()
-		defer svc.mu.Unlock()
-		rec := svc.records["repo"]
-		return rec != nil && rec.State == repoStateDegraded
-	})
+	<-joined
 	if st := requireFailure(t, ctl, phaseServe, errFUSEServerExited.Error()); st.MountError != errFUSEServerExited.Error() {
 		t.Fatalf("mount_error = %q, want %q", st.MountError, errFUSEServerExited)
 	}
