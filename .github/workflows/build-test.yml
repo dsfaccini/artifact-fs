@@ -150,12 +150,15 @@ jobs:
           if [ "${{ matrix.user }}" = root ]; then
             as_user=(sudo --preserve-env=AFS_RUN_E2E_TESTS)
           fi
-          "${as_user[@]}" "$RUNNER_TEMP/artifact-fs-e2e.test" \
+          # A hang can stop the binary's -test.timeout panic from printing, so a
+          # watchdog dumps every goroutine a minute after that timeout. The job
+          # timeout must leave room for both.
+          "${as_user[@]}" .github/scripts/run-with-hang-dump.sh 180 "$RUNNER_TEMP/artifact-fs-e2e.test" \
             -test.count=1 \
             -test.run '^TestFUSEMountSmoke$' \
             -test.timeout=2m \
             -test.v
-          "${as_user[@]}" "$RUNNER_TEMP/artifact-fs-e2e.test" \
+          "${as_user[@]}" .github/scripts/run-with-hang-dump.sh 1260 "$RUNNER_TEMP/artifact-fs-e2e.test" \
             -test.count=1 \
             -test.run '^TestE2E' \
             -test.timeout=20m \
