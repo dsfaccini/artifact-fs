@@ -301,19 +301,18 @@ type Registry interface {
 // and reads blobs for the hydrator.
 type GitStore interface {
 	CloneBlobless(ctx context.Context, cfg RepoConfig) error
-	CloneBloblessNonInteractive(ctx context.Context, cfg RepoConfig) error
 	PrepareSource(ctx context.Context, cfg RepoConfig, requirement SourceRequirement) (PreparedSource, error)
 	ValidateAmbientRemote(repo RepoConfig) error
-	ConfigureRemoteNonInteractive(ctx context.Context, repo RepoConfig) error
+	ConfigureRemoteAmbient(ctx context.Context, repo RepoConfig) error
 	ConfigureRemoteWithCredentials(ctx context.Context, repo RepoConfig) error
-	Fetch(ctx context.Context, repo RepoConfig) error
-	FetchRefNonInteractive(ctx context.Context, repo RepoConfig, ref string) error
+	FetchNonInteractive(ctx context.Context, repo RepoConfig) error
+	FetchRefAmbient(ctx context.Context, repo RepoConfig, ref string) error
 	FetchRefWithCredentials(ctx context.Context, repo RepoConfig, ref string) error
 	PrepareFetchedBranch(ctx context.Context, repo RepoConfig, ref string) error
 	ValidatePreparedGitDir(ctx context.Context, repo RepoConfig) error
 	ConfigureAdoptedWorktree(ctx context.Context, repo RepoConfig) error
-	WarnAdoptedOriginCredentials(ctx context.Context, repo RepoConfig)
-	RemoveAdoptedFSMonitorHook(ctx context.Context, repo RepoConfig) error
+	WarnAdoptedRemoteCredentials(ctx context.Context, repo RepoConfig)
+	ReleaseAdoptedWorktree(ctx context.Context, repo RepoConfig) error
 	EnsureIndexInitialized(ctx context.Context, repo RepoConfig) error
 	ConfigureStatusOptimization(ctx context.Context, repo RepoConfig, stateRoot string) error
 	ConfigureFSMonitorHook(ctx context.Context, repo RepoConfig, stateRoot string) error

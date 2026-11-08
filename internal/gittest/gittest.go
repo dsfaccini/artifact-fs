@@ -5,6 +5,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -200,4 +203,44 @@ func (c *expiringContext) Err() error {
 		return context.DeadlineExceeded
 	}
 	return c.Context.Err()
+}
+
+// IsolatePrompts keeps the machine's prompt programs and SSH settings out of
+// a test's Git commands; IsolateConfig already isolates Git config. It sets
+// SSH_ASKPASS, which Git falls back to for its own prompts, to a program that
+// records each run in the returned file. The program answers no, which also
+// refuses an SSH host key, so a prompt that runs ends instead of repeating.
+func IsolatePrompts(t *testing.T) string {
+	t.Helper()
+	for _, key := range []string{"GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "SSH_ASKPASS_REQUIRE"} {
+		t.Setenv(key, "")
+		os.Unsetenv(key)
+	}
+	dir := t.TempDir()
+	runs := filepath.Join(dir, "askpass-runs")
+	askpass := filepath.Join(dir, "askpass")
+	if err := os.WriteFile(askpass, []byte("#!/bin/sh\necho \"$*\" >> '"+runs+"'\necho no\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SSH_ASKPASS", askpass)
+	return runs
+}
+
+// RequireNoPrompt fails t if the program IsolatePrompts set ran.
+func RequireNoPrompt(t testing.TB, runs string) {
+	t.Helper()
+	if data, err := os.ReadFile(runs); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Git ran SSH_ASKPASS: %q, %v", data, err)
+	}
+}
+
+// UnauthorizedRemote returns an HTTP remote that answers every request with 401.
+func UnauthorizedRemote(t testing.TB) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="test"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL + "/repo.git"
 }

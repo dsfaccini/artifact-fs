@@ -368,7 +368,7 @@ func TestRetryGitOperationPermanentFailures(t *testing.T) {
 	}
 }
 
-func TestFetchRefNonInteractiveRetriesTransientFailures(t *testing.T) {
+func TestFetchRefAmbientRetriesTransientFailures(t *testing.T) {
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "bin")
 	if err := os.Mkdir(bin, 0o755); err != nil {
@@ -390,8 +390,8 @@ func TestFetchRefNonInteractiveRetriesTransientFailures(t *testing.T) {
 	store := New(nil)
 	store.gitRetryDelays = []time.Duration{0, 0}
 	repo := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "prepared", GitDir: filepath.Join(tmp, "prepared.git")}, RepoSpec: model.RepoSpec{Branch: "main"}}
-	if err := store.FetchRefNonInteractive(context.Background(), repo, "main"); err != nil {
-		t.Fatalf("FetchRefNonInteractive: %v", err)
+	if err := store.FetchRefAmbient(context.Background(), repo, "main"); err != nil {
+		t.Fatalf("FetchRefAmbient: %v", err)
 	}
 	count, err := os.ReadFile(countPath)
 	if err != nil {

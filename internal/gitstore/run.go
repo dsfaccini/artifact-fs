@@ -33,11 +33,15 @@ func runGitInput(ctx context.Context, gitDir string, extraEnv []string, input []
 
 // runLazyFetchGitInput runs a Git command that fetches objects as a lazy fetch
 // does: with lazyFetchEnv, in its own session, so it cannot prompt.
-func runLazyFetchGitInput(ctx context.Context, gitDir string, input []byte, args ...string) (string, error) {
+func (s *Store) runLazyFetchGitInput(ctx context.Context, gitDir string, input []byte, args ...string) (string, error) {
+	env, err := s.lazyFetchEnv()
+	if err != nil {
+		return "", err
+	}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	configureCancelableCommand(cmd)
 	configureCommandSession(cmd)
-	return runInputCommand(ctx, cmd, gitDir, lazyFetchEnv(), input)
+	return runInputCommand(ctx, cmd, gitDir, env, input)
 }
 
 func runInputCommand(ctx context.Context, cmd *exec.Cmd, gitDir string, extraEnv []string, input []byte) (string, error) {
@@ -68,9 +72,30 @@ func setGitWorktreeDirectory(cmd *exec.Cmd, extraEnv []string) {
 	}
 }
 
+// runNetworkGit runs a Git command that can contact a remote, such as a fetch
+// or a read-tree that lazily fetches missing trees, as a lazy fetch does:
+// with lazyFetchEnv, then extraEnv, in its own session, so neither Git nor
+// SSH can prompt. Without it, git runs in a background process group, and
+// the terminal stops it at a prompt. Credential helpers and the askpass
+// programs the user set still run.
+func (s *Store) runNetworkGit(ctx context.Context, gitDir string, extraEnv []string, args ...string) (string, error) {
+	env, err := s.lazyFetchEnv()
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, "git", args...)
+	configureCancelableCommand(cmd)
+	configureCommandSession(cmd)
+	return runGitCommand(ctx, cmd, gitDir, append(env, extraEnv...), true)
+}
+
 func runGitWithEnvCapture(ctx context.Context, gitDir string, extraEnv []string, captureOutput bool, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	configureCancelableCommand(cmd)
+	return runGitCommand(ctx, cmd, gitDir, extraEnv, captureOutput)
+}
+
+func runGitCommand(ctx context.Context, cmd *exec.Cmd, gitDir string, extraEnv []string, captureOutput bool) (string, error) {
 	setGitWorktreeDirectory(cmd, extraEnv)
 	env := os.Environ()
 	if gitDir != "" {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -15,7 +16,7 @@ import (
 // ReadTreeHEAD initializes the index during controlled clone or preparation.
 // Do not call it from delayed HEAD watchers: it can discard newer staged work.
 func (s *Store) ReadTreeHEAD(ctx context.Context, repo model.RepoConfig) error {
-	_, err := runGit(ctx, repo.GitDir, "read-tree", "HEAD")
+	_, err := s.runNetworkGit(ctx, repo.GitDir, nil, "read-tree", "HEAD")
 	return err
 }
 
@@ -59,20 +60,29 @@ func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfi
 	return s.ReadTreeHEAD(ctx, repo)
 }
 
-// WarnAdoptedOriginCredentials logs a warning when an adopted worktree's origin
-// embeds credentials. The warning leaves the origin out: redaction is
-// heuristic, and this origin is known to hold credentials.
+// WarnAdoptedRemoteCredentials logs one warning when an adopted worktree's
+// origin or one of its promisor remotes embeds credentials. The warning leaves
+// the remote out: redaction is heuristic, and this remote is known to hold
+// credentials.
 //
 // add-repo never persists inline credentials: a sync clone uses them once
 // and stores the URL without them, and async and prepared repos reject them,
 // because the daemon would store the URL and fetch with it on its own
 // schedule. Adoption only warns. It stores no URL and never clones, fetches or
-// refreshes. Origin stays the user's existing Git config, which only Git's
-// lazy fetches of missing blobs and trees use, as any Git command in the
-// worktree would. ArtifactFS redacts all Git output it logs.
-func (s *Store) WarnAdoptedOriginCredentials(ctx context.Context, repo model.RepoConfig) {
-	if remote, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin"); err == nil && remoteHasInlineCredentials(remote) {
-		s.logger.WarnContext(ctx, "adopted worktree origin embeds credentials; Git's lazy fetches use them", "repo", repo.Name)
+// refreshes. The remotes stay the user's existing Git config. Git's lazy
+// fetches and the hydrator's batch fetches of missing blobs and trees use the
+// promisor remotes, as any Git command in the worktree would. ArtifactFS
+// redacts all Git output it logs.
+func (s *Store) WarnAdoptedRemoteCredentials(ctx context.Context, repo model.RepoConfig) {
+	names := []string{"origin"}
+	if promisors, err := promisorRemotes(ctx, repo.GitDir); err == nil {
+		names = append(names, promisors...)
+	}
+	for _, name := range names {
+		if remote, err := runGit(ctx, repo.GitDir, "remote", "get-url", "--", name); err == nil && remoteHasInlineCredentials(remote) {
+			s.logger.WarnContext(ctx, "adopted worktree remote embeds credentials; fetches of missing objects use them", "repo", repo.Name)
+			return
+		}
 	}
 }
 
@@ -250,11 +260,10 @@ func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfi
 	if err != nil {
 		return err
 	}
-	hookDir := filepath.Join(repo.GitDir, "hooks")
-	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+	hookPath := fsmonitorHookPath(repo.GitDir)
+	if err := os.MkdirAll(filepath.Dir(hookPath), 0o755); err != nil {
 		return err
 	}
-	hookPath := filepath.Join(hookDir, "artifact-fs-fsmonitor")
 	script := fsmonitorHookScript(stateRoot, exe, repo.Name)
 	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
 		return err
@@ -270,19 +279,38 @@ func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfi
 	return nil
 }
 
-// RemoveAdoptedFSMonitorHook stops native Git from consulting ArtifactFS once
-// a worktree is released. extensions.worktreeConfig stays on because sibling
-// worktrees may now keep their own settings in config.worktree.
-func (s *Store) RemoveAdoptedFSMonitorHook(ctx context.Context, repo model.RepoConfig) error {
+func fsmonitorHookPath(gitDir string) string {
+	return filepath.Join(gitDir, "hooks", "artifact-fs-fsmonitor")
+}
+
+// ReleaseAdoptedWorktree hands a worktree back to native Git once remove-repo
+// releases it. It unsets the FSMonitor hook and the filesystem settings that
+// ConfigureAdoptedWorktree pinned for the mount, so the worktree inherits its
+// repository's settings again. It unsets a key only while it holds the value
+// adoption writes, so an adoption that failed before writing it leaves the
+// worktree's own value. A value the worktree's own config held before a
+// successful adoption does not come back, because adoption overwrote it. The
+// core.worktree and core.bare pins stay, because they match the registered
+// worktree. extensions.worktreeConfig stays on because sibling worktrees may
+// now keep their own settings in config.worktree.
+func (s *Store) ReleaseAdoptedWorktree(ctx context.Context, repo model.RepoConfig) error {
 	// --worktree resolves to this file, but fails once the extension is off.
 	worktreeConfig := filepath.Join(repo.GitDir, "config.worktree")
 	if _, err := os.Stat(worktreeConfig); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	if _, err := runGit(ctx, repo.GitDir, "config", "--file", worktreeConfig, "--unset-all", "core.fsmonitor"); err != nil {
-		var exitErr *gitCommandError
-		if !errors.As(err, &exitErr) || exitErr.exitCode != 5 {
-			return err
+	for _, pin := range [][2]string{
+		{"core.fsmonitor", "^" + regexp.QuoteMeta(fsmonitorHookPath(repo.GitDir)) + "$"},
+		{"fsmonitor.allowRemote", "^true$"},
+		{"core.filemode", "^true$"},
+		{"core.ignorecase", "^false$"},
+		{"core.symlinks", "^true$"},
+	} {
+		if _, err := runGit(ctx, repo.GitDir, "config", "--file", worktreeConfig, "--unset-all", pin[0], pin[1]); err != nil {
+			var exitErr *gitCommandError
+			if !errors.As(err, &exitErr) || exitErr.exitCode != 5 {
+				return err
+			}
 		}
 	}
 	return nil

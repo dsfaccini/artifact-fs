@@ -14,6 +14,7 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 )
@@ -365,6 +366,160 @@ func TestAddRepoSyncFreshCloneServesFetchRef(t *testing.T) {
 	}
 	if oid, ref := publishedHead(t, got); oid != feature || ref != "feature" {
 		t.Fatalf("published %s at %q, want feature %s", oid, ref, feature)
+	}
+}
+
+// --depth bounds the history every preparation transfers, also when it
+// fetches a fetch ref other than the source ref.
+func TestSyncPreparationFetchRefKeepsHistoryDepth(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	newBranchedRemote(t, remote)
+	runCmd(t, "git", "-C", remote, "checkout", "feature")
+	commitFile(t, remote, "MORE.md", "more\n")
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	// Git ignores --depth for a clone from a local path.
+	if err := svc.ctl().AddRepo(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + remote, Branch: "main", FetchRef: "feature", HistoryDepth: 1}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commits := func() string {
+		return strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", cfg.GitDir, "rev-list", "--count", "HEAD"))
+	}
+	if got := commits(); got != "1" {
+		t.Fatalf("add-repo --depth 1 transferred %s commits of the fetch ref, want 1", got)
+	}
+	// A later fetch adds only the new commits to the history it has.
+	commitFile(t, remote, "AGAIN.md", "again\n")
+	commitFile(t, remote, "LAST.md", "last\n")
+	if _, err := svc.ctl().Prepare(ctx, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	if got := commits(); got != "3" {
+		t.Fatalf("prepare with --depth 1 left %s commits of the fetch ref, want the 2 new ones on the 1 it had", got)
+	}
+}
+
+// newPreparedGitDir returns a work repository pushing to a bare remote, and a
+// git dir that already holds the remote's master branch, as a baked image
+// would.
+func newPreparedGitDir(t *testing.T, tmp string) (work, gitDir string) {
+	t.Helper()
+	bare := filepath.Join(tmp, "origin.git")
+	work = filepath.Join(tmp, "work")
+	gitDir = filepath.Join(tmp, "prepared.git")
+	runCmd(t, "git", "init", "--bare", bare)
+	runCmd(t, "git", "clone", bare, work)
+	runCmd(t, "git", "-C", work, "checkout", "-b", "master")
+	commitFile(t, work, "README.md", "hello\n")
+	runCmd(t, "git", "-C", work, "push", "origin", "master")
+	runCmd(t, "git", "init", "--separate-git-dir", gitDir, "--initial-branch", "master", filepath.Join(tmp, "prepared"))
+	runCmd(t, "git", "--git-dir", gitDir, "remote", "add", "origin", "file://"+bare)
+	runCmd(t, "git", "--git-dir", gitDir, "fetch", "--update-head-ok", "origin", "+refs/heads/master:refs/heads/master")
+	return work, gitDir
+}
+
+// preparePreparedGitDir registers gitDir with --prepared-gitdir --depth 1,
+// prepares it as the daemon does, and fails t unless its master matches
+// work's.
+func preparePreparedGitDir(t *testing.T, svc *Service, work, gitDir string) {
+	t.Helper()
+	ctx := context.Background()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: gitDir}, RepoSpec: model.RepoSpec{Branch: "master", PreparedGitDir: true, FetchRef: "master", HistoryDepth: 1}, Enabled: true}
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.prepareAsync(ctx, got, 1); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	want := strings.TrimSpace(runCmdOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
+	if head := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "rev-parse", "refs/heads/master")); head != want {
+		t.Fatalf("master = %s, want %s", head, want)
+	}
+}
+
+// A fetch with --depth marks its tip shallow even when the git dir holds the
+// tip's parent. The check that a prepared git dir's branch only moves forward
+// then cannot see the old tip below the new one.
+func TestPreparedGitDirWithDepthMovesItsExistingBranch(t *testing.T) {
+	tmp := t.TempDir()
+	work, gitDir := newPreparedGitDir(t, tmp)
+	commitFile(t, work, "MORE.md", "more\n")
+	runCmd(t, "git", "-C", work, "push", "origin", "master")
+	svc, err := New(context.Background(), filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	preparePreparedGitDir(t, svc, work, gitDir)
+}
+
+// A fetch command or refresh fetches the remote-tracking branch a later
+// preparation moves the prepared branch to, so it must not mark it shallow
+// either.
+func TestPreparedGitDirWithDepthPreparesAgainAfterAFetch(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	work, gitDir := newPreparedGitDir(t, tmp)
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	preparePreparedGitDir(t, svc, work, gitDir)
+	commitFile(t, work, "MORE.md", "more\n")
+	runCmd(t, "git", "-C", work, "push", "origin", "master")
+	if err := svc.ctl().FetchNow(ctx, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	// Registering the repo again prepares it again.
+	preparePreparedGitDir(t, svc, work, gitDir)
+}
+
+// add-repo without --async clones or fetches in the CLI, where git runs in a
+// background process group. A prompt there stops git until the prepare
+// timeout, so a remote that asks for credentials must fail add-repo instead.
+// Git falls back to SSH_ASKPASS, which IsolatePrompts records, for the prompt
+// it would show on the terminal.
+func TestSyncAddRepoDoesNotPrompt(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		svc  func(t *testing.T) *Service
+	}{
+		{"fresh clone", func(t *testing.T) *Service {
+			svc, err := New(context.Background(), filepath.Join(t.TempDir(), "artifact-fs"), discardLogger())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = svc.Close() })
+			return svc
+		}},
+		{"existing clone", func(t *testing.T) *Service {
+			svc, _ := newSyncedDaemon(t)
+			return svc
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			askpassRuns := gittest.IsolatePrompts(t)
+			svc := tt.svc(t)
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: gittest.UnauthorizedRemote(t), Branch: "main"}, Enabled: true}
+			if err := svc.ctl().AddRepo(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "terminal prompts disabled") {
+				t.Fatalf("add-repo from a remote that refuses every request = %v, want the non-interactive failure", err)
+			}
+			gittest.RequireNoPrompt(t, askpassRuns)
+		})
 	}
 }
 

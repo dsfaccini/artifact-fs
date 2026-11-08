@@ -54,7 +54,7 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 				continue
 			}
 			ctx, cancel := context.WithTimeout(rt.ctx, 30*time.Second)
-			err := s.git.Fetch(ctx, cfg)
+			err := s.git.FetchNonInteractive(ctx, cfg)
 			if err != nil {
 				cancel()
 				s.mu.Lock()
