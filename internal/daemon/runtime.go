@@ -737,11 +737,14 @@ func (s *Service) stopRuntime(ctx context.Context, rt *repoRuntime) error {
 	if rt.gate != nil {
 		rt.gate.MarkFailed(context.Canceled)
 	}
-	timer := time.NewTimer(drainTimeout)
-	defer timer.Stop()
+	drainCtx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	if s.drainContext != nil {
+		drainCtx, cancel = s.drainContext()
+	}
+	defer cancel()
 	select {
 	case <-drained:
-	case <-timer.C:
+	case <-drainCtx.Done():
 		return fmt.Errorf("timed out draining unmounted repo %s", cfg.Name)
 	}
 	if rt.hydrator != nil {
