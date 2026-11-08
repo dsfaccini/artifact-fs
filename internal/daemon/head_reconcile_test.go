@@ -402,6 +402,43 @@ func TestStatusReportsATrackedDeleteDirtyUntilReconcilePrunesIt(t *testing.T) {
 	}
 }
 
+// With a daemon running, status reads a delete against the generation the
+// mount serves. After a failed overlay transition, the published generation
+// lacks the deleted path while the served one still has it.
+func TestStatusReadsDeletesAgainstTheServedGeneration(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	if err := f.svc.registry.AddRepo(f.ctx, f.rt.cfg); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := acquireDaemonLock(f.svc.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	f.svc.recordRuntimeState(f.rt, "")
+	f.unlink(f.engine(), "README.md")
+	runCmd(t, "git", "-C", f.workDir, "rm", "-q", "-f", "README.md")
+	if err := os.WriteFile(filepath.Join(f.workDir, "other.txt"), []byte("other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.commitToMain("drop README")
+	if err := f.rt.overlay.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.signal()
+	var st model.RepoRuntimeState
+	waitFor(t, nil, func() bool {
+		st, err = f.svc.ctl().Status(f.ctx, f.rt.cfg.Name)
+		return err == nil && st.LastErrorPhase == phaseHEADReconcile
+	})
+	if st.ServedGeneration != f.oldGen || st.PublishedGeneration != f.oldGen+1 {
+		t.Fatalf("served/published generation = %d/%d, want %d/%d", st.ServedGeneration, st.PublishedGeneration, f.oldGen, f.oldGen+1)
+	}
+	if !st.DirtyOverlay {
+		t.Fatal("status reports the overlay clean while it hides a file the served generation has")
+	}
+}
+
 // A path the base never had, made and removed again, leaves the overlay
 // clean, as an editor's swap file or an rm -rf of build output does.
 func TestStatusReportsCleanAfterAnUntrackedPathComesAndGoes(t *testing.T) {
