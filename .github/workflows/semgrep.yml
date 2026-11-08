@@ -5,7 +5,9 @@ on:
     branches: [main, master]
   workflow_dispatch: {}
   schedule:
-    - cron: '0 0 1-7 * 6' # per-repo, staggered across month
+    # Weekly on Saturday. cron fires when either day field matches, so a
+    # day-of-month range cannot narrow it to one Saturday a month.
+    - cron: '0 0 * * 6'
 concurrency:
   group: semgrep-${{ github.event_name }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
@@ -15,6 +17,7 @@ jobs:
   semgrep:
     name: semgrep-oss
     runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         with:

@@ -2,26 +2,33 @@ name: Examples
 
 on:
   push:
-    branches: ["**"]
-    # The container builds compile the Go sources, so only docs skip this
-    # workflow. A workflow skipped by path filters reports no checks, so none
-    # of its jobs can be a required check.
+    branches-ignore: [main]
+    # build-test compiles every Go package, so a branch runs the examples only
+    # for a change to what only they check. examples-main.yml runs them on every
+    # push to main, which catches a Go change that breaks a container build. A
+    # workflow skipped by path filters reports no checks, so none of its jobs
+    # can be a required check.
     paths:
-      - "**"
-      - "!**.md"
-      - "!**.png"
       - "examples/**"
+      - ".dockerignore"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/examples.yml"
+  workflow_call: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Each main run gets a group of its own, so a later merge cancels neither a
+  # running nor a pending main run.
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 jobs:
   container-examples:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
