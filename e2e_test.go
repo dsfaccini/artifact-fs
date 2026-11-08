@@ -1361,17 +1361,19 @@ func startE2EDaemon(ctx context.Context, svc *daemon.Service) chan error {
 	return errCh
 }
 
-// waitForMount waits for the daemon to mount repoName at path, reading its
-// status through ctl. It returns the daemon's mount error once that error
-// outlasts mountErrorGrace.
+// waitForMount waits for the daemon to mount repoName at path and record the
+// mount, reading its status through ctl. It returns the daemon's mount error
+// once that error outlasts mountErrorGrace.
 func waitForMount(ctl *daemon.Controller, path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var failingSince time.Time
 	for time.Now().Before(deadline) {
-		if isMounted(path) {
+		st, err := ctl.Status(context.Background(), repoName)
+		// The fuse library serves the mount, and the mount table lists it,
+		// before the mount call returns and the daemon records the mount.
+		if isMounted(path) && err == nil && st.Phase != "mount" {
 			return nil
 		}
-		st, err := ctl.Status(context.Background(), repoName)
 		switch {
 		case err != nil || st.MountError == "":
 			failingSince = time.Time{}
@@ -1382,7 +1384,7 @@ func waitForMount(ctl *daemon.Controller, path string, timeout time.Duration) er
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return fmt.Errorf("FUSE mount did not appear within %s", timeout)
+	return fmt.Errorf("FUSE mount did not appear in the mount table and in status within %s", timeout)
 }
 
 func lsDir(t *testing.T, dir string) []string {

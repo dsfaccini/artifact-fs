@@ -144,8 +144,8 @@ func TestStatusReportsAnExitedFUSEServer(t *testing.T) {
 	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
-	// The join records the serve failure, then the runtime's state in a
-	// second write, so the test reads status once the join ended.
+	// The join records the serve failure on its own goroutine, so the test
+	// reads status once the join ended.
 	joined := make(chan struct{})
 	var joinOnce sync.Once
 	svc.joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
@@ -156,6 +156,33 @@ func TestStatusReportsAnExitedFUSEServer(t *testing.T) {
 	<-joined
 	if st := requireFailure(t, ctl, phaseServe, "lost"); st.State != repoStateDegraded {
 		t.Fatalf("state = %q, want degraded", st.State)
+	}
+}
+
+// The join records a lost connection with the state it leaves in one write,
+// so no status shows the failure with the state from before it.
+func TestStatusShowsALostConnectionWithTheStateItLeaves(t *testing.T) {
+	t.Parallel()
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("connection lost")}
+	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
+		return mfs, nil
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	recorded := make(chan model.RepoRuntimeState, 1)
+	svc.joinRecorded = func() {
+		st, err := ctl.Status(ctx, "repo")
+		if err != nil {
+			t.Error(err)
+		}
+		recorded <- st
+	}
+	close(mfs.exit)
+	if st := <-recorded; st.LastErrorPhase != phaseServe || st.State != repoStateDegraded || st.Phase != phaseMount {
+		t.Fatalf("status once the lost connection was recorded = %+v, want degraded in the mount phase with the serve failure", st)
 	}
 }
 
@@ -245,6 +272,9 @@ func TestStatusReportsAFailedRegistrySync(t *testing.T) {
 	requireFailure(t, ctl, phaseRegistrySync, "Scan error")
 }
 
+// A failing retry rewrites FETCH_HEAD after the recorded failure, and status
+// must not read it as a later successful fetch, also before the daemon
+// records the retry.
 func TestStatusReportsAFailedRefresh(t *testing.T) {
 	t.Parallel()
 	svc, ctl := newSyncedDaemon(t)
@@ -267,16 +297,24 @@ func TestStatusReportsAFailedRefresh(t *testing.T) {
 	case err := <-done:
 		t.Fatalf("Start returned before the refresh retried: %v", err)
 	}
-	if st := requireFailure(t, ctl, phaseFetch, "fetch"); st.LastFetchResult != string(fetchFailed) {
+	st := requireFailure(t, ctl, phaseFetch, "fetch")
+	fi, err := os.Stat(filepath.Join(cfg.GitDir, "FETCH_HEAD"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().After(st.LastErrorAt) {
+		t.Fatalf("FETCH_HEAD written at %v, want the retry's write after the recorded failure at %v", fi.ModTime(), st.LastErrorAt)
+	}
+	if st.LastFetchResult != string(fetchFailed) {
 		t.Fatalf("fetch result = %q, want %q", st.LastFetchResult, fetchFailed)
 	}
 }
 
-// pausedRefreshGit runs the first refresh fetch and pauses every later one
-// until its context ends. The refresh loop records a fetch's outcome before
-// it retries, so a paused retry closes retried once the first outcome is
-// recorded. A retry that ran would touch FETCH_HEAD before it failed, which
-// status reads as a later successful fetch.
+// pausedRefreshGit runs every refresh fetch, and pauses each one after the
+// first, once its git has run, until its context ends. The refresh loop
+// records a fetch's outcome before it retries, so retried closes once the
+// first outcome is recorded and the retry's git has written FETCH_HEAD, and
+// before the daemon records the retry.
 type pausedRefreshGit struct {
 	model.GitStore
 	fetches   atomic.Int32
@@ -285,12 +323,58 @@ type pausedRefreshGit struct {
 }
 
 func (g *pausedRefreshGit) FetchNonInteractive(ctx context.Context, repo model.RepoConfig) error {
+	err := g.GitStore.FetchNonInteractive(ctx, repo)
 	if g.fetches.Add(1) == 1 {
-		return g.GitStore.FetchNonInteractive(ctx, repo)
+		return err
 	}
 	g.retryOnce.Do(func() { close(g.retried) })
 	<-ctx.Done()
-	return ctx.Err()
+	return err
+}
+
+// A fetch command records nothing, so status reads its result from
+// FETCH_HEAD: a fetch that succeeded is ok, and the FETCH_HEAD a failed one
+// emptied is no fetch.
+func TestStatusReportsOnlyASuccessfulFetchCommand(t *testing.T) {
+	t.Parallel()
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetchHead := filepath.Join(cfg.GitDir, "FETCH_HEAD")
+	if err := ctl.FetchNow(ctx, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(fetchHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := ctl.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LastFetchResult != string(fetchOK) || !st.LastFetchAt.Equal(fi.ModTime()) {
+		t.Fatalf("last fetch = %q at %v, want %q at %v", st.LastFetchResult, st.LastFetchAt, fetchOK, fi.ModTime())
+	}
+
+	if err := os.RemoveAll(cfg.RemoteURL); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctl.FetchNow(ctx, "repo"); err == nil {
+		t.Fatal("fetch from a removed remote succeeded")
+	}
+	if fi, err := os.Stat(fetchHead); err != nil || !fi.ModTime().After(st.LastFetchAt) {
+		t.Fatalf("FETCH_HEAD after the failed fetch = %v, want it written after %v", err, st.LastFetchAt)
+	}
+	st, err = ctl.Status(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LastFetchResult != string(fetchNever) || !st.LastFetchAt.IsZero() {
+		t.Fatalf("last fetch after a failed fetch = %q at %v, want %q", st.LastFetchResult, st.LastFetchAt, fetchNever)
+	}
 }
 
 // The daemon refreshes in the background, so a remote that asks for
@@ -389,15 +473,12 @@ func TestStatusKeepsAConnectionFailureAtStart(t *testing.T) {
 	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
-	// The daemon records the started runtime only after the connection failed.
-	svc.runtimeStarted = func() {
-		waitFor(t, nil, func() bool {
-			svc.mu.Lock()
-			defer svc.mu.Unlock()
-			rec := svc.records["repo"]
-			return rec != nil && rec.State == repoStateDegraded
-		})
-	}
+	// The runtime finishes starting only after the join recorded the
+	// failed connection.
+	joined := make(chan struct{})
+	var joinOnce sync.Once
+	svc.joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
+	svc.runtimeStarted = func() { <-joined }
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -407,6 +488,43 @@ func TestStatusKeepsAConnectionFailureAtStart(t *testing.T) {
 	}
 	if st.State != repoStateDegraded || st.LastErrorPhase != phaseServe || st.MountError != "connection lost" {
 		t.Fatalf("status after the connection failed at start = %+v, want degraded with the serve failure", st)
+	}
+}
+
+// statusAtConfigureGit reads status each time the daemon configures Git for
+// a mount.
+type statusAtConfigureGit struct {
+	model.GitStore
+	status func()
+}
+
+func (g *statusAtConfigureGit) ConfigureStatusOptimization(ctx context.Context, repo model.RepoConfig, stateRoot string) error {
+	g.status()
+	return g.GitStore.ConfigureStatusOptimization(ctx, repo, stateRoot)
+}
+
+// Status reports a mount once the mount serves. The mount point serves
+// while the daemon configures Git for it.
+func TestStatusReportsAMountWhileTheDaemonConfiguresGit(t *testing.T) {
+	t.Parallel()
+	svc, ctl := newSyncedDaemon(t)
+	ctx := context.Background()
+	var reads []model.RepoRuntimeState
+	svc.git = &statusAtConfigureGit{GitStore: svc.git, status: func() {
+		st, err := ctl.Status(ctx, "repo")
+		if err != nil {
+			t.Error(err)
+		}
+		reads = append(reads, st)
+	}}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(reads) != 1 {
+		t.Fatalf("the daemon configured Git %d times for one mount, want once", len(reads))
+	}
+	if st := reads[0]; st.State != repoStateMounted || st.Phase != phaseServe || st.ServedGeneration == 0 {
+		t.Fatalf("status while the daemon configures Git = %+v, want mounted and serving", st)
 	}
 }
 
@@ -469,13 +587,16 @@ func TestRetryClearsAConnectionFailure(t *testing.T) {
 	svc.mu.Lock()
 	rt := svc.running["repo"]
 	svc.mu.Unlock()
+	joined := make(chan struct{})
+	var joinOnce sync.Once
+	svc.joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
 	close(first.exit)
-	// The failed mount is unmounted and its failure recorded.
+	// The failure is recorded and the failed mount unmounted.
+	<-joined
 	waitFor(t, nil, func() bool {
 		svc.mu.Lock()
 		defer svc.mu.Unlock()
-		rec := svc.records["repo"]
-		return rt.mount == mountNone && rec != nil && rec.State == repoStateDegraded
+		return rt.mount == mountNone
 	})
 	requireFailure(t, ctl, phaseServe, "connection lost")
 	if err := svc.syncRepos(ctx); err != nil {
@@ -499,16 +620,14 @@ func TestStatusReportsACleanFUSEExit(t *testing.T) {
 	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
 		return mfs, nil
 	}
+	joined := make(chan struct{})
+	var joinOnce sync.Once
+	svc.joinFinished = func() { joinOnce.Do(func() { close(joined) }) }
 	if err := svc.syncRepos(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	close(mfs.exit)
-	waitFor(t, nil, func() bool {
-		svc.mu.Lock()
-		defer svc.mu.Unlock()
-		rec := svc.records["repo"]
-		return rec != nil && rec.State == repoStateDegraded
-	})
+	<-joined
 	if st := requireFailure(t, ctl, phaseServe, errFUSEServerExited.Error()); st.MountError != errFUSEServerExited.Error() {
 		t.Fatalf("mount_error = %q, want %q", st.MountError, errFUSEServerExited)
 	}
