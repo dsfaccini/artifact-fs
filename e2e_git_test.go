@@ -962,6 +962,7 @@ func assertGitStatus(t *testing.T, dir string, want map[string]string) {
 		}
 		t.Fatalf("git status got no answer from the fsmonitor hook; its fsm_hook trace2 events: %v", hookEvents)
 	}
+	t.Logf("fsm_hook trivial=%v", bytes.Contains(events, []byte(`"category":"fsm_hook","key":"query/trivial-response"`)))
 }
 
 func waitForOverlayClean(t *testing.T, repo *mountedE2ERepo) {
