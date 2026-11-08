@@ -605,6 +605,59 @@ func testE2EOpenFileChangesAfterUnlink(t *testing.T, repo *mountedE2ERepo) {
 	}
 }
 
+// The mount sets default_permissions, so the kernel denies an op that a mode
+// set through the mount forbids before artifact-fs sees it. macFUSE's FSKit
+// backend ignores default_permissions, and run skips this test on FSKit.
+func testE2EKernelChecksPermissionBits(t *testing.T, repo *mountedE2ERepo) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores permission bits")
+	}
+	chmod := func(path string, mode os.FileMode) {
+		t.Helper()
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := os.Chmod(path, st.Mode().Perm()); err != nil {
+				t.Errorf("restore the mode of %s: %v", path, err)
+			}
+		})
+	}
+
+	path := filepath.Join(repo.mountPath, "README.md")
+	if _, err := os.ReadFile(path); err != nil {
+		t.Fatal(err)
+	}
+	chmod(path, 0o200)
+	f, err := os.Open(path)
+	if err == nil {
+		f.Close()
+	}
+	if !errors.Is(err, unix.EACCES) {
+		t.Errorf("open a file without read permission = %v, want EACCES", err)
+	}
+
+	dir := filepath.Join(repo.mountPath, "read-only-dir")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "allowed.txt"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	chmod(dir, 0o555)
+	denied := filepath.Join(dir, "denied.txt")
+	if err := os.WriteFile(denied, nil, 0o644); !errors.Is(err, unix.EACCES) {
+		t.Errorf("create a file in a directory without write permission = %v, want EACCES", err)
+	}
+	if _, err := os.Lstat(denied); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("lstat the name a denied create named = %v, want it absent", err)
+	}
+}
+
 // openAndReadE2E opens path, reads all of it, and keeps the file open until
 // the test ends.
 func openAndReadE2E(t *testing.T, path string) (*os.File, string) {
