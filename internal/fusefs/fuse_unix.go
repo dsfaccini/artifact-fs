@@ -43,9 +43,11 @@ type MountedFS interface {
 	// that vanished or changed type, and a negative entry whose name now
 	// exists. It also retires the inode number of each path that vanished,
 	// and closes each overlay file that a handle that is not detached holds
-	// and the overlay no longer names for the handle's path. Call it after a
-	// generation switch, holding no lock an op takes. FSKit takes no
-	// invalidations, so it only retires numbers and closes files there.
+	// and the overlay no longer names for the handle's path. It moves the read
+	// generation of each inode whose path kept its identity to the current
+	// one. Call it after a generation switch, holding no lock an op takes.
+	// FSKit takes no invalidations, so it only retires numbers, closes files
+	// and moves read generations there.
 	InvalidateChanged() error
 	// OpenFileGenerations returns the snapshot generations that open files
 	// read. A prune keeps them.
@@ -134,6 +136,9 @@ type ArtifactFuse struct {
 	// again when a close ran since, because the close could not see the
 	// handle. See addFileHandle.
 	cacheCloses atomic.Uint64
+	// openPins counts, by generation, the opens that read it and have not yet
+	// registered their handles or failed. See pinInode.
+	openPins map[int64]int
 
 	// notifier is nil when nothing should reach the kernel. fs.mu guards it:
 	// the mount publishes it after ops may have started.
@@ -150,10 +155,13 @@ type InodeRef struct {
 	Type string // file, dir, symlink
 	Mode uint32
 	// Gen is the snapshot generation of the base attributes last reported for
-	// this inode, or 0 when the kernel's view came from the overlay. Base reads
-	// serve Gen so their length matches the size the kernel holds after a HEAD
-	// change, until a new reply reports the current generation.
+	// this inode, or 0 when the kernel's view came from the overlay.
 	Gen int64
+	// ReadGen is the generation that base reads serve, so their length
+	// matches the size the kernel holds after a HEAD change. The path has the
+	// identity last reported there. It is Gen, or a later generation the
+	// switch pass found that identity in. It is 0 when Gen is.
+	ReadGen int64
 	// Blob is the Attrs.Blob last reported for this inode. Type, Mode and Blob
 	// are the identity the kernel holds.
 	Blob string
@@ -193,6 +201,8 @@ type InodeRef struct {
 
 // report records attrs as what the kernel last received for ref. Reads then
 // serve attrs.Gen, so the kernel's pages may mix two blobs when the blob changes.
+// A reply computed before the switch pass advanced ReadGen still records: the
+// pass sent the kernel nothing that makes it discard the reply.
 //
 // A reply computed before a generation switch can be recorded after a reply
 // computed after it. The switch's InvalidateInode makes the kernel discard
@@ -211,7 +221,7 @@ func (ref *InodeRef) report(attrs Attrs) {
 	if attrs.Blob != ref.Blob {
 		ref.PageBlob = ""
 	}
-	ref.Type, ref.Mode, ref.Gen, ref.Blob = attrs.Type, attrs.Mode, attrs.Gen, attrs.Blob
+	ref.Type, ref.Mode, ref.Gen, ref.ReadGen, ref.Blob = attrs.Type, attrs.Mode, attrs.Gen, attrs.Gen, attrs.Blob
 	ref.Size, ref.Mtime = attrs.Size, attrs.Mtime
 }
 
@@ -283,6 +293,7 @@ func NewArtifactFuse(repo model.RepoPaths, engine *Engine) *ArtifactFuse {
 		fileHandles:    make(map[fuseops.HandleID]*FileHandle),
 		nextHandleID:   1,
 		negatives:      make(map[kernelEntry]time.Time),
+		openPins:       make(map[int64]int),
 	}
 	root := &InodeRef{ID: fuseops.RootInodeID, Path: ".", Type: "dir", Mode: 0o755, Refcnt: 1, IsRoot: true}
 	fs.inodes[fuseops.RootInodeID] = root
@@ -641,6 +652,12 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // which keeps the kernel's view of it current. A dormant mapping gets no
 // invalidation: the kernel holds nothing for it. A failure skips only what it
 // concerns, and the first one is returned.
+//
+// An inode whose base identity the current generation still has reads that
+// generation from then on, so a prune need not keep the one it read. The
+// pass advances InodeRef.ReadGen for each inode it compares and finds
+// unchanged with no Prior. With send false it compares no inode, so it
+// checks the inodes that open file handles are on for that alone.
 func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	type known struct {
 		pathMapping
@@ -648,6 +665,8 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		reported Identity
 		prior    Identity
 		base     bool
+		// gen and readGen are the inode's Gen and ReadGen the pass read.
+		gen, readGen int64
 	}
 	// unmappedInode is an unmapped inode, whose path may have come back.
 	type unmappedInode struct {
@@ -655,6 +674,9 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		ref InodeRef
 	}
 	now := time.Now()
+	// Each identity the pass resolves is at gen while the generation has not
+	// moved since.
+	gen := fs.engine.Generation()
 	fs.mu.RLock()
 	notifier := fs.notifier
 	send = send && notifier != nil
@@ -673,7 +695,21 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			existenceOnly = append(existenceOnly, pathMapping{id, path})
 			continue
 		}
-		inodes = append(inodes, known{pathMapping: pathMapping{id, path}, entry: kernelEntry{parent, filepath.Base(path)}, reported: ref.identity(), prior: ref.Prior, base: ref.Gen != 0})
+		inodes = append(inodes, known{pathMapping: pathMapping{id, path}, entry: kernelEntry{parent, filepath.Base(path)}, reported: ref.identity(), prior: ref.Prior, base: ref.Gen != 0, gen: ref.Gen, readGen: ref.ReadGen})
+	}
+	// opened holds, with send false, each inode an open file handle is on
+	// that may read an older generation than gen.
+	var opened []known
+	if !send {
+		seen := map[fuseops.InodeID]bool{}
+		for _, fh := range fs.fileHandles {
+			ref := fs.inodes[fh.inode.ID]
+			if ref == nil || seen[ref.ID] || ref.Stale || ref.Gen == 0 || ref.ReadGen == gen || ref.Prior.Type != "" || ref.Path == ".git" {
+				continue
+			}
+			seen[ref.ID] = true
+			opened = append(opened, known{pathMapping: pathMapping{ref.ID, ref.Path}, reported: ref.identity(), base: true, gen: ref.Gen, readGen: ref.ReadGen})
+		}
 	}
 	var returning []unmappedInode
 	for path, id := range fs.unmapped {
@@ -705,6 +741,9 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// the path, and settleUnmappedBelow before an unlink or a rename.
 	var changed []fuseops.InodeID
 	var vanished []pathMapping
+	// unchanged holds each inode whose base identity the path still has, to
+	// read gen from then on.
+	var unchanged []known
 	for _, k := range inodes {
 		current, exists, err := fs.engine.Identity(k.path)
 		if err != nil {
@@ -724,6 +763,18 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			}
 		case hidden, k.base && current != k.reported, !k.base && current.Blob != "":
 			changed = append(changed, k.id)
+		case k.base && current == k.reported:
+			unchanged = append(unchanged, k)
+		}
+	}
+	for _, k := range opened {
+		current, exists, err := fs.engine.Identity(k.path)
+		if err != nil {
+			failed(err, "resolve "+k.path)
+			continue
+		}
+		if exists && current == k.reported {
+			unchanged = append(unchanged, k)
 		}
 	}
 	// The name of an unmapped inode already left the kernel, through the op
@@ -776,6 +827,15 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	for _, id := range changed {
 		if ref := fs.inodes[id]; ref != nil {
 			ref.Invalidated, ref.Prior = true, Identity{}
+		}
+	}
+	// A reply or an op since the check can have changed what the kernel holds,
+	// and a switch since the check what the identities were resolved against.
+	if fs.engine.Generation() == gen {
+		for _, k := range unchanged {
+			if ref := fs.inodes[k.id]; ref != nil && !ref.Stale && ref.Prior.Type == "" && ref.identity() == k.reported && ref.Gen == k.gen && ref.ReadGen == k.readGen {
+				ref.ReadGen = gen
+			}
 		}
 	}
 	overlapped := fs.renameSeq != renameSeq || renameSeq%2 != 0
@@ -845,27 +905,59 @@ func (fs *ArtifactFuse) requireInode(id fuseops.InodeID, missing error) (*InodeR
 	return &snapshot, nil
 }
 
-// OpenFileGenerations returns, once each, the generation of each inode that
-// an open file handle is on. A handle reads its inode's generation: it opens
-// the blob there again when it holds no descriptor of it. A retired inode's
-// handles read their own copies, so its generation is left out.
+// OpenFileGenerations returns, once each, the generations that opens pinned
+// and the read generation of each inode that an open file handle is on. A
+// handle reads its inode's read generation: it opens the blob there again
+// when it holds no descriptor of it. A retired inode's handles read their own
+// copies, and the .git file reads no generation, so both are left out.
 func (fs *ArtifactFuse) OpenFileGenerations() []int64 {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
-	var gens []int64
+	gens := slices.Collect(maps.Keys(fs.openPins))
 	for _, fh := range fs.fileHandles {
-		if ref := fs.inodes[fh.inode.ID]; ref != nil && !ref.Stale && ref.Gen != 0 && !slices.Contains(gens, ref.Gen) {
-			gens = append(gens, ref.Gen)
+		if ref := fs.inodes[fh.inode.ID]; ref != nil && !ref.Stale && ref.ReadGen != 0 && ref.Path != ".git" && !slices.Contains(gens, ref.ReadGen) {
+			gens = append(gens, ref.ReadGen)
 		}
 	}
 	return gens
+}
+
+// pinInode returns a copy of id's inode, or ESTALE for a retired or missing
+// one. It pins the read generation, which the open reads in every attempt,
+// in the same fs.mu hold, so a prune keeps it until the open registers its
+// handle or fails. It returns the pinned generation, or 0 for none.
+func (fs *ArtifactFuse) pinInode(id fuseops.InodeID) (*InodeRef, int64, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	ref := fs.inodes[id]
+	if ref == nil || ref.Stale {
+		return nil, 0, syscall.ESTALE
+	}
+	snapshot := *ref
+	if ref.ReadGen == 0 || ref.Path == ".git" {
+		return &snapshot, 0, nil
+	}
+	fs.openPins[ref.ReadGen]++
+	return &snapshot, ref.ReadGen, nil
+}
+
+// unpinLocked releases a pin of gen that pinInode took, if gen is not 0.
+// Caller must hold fs.mu write lock.
+func (fs *ArtifactFuse) unpinLocked(gen int64) {
+	if gen == 0 {
+		return
+	}
+	fs.openPins[gen]--
+	if fs.openPins[gen] == 0 {
+		delete(fs.openPins, gen)
+	}
 }
 
 func (fs *ArtifactFuse) inodeGeneration(id fuseops.InodeID) int64 {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
 	if ref := fs.inodes[id]; ref != nil {
-		return ref.Gen
+		return ref.ReadGen
 	}
 	return 0
 }
@@ -877,7 +969,7 @@ func (fs *ArtifactFuse) inodeGeneration(id fuseops.InodeID) int64 {
 func (fs *ArtifactFuse) markWritten(id fuseops.InodeID, path string) {
 	fs.mu.Lock()
 	if ref := fs.inodes[id]; ref != nil {
-		ref.Gen, ref.PageBlob = 0, ""
+		ref.Gen, ref.ReadGen, ref.PageBlob = 0, 0, ""
 		fs.writeSeq++
 		ref.WrittenAt = fs.writeSeq
 		if _, mapped := fs.pathToInode[path]; !mapped && ref.Path == path && !ref.Stale {
@@ -1017,7 +1109,7 @@ func (fs *ArtifactFuse) moveInodePath(oldPath, newPath string) {
 		fs.pathToInode[move.newPath] = move.id
 		if ref := fs.inodes[move.id]; ref != nil {
 			ref.Path = move.newPath
-			ref.Gen = 0
+			ref.Gen, ref.ReadGen = 0, 0
 		}
 	}
 	for _, dh := range fs.dirHandles {
@@ -1838,10 +1930,17 @@ func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) er
 func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, checkPermissions bool) error {
 	created := fs.takeCreateOpenPending(op.Inode)
 	return fs.shared(ctx, func(ctx context.Context, b *Blobs) error {
-		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
+		ref, pinned, err := fs.pinInode(op.Inode)
 		if err != nil {
 			return err
 		}
+		defer func() {
+			if pinned != 0 {
+				fs.mu.Lock()
+				fs.unpinLocked(pinned)
+				fs.mu.Unlock()
+			}
+		}()
 		fh := &FileHandle{inode: ref, path: ref.Path, writable: !op.OpenFlags.IsReadOnly()}
 		var access uint32
 		if checkPermissions && !created && ref.Path != ".git" {
@@ -1860,7 +1959,7 @@ func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, ch
 			var blob string
 			if ref.Path != ".git" {
 				// An open for writing only reads nothing, so it prefetches nothing.
-				f, gen, opened, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.Gen, !op.OpenFlags.IsWriteOnly(), access)
+				f, gen, opened, err := fs.engine.OpenFile(ctx, b, ref.Path, ref.ReadGen, !op.OpenFlags.IsWriteOnly(), access)
 				if err != nil {
 					return err
 				}
@@ -1871,13 +1970,14 @@ func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, ch
 			}
 			// A create may have retired the inode during the open, after its
 			// retirement detached the handles already open.
-			handle, keep, dropped, err := fs.addFileHandle(op.Inode, fh, blob, closes, attempt == openAttempts)
+			handle, keep, dropped, err := fs.addFileHandle(op.Inode, fh, blob, closes, attempt == openAttempts, pinned)
 			if dropped != nil {
 				_ = dropped.Close()
 			}
 			if errors.Is(err, errCloseOverlapped) {
 				continue
 			}
+			pinned = 0
 			if err != nil {
 				if fh.cacheFile != nil {
 					_ = fh.cacheFile.Close()
@@ -1914,10 +2014,15 @@ var errCloseOverlapped = errors.New("a close of cached files overlapped the open
 // the fs.mu hold of its count check. A write bumps cacheCloses before
 // markWritten clears the page blob, so a registration between the two sees
 // the moved count.
-func (fs *ArtifactFuse) addFileHandle(id fuseops.InodeID, fh *FileHandle, blob string, closes uint64, last bool) (fuseops.HandleID, bool, *os.File, error) {
+//
+// It releases pin, the generation pinInode pinned for the open, unless it
+// returns errCloseOverlapped. A registration releases it in the hold that
+// adds fh, so OpenFileGenerations sees the pin or the handle.
+func (fs *ArtifactFuse) addFileHandle(id fuseops.InodeID, fh *FileHandle, blob string, closes uint64, last bool, pin int64) (fuseops.HandleID, bool, *os.File, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	if ref := fs.inodes[id]; ref != nil && ref.Stale {
+		fs.unpinLocked(pin)
 		return 0, false, nil, syscall.ESTALE
 	}
 	var dropped *os.File
@@ -1928,6 +2033,7 @@ func (fs *ArtifactFuse) addFileHandle(id fuseops.InodeID, fh *FileHandle, blob s
 		}
 		blob = ""
 	}
+	fs.unpinLocked(pin)
 	keep := fs.openedBlobLocked(id, blob)
 	handle := fs.nextHandleID
 	fs.nextHandleID++

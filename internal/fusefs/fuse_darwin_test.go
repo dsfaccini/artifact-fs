@@ -104,6 +104,12 @@ func TestInvalidateChangedSendsNothingOnFSKit(t *testing.T) {
 	}
 }
 
+// The FSKit switch pass compares no inode, so it checks the inodes that open
+// file handles are on for their read generation alone.
+func TestOpenFileGenerationAfterSwitchesOnFSKit(t *testing.T) {
+	testOpenFileGenerationAfterSwitches(t, BackendFSKit)
+}
+
 // A failed FSKit attempt's Server can keep serving after fuse.Mount returns.
 // So each attempt gets its own Notifier, and the mount invalidates through
 // the Notifier of the attempt that mounted.

@@ -123,16 +123,16 @@ func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, co
 
 // pruneGenerations prunes snap's generations below keepFrom, except those
 // that rt, when not nil, retired within the retention window, and those its
-// mount's open files read. An inode whose attributes the kernel received
+// serving mount's open files read. An inode whose attributes the kernel received
 // before a switch keeps reading the generation they came from until it asks
 // again.
 func (s *Service) pruneGenerations(ctx context.Context, rt *repoRuntime, snap *snapshot.Store, keepFrom int64) error {
 	var open []int64
 	if rt != nil {
 		s.mu.Lock()
-		mfs := rt.mfs
+		mfs, serving := rt.mfs, rt.mount == mountServing
 		s.mu.Unlock()
-		if mfs != nil {
+		if serving {
 			open = mfs.OpenFileGenerations()
 		}
 		retention := cmp.Or(s.generationRetention, defaultGenerationRetention)

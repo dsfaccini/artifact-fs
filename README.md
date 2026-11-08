@@ -521,7 +521,8 @@ with a 1 minute TTL. Every base file and directory reports the time of the HEAD
 commit the mount serves as its mtime.
 
 On every backend, an inode reads the generation of the attributes the kernel
-last received for it, so its reads match the size the kernel holds. The daemon
+last received for it, or a later one in which its path has the same type, mode
+and blob, so its reads match the size the kernel holds. The daemon
 keeps a generation readable while an open file's inode reads it, and for 2 s
 after the mount stops serving it. It prunes the generation at a later HEAD
 change or preparation. An inode with no open file then reads the current

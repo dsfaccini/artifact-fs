@@ -2101,6 +2101,119 @@ func TestOpenWithoutItsFileKeepsItsBlobPastAPrune(t *testing.T) {
 	}
 }
 
+// An open pins the generation it reads until it registers its handle. A
+// write can overlap its first attempt, and a HEAD change that removes its
+// path, with the prune after it, can run before its next attempt. The prune
+// must keep the pinned generation, so the next attempt still opens the blob.
+func TestOpenOverlappedByAPruneKeepsItsGeneration(t *testing.T) {
+	other := baseFile("other.txt", "blob-OTHER", 0o100644)
+	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644), other)
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	written := f.lookup(fuseops.RootInodeID, "other.txt")
+	writer := f.openRW(written)
+	f.fs.testHookBeforeAddFileHandle = func() {
+		f.fs.testHookBeforeAddFileHandle = nil
+		if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: written, Handle: writer.Handle, Data: []byte("Y")}); err != nil {
+			t.Fatal(err)
+		}
+		f.switchTo(other)
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.snap.PruneGenerations(f.ctx, f.resolver.Generation(), f.mount.OpenFileGenerations()...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	open := f.open(held)
+	if got := mustReadHandle(t, f, held, open.Handle); got != "blob-AAAA" {
+		t.Fatalf("the open that a write and a prune overlapped reads %q, want blob-AAAA", got)
+	}
+}
+
+// pruneAfterTwoSwitches opens file.txt on a fixture mounted through
+// backend, then switches twice to later and prunes the generations below the
+// current one that the mount does not report for open files. It reports
+// whether the generation the open read survived, and what the open reads.
+func pruneAfterTwoSwitches(t *testing.T, backend string, later model.BaseNode) (bool, string) {
+	t.Helper()
+	f := newCacheFixtureOn(t, backend, baseFile("file.txt", "blob-AAAA", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	open := f.open(held)
+	first := f.resolver.Generation()
+	for range 2 {
+		f.switchTo(later)
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok, err := f.snap.LookupNode(f.ctx, first, "file.txt"); err != nil || !ok {
+		t.Fatalf("file.txt in generation %d before the prune = %t, %v", first, ok, err)
+	}
+	if err := f.snap.PruneGenerations(f.ctx, f.resolver.Generation(), f.mount.OpenFileGenerations()...); err != nil {
+		t.Fatal(err)
+	}
+	_, kept, err := f.snap.LookupNode(f.ctx, first, "file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return kept, mustReadHandle(t, f, held, open.Handle)
+}
+
+// testOpenFileGenerationAfterSwitches checks, on backend, that an open
+// handle keeps its generation through a prune only while it needs it. While
+// the path keeps its blob, the switch pass moves the inode's read generation
+// to the one it serves, so the prune removes the older one and the handle
+// reads the blob there. Once the blob changes, the kernel still holds the old
+// size, so the handle keeps reading the old generation and the prune keeps it.
+func testOpenFileGenerationAfterSwitches(t *testing.T, backend string) {
+	for _, tt := range []struct {
+		name  string
+		later model.BaseNode
+		kept  bool
+	}{
+		{name: "unchanged", later: baseFile("file.txt", "blob-AAAA", 0o100644)},
+		{name: "changed", later: baseFile("file.txt", "blob-BBBB", 0o100644), kept: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			kept, got := pruneAfterTwoSwitches(t, backend, tt.later)
+			if kept != tt.kept || got != "blob-AAAA" {
+				t.Fatalf("after two switches and a prune, the generation the open read is kept = %t and the open reads %q, want %t and blob-AAAA", kept, got, tt.kept)
+			}
+		})
+	}
+}
+
+func TestOpenFileGenerationAfterSwitches(t *testing.T) {
+	testOpenFileGenerationAfterSwitches(t, BackendKernel)
+}
+
+// The switch pass advances the read generation of an inode whose path has
+// its blob back. A reply computed before that pass, at a generation that held
+// another blob, still reaches a kernel that took no invalidation since.
+// report must record it, so reads serve the blob whose size the kernel took.
+func TestReplyComputedBeforeTheReadGenerationMovedRecords(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644))
+	inode := f.lookup(fuseops.RootInodeID, "file.txt")
+	f.switchTo(baseFile("file.txt", "blob-BB", 0o100644))
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	older, err := f.fs.engine.Attrs(&Blobs{}, "file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.switchTo(baseFile("file.txt", "blob-AAAA", 0o100644))
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.fs.setReported(inode, older); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustReadHandle(t, f, inode, f.open(inode).Handle); got != "blob-BB" || int64(len(got)) != older.Size {
+		t.Fatalf("read after the kernel took the %d-byte size of the older reply = %q, want blob-BB", older.Size, got)
+	}
+}
+
 // An unlink through the mount retires an open file's inode, and its handle
 // then reads its own copy, never a generation. A prune that keeps the
 // generations the mount reports for open files must still prune the one the
