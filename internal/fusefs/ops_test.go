@@ -958,7 +958,7 @@ func engineRead(ctx context.Context, e *Engine, path string, off int64, dst []by
 
 func engineSetMtime(ctx context.Context, e *Engine, path, typ string, t time.Time) error {
 	return e.Do(ctx, nil, func(ctx context.Context, b *Blobs) error {
-		_, err := e.SetAttributes(ctx, b, path, typ, nil, 0, nil, &t)
+		_, err := e.SetAttributes(ctx, b, path, typ, nil, 0, nil, &t, nil)
 		return err
 	})
 }

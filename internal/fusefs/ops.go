@@ -195,12 +195,16 @@ func (e *Engine) blobSize(ctx context.Context, n model.BaseNode) (int64, error) 
 }
 
 // openFiles is the adapter's open file handles, which Unlink and Rename keep
-// readable after they remove or replace the handles' path.
+// readable after they remove or replace the handles' path, and which
+// SetAttributes keeps from serving content its change replaces.
 type openFiles interface {
 	// hasOpenFile reports whether a file handle that is not detached is open on path.
 	hasOpenFile(path string) bool
 	// pinOpenFiles points the open handles on path at the overlay file at backingPath.
 	pinOpenFiles(path, backingPath string) error
+	// closeCachedFilesForPath closes the files that the open handles on path
+	// cached, so their next reads resolve the path again.
+	closeCachedFilesForPath(path string)
 }
 
 // Generation returns the snapshot generation the engine serves.
@@ -925,13 +929,18 @@ var errAttrUnsupported = fmt.Errorf("%w: %w", syscall.ENOTSUP, fs.ErrInvalid)
 // overlay first. sizeAccess holds the owner permission bits to check a size
 // change against, none when the adapter does not check it. typ is the type of
 // the inode the change comes through: SetAttributes changes nothing and
-// returns errTypeChanged when path resolves to another type.
-func (e *Engine) SetAttributes(ctx context.Context, b *Blobs, path, typ string, size *int64, sizeAccess uint32, mode *uint32, mtime *time.Time) (Attrs, error) {
+// returns errTypeChanged when path resolves to another type. Before a size or
+// mtime change, it closes the files that files' handles on path cached, after
+// that check, so a refused change leaves them. files may be nil.
+func (e *Engine) SetAttributes(ctx context.Context, b *Blobs, path, typ string, size *int64, sizeAccess uint32, mode *uint32, mtime *time.Time, files openFiles) (Attrs, error) {
 	if err := func() error {
 		e.Resolver.transition.RLock()
 		defer e.Resolver.transition.RUnlock()
 		if n, err := e.Resolver.resolvePath(path); err == nil && n.nodeType() != typ {
 			return errTypeChanged
+		}
+		if files != nil && (size != nil || mtime != nil) {
+			files.closeCachedFilesForPath(path)
 		}
 		if size != nil {
 			if sizeAccess != 0 {

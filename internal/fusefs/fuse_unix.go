@@ -1674,16 +1674,14 @@ func (fs *ArtifactFuse) setInodeAttributes(ctx context.Context, op *fuseops.SetI
 			m := uint32(op.Mode.Perm())
 			mode = &m
 		}
-		changesContent := op.Size != nil || op.Mtime != nil
-		if changesContent {
-			fs.closeCachedFilesForPath(ref.Path)
-		}
 		var sizeAccess uint32
 		if op.Size != nil && checkPermissions && !fs.handleWritable(op.Handle) {
 			sizeAccess = ownerWrite
 		}
-		attrs, err := fs.engine.SetAttributes(ctx, b, ref.Path, ref.Type, size, sizeAccess, mode, op.Mtime)
-		if changesContent {
+		attrs, err := fs.engine.SetAttributes(ctx, b, ref.Path, ref.Type, size, sizeAccess, mode, op.Mtime, fs)
+		// A refused change changed nothing, so the handles keep what they
+		// cached.
+		if (op.Size != nil || op.Mtime != nil) && !errors.Is(err, errTypeChanged) {
 			fs.closeCachedFilesForPath(ref.Path)
 		}
 		if err != nil {

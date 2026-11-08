@@ -2647,9 +2647,10 @@ func TestGetattrOfAwayInodeWithNoContentReturnsESTALE(t *testing.T) {
 // changes, and the macFUSE kernel extension revokes it, so a file held open
 // there would fail at once. The switch pass, a lookup or a getattr can see the
 // change first. A getattr keeps the held inode's type, and an open file keeps
-// reading what it opened. A write or a chmod through the held inode never
-// reaches the path: before the pass, nor after a later switch that brings the
-// path back as its old type with another identity.
+// reading what it opened, also after a truncate through it was refused. A
+// write, a truncate or a chmod through the held inode never reaches the path:
+// before the pass, nor after a later switch that brings the path back as its
+// old type with another identity.
 func TestTypeChangeGivesThePathANewInode(t *testing.T) {
 	file := baseFile("p", "blob-P", 0o100644)
 	dir := []model.BaseNode{baseDir("p", "tree-P"), baseFile("p/x.txt", "x", 0o100644)}
@@ -2668,8 +2669,8 @@ func TestTypeChangeGivesThePathANewInode(t *testing.T) {
 	} {
 		from, to := change.from[0].Type, change.to[0].Type
 		typeBits := func(typ string) os.FileMode { return inodeAttrs(0, 0, typ, time.Time{}, time.Time{}).Mode.Type() }
-		for _, first := range []string{"pass", "lookup", "getattr", "chmod", "write"} {
-			if first == "write" && from != "file" {
+		for _, first := range []string{"pass", "lookup", "getattr", "chmod", "write", "truncate"} {
+			if (first == "write" || first == "truncate") && from != "file" {
 				continue
 			}
 			t.Run(change.name+"/"+first, func(t *testing.T) {
@@ -2732,6 +2733,11 @@ func TestTypeChangeGivesThePathANewInode(t *testing.T) {
 					refused("chmod", chmod)
 				case "write":
 					refused("write", write)
+				case "truncate":
+					refused("truncate", func() error {
+						var size uint64
+						return f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: held, Handle: &open.Handle, Size: &size})
+					})
 				}
 				op := &fuseops.LookUpInodeOp{Parent: root, Name: "p"}
 				if err := f.fs.LookUpInode(f.ctx, op); err != nil {
