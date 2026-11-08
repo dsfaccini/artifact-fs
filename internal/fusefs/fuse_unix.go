@@ -1041,8 +1041,11 @@ func (fs *ArtifactFuse) hasOpenFile(path string) bool {
 // pinOpenFiles points the handles open on path at backingPath, so they all
 // share one copy. That includes a handle that holds another overlay file,
 // such as one a reconcile removed after a commit: a write through it goes by
-// path, so that file holds nothing the path's content lacks. A detached
-// handle no longer names path, so it keeps its own file.
+// path, so that file holds nothing the path's content lacks. A handle that
+// holds backingPath through a read-only descriptor, which a backing file an
+// earlier version left read-only gave it, opens it again for writing where
+// it now can. A detached handle no longer names path, so it keeps its own
+// file.
 func (fs *ArtifactFuse) pinOpenFiles(path, backingPath string) error {
 	backing, err := os.Stat(backingPath)
 	if err != nil {
@@ -1066,15 +1069,21 @@ func (fs *ArtifactFuse) pinOpenFiles(path, backingPath string) error {
 			st, statErr := fh.cacheFile.Stat()
 			holdsBacking = statErr == nil && os.SameFile(st, backing)
 		}
-		if !fh.detached && !holdsBacking {
-			f, openErr := os.OpenFile(backingPath, os.O_RDWR, 0)
-			if openErr != nil {
-				f, openErr = os.Open(backingPath)
-				if openErr != nil {
+		var f *os.File
+		switch {
+		case fh.detached:
+		case !holdsBacking:
+			var openErr error
+			if f, openErr = os.OpenFile(backingPath, os.O_RDWR, 0); openErr != nil {
+				if f, openErr = os.Open(backingPath); openErr != nil {
 					fh.mu.Unlock()
 					return openErr
 				}
 			}
+		case !openForWriting(fh.cacheFile):
+			f, _ = os.OpenFile(backingPath, os.O_RDWR, 0)
+		}
+		if f != nil {
 			old := fh.cacheFile
 			fh.cacheFile = f
 			fh.cacheGeneration = -1
@@ -1458,9 +1467,8 @@ func (fs *ArtifactFuse) setInodeAttributes(ctx context.Context, op *fuseops.SetI
 // content no setattr may change. checkPermissions is as in setInodeAttributes.
 func (fs *ArtifactFuse) setPinnedAttributes(op *fuseops.SetInodeAttributesOp, checkPermissions bool) error {
 	type pinnedHandle struct {
-		id       fuseops.HandleID
-		fh       *FileHandle
-		writable bool
+		id fuseops.HandleID
+		fh *FileHandle
 	}
 	fs.mu.RLock()
 	ref := fs.inodes[op.Inode]
@@ -1472,7 +1480,7 @@ func (fs *ArtifactFuse) setPinnedAttributes(op *fuseops.SetInodeAttributesOp, ch
 	for id, fh := range fs.fileHandles {
 		fh.mu.Lock()
 		if fh.inode.ID == op.Inode && fh.detached && fh.pinned && fh.cacheFile != nil {
-			pinned = append(pinned, pinnedHandle{id, fh, openForWriting(fh.cacheFile)})
+			pinned = append(pinned, pinnedHandle{id, fh})
 		}
 		fh.mu.Unlock()
 	}
@@ -1485,18 +1493,9 @@ func (fs *ArtifactFuse) setPinnedAttributes(op *fuseops.SetInodeAttributesOp, ch
 			return err
 		}
 	}
-	// Handles share their copy, so each copy changes once, through a
-	// descriptor that may write where one holds it: one that a backing file
-	// left read-only made read-only cannot truncate.
-	slices.SortFunc(pinned, func(a, b pinnedHandle) int {
-		if a.writable != b.writable {
-			if a.writable {
-				return -1
-			}
-			return 1
-		}
-		return cmp.Compare(a.id, b.id)
-	})
+	// The handles of a file share their copy, so each copy changes once,
+	// through the first handle that holds it.
+	slices.SortFunc(pinned, func(a, b pinnedHandle) int { return cmp.Compare(a.id, b.id) })
 	var changed []os.FileInfo
 	for _, p := range pinned {
 		var err error
