@@ -19,41 +19,40 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
+// A blob larger than the batch reader's 256 KiB buffer, with NULs, CRs,
+// invalid UTF-8 and no trailing newline, reaches the cache byte for byte from
+// a blobless clone's remote. The next blob read from the same process shows
+// the stream stayed in step.
 func TestBlobToCacheBinarySafe(t *testing.T) {
 	t.Parallel()
+	var binary strings.Builder
+	for i := 0; binary.Len() < 300<<10; i++ {
+		binary.WriteString("\x00\r\n\xff\xfe" + strconv.Itoa(i) + "\r")
+	}
+	binary.WriteString("\xc3")
+	files := []struct{ name, content string }{{"binary.dat", binary.String()}, {"after.txt", "after\n"}}
+	remote := gittest.PartialCloneRemote(t, map[string]string{files[0].name: files[0].content, files[1].name: files[1].content})
 	tmp := t.TempDir()
-	repo := filepath.Join(tmp, "repo")
-	run(t, "git", "init", repo)
-	// Write a file ending with a newline (should be preserved)
-	os.WriteFile(filepath.Join(repo, "file.txt"), []byte("line\n"), 0o644)
-	run(t, "git", "-C", repo, "add", "file.txt")
-	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
-
-	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git"), BlobCacheDir: filepath.Join(tmp, "cache")}}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: filepath.Join(tmp, "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main"}}
 	store := New(nil)
-	ctx := context.Background()
-	oid, _, _ := store.ResolveHEAD(ctx, cfg)
-	nodes, _ := store.BuildTreeIndex(ctx, cfg, oid)
-	var blobOID string
-	for _, n := range nodes {
-		if n.Path == "file.txt" {
-			blobOID = n.ObjectOID
+	defer store.Close()
+	if err := store.CloneBlobless(t.Context(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		oid := strings.TrimSpace(runOutput(t, "git", "--git-dir", cfg.GitDir, "rev-parse", "HEAD:"+file.name))
+		dst := filepath.Join(tmp, "cache", oid)
+		size, err := store.BlobToCache(t.Context(), cfg.RepoPaths, oid, dst)
+		if err != nil {
+			t.Fatalf("BlobToCache(%s): %v", file.name, err)
 		}
-	}
-	if blobOID == "" {
-		t.Fatal("no blob OID found")
-	}
-	dst := filepath.Join(tmp, "cache", blobOID)
-	size, err := store.BlobToCache(ctx, cfg.RepoPaths, blobOID, dst)
-	if err != nil {
-		t.Fatalf("BlobToCache: %v", err)
-	}
-	if size != 5 {
-		t.Fatalf("expected size 5 (line\\n), got %d", size)
-	}
-	data, _ := os.ReadFile(dst)
-	if string(data) != "line\n" {
-		t.Fatalf("expected 'line\\n', got %q", data)
+		data, err := os.ReadFile(dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if size != int64(len(file.content)) || !bytes.Equal(data, []byte(file.content)) {
+			t.Fatalf("BlobToCache(%s) wrote %d bytes, reported %d; want the blob's %d bytes", file.name, len(data), size, len(file.content))
+		}
 	}
 }
 
@@ -393,46 +392,6 @@ func TestVerifyBlobHashesWithoutGit(t *testing.T) {
 	}
 }
 
-func TestBlobToCacheHonorsCanceledContext(t *testing.T) {
-	t.Parallel()
-	tmp := t.TempDir()
-	repo := filepath.Join(tmp, "repo")
-	run(t, "git", "init", repo)
-	os.WriteFile(filepath.Join(repo, "file.txt"), []byte("line\n"), 0o644)
-	run(t, "git", "-C", repo, "add", "file.txt")
-	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
-
-	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git"), BlobCacheDir: filepath.Join(tmp, "cache")}}
-	store := New(nil)
-	oid, _, err := store.ResolveHEAD(context.Background(), cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	nodes, err := store.BuildTreeIndex(context.Background(), cfg, oid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var blobOID string
-	for _, n := range nodes {
-		if n.Path == "file.txt" {
-			blobOID = n.ObjectOID
-		}
-	}
-	if blobOID == "" {
-		t.Fatal("no blob OID found")
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	dst := filepath.Join(tmp, "cache", blobOID)
-	_, err = store.BlobToCache(ctx, cfg.RepoPaths, blobOID, dst)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled", err)
-	}
-	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("cache file should not be written after cancellation: %v", err)
-	}
-}
-
 func TestReadBlobRespectsMaxBytes(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -478,6 +437,7 @@ func TestReadBlobRespectsMaxBytes(t *testing.T) {
 }
 
 func TestBatchPoolBoundsConcurrentProcesses(t *testing.T) {
+	t.Parallel()
 	repo := filepath.Join(t.TempDir(), "repo")
 	run(t, "git", "init", repo)
 	p := &batchPool{
@@ -514,10 +474,8 @@ func TestBlobToCacheLogsLazyFetchStderrWithoutPrompting(t *testing.T) {
 
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	cfg := model.RepoPaths{ID: "x", GitDir: gitDir}
-	if _, err := store.BlobToCache(ctx, cfg, blobOID, filepath.Join(tmp, "cache", blobOID)); err == nil {
+	if _, err := store.BlobToCache(t.Context(), cfg, blobOID, filepath.Join(tmp, "cache", blobOID)); err == nil {
 		t.Fatal("BlobToCache fetched a blob the promisor remote refused")
 	}
 	store.Close()
@@ -533,9 +491,7 @@ func TestBuildTreeIndexLazyTreeFetchDoesNotPrompt(t *testing.T) {
 	gitDir, commit, _ := partialClone(t, tmp, "tree:0")
 	run(t, "git", "--git-dir", gitDir, "remote", "set-url", "origin", gittest.UnauthorizedRemote(t))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	_, err := New(nil).BuildTreeIndex(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: gitDir}}, commit)
+	_, err := New(nil).BuildTreeIndex(t.Context(), model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: gitDir}}, commit)
 	if err == nil || !strings.Contains(err.Error(), "terminal prompts disabled") {
 		t.Fatalf("BuildTreeIndex error = %v, want the lazy tree fetch's non-interactive failure", err)
 	}

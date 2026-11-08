@@ -6,7 +6,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -16,26 +15,28 @@ func TestCommitTimestamp(t *testing.T) {
 	tmp := t.TempDir()
 	repo := filepath.Join(tmp, "repo")
 	run(t, "git", "init", repo)
-	os.WriteFile(filepath.Join(repo, "f.txt"), []byte("x"), 0o644)
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	run(t, "git", "-C", repo, "add", ".")
-	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+	commit := exec.Command("git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+	commit.Env = append(os.Environ(), "GIT_AUTHOR_DATE=@1000000000 +0000", "GIT_COMMITTER_DATE=@1700000000 +0000")
+	if out, err := commit.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, out)
+	}
 
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
 	store := New(nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	oid, _, err := store.ResolveHEAD(ctx, cfg)
+	oid, _, err := store.ResolveHEAD(t.Context(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts, err := store.CommitTimestamp(ctx, cfg, oid)
+	ts, err := store.CommitTimestamp(t.Context(), cfg, oid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Timestamp should be recent (within last minute).
-	now := time.Now().Unix()
-	if ts < now-60 || ts > now+60 {
-		t.Fatalf("timestamp %d not within 60s of now %d", ts, now)
+	if ts != 1700000000 {
+		t.Fatalf("CommitTimestamp = %d, want the committer date 1700000000", ts)
 	}
 }
 

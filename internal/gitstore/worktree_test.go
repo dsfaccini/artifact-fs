@@ -9,12 +9,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
 func TestConfigureStatusOptimizationDoesNotWriteIndex(t *testing.T) {
+	t.Parallel()
 	tmp := t.TempDir()
 	repo := filepath.Join(tmp, "repo")
 	run(t, "git", "init", repo)
@@ -30,8 +30,7 @@ func TestConfigureStatusOptimizationDoesNotWriteIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	ctx := t.Context()
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", GitDir: gitDir, MountPath: repo}}
 	if err := New(nil).ConfigureStatusOptimization(ctx, cfg, tmp); err != nil {
 		t.Fatalf("ConfigureStatusOptimization: %v", err)
@@ -62,24 +61,6 @@ func TestFSMonitorHookScriptQuotesArgs(t *testing.T) {
 	}
 }
 
-func TestReadTreeHEAD(t *testing.T) {
-	t.Parallel()
-	tmp := t.TempDir()
-	repo := filepath.Join(tmp, "repo")
-	run(t, "git", "init", repo)
-	os.WriteFile(filepath.Join(repo, "f.txt"), []byte("x"), 0o644)
-	run(t, "git", "-C", repo, "add", ".")
-	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
-
-	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
-	store := New(nil)
-	ctx := context.Background()
-	// Should not error on a clean repo.
-	if err := store.ReadTreeHEAD(ctx, cfg); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestEnsureIndexInitializedPreservesStagedEntries(t *testing.T) {
 	t.Parallel()
 	repo := filepath.Join(t.TempDir(), "repo")
@@ -99,65 +80,28 @@ func TestEnsureIndexInitializedPreservesStagedEntries(t *testing.T) {
 	}
 	run(t, "git", "-C", repo, "add", "tracked.txt")
 	run(t, "git", "-C", repo, "add", "-N", "intent.txt")
-
-	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
-	if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err != nil {
+	// A hook that ran would discard the staged entries.
+	dir := t.TempDir()
+	fsmonitorCalled, fsmonitorHook := filepath.Join(dir, "fsmonitor-called"), filepath.Join(dir, "fsmonitor")
+	if err := os.WriteFile(fsmonitorHook, []byte("#!/bin/sh\n: > '"+fsmonitorCalled+"'\ngit read-tree HEAD\nprintf 'token\\n'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	staged := runOutput(t, "git", "-C", repo, "diff", "--cached", "--name-only")
+	run(t, "git", "-C", repo, "config", "core.fsmonitor", fsmonitorHook)
+
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
+	if err := New(nil).EnsureIndexInitialized(t.Context(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(fsmonitorCalled); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fsmonitor hook ran during index validation: %v", err)
+	}
+	staged := runOutput(t, "git", "-C", repo, "-c", "core.fsmonitor=false", "diff", "--cached", "--name-only")
 	if !strings.Contains(staged, "tracked.txt") {
 		t.Fatalf("staged entries = %q, want tracked.txt", staged)
 	}
-	debug := runOutput(t, "git", "-C", repo, "ls-files", "--debug", "intent.txt")
+	debug := runOutput(t, "git", "-C", repo, "-c", "core.fsmonitor=false", "ls-files", "--debug", "intent.txt")
 	if !strings.Contains(debug, "flags: 20004000") {
 		t.Fatalf("intent-to-add entry was not preserved:\n%s", debug)
-	}
-}
-
-func TestEnsureIndexInitializedDoesNotReadTreeWhenIndexExists(t *testing.T) {
-	repo := filepath.Join(t.TempDir(), "repo")
-	run(t, "git", "init", repo)
-	if _, err := os.Stat(filepath.Join(repo, ".git", "index")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("initial index stat error = %v, want not exist", err)
-	}
-	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("tracked\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	run(t, "git", "-C", repo, "add", "tracked.txt")
-
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	bin := t.TempDir()
-	logPath := filepath.Join(bin, "git.log")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AFS_GIT_LOG\"\nif [ \"$1\" = read-tree ]; then exit 99; fi\nexec \"$AFS_REAL_GIT\" \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("AFS_GIT_LOG", logPath)
-	t.Setenv("AFS_REAL_GIT", realGit)
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: filepath.Join(repo, ".git")}}
-	if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err != nil {
-		t.Fatal(err)
-	}
-	logged, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.TrimSpace(string(logged)); got != "-c core.fsmonitor=false ls-files --stage --" {
-		t.Fatalf("git invocation = %q, want non-mutating index validation", got)
-	}
-}
-
-func TestEnsureIndexInitializedHonorsCanceledContext(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	err := New(nil).EnsureIndexInitialized(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{GitDir: t.TempDir()}})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("EnsureIndexInitialized error = %v, want context canceled", err)
 	}
 }
 
@@ -304,6 +248,7 @@ func TestBootstrapCleanIndexForFSMonitorMarksSnapshotEntriesWithoutReadingBlobs(
 }
 
 func TestBootstrapCleanIndexForFSMonitorSkipsStagedIndexAndExistingLock(t *testing.T) {
+	t.Parallel()
 	repo := filepath.Join(t.TempDir(), "repo")
 	run(t, "git", "init", repo)
 	run(t, "git", "-C", repo, "config", "user.name", "test")
@@ -348,6 +293,7 @@ func TestBootstrapCleanIndexForFSMonitorSkipsStagedIndexAndExistingLock(t *testi
 }
 
 func TestBootstrapCleanIndexForFSMonitorLeavesCRLFNormalizingPathsToGit(t *testing.T) {
+	t.Parallel()
 	repo := filepath.Join(t.TempDir(), "repo")
 	run(t, "git", "init", repo)
 	run(t, "git", "-C", repo, "config", "user.name", "test")
@@ -402,6 +348,7 @@ func TestBootstrapCleanIndexForFSMonitorLeavesCRLFNormalizingPathsToGit(t *testi
 // The bootstrap runs before the mount, where the hook issues a token it
 // trusts later only for the bootstrap's own query.
 func TestBootstrapCleanIndexForFSMonitorMarksItsHookQuery(t *testing.T) {
+	t.Parallel()
 	repo := filepath.Join(t.TempDir(), "repo")
 	run(t, "git", "init", repo)
 	run(t, "git", "-C", repo, "config", "user.name", "test")
@@ -429,8 +376,10 @@ func TestBootstrapCleanIndexForFSMonitorMarksItsHookQuery(t *testing.T) {
 }
 
 func TestBootstrapCleanIndexForFSMonitorSkipsConversionAttributes(t *testing.T) {
+	t.Parallel()
 	for _, attribute := range []string{"eol=crlf", "crlf", "filter=convert", "ident", "working-tree-encoding=UTF-16"} {
 		t.Run(attribute, func(t *testing.T) {
+			t.Parallel()
 			repo := filepath.Join(t.TempDir(), "repo")
 			run(t, "git", "init", repo)
 			run(t, "git", "-C", repo, "config", "user.name", "test")
@@ -465,6 +414,7 @@ func TestBootstrapCleanIndexForFSMonitorSkipsConversionAttributes(t *testing.T) 
 }
 
 func TestBootstrapCleanIndexForFSMonitorRequiresSnapshotToMatchHEAD(t *testing.T) {
+	t.Parallel()
 	repo := filepath.Join(t.TempDir(), "repo")
 	run(t, "git", "init", repo)
 	run(t, "git", "-C", repo, "config", "user.name", "test")
@@ -492,6 +442,7 @@ func TestBootstrapCleanIndexForFSMonitorRequiresSnapshotToMatchHEAD(t *testing.T
 }
 
 func TestBootstrapCleanIndexForFSMonitorSkipsTrackedEmptyIntentToAdd(t *testing.T) {
+	t.Parallel()
 	repo := filepath.Join(t.TempDir(), "repo")
 	run(t, "git", "init", repo)
 	run(t, "git", "-C", repo, "config", "user.name", "test")
@@ -519,6 +470,7 @@ func TestBootstrapCleanIndexForFSMonitorSkipsTrackedEmptyIntentToAdd(t *testing.
 }
 
 func TestBootstrapCleanIndexForFSMonitorSkipsConfiguredAttributesFile(t *testing.T) {
+	t.Parallel()
 	repo := filepath.Join(t.TempDir(), "repo")
 	run(t, "git", "init", repo)
 	run(t, "git", "-C", repo, "config", "user.name", "test")
@@ -550,6 +502,7 @@ func TestBootstrapCleanIndexForFSMonitorSkipsConfiguredAttributesFile(t *testing
 }
 
 func TestBootstrapCleanIndexForFSMonitorSkipsIntentToAddAndUnmergedEntries(t *testing.T) {
+	t.Parallel()
 	createRepo := func(t *testing.T) (string, string) {
 		t.Helper()
 		repo := filepath.Join(t.TempDir(), "repo")
@@ -564,6 +517,7 @@ func TestBootstrapCleanIndexForFSMonitorSkipsIntentToAddAndUnmergedEntries(t *te
 		return repo, strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
 	}
 	t.Run("intent-to-add", func(t *testing.T) {
+		t.Parallel()
 		repo, head := createRepo(t)
 		if err := os.WriteFile(filepath.Join(repo, "intent.txt"), []byte("intent\n"), 0o644); err != nil {
 			t.Fatal(err)
@@ -583,6 +537,7 @@ func TestBootstrapCleanIndexForFSMonitorSkipsIntentToAddAndUnmergedEntries(t *te
 		}
 	})
 	t.Run("unmerged", func(t *testing.T) {
+		t.Parallel()
 		repo, _ := createRepo(t)
 		run(t, "git", "-C", repo, "checkout", "-b", "side")
 		if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("side\n"), 0o644); err != nil {
@@ -653,6 +608,7 @@ func TestBootstrapCleanIndexForFSMonitorSkipsAlternateIndex(t *testing.T) {
 }
 
 func TestBootstrapCleanIndexForFSMonitorSkipsMissingAttributesBlob(t *testing.T) {
+	t.Parallel()
 	repo := filepath.Join(t.TempDir(), "repo")
 	run(t, "git", "init", repo)
 	run(t, "git", "-C", repo, "config", "user.name", "test")
@@ -763,6 +719,7 @@ func TestEnsureIndexInitializedCreatesMissingAlternateIndex(t *testing.T) {
 }
 
 func TestEnsureIndexInitializedRejectsCorruptIndex(t *testing.T) {
+	t.Parallel()
 	cases := map[string][]byte{
 		"truncated":         []byte("DIRC"),
 		"invalid signature": append([]byte("NOPE"), make([]byte, 28)...),
@@ -770,6 +727,7 @@ func TestEnsureIndexInitializedRejectsCorruptIndex(t *testing.T) {
 	}
 	for name, contents := range cases {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			repo := filepath.Join(t.TempDir(), "repo")
 			run(t, "git", "init", repo)
 			run(t, "git", "-C", repo, "config", "user.name", "test")

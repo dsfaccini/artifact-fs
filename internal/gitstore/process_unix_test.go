@@ -194,8 +194,7 @@ func TestNetworkGitRunsSSHWithoutTerminal(t *testing.T) {
 				report := filepath.Join(tmp, "ssh-session")
 				t.Setenv(sshSessionReportEnv, report)
 
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
+				ctx := t.Context()
 				store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
 				err := tt.read(ctx, store, model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", GitDir: gitDir}}, commit, blob)
 				store.Close()
@@ -748,8 +747,7 @@ func TestPreparedGitDirFetchHonorsCoreSSHCommand(t *testing.T) {
 	run(t, "git", "--git-dir", gitDir, "config", "core.sshCommand", shellScriptQuote(exe))
 	report := filepath.Join(tmp, "ssh-session")
 	t.Setenv(sshSessionReportEnv, report)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	ctx := t.Context()
 	store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	store.gitRetryDelays = nil
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{PreparedGitDir: true}}

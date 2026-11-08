@@ -12,13 +12,19 @@ import (
 )
 
 func TestAdoptedWorktreeConfigMigration(t *testing.T) {
+	t.Parallel()
+	// The primary and a sibling checkout keep these, and only the adopted
+	// worktree reads adoption's settings.
+	shared := map[string]string{"core.filemode": "false", "core.ignorecase": "true", "core.symlinks": "false"}
+	adopted := map[string]string{"core.filemode": "true", "core.ignorecase": "false", "core.symlinks": "true"}
 	for _, mode := range []string{"bare-primary", "existing-primary-override", "missing-index", "primary-gitdir", "wrong-mount-path", "primary-path-whitespace", "reftable"} {
 		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
 			dir, err := filepath.EvalSymlinks(t.TempDir())
 			if err != nil {
 				t.Fatal(err)
 			}
-			source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
+			source, worktree, side := filepath.Join(dir, "source"), filepath.Join(dir, "worktree"), filepath.Join(dir, "side")
 			if mode == "primary-path-whitespace" {
 				source += " "
 			}
@@ -33,8 +39,12 @@ func TestAdoptedWorktreeConfigMigration(t *testing.T) {
 			run(t, "git", "-C", source, "add", "README.md")
 			run(t, "git", "-C", source, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
 			run(t, "git", "-C", source, "worktree", "add", "-b", "topic", worktree)
+			run(t, "git", "-C", source, "worktree", "add", "-b", "side", side)
 			gitDir := strings.TrimSpace(runOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
 			common := filepath.Join(source, ".git")
+			for key, value := range shared {
+				run(t, "git", "--git-dir", common, "config", key, value)
+			}
 			wantBare := "false"
 			switch mode {
 			case "primary-path-whitespace":
@@ -104,6 +114,13 @@ func TestAdoptedWorktreeConfigMigration(t *testing.T) {
 			}
 			if got := strings.TrimSpace(runOutput(t, "git", "-C", worktree, "rev-parse", "--show-toplevel")); got != worktree {
 				t.Fatalf("adopted worktree resolved to %q", got)
+			}
+			for checkout, want := range map[string]map[string]string{source: shared, side: shared, worktree: adopted} {
+				for key, value := range want {
+					if got := strings.TrimSpace(runOutput(t, "git", "-C", checkout, "config", "--get", key)); got != value {
+						t.Fatalf("%s in %s = %q, want %q", key, checkout, got, value)
+					}
+				}
 			}
 			if mode == "existing-primary-override" || mode == "primary-path-whitespace" {
 				if got := strings.TrimSuffix(runOutput(t, "git", "-C", source, "rev-parse", "--show-toplevel"), "\n"); got != source {
