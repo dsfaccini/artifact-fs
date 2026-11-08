@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -140,6 +143,7 @@ func TestNetworkGitRunsSSHWithoutTerminal(t *testing.T) {
 			return store.PrepareFetchedBranch(ctx, cfg, "main")
 		}},
 		{"refresh fetch", "blob:none", false, false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
+			cfg.FetchRef = "refs/heads/main"
 			return store.FetchNonInteractive(ctx, cfg)
 		}},
 		{"prepare fetch", "blob:none", false, false, func(ctx context.Context, store *Store, cfg model.RepoConfig, _, _ string) error {
@@ -268,7 +272,7 @@ func TestSSHWrapperLastsUntilClose(t *testing.T) {
 	store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	store.gitRetryDelays = nil
 	defer store.Close()
-	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{FetchRef: "refs/heads/main"}}
 	fetch := func() {
 		t.Helper()
 		if err := os.Remove(report); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -293,6 +297,214 @@ func TestSSHWrapperLastsUntilClose(t *testing.T) {
 	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Close left the SSH wrapper's directory: %v", err)
 	}
+}
+
+// A Store reuses its SSH wrapper while the wrapper and its directory are
+// private to the effective uid and neither is a symlink, and only then. A
+// temp cleaner can remove the directory, and another local user can then make
+// one at its path and put a program there. The Store writes a new wrapper
+// elsewhere, and nothing into what it found. It removes nothing it did not
+// make.
+func TestSSHWrapperIsReusedOnlyWhilePrivate(t *testing.T) {
+	// plant writes a program named ssh in a new directory and returns the
+	// directory.
+	plant := func(t *testing.T) string {
+		t.Helper()
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	for _, tt := range []struct {
+		name string
+		root bool
+		// reused is whether the Store keeps the wrapper after replace.
+		reused bool
+		// replace changes the wrapper's directory dir and returns the
+		// directory that holds what dir/ssh now reaches.
+		replace func(t *testing.T, dir string) (string, error)
+	}{
+		{name: "unchanged", reused: true, replace: func(t *testing.T, dir string) (string, error) {
+			return dir, nil
+		}},
+		{name: "directory symlink", replace: func(t *testing.T, dir string) (string, error) {
+			planted := plant(t)
+			return planted, errors.Join(os.RemoveAll(dir), os.Symlink(planted, dir))
+		}},
+		{name: "directory mode", replace: func(t *testing.T, dir string) (string, error) {
+			return dir, os.Chmod(dir, 0o755)
+		}},
+		{name: "directory owner", root: true, replace: func(t *testing.T, dir string) (string, error) {
+			return dir, os.Lchown(dir, 1, 1)
+		}},
+		{name: "wrapper symlink", replace: func(t *testing.T, dir string) (string, error) {
+			planted := plant(t)
+			wrapper := filepath.Join(dir, "ssh")
+			return planted, errors.Join(os.Remove(wrapper), os.Symlink(filepath.Join(planted, "ssh"), wrapper))
+		}},
+		{name: "wrapper mode", replace: func(t *testing.T, dir string) (string, error) {
+			return dir, os.Chmod(filepath.Join(dir, "ssh"), 0o755)
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.root && os.Geteuid() != 0 {
+				t.Skip("only root can give a directory another owner")
+			}
+			gittest.IsolatePrompts(t)
+			fakeSSHOnPath(t)
+			store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+			defer store.Close()
+			first := filepath.Dir(sshWrapper(t, store))
+			watched, err := tt.replace(t, first)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := dirContents(t, watched)
+			second := filepath.Dir(sshWrapper(t, store))
+			switch {
+			case tt.reused && second != first:
+				t.Fatalf("wrote a new SSH wrapper in %s, though the one in %s was unchanged", second, first)
+			case !tt.reused && second == first:
+				t.Fatalf("reused the SSH wrapper in %s after a %s change", first, tt.name)
+			}
+			after := dirContents(t, watched)
+			// The Store may remove its own replaced directory, but nothing else.
+			if after == nil && (tt.reused || watched != first) {
+				t.Fatalf("removed %s", watched)
+			}
+			if after != nil && !maps.Equal(before, after) {
+				t.Fatalf("wrote into %s: %q became %q", watched, before, after)
+			}
+		})
+	}
+}
+
+// batchModeSSH holds the Store's lock across no file operation, so a blob read
+// does not wait while a fetch writes the SSH wrapper. Of two calls that write
+// one at once, the first to finish wins, and the other removes its own.
+func TestBlobReadProceedsWhileAnSSHWrapperIsWritten(t *testing.T) {
+	gittest.IsolatePrompts(t)
+	fakeSSHOnPath(t)
+	gitDir, _, blob := partialClone(t, t.TempDir(), "blob:none")
+	store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer store.Close()
+	reached, release := pauseFirstSSHWrapper(t, store)
+	type result struct {
+		wrapper string
+		err     error
+	}
+	fetch := make(chan result, 1)
+	go func() {
+		env, err := store.lazyFetchEnv()
+		wrapper, _ := envValue(env, "GIT_SSH")
+		fetch <- result{wrapper, err}
+	}()
+	paused := <-reached
+	data, err := store.ReadBlob(t.Context(), model.RepoPaths{Name: "x", GitDir: gitDir}, blob, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "data\n" {
+		t.Fatalf("read %q", data)
+	}
+	release()
+	got := <-fetch
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if want := filepath.Join(store.sshWrapperDir, "ssh"); got.wrapper != want {
+		t.Fatalf("the fetch got the SSH wrapper %q, not the Store's %q", got.wrapper, want)
+	}
+	if _, err := os.Stat(paused); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the losing call left its SSH wrapper directory: %v", err)
+	}
+}
+
+// Close does not wait while a call writes the SSH wrapper. The call then
+// removes its directory and returns the closed error.
+func TestCloseWhileAnSSHWrapperIsWritten(t *testing.T) {
+	gittest.IsolatePrompts(t)
+	fakeSSHOnPath(t)
+	store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reached, release := pauseFirstSSHWrapper(t, store)
+	fetch := make(chan error, 1)
+	go func() {
+		_, err := store.lazyFetchEnv()
+		fetch <- err
+	}()
+	paused := <-reached
+	store.Close()
+	release()
+	if err := <-fetch; !errors.Is(err, errStoreClosed) {
+		t.Fatalf("lazyFetchEnv after Close returned %v, want %v", err, errStoreClosed)
+	}
+	if _, err := os.Stat(paused); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the call left its SSH wrapper directory after Close: %v", err)
+	}
+}
+
+// pauseFirstSSHWrapper pauses store's first call that writes an SSH wrapper,
+// once it made the wrapper's directory. reached yields that directory when
+// the call pauses, and release lets the call go on.
+func pauseFirstSSHWrapper(t *testing.T, store *Store) (reached <-chan string, release func()) {
+	dirs := make(chan string, 1)
+	gate := make(chan struct{})
+	var paused atomic.Bool
+	store.testHookSSHWrapperDirMade = func(dir string) {
+		if paused.CompareAndSwap(false, true) {
+			dirs <- dir
+			<-gate
+		}
+	}
+	release = sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
+	return dirs, release
+}
+
+// sshWrapper returns the GIT_SSH that store's lazyFetchEnv sets.
+func sshWrapper(t *testing.T, store *Store) string {
+	t.Helper()
+	env, err := store.lazyFetchEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper, ok := envValue(env, "GIT_SSH")
+	if !ok {
+		t.Fatalf("lazyFetchEnv set no GIT_SSH: %q", env)
+	}
+	return wrapper
+}
+
+func envValue(env []string, key string) (string, bool) {
+	for _, kv := range env {
+		if value, ok := strings.CutPrefix(kv, key+"="); ok {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+// dirContents maps each file in dir to its content, following symlinks, or
+// returns nil when dir does not exist.
+func dirContents(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := map[string]string{}
+	for _, entry := range entries {
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		contents[entry.Name()] = string(data)
+	}
+	return contents
 }
 
 // An SSH program the environment names runs as the user set it, without
@@ -320,7 +532,7 @@ func TestNetworkGitKeepsTheEnvironmentsSSHProgram(t *testing.T) {
 			t.Setenv(sshSessionReportEnv, report)
 			store := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
 			store.gitRetryDelays = nil
-			if err := store.FetchNonInteractive(t.Context(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}}); err == nil {
+			if err := store.FetchNonInteractive(t.Context(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{FetchRef: "refs/heads/main"}}); err == nil {
 				t.Fatal("fetched through an SSH command that fails")
 			}
 			for _, contact := range readSSHContacts(t, report) {

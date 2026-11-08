@@ -25,6 +25,7 @@ import (
 )
 
 func TestAddRepoAsyncRegistersWithoutClone(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -67,6 +68,7 @@ func TestAddRepoAsyncRegistersWithoutClone(t *testing.T) {
 }
 
 func TestAddRepoSyncReregistrationUpdatesExistingCloneBranch(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	remote := filepath.Join(tmp, "remote")
@@ -173,6 +175,7 @@ func TestSyncRegistrationIsNotMountedWhilePreparing(t *testing.T) {
 }
 
 func TestSupersededPrepareDoesNotMutateExistingClone(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	repo := filepath.Join(tmp, "repo")
@@ -257,6 +260,7 @@ func TestSupersededPrepareDoesNotMutateExistingClone(t *testing.T) {
 }
 
 func TestRepoPrepareLockSerializesServices(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	first, err := NewController(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -315,6 +319,7 @@ func TestRepoPrepareLockSerializesServices(t *testing.T) {
 }
 
 func TestAddRepoAsyncRejectsInlineCredentials(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -344,6 +349,7 @@ func TestAddRepoAsyncRejectsInlineCredentials(t *testing.T) {
 }
 
 func TestPrepareAsyncRejectsPersistedInlineCredentialsBeforeClone(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -484,6 +490,7 @@ func TestPrepareAsyncExistingCloneRejectsCredentialedRemoteBeforeSetURL(t *testi
 }
 
 func TestAddRepoPreparedGitDirValidation(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -511,6 +518,7 @@ func TestAddRepoPreparedGitDirValidation(t *testing.T) {
 }
 
 func TestSyncReposSkipsResetWhilePrepareWorkerInFlight(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -566,6 +574,7 @@ func TestSyncReposSkipsResetWhilePrepareWorkerInFlight(t *testing.T) {
 }
 
 func TestDrivePrepareSkipsStalePreparingSnapshot(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -630,6 +639,7 @@ func TestDrivePrepareSkipsStalePreparingSnapshot(t *testing.T) {
 }
 
 func TestPrepareAsyncFailurePersistsRedactedError(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -1149,6 +1159,7 @@ func TestAddRepoSyncFailureDoesNotOverwriteNewerConfig(t *testing.T) {
 }
 
 func TestPrepareAsyncPreparedGitDirPublishesSnapshotAndMarksReady(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	bare := filepath.Join(tmp, "origin.git")
@@ -1244,6 +1255,7 @@ func TestPrepareAsyncPreparedGitDirPublishesSnapshotAndMarksReady(t *testing.T) 
 }
 
 func TestSyncPrepareRetainsPreviousGenerationForDaemonHandoff(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	preparedGitDir := createPreparedGitDir(t, tmp)
@@ -1297,6 +1309,7 @@ func TestSyncPrepareRetainsPreviousGenerationForDaemonHandoff(t *testing.T) {
 }
 
 func TestSizeUpdateBatcherFlushesOnStop(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	snap, err := snapshot.New(ctx, filepath.Join(tmp, "snap.sqlite"))
@@ -1353,76 +1366,74 @@ func TestPrepareAsyncFreshCloneSkipsSecondFetchForBranchFetchRef(t *testing.T) {
 	runCmd(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
 	runCmd(t, "git", "-C", work, "push", "origin", "master")
 
-	for _, fetchRef := range []string{"master", "refs/heads/master", "origin/master", "refs/remotes/origin/master"} {
-		t.Run(fetchRef, func(t *testing.T) {
-			svc, err := New(ctx, filepath.Join(tmp, "artifact-fs", strings.ReplaceAll(fetchRef, "/", "-")), slog.New(slog.NewTextHandler(io.Discard, nil)))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer svc.Close()
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
 
-			cfg := model.RepoConfig{
-				RepoPaths: model.RepoPaths{
-					Name: "repo",
-					ID:   "repo",
-				},
-				RepoSpec: model.RepoSpec{
-					RemoteURL: "file://" + bare,
-					Branch:    "master",
-					FetchRef:  fetchRef,
-				},
-				Enabled: true,
-			}
-			if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
-				t.Fatal(err)
-			}
-			got, err := svc.registry.GetRepo(ctx, "repo")
-			if err != nil {
-				t.Fatal(err)
-			}
+	cfg := model.RepoConfig{
+		RepoPaths: model.RepoPaths{
+			Name: "repo",
+			ID:   "repo",
+		},
+		RepoSpec: model.RepoSpec{
+			RemoteURL: "file://" + bare,
+			Branch:    "master",
+			// add-repo stores every spelling of the branch as refs/heads/master, so one covers them all.
+			FetchRef: "origin/master",
+		},
+		Enabled: true,
+	}
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
 
-			realGit, err := exec.LookPath("git")
-			if err != nil {
-				t.Fatal(err)
-			}
-			bin := filepath.Join(t.TempDir(), "bin")
-			if err := os.Mkdir(bin, 0o755); err != nil {
-				t.Fatal(err)
-			}
-			logPath := filepath.Join(t.TempDir(), "git.log")
-			fakeGit := filepath.Join(bin, "git")
-			if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_COMMAND_LOG\"\nexec \"$AFS_REAL_GIT\" \"$@\"\n"), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			t.Setenv("AFS_REAL_GIT", realGit)
-			t.Setenv("GIT_COMMAND_LOG", logPath)
-			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(t.TempDir(), "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "git.log")
+	fakeGit := filepath.Join(bin, "git")
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_COMMAND_LOG\"\nexec \"$AFS_REAL_GIT\" \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AFS_REAL_GIT", realGit)
+	t.Setenv("GIT_COMMAND_LOG", logPath)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-			if err := svc.prepareAsync(ctx, got, 1); err != nil {
-				t.Fatalf("prepareAsync: %v", err)
-			}
-			logData, err := os.ReadFile(logPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			for line := range strings.SplitSeq(string(logData), "\n") {
-				if strings.HasPrefix(line, "fetch ") {
-					t.Fatalf("fresh branch clone ran redundant fetch; git log:\n%s", logData)
-				}
-			}
+	if err := svc.prepareAsync(ctx, got, 1); err != nil {
+		t.Fatalf("prepareAsync: %v", err)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for line := range strings.SplitSeq(string(logData), "\n") {
+		if strings.HasPrefix(line, "fetch ") {
+			t.Fatalf("fresh branch clone ran redundant fetch; git log:\n%s", logData)
+		}
+	}
 
-			got, err = svc.registry.GetRepo(ctx, "repo")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got.PrepareState != model.PrepareStateReady {
-				t.Fatalf("PrepareState = %q, want ready", got.PrepareState)
-			}
-		})
+	got, err = svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PrepareState != model.PrepareStateReady {
+		t.Fatalf("PrepareState = %q, want ready", got.PrepareState)
 	}
 }
 
 func TestPrepareAsyncDoesNotOpenGateWhenReadyPersistenceFails(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	preparedGitDir := createPreparedGitDir(t, tmp)
@@ -1495,6 +1506,7 @@ func TestPrepareAsyncDoesNotOpenGateWhenReadyPersistenceFails(t *testing.T) {
 }
 
 func TestPrepareAsyncDoesNotMarkSupersededConfigReady(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	firstGitDir := createPreparedGitDir(t, filepath.Join(tmp, "first"))
@@ -1551,6 +1563,7 @@ func TestPrepareAsyncDoesNotMarkSupersededConfigReady(t *testing.T) {
 }
 
 func TestPrepareAsyncDoesNotMarkSupersededConfigFailed(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -1603,6 +1616,7 @@ func TestPrepareAsyncDoesNotMarkSupersededConfigFailed(t *testing.T) {
 }
 
 func TestPrepareRequeuesReadyVerifiedSourceForRecovery(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	bare := filepath.Join(tmp, "origin.git")
@@ -1749,6 +1763,15 @@ func waitFor(t *testing.T, done <-chan error, ready func() bool) {
 			t.Fatalf("operation returned before the awaited step: %v", err)
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+// wake wakes svc's sync loop, as a CLI command's nudge does. A test daemon
+// never polls the registry, so a test wakes it after each registry change.
+func wake(svc *Service) {
+	select {
+	case svc.wake <- struct{}{}:
+	default:
 	}
 }
 

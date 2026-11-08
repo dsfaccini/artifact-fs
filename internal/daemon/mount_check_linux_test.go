@@ -8,6 +8,7 @@ import (
 // The Linux mount table names a mount's source and type, which tell a
 // daemon's own mount of a repo from any other mount.
 func TestMountTableReadsTheMountSourceAndType(t *testing.T) {
+	t.Parallel()
 	const procMounts = "/dev/root / ext4 rw 0 0\n" +
 		"artifact-fs:my\\040repo /home/u/mnt/my\\040repo fuse.artifact-fs rw,nosuid,nodev 0 0\n"
 	entry, found := matchProcMounts(procMounts, "/home/u/mnt/my repo")

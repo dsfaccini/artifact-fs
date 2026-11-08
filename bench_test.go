@@ -79,6 +79,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 		RepoSpec: model.RepoSpec{
 			RemoteURL: repo.url,
 			Branch:    repo.branch,
+			FetchRef:  repo.branch,
 		},
 	}
 
