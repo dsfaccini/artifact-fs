@@ -57,6 +57,42 @@ func (b *synchronizedBuffer) Reset() {
 	b.b.Reset()
 }
 
+// newE2ELogger returns the logger of an e2e daemon. It writes warnings and
+// errors to stderr, and every record from Debug up to logs. The fuse library
+// logs the error behind an op's EIO at Debug, and logFuseErrors prints it when
+// a test fails.
+func newE2ELogger(logs *synchronizedBuffer) *slog.Logger {
+	return slog.New(slog.NewMultiHandler(
+		logging.NewJSONLogger(os.Stderr, slog.LevelWarn).Handler(),
+		logging.NewJSONLogger(logs, slog.LevelDebug).Handler(),
+	))
+}
+
+// newTestE2ELogger returns a newE2ELogger whose fuse error lines t prints if it fails.
+func newTestE2ELogger(t *testing.T) *slog.Logger {
+	t.Helper()
+	logs := &synchronizedBuffer{}
+	t.Cleanup(func() {
+		if t.Failed() {
+			logFuseErrors(t, logs)
+		}
+	})
+	return newE2ELogger(logs)
+}
+
+// logFuseErrors logs each fuse error line of the daemon in logs.
+func logFuseErrors(t *testing.T, logs *synchronizedBuffer) {
+	t.Helper()
+	if logs == nil {
+		return
+	}
+	for line := range strings.SplitSeq(logs.String(), "\n") {
+		if strings.Contains(line, `"msg":"fuse error"`) {
+			t.Log("daemon: " + line)
+		}
+	}
+}
+
 func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 	t.Helper()
 	if os.Getenv("AFS_RUN_E2E_TESTS") != "1" {
@@ -88,8 +124,7 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	logs := &synchronizedBuffer{}
-	logger := logging.NewJSONLogger(io.MultiWriter(os.Stderr, logs), slog.LevelWarn)
-	svc, err := daemon.New(ctx, root, logger)
+	svc, err := daemon.New(ctx, root, newE2ELogger(logs))
 	if err != nil {
 		cancel()
 		t.Fatal(err)
@@ -137,6 +172,9 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 		logs:      logs,
 	}
 	t.Cleanup(func() {
+		if t.Failed() {
+			logFuseErrors(t, repo.logs)
+		}
 		repo.close(t)
 	})
 	primeE2EMountPolling(t, repo.mountPath)
@@ -189,7 +227,7 @@ func (r *mountedE2ERepo) restart(t *testing.T) {
 	r.stop(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	svc, err := daemon.New(ctx, r.root, logging.NewJSONLogger(io.MultiWriter(os.Stderr, r.logs), slog.LevelWarn))
+	svc, err := daemon.New(ctx, r.root, newE2ELogger(r.logs))
 	if err != nil {
 		cancel()
 		t.Fatal(err)
@@ -424,6 +462,9 @@ func testE2EGitCheckoutBranchSwitch(t *testing.T, repo *mountedE2ERepo) {
 		"commit", "-m", "feature branch commit",
 	)
 	waitForBranchAndStatus(t, repo.mountPath, "feature", map[string]string{})
+	if branches := gitCmd(t, repo.mountPath, "branch", "--format=%(refname:short)"); branches != "feature\nmain\n" {
+		t.Fatalf("git branch = %q, want feature and main", branches)
+	}
 
 	gitCmd(t, repo.mountPath, "checkout", "main")
 	waitForBranchAndStatus(t, repo.mountPath, "main", map[string]string{})
@@ -490,6 +531,9 @@ func testE2EGitCheckoutRestorePath(t *testing.T, repo *mountedE2ERepo) {
 		t.Fatal(err)
 	}
 	assertGitStatus(t, repo.mountPath, map[string]string{"README.md": " M"})
+	if diff := gitCmd(t, repo.mountPath, "diff", "README.md"); !strings.Contains(diff, "\n+local change\n") {
+		t.Fatalf("git diff README.md = %q, want the added line", diff)
+	}
 
 	gitCmd(t, repo.mountPath, "checkout", "--", "README.md")
 	assertGitStatus(t, repo.mountPath, map[string]string{})
@@ -616,14 +660,16 @@ func testE2EGitCommitPreservesUnstagedAfterStagedCommit(t *testing.T, repo *moun
 }
 
 func testE2EGitCommitTrackedRename(t *testing.T, repo *mountedE2ERepo) {
-	openSource, err := os.Open(filepath.Join(repo.mountPath, "SECURITY.md"))
+	sourcePath := filepath.Join(repo.mountPath, "SECURITY.md")
+	content := readFileEventually(t, sourcePath)
+	openSource, err := os.Open(sourcePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer openSource.Close()
 	gitCmd(t, repo.mountPath, "mv", "SECURITY.md", "SECURITY-renamed.md")
-	if _, err := openSource.Stat(); err != nil {
-		t.Fatalf("stat open source after rename: %v", err)
+	if got, err := io.ReadAll(openSource); err != nil || string(got) != content {
+		t.Fatalf("read through the open source after git mv = %q, %v; want %q", got, err, content)
 	}
 	assertGitStatus(t, repo.mountPath, map[string]string{"SECURITY.md -> SECURITY-renamed.md": "R "})
 
@@ -636,8 +682,8 @@ func testE2EGitCommitTrackedRename(t *testing.T, repo *mountedE2ERepo) {
 
 	waitForHeadAndStatus(t, repo.mountPath, preCommitHEAD, map[string]string{})
 	assertPathMissing(t, filepath.Join(repo.mountPath, "SECURITY.md"))
-	if got := readFileStr(t, filepath.Join(repo.mountPath, "SECURITY-renamed.md")); !strings.Contains(got, "Security") {
-		t.Fatalf("renamed file content = %q", got)
+	if got := readFileStr(t, filepath.Join(repo.mountPath, "SECURITY-renamed.md")); got != content {
+		t.Fatalf("renamed file content = %q, want %q", got, content)
 	}
 }
 
@@ -879,11 +925,44 @@ func testE2EGitPush(t *testing.T, repo *mountedE2ERepo) {
 	}
 }
 
+// assertGitStatus asserts git status in dir, and that the fsmonitor hook the
+// daemon installs answered it with the paths changed since the index's token.
+// Git falls back to a full scan when the hook fails, and the hook answers "/",
+// a full rescan, for a token it does not trust, so the status alone passes
+// without either answer.
 func assertGitStatus(t *testing.T, dir string, want map[string]string) {
 	t.Helper()
-	got := gitStatusShortMap(t, dir)
+	trace := filepath.Join(t.TempDir(), "trace2.json")
+	cmd := exec.Command("git", gitArgsWithSafeDirectory(dir, "status", "--short", "--untracked-files=all")...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_TRACE2_EVENT="+trace)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git status failed: %v\nstderr: %s", err, stderr.String())
+	}
+	got, err := parseStatusOutput(stdout.String())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("git status mismatch:\n got: %v\nwant: %v", got, want)
+	}
+	events, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(events, []byte(`"category":"fsm_hook","key":"query/response-length"`)) ||
+		bytes.Contains(events, []byte(`"category":"fsm_hook","key":"query/failed"`)) ||
+		bytes.Contains(events, []byte(`"category":"fsm_hook","key":"query/trivial-response"`)) {
+		var hookEvents []string
+		for line := range strings.SplitSeq(string(events), "\n") {
+			if strings.Contains(line, `"category":"fsm_hook"`) {
+				hookEvents = append(hookEvents, line)
+			}
+		}
+		t.Fatalf("git status got no answer, or only a full rescan, from the fsmonitor hook; its fsm_hook trace2 events: %v\nstderr: %s", hookEvents, stderr.String())
 	}
 }
 
@@ -899,26 +978,6 @@ func waitForOverlayClean(t *testing.T, repo *mountedE2ERepo) {
 		}
 		return false, "overlay remains dirty"
 	})
-}
-
-func gitStatusShortMap(t *testing.T, dir string) map[string]string {
-	t.Helper()
-	out := gitCmd(t, dir, "status", "--short", "--untracked-files=all")
-	status := map[string]string{}
-	out = strings.TrimRight(out, "\n")
-	if out == "" {
-		return status
-	}
-	for line := range strings.SplitSeq(out, "\n") {
-		if line == "" {
-			continue
-		}
-		if len(line) < 4 {
-			t.Fatalf("unexpected git status line %q", line)
-		}
-		status[strings.TrimSpace(line[3:])] = line[:2]
-	}
-	return status
 }
 
 func gitCmdQuiet(t *testing.T, dir string, args ...string) {

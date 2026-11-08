@@ -4,15 +4,15 @@ package main
 
 import (
 	"context"
-	"log/slog"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/daemon"
-	"github.com/cloudflare/artifact-fs/internal/logging"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -105,8 +105,8 @@ func TestE2EAsyncPreparedGitDirFailureThenRetry(t *testing.T) {
 		return false, "state=" + st.State + " prepare_error=" + st.PrepareError
 	})
 
-	if _, err := os.ReadDir(repo.mountPath); err == nil {
-		t.Fatal("ReadDir unexpectedly succeeded after prepare failure")
+	if _, err := os.ReadDir(repo.mountPath); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("ReadDir after prepare failure = %v, want EIO", err)
 	}
 
 	gitCmd(t, preparedWorktree, "remote", "set-url", "origin", remoteURL)
@@ -149,11 +149,15 @@ func installBlockingGitFetchWrapper(t *testing.T, unblockPath string) {
 	}
 	wrapperDir := t.TempDir()
 	wrapperPath := filepath.Join(wrapperDir, "git")
+	// The wait gives up after 60 seconds, so a fetch the test never unblocks
+	// ends with the test.
 	script := `#!/bin/sh
 for arg in "$@"; do
   if [ "$arg" = "fetch" ]; then
-    while [ ! -f "$AFS_ASYNC_GIT_UNBLOCK" ]; do
+    waited=0
+    while [ ! -f "$AFS_ASYNC_GIT_UNBLOCK" ] && [ "$waited" -lt 1200 ]; do
       sleep 0.05
+      waited=$((waited + 1))
     done
     break
   fi
@@ -187,8 +191,8 @@ func newAsyncPreparedE2ERepo(t *testing.T, preparedGitDir string, fetchRef strin
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	logger := logging.NewJSONLogger(os.Stderr, slog.LevelWarn)
-	svc, err := daemon.New(ctx, root, logger)
+	logs := &synchronizedBuffer{}
+	svc, err := daemon.New(ctx, root, newE2ELogger(logs))
 	if err != nil {
 		cancel()
 		t.Fatal(err)
@@ -234,8 +238,12 @@ func newAsyncPreparedE2ERepo(t *testing.T, preparedGitDir string, fetchRef strin
 		ctl:       ctl,
 		cancel:    cancel,
 		errCh:     errCh,
+		logs:      logs,
 	}
 	t.Cleanup(func() {
+		if t.Failed() {
+			logFuseErrors(t, repo.logs)
+		}
 		repo.close(t)
 	})
 	return repo
