@@ -2642,6 +2642,85 @@ func TestGetattrOfAwayInodeWithNoContentReturnsESTALE(t *testing.T) {
 	}
 }
 
+// A path that changes type gets a new inode, and the inode the kernel holds
+// for it is retired. Linux fails every op on an inode whose type a reply
+// changes, and the macFUSE kernel extension revokes it, so a file held open
+// there would fail at once. The switch pass, a lookup or a getattr can see the
+// change first. A getattr keeps the held inode's type, and an open file keeps
+// reading what it opened. Once the pass ran, a setattr through the held inode
+// no longer reaches the path.
+func TestTypeChangeGivesThePathANewInode(t *testing.T) {
+	file := baseFile("p", "blob-P", 0o100644)
+	dir := []model.BaseNode{baseDir("p", "tree-P"), baseFile("p/x.txt", "x", 0o100644)}
+	link := model.BaseNode{Path: "p", Type: "symlink", Mode: 0o120000, ObjectOID: "target", SizeState: "known", SizeBytes: 6}
+	for _, change := range []struct {
+		name     string
+		from, to []model.BaseNode
+	}{
+		{"file to dir", []model.BaseNode{file}, dir},
+		{"file to symlink", []model.BaseNode{file}, []model.BaseNode{link}},
+		{"dir to file", dir, []model.BaseNode{file}},
+		{"symlink to file", []model.BaseNode{link}, []model.BaseNode{file}},
+	} {
+		from, to := change.from[0].Type, change.to[0].Type
+		typeBits := func(typ string) os.FileMode { return inodeAttrs(0, 0, typ, time.Time{}, time.Time{}).Mode.Type() }
+		for _, first := range []string{"pass", "lookup", "getattr"} {
+			t.Run(change.name+"/"+first, func(t *testing.T) {
+				f := newCacheFixture(t, change.from...)
+				var root fuseops.InodeID = fuseops.RootInodeID
+				held := f.lookup(root, "p")
+				var open *fuseops.OpenFileOp
+				if from == "file" {
+					open = f.open(held)
+				}
+				f.switchTo(change.to...)
+				switch first {
+				case "pass":
+					if err := f.mount.InvalidateChanged(); err != nil {
+						t.Fatal(err)
+					}
+					before, _, err := f.fs.engine.Identity("p")
+					if err != nil {
+						t.Fatal(err)
+					}
+					mode := os.FileMode(0o600)
+					if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: held, Mode: &mode}); kernelErrno(err) != syscall.ESTALE {
+						t.Fatalf("chmod through held %s inode %d after p became a %s = %v, want ESTALE", from, held, to, err)
+					}
+					if after, _, err := f.fs.engine.Identity("p"); err != nil || after != before {
+						t.Fatalf("p after a chmod through the held %s inode = %+v, %v, want %+v", from, after, err, before)
+					}
+				case "getattr":
+					op := &fuseops.GetInodeAttributesOp{Inode: held}
+					if err := f.fs.GetInodeAttributes(f.ctx, op); err != nil {
+						t.Fatal(err)
+					}
+					if got := op.Attributes.Mode.Type(); got != typeBits(from) {
+						t.Fatalf("getattr of held %s inode %d after p became a %s = type %v, want %v", from, held, to, got, typeBits(from))
+					}
+				}
+				op := &fuseops.LookUpInodeOp{Parent: root, Name: "p"}
+				if err := f.fs.LookUpInode(f.ctx, op); err != nil {
+					t.Fatal(err)
+				}
+				if op.Entry.Child == 0 || op.Entry.Child == held || op.Entry.Attributes.Mode.Type() != typeBits(to) {
+					t.Fatalf("lookup of p, a %s now, = inode %d of type %v, want a new inode, not %d, of type %v", to, op.Entry.Child, op.Entry.Attributes.Mode.Type(), held, typeBits(to))
+				}
+				if first != "pass" {
+					if err := f.mount.InvalidateChanged(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if open != nil {
+					if got := mustReadHandle(t, f, held, open.Handle); got != "blob-P" {
+						t.Fatalf("read through the file held open after p became a %s = %q, want %q", to, got, "blob-P")
+					}
+				}
+			})
+		}
+	}
+}
+
 // readHandle reads up to 64 bytes through handle h of inode.
 func readHandle(f *cacheFixture, inode fuseops.InodeID, h fuseops.HandleID) (string, error) {
 	read := &fuseops.ReadFileOp{Inode: inode, Handle: h, Size: 64, Dst: make([]byte, 64)}

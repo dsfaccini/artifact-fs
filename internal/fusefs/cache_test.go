@@ -125,11 +125,11 @@ func newCacheFixtureOn(t *testing.T, backend string, nodes ...model.BaseNode) *c
 }
 
 // publish publishes nodes as a new generation, with a blob file for each
-// file's blob that holds the blob's name.
+// file's or symlink's blob that holds the blob's name.
 func (f *cacheFixture) publish(nodes ...model.BaseNode) int64 {
 	f.t.Helper()
 	for _, n := range nodes {
-		if n.Type != "file" {
+		if n.Type == "dir" {
 			continue
 		}
 		path := filepath.Join(f.t.TempDir(), n.ObjectOID)
@@ -478,10 +478,9 @@ func TestSwitchPassInvalidatesInodeAReplyUpdatedFirst(t *testing.T) {
 }
 
 // A switch that turns a held file into a directory invalidates its entry and
-// its inode once. A lookup before the pass already reports the directory, so
-// the pass sees the type change through Prior. Once the pass invalidated the
-// inode, a lookup keeps no Prior, and a later switch that keeps the directory
-// sends nothing.
+// its inode once. A lookup before the pass already gave the kernel the
+// directory under a new inode, so the pass sends nothing. A later switch that
+// keeps the directory sends nothing either.
 func TestSwitchPassInvalidatesRetypedEntryOnce(t *testing.T) {
 	for _, lookupFirst := range []bool{false, true} {
 		t.Run(fmt.Sprint("lookup before the pass=", lookupFirst), func(t *testing.T) {
@@ -489,21 +488,23 @@ func TestSwitchPassInvalidatesRetypedEntryOnce(t *testing.T) {
 			held := f.lookup(fuseops.RootInodeID, "swap")
 			dir := []model.BaseNode{baseDir("swap", "t1"), baseFile("swap/x.txt", "x", 0o100644)}
 			f.switchTo(dir...)
+			wantInodes, wantEntries := []fuseops.InodeID{held}, []kernelEntry{{fuseops.RootInodeID, "swap"}}
 			if lookupFirst {
 				f.lookup(fuseops.RootInodeID, "swap")
+				wantInodes, wantEntries = nil, nil
 			}
 			if err := f.mount.InvalidateChanged(); err != nil {
 				t.Fatal(err)
 			}
-			if inodes, entries := f.notifier.recorded(); !slices.Equal(inodes, []fuseops.InodeID{held}) || !slices.Equal(entries, []kernelEntry{{fuseops.RootInodeID, "swap"}}) {
-				t.Fatalf("the switch that made swap a directory invalidated inodes %v and entries %v, want inode %d and entry swap", inodes, entries, held)
+			if inodes, entries := f.notifier.recorded(); !slices.Equal(inodes, wantInodes) || !slices.Equal(entries, wantEntries) {
+				t.Fatalf("the switch that made swap a directory invalidated inodes %v and entries %v, want inodes %v and entries %v", inodes, entries, wantInodes, wantEntries)
 			}
 			f.lookup(fuseops.RootInodeID, "swap")
 			f.switchTo(dir...)
 			if err := f.mount.InvalidateChanged(); err != nil {
 				t.Fatal(err)
 			}
-			if inodes, entries := f.notifier.recorded(); len(inodes) != 1 || len(entries) != 1 {
+			if inodes, entries := f.notifier.recorded(); len(inodes) != len(wantInodes) || len(entries) != len(wantEntries) {
 				t.Fatalf("a switch that kept the directory swap sent invalidations: inodes %v, entries %v", inodes, entries)
 			}
 		})
@@ -512,12 +513,10 @@ func TestSwitchPassInvalidatesRetypedEntryOnce(t *testing.T) {
 
 // An entry invalidation leaves the kernel's attributes and pages of the
 // inode. A switch that retypes a held file therefore invalidates its inode
-// too. Otherwise a later switch that brings the path back as a file of the
-// same size, followed by a lookup or getattr before its pass, records the new
-// blob, and that pass finds nothing changed while the kernel's pages still
-// hold the first blob. A switch that removes the held file invalidates only
-// its entry, and the file's inode never takes the new blob as its own: a
-// lookup, getattr or pass that finds the path back changed retires it.
+// too, and retires it. A switch that removes the held file invalidates only
+// its entry, and a lookup, getattr or pass that finds the path back changed
+// retires the file's inode. Either way the inode never takes the blob of a
+// later switch that brings the path back as a file.
 func TestSwitchPassInvalidatesInodeWithItsEntry(t *testing.T) {
 	for _, away := range []struct {
 		name  string

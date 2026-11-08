@@ -41,13 +41,15 @@ type MountedFS interface {
 	// and the merged view no longer matches: the attributes and pages of an
 	// inode whose type, permission bits or blob changed, the entry of a name
 	// that vanished or changed type, and a negative entry whose name now
-	// exists. It also retires the inode number of each path that vanished,
-	// and closes each overlay file that a handle that is not detached holds
-	// and the overlay no longer names for the handle's path. It moves the read
-	// generation of each inode whose path kept its identity to the current
-	// one. Call it after a generation switch, holding no lock an op takes.
-	// FSKit takes no invalidations, so it only retires numbers, closes files
-	// and moves read generations there.
+	// exists. It also retires the inode number of each path that vanished and
+	// the inode of each path that changed type, and closes each overlay file
+	// that a handle that is not detached holds and the overlay no longer
+	// names for the handle's path. It moves the read generation of each inode
+	// whose path kept its identity to the current one. Call it after a
+	// generation switch, holding no lock an op takes. FSKit takes no
+	// invalidations, so there it only retires numbers, closes files and moves
+	// read generations, and it retires only the inodes that open files are on
+	// when their paths changed type. A lookup or getattr retires any other.
 	InvalidateChanged() error
 	// OpenFileGenerations returns the snapshot generations that open files
 	// read. A prune keeps them.
@@ -305,7 +307,9 @@ func NewArtifactFuse(repo model.RepoPaths, engine *Engine) *ArtifactFuse {
 // as what the kernel last received for it. A path with a dormant mapping gets
 // its number back. An unmapped inode whose path came back with its identity
 // maps back to the path; one whose path came back as something else is
-// retired. Caller must hold fs.mu write lock.
+// retired. A path whose type changed gets a new number, and the inode the
+// kernel holds for it is retired: the kernel fails every op on an inode whose
+// type changes. Caller must hold fs.mu write lock.
 func (fs *ArtifactFuse) allocInode(path string, attrs Attrs) *InodeRef {
 	id, ok := fs.pathToInode[path]
 	if held, found := fs.unmapped[path]; !ok && found {
@@ -318,9 +322,13 @@ func (fs *ArtifactFuse) allocInode(path string, attrs Attrs) *InodeRef {
 		}
 	}
 	if ref := fs.inodes[id]; ok && ref != nil {
-		ref.Refcnt++
-		ref.report(attrs)
-		return ref
+		if ref.Type == attrs.Type {
+			ref.Refcnt++
+			ref.report(attrs)
+			return ref
+		}
+		fs.retireRetypedLocked(id, path)
+		ok = false
 	}
 	if !ok {
 		id = fs.nextInodeID
@@ -380,6 +388,17 @@ func (fs *ArtifactFuse) unmapPathLocked(id fuseops.InodeID, path string) {
 	if fs.inodes[id] != nil {
 		fs.unmapped[path] = id
 	}
+}
+
+// retireRetypedLocked retires id, whose path now has another type than the
+// one the kernel holds for id, and unmaps the path from it, so the path gets
+// a new number. id's handles keep reading the content they opened. Caller
+// must hold fs.mu write lock.
+func (fs *ArtifactFuse) retireRetypedLocked(id fuseops.InodeID, path string) {
+	if fs.pathToInode[path] == id {
+		delete(fs.pathToInode, path)
+	}
+	fs.retireLocked(id)
 }
 
 // mapLocked maps path back to id, an unmapped inode whose path came back.
@@ -640,7 +659,8 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // removed. When send is true it also tells the kernel what changed. Every inode
 // the kernel holds at a path gets the check for a name that vanished or
 // changed type. A name that changed type gets its entry and its inode
-// invalidated, and a vanished name only its entry. An unmapped inode whose
+// invalidated, and its inode retired, so the name gets a new number. A
+// vanished name gets only its entry invalidated. An unmapped inode whose
 // path came back maps back to the path when the path has its identity, and
 // is retired and invalidated otherwise. An inode whose identity the kernel
 // received from the base snapshot gets the identity comparison. One the
@@ -657,7 +677,8 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // generation from then on, so a prune need not keep the one it read. The
 // pass advances InodeRef.ReadGen for each inode it compares and finds
 // unchanged with no Prior. With send false it compares no inode, so it
-// checks the inodes that open file handles are on for that alone.
+// checks the inodes that open file handles are on for that and for a type
+// change alone.
 func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	type known struct {
 		pathMapping
@@ -740,7 +761,8 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// a getattr when its path comes back, createEntry when a create takes
 	// the path, and settleUnmappedBelow before an unlink or a rename.
 	var changed []fuseops.InodeID
-	var vanished []pathMapping
+	// retyped holds each held inode whose path changed type, to retire.
+	var vanished, retyped []pathMapping
 	// unchanged holds each inode whose base identity the path still has, to
 	// read gen from then on.
 	var unchanged []known
@@ -754,12 +776,13 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		// the switch and this pass replaced it.
 		hidden := k.prior.Type != ""
 		switch {
-		case !exists || current.Type != k.reported.Type || hidden && current.Type != k.prior.Type:
+		case !exists || current.Type != k.reported.Type:
 			entries = append(entries, k.entry)
 			if !exists {
 				vanished = append(vanished, k.pathMapping)
 			} else {
 				changed = append(changed, k.id)
+				retyped = append(retyped, k.pathMapping)
 			}
 		case hidden, k.base && current != k.reported, !k.base && current.Blob != "":
 			changed = append(changed, k.id)
@@ -773,8 +796,11 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			failed(err, "resolve "+k.path)
 			continue
 		}
-		if exists && current == k.reported {
+		switch {
+		case exists && current == k.reported:
 			unchanged = append(unchanged, k)
+		case exists && current.Type != k.reported.Type:
+			retyped = append(retyped, k.pathMapping)
 		}
 	}
 	// The name of an unmapped inode already left the kernel, through the op
@@ -832,6 +858,11 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// A reply or an op since the check can have changed what the kernel holds,
 	// and a switch since the check what the identities were resolved against.
 	if fs.engine.Generation() == gen {
+		for _, m := range retyped {
+			if fs.pathToInode[m.path] == m.id {
+				fs.retireRetypedLocked(m.id, m.path)
+			}
+		}
 		for _, k := range unchanged {
 			if ref := fs.inodes[k.id]; ref != nil && !ref.Stale && ref.Prior.Type == "" && ref.identity() == k.reported && ref.Gen == k.gen && ref.ReadGen == k.readGen {
 				ref.ReadGen = gen
@@ -1051,7 +1082,8 @@ func (fs *ArtifactFuse) heldAttrs(id fuseops.InodeID) (Attrs, bool) {
 // the switch pass does: it maps id back to the path, or retires id and
 // returns ESTALE when the path changed or another inode holds it. Recording a
 // changed identity on an unmapped inode would let the pass map the path back
-// to it.
+// to it. When attrs give id's path another type, setReported retires id and
+// returns ESTALE, as allocInode does.
 func (fs *ArtifactFuse) setReported(id fuseops.InodeID, attrs Attrs) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -1060,6 +1092,10 @@ func (fs *ArtifactFuse) setReported(id fuseops.InodeID, attrs Attrs) error {
 		return nil
 	}
 	if fs.unmapped[ref.Path] == id && !fs.settleLocked(id, ref.Path, attrs.identity()) {
+		return syscall.ESTALE
+	}
+	if ref.Type != attrs.Type {
+		fs.retireRetypedLocked(id, ref.Path)
 		return syscall.ESTALE
 	}
 	ref.report(attrs)

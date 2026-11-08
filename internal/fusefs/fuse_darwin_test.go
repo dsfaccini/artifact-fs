@@ -104,8 +104,39 @@ func TestInvalidateChangedSendsNothingOnFSKit(t *testing.T) {
 	}
 }
 
+// The FSKit switch pass retires the inode of a file held open whose path
+// changed type, so a write through it no longer reaches the path. The open
+// file keeps reading what it opened.
+func TestFSKitSwitchPassRetiresOpenFileWhosePathChangedType(t *testing.T) {
+	link := model.BaseNode{Path: "p", Type: "symlink", Mode: 0o120000, ObjectOID: "target", SizeState: "known", SizeBytes: 6}
+	for _, to := range [][]model.BaseNode{{link}, {baseDir("p", "tree-P"), baseFile("p/x.txt", "x", 0o100644)}} {
+		t.Run(to[0].Type, func(t *testing.T) {
+			f := newCacheFixtureOn(t, BackendFSKit, baseFile("p", "blob-P", 0o100644))
+			held := f.lookup(fuseops.RootInodeID, "p")
+			open := f.openRW(held)
+			f.switchTo(to...)
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			before, _, err := f.fs.engine.Identity("p")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("written")}); kernelErrno(err) != syscall.ESTALE {
+				t.Fatalf("write through the file held open after p became a %s = %v, want ESTALE", to[0].Type, err)
+			}
+			if after, _, err := f.fs.engine.Identity("p"); err != nil || after != before {
+				t.Fatalf("p after a write through the held file = %+v, %v, want %+v", after, err, before)
+			}
+			if got := mustReadHandle(t, f, held, open.Handle); got != "blob-P" {
+				t.Fatalf("read through the file held open after p became a %s = %q, want %q", to[0].Type, got, "blob-P")
+			}
+		})
+	}
+}
+
 // The FSKit switch pass compares no inode, so it checks the inodes that open
-// file handles are on for their read generation alone.
+// file handles are on for their read generation and type alone.
 func TestOpenFileGenerationAfterSwitchesOnFSKit(t *testing.T) {
 	testOpenFileGenerationAfterSwitches(t, BackendFSKit)
 }
