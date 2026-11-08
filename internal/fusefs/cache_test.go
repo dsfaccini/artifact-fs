@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"os"
@@ -201,8 +202,9 @@ func entrySet(entries []kernelEntry) map[kernelEntry]int {
 }
 
 // After a generation switch, the mount invalidates each inode the kernel
-// holds whose type, permission bits or blob changed, and the entry of each
-// name that vanished or changed type. On Linux it also invalidates each
+// holds whose type, permission bits or blob changed, the entry of each name
+// that vanished, and both the entry and the inode of each name that changed
+// type. On Linux it also invalidates each
 // negative entry whose name now exists. A name made through the mount is
 // already positive in the kernel, so it gets no invalidation, and neither do
 // directories whose tree changed or overlay entries.
@@ -223,12 +225,12 @@ func TestInvalidateChangedDropsWhatTheSwitchChanged(t *testing.T) {
 	same := f.lookup(root, "same.txt")
 	edited := f.lookup(root, "edited.txt")
 	chmod := f.lookup(root, "chmod.sh")
-	f.lookup(root, "gone.txt")
-	f.lookup(root, "swap")
+	gone := f.lookup(root, "gone.txt")
+	swap := f.lookup(root, "swap")
 	dir := f.lookup(root, "dir")
 	f.lookup(dir, "kept.txt")
 	olddir := f.lookup(root, "olddir")
-	f.lookup(olddir, "child.txt")
+	child := f.lookup(olddir, "child.txt")
 	f.lookup(root, ".git")
 
 	// Names the kernel caches as missing: one the switch adds, one that stays
@@ -273,8 +275,8 @@ func TestInvalidateChangedDropsWhatTheSwitchChanged(t *testing.T) {
 	}
 
 	inodes, entries := f.notifier.recorded()
-	if want := sortedInodes([]fuseops.InodeID{edited, chmod}); !slices.Equal(sortedInodes(inodes), want) {
-		t.Errorf("invalidated inodes = %v, want %v (edited.txt, chmod.sh); same.txt is inode %d", sortedInodes(inodes), want, same)
+	if want := sortedInodes([]fuseops.InodeID{edited, chmod, swap}); !slices.Equal(sortedInodes(inodes), want) {
+		t.Errorf("invalidated inodes = %v, want %v (edited.txt, chmod.sh, swap); same.txt is inode %d, gone.txt %d, olddir %d, olddir/child.txt %d", sortedInodes(inodes), want, same, gone, olddir, child)
 	}
 	want := map[kernelEntry]int{
 		{root, "gone.txt"}:    1,
@@ -412,5 +414,156 @@ func TestInvalidateChangedDropsWrittenPagesWhenABaseBlobReturns(t *testing.T) {
 	}
 	if after, _ := f.notifier.recorded(); !slices.Equal(after[len(before):], []fuseops.InodeID{inode}) {
 		t.Fatalf("inodes the switch back to blob-a invalidated = %v, want file.txt (%d)", after[len(before):], inode)
+	}
+}
+
+// A lookup or getattr between a switch and its pass reports the new blob, so
+// the identity the kernel received already matches the merged view when the
+// pass compares them. The kernel's pages can still hold the old blob: the
+// macFUSE kernel extension ignores a lookup's attributes for an inode it
+// holds, and drops pages on a getattr only when the size changed. The pass
+// must still invalidate the inode, and a later switch that keeps the file
+// must not invalidate it again.
+func TestSwitchPassInvalidatesInodeAReplyUpdatedFirst(t *testing.T) {
+	for _, reply := range []string{"none", "lookup", "getattr"} {
+		t.Run(reply, func(t *testing.T) {
+			f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
+			held := f.lookup(fuseops.RootInodeID, "file.txt")
+			f.open(held)
+			f.switchTo(baseFile("file.txt", "blob-B", 0o100644))
+			switch reply {
+			case "lookup":
+				f.lookup(fuseops.RootInodeID, "file.txt")
+			case "getattr":
+				f.getattr(held)
+			}
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if inodes, _ := f.notifier.recorded(); !slices.Equal(inodes, []fuseops.InodeID{held}) {
+				t.Fatalf("pass invalidated inodes %v, want held inode %d, whose pages hold blob-A", inodes, held)
+			}
+			f.getattr(held)
+			f.switchTo(baseFile("file.txt", "blob-B", 0o100644))
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if inodes, _ := f.notifier.recorded(); len(inodes) != 1 {
+				t.Fatalf("a switch that kept file.txt invalidated it again: inodes %v", inodes)
+			}
+		})
+	}
+}
+
+// A switch that turns a held file into a directory invalidates its entry and
+// its inode once. A lookup before the pass already reports the directory, so
+// the pass sees the type change through Prior. Once the pass invalidated the
+// inode, a lookup keeps no Prior, and a later switch that keeps the directory
+// sends nothing.
+func TestSwitchPassInvalidatesRetypedEntryOnce(t *testing.T) {
+	for _, lookupFirst := range []bool{false, true} {
+		t.Run(fmt.Sprint("lookup before the pass=", lookupFirst), func(t *testing.T) {
+			f := newCacheFixture(t, baseFile("swap", "blob-S", 0o100644))
+			held := f.lookup(fuseops.RootInodeID, "swap")
+			dir := []model.BaseNode{baseDir("swap", "t1"), baseFile("swap/x.txt", "x", 0o100644)}
+			f.switchTo(dir...)
+			if lookupFirst {
+				f.lookup(fuseops.RootInodeID, "swap")
+			}
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if inodes, entries := f.notifier.recorded(); !slices.Equal(inodes, []fuseops.InodeID{held}) || !slices.Equal(entries, []kernelEntry{{fuseops.RootInodeID, "swap"}}) {
+				t.Fatalf("the switch that made swap a directory invalidated inodes %v and entries %v, want inode %d and entry swap", inodes, entries, held)
+			}
+			f.lookup(fuseops.RootInodeID, "swap")
+			f.switchTo(dir...)
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if inodes, entries := f.notifier.recorded(); len(inodes) != 1 || len(entries) != 1 {
+				t.Fatalf("a switch that kept the directory swap sent invalidations: inodes %v, entries %v", inodes, entries)
+			}
+		})
+	}
+}
+
+// An entry invalidation leaves the kernel's attributes and pages of the
+// inode. A switch that retypes a held file therefore invalidates its inode
+// too. Otherwise a later switch that brings the path back as a file of the
+// same size, followed by a lookup or getattr before its pass, records the new
+// blob, and that pass finds nothing changed while the kernel's pages still
+// hold the first blob. A switch that removes the held file invalidates only
+// its entry, and the file's inode never takes the new blob as its own: a
+// lookup, getattr or pass that finds the path back changed retires it.
+func TestSwitchPassInvalidatesInodeWithItsEntry(t *testing.T) {
+	for _, away := range []struct {
+		name  string
+		nodes []model.BaseNode
+	}{
+		{"retype", []model.BaseNode{baseDir("swap", "t1"), baseFile("swap/x.txt", "x", 0o100644)}},
+		{"vanish", nil},
+	} {
+		for _, reply := range []string{"none", "lookup", "getattr"} {
+			t.Run(away.name+"/"+reply, func(t *testing.T) {
+				f := newCacheFixture(t, baseFile("swap", "blob-S", 0o100644))
+				held := f.lookup(fuseops.RootInodeID, "swap")
+				f.open(held)
+				f.switchTo(away.nodes...)
+				if err := f.mount.InvalidateChanged(); err != nil {
+					t.Fatal(err)
+				}
+				f.switchTo(baseFile("swap", "blob-T", 0o100644))
+				switch reply {
+				case "lookup":
+					f.lookup(fuseops.RootInodeID, "swap")
+				case "getattr":
+					f.getattr(held)
+				}
+				if err := f.mount.InvalidateChanged(); err != nil {
+					t.Fatal(err)
+				}
+				if away.nodes == nil {
+					if got := openErrno(f, held); got != syscall.ESTALE {
+						t.Fatalf("open of held inode %d, whose path came back as blob-T, = errno %v, want ESTALE", held, got)
+					}
+					return
+				}
+				if inodes, _ := f.notifier.recorded(); !slices.Contains(inodes, held) {
+					t.Fatalf("passes invalidated inodes %v, want held inode %d, whose pages hold blob-S", inodes, held)
+				}
+			})
+		}
+	}
+}
+
+// The switch pass sends a vanished regular file only its entry invalidation,
+// because the file's content did not change: its open file keeps reading what
+// it read. When the path comes back unchanged, the pass maps it back to the
+// held inode and sends nothing.
+func TestSwitchPassSendsOnlyTheEntryOfAVanishedFile(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	open := f.open(held)
+	f.switchTo()
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if inodes, entries := f.notifier.recorded(); len(inodes) != 0 || !slices.Equal(entries, []kernelEntry{{fuseops.RootInodeID, "file.txt"}}) {
+		t.Fatalf("the switch that removed file.txt invalidated inodes %v and entries %v, want only the entry of file.txt", inodes, entries)
+	}
+	f.switchTo(baseFile("file.txt", "blob-A", 0o100644))
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if inodes, _ := f.notifier.recorded(); len(inodes) != 0 {
+		t.Fatalf("the switch that restored file.txt invalidated inodes %v", inodes)
+	}
+	read := &fuseops.ReadFileOp{Inode: held, Handle: open.Handle, Size: 64, Dst: make([]byte, 64)}
+	if err := f.fs.ReadFile(f.ctx, read); err != nil {
+		t.Fatalf("read through the open file after file.txt came back: %v", err)
+	}
+	if got := f.lookup(fuseops.RootInodeID, "file.txt"); got != held {
+		t.Fatalf("file.txt came back unchanged as inode %d, want %d", got, held)
 	}
 }
