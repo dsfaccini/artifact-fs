@@ -190,7 +190,12 @@ func TestEnsureHydratedVerifiesUnknownCacheHitOnce(t *testing.T) {
 	const readers = 8
 	errCh := make(chan error, readers)
 	done := hydrateConcurrently(t.Context(), h, cfg, node, readers, errCh)
-	waitForWaiters(t, h, &h.verifying, taskKey(cfg.ID, node.ObjectOID), readers, done)
+	waitForWaiters(t, h, &h.verifying, taskKey(cfg.ID, node.ObjectOID), readers, func() error {
+		if calls := fetcher.VerifyCalls(); calls > 1 {
+			return fmt.Errorf("%d VerifyBlob calls before every reader waited on one", calls)
+		}
+		return returnedEarly(done)
+	})
 	close(releaseVerify)
 	<-done
 	close(errCh)
@@ -266,7 +271,7 @@ func TestEnsureHydratedJoinsActiveFetch(t *testing.T) {
 	first := hydrateConcurrently(t.Context(), h, cfg, node, 1, errCh)
 	<-fetchStarted
 	joined := hydrateConcurrently(t.Context(), h, cfg, node, readers, errCh)
-	waitForWaiters(t, h, &h.wait, taskKey(cfg.ID, node.ObjectOID), readers+1, joined)
+	waitForWaiters(t, h, &h.wait, taskKey(cfg.ID, node.ObjectOID), readers+1, func() error { return returnedEarly(joined) })
 	close(releaseFetch)
 	<-first
 	<-joined
@@ -1679,9 +1684,9 @@ func hydrateConcurrently(ctx context.Context, h *Service, cfg model.RepoPaths, n
 }
 
 // waitForWaiters polls until at least n callers wait on key in waiters, one of
-// h's inflight maps, and fails t if done closes first. go test -timeout is its
-// only bound.
-func waitForWaiters[T any](t *testing.T, h *Service, waiters *inflight[T], key string, n int, done <-chan struct{}) {
+// h's inflight maps. It fails t when stop, if set, reports an error first. go
+// test -timeout is its only bound.
+func waitForWaiters[T any](t *testing.T, h *Service, waiters *inflight[T], key string, n int, stop func() error) {
 	t.Helper()
 	for {
 		h.mu.Lock()
@@ -1690,11 +1695,22 @@ func waitForWaiters[T any](t *testing.T, h *Service, waiters *inflight[T], key s
 		if waiting >= n {
 			return
 		}
-		select {
-		case <-done:
-			t.Fatalf("callers returned while %d of %d waited on %s", waiting, n, key)
-		case <-time.After(10 * time.Millisecond):
+		if stop != nil {
+			if err := stop(); err != nil {
+				t.Fatalf("%d of %d callers wait on %s: %v", waiting, n, key, err)
+			}
 		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// returnedEarly reports an error once done has closed.
+func returnedEarly(done <-chan struct{}) error {
+	select {
+	case <-done:
+		return errors.New("the callers returned")
+	default:
+		return nil
 	}
 }
 

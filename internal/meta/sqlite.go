@@ -16,6 +16,11 @@ import (
 
 const busyTimeout = 5 * time.Second
 
+// testHookAfterWALSwitchBusy, when set, runs in OpenDB after a switch to WAL
+// failed with SQLITE_BUSY, before the retry. The test catches a call that no
+// longer runs or no longer precedes a retry.
+var testHookAfterWALSwitchBusy func()
+
 func OpenDB(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir db dir: %w", err)
@@ -48,6 +53,9 @@ func OpenDB(path string) (*sql.DB, error) {
 		if !errors.As(err, &sqliteErr) || sqliteErr.Code()&0xff != sqlite3.SQLITE_BUSY || time.Now().After(deadline) {
 			db.Close()
 			return nil, err
+		}
+		if testHookAfterWALSwitchBusy != nil {
+			testHookAfterWALSwitchBusy()
 		}
 	}
 }
@@ -96,8 +104,10 @@ func Migrate(ctx context.Context, db *sql.DB, migrations []Migration) error {
 }
 
 // testHookBeforeBegin, when set, runs in a migration step before it takes the
-// write lock. Keep the call before BEGIN IMMEDIATE: the test catches a call
-// that no longer runs, not a moved one.
+// write lock. Keep the call between Migrate's first read of user_version and
+// BEGIN IMMEDIATE. The test misses a call moved before that read: it then
+// passes without the interleaving it names. A call moved past BEGIN IMMEDIATE
+// fails the test with SQLITE_BUSY after busy_timeout.
 var testHookBeforeBegin func()
 
 // migrateNext applies the next migration, if any, and returns the version

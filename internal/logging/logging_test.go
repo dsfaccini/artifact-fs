@@ -59,8 +59,8 @@ func TestNewJSONLoggerRedactsEveryStringBoundary(t *testing.T) {
 
 type remoteName string
 
-// The logger does not look inside a value of a named string type, a struct, a
-// slice or a map. The JSON handler marshals one as it is, so a credential in it
+// The logger does not look inside a value of a named string type without a
+// String method, a struct, a slice or a map. The JSON handler marshals one as it is, so a credential in it
 // reaches the log.
 func TestNewJSONLoggerLeavesOtherValuesAsTheyAre(t *testing.T) {
 	secret := "https://credential-user:super-secret@example.com/org/repo.git"

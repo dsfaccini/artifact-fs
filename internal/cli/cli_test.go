@@ -337,6 +337,14 @@ func TestRemoveRepoCLIUnregistersTheRepo(t *testing.T) {
 			t.Fatalf("add-repo %s exit = %d, stderr=%q", name, code, stderr)
 		}
 	}
+	listed, stderr, code := runCLI(t, "list-repos")
+	if code != 0 {
+		t.Fatalf("list-repos exit = %d, stderr=%q", code, stderr)
+	}
+	lines := strings.SplitAfter(listed, "\n")
+	if len(lines) != 3 || !strings.HasPrefix(lines[0], "other\t") || !strings.HasPrefix(lines[1], "repo\t") {
+		t.Fatalf("list-repos = %q, want other and repo", listed)
+	}
 
 	stdout, stderr, code := runCLI(t, "remove-repo", "--name", "repo")
 	if code != 0 {
@@ -349,8 +357,8 @@ func TestRemoveRepoCLIUnregistersTheRepo(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("list-repos exit = %d, stderr=%q", code, stderr)
 	}
-	if !strings.HasPrefix(stdout, "other\t") || strings.Count(stdout, "\n") != 1 {
-		t.Fatalf("list-repos = %q, want only other", stdout)
+	if stdout != lines[0] {
+		t.Fatalf("list-repos = %q, want only %q", stdout, lines[0])
 	}
 
 	stdout, stderr, code = runCLI(t, "remove-repo", "--name", "repo")
