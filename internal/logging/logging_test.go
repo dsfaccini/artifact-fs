@@ -57,12 +57,16 @@ func TestNewJSONLoggerRedactsEveryStringBoundary(t *testing.T) {
 	}
 }
 
-// The logger does not look inside a struct, slice or map value. The JSON
-// handler marshals one as it is, so a credential in it reaches the log.
-func TestNewJSONLoggerLeavesCompositeValuesAsTheyAre(t *testing.T) {
+type remoteName string
+
+// The logger does not look inside a value of a named string type, a struct, a
+// slice or a map. The JSON handler marshals one as it is, so a credential in it
+// reaches the log.
+func TestNewJSONLoggerLeavesOtherValuesAsTheyAre(t *testing.T) {
 	secret := "https://credential-user:super-secret@example.com/org/repo.git"
 	var output bytes.Buffer
-	NewJSONLogger(&output, slog.LevelInfo).Info("composite",
+	NewJSONLogger(&output, slog.LevelInfo).Info("other values",
+		"named", remoteName(secret),
 		"slice", []string{secret},
 		"map", map[string]string{"remote": secret},
 		"struct", struct{ Remote string }{secret},
@@ -72,6 +76,7 @@ func TestNewJSONLoggerLeavesCompositeValuesAsTheyAre(t *testing.T) {
 		t.Fatalf("decode JSON log: %v\n%s", err, output.String())
 	}
 	for key, want := range map[string]any{
+		"named":  secret,
 		"slice":  []any{secret},
 		"map":    map[string]any{"remote": secret},
 		"struct": map[string]any{"Remote": secret},
