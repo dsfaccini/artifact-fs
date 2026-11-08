@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -546,23 +545,20 @@ func TestStatusReportsManyUntrackedDeletesClean(t *testing.T) {
 	t.Parallel()
 	f := newHeadReconcileFixture(t)
 	// Ten thousand unlinks through the engine would make this test slow, so
-	// it writes the delete entries they leave in one transaction.
+	// it writes the delete entries they leave, build/0.o to build/9999.o, in
+	// one statement.
 	db, err := meta.OpenDB(f.rt.cfg.OverlayDBPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	tx, err := db.BeginTx(f.ctx, nil)
-	if err != nil {
+	if _, err := db.ExecContext(f.ctx, `WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 9999)
+		INSERT INTO overlay_entries(path, kind, mode, mtime_unix_ns, ctime_unix_ns) SELECT 'build/' || i || '.o', ?, 0, 0, 0 FROM n`, model.OverlayKindDelete); err != nil {
 		t.Fatal(err)
 	}
-	for i := range 10000 {
-		if _, err := tx.ExecContext(f.ctx, `INSERT INTO overlay_entries(path, kind, mode, mtime_unix_ns, ctime_unix_ns) VALUES (?, ?, 0, 0, 0)`, fmt.Sprintf("build/%d.o", i), model.OverlayKindDelete); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	var count int
+	if err := db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM overlay_entries WHERE kind = ? AND path GLOB 'build/*.o'`, model.OverlayKindDelete).Scan(&count); err != nil || count != 10000 {
+		t.Fatalf("delete entries = %d, %v; want 10000", count, err)
 	}
 	if f.overlayDirty() {
 		t.Fatal("status reports deletes of paths the served generation lacks as dirty")
