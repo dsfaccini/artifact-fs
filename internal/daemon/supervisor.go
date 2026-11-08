@@ -215,8 +215,7 @@ func (s *Service) stopRepo(repo model.RepoConfig, stopped string, logMsg string,
 		if claimed && !repo.Enabled && s.mountDue(repo) {
 			if err := s.releaseLeftoverMount(repo); err != nil {
 				s.logger.Error(logMsg, "repo", repo.Name, "error", auth.RedactLogString(err.Error(), repo.RemoteURL))
-				s.recordFailure(repo, phaseUnmount, err, s.backoffMount(repo))
-				s.recordRuntime(repo.ID, func(rec *model.RepoRuntimeRecord) {
+				s.recordFailure(repo, phaseUnmount, err, s.backoffMount(repo), func(rec *model.RepoRuntimeRecord) {
 					rec.State, rec.Phase, rec.MountRequest = repoStateUnmounted, phaseUnmount, stopped
 				})
 				return true
@@ -235,8 +234,7 @@ func (s *Service) stopRepo(repo model.RepoConfig, stopped string, logMsg string,
 	}
 	failed := func(err error) {
 		s.logger.Error(logMsg, "repo", repo.Name, "error", auth.RedactLogString(err.Error(), repo.RemoteURL))
-		s.recordFailure(repo, phaseUnmount, err, time.Now().Add(registrySyncInterval))
-		s.recordRuntime(repo.ID, func(rec *model.RepoRuntimeRecord) { rec.MountRequest = repo.MountRequest })
+		s.recordFailure(repo, phaseUnmount, err, time.Now().Add(registrySyncInterval), func(rec *model.RepoRuntimeRecord) { rec.MountRequest = repo.MountRequest })
 	}
 	s.recordPhase(repo, phaseUnmount)
 	op, started, err := s.stop(repo.ID, func(err error) {
