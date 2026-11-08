@@ -632,6 +632,26 @@ func (s *Store) SyncFile(ctx context.Context, path string) error {
 	return dir.Close()
 }
 
+// GrantOwnerAccess lets path's backing file open for writing, as a write
+// through the overlay does: when an earlier version left it read-only, it
+// grants the owner read and write. A file that opens for writing stays as it
+// is.
+func (s *Store) GrantOwnerAccess(ctx context.Context, path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok, err := s.lookupCommitted(ctx, model.CleanPath(path))
+	if err != nil || !ok || e.IsDeleted() || e.BackingPath == "" {
+		return err
+	}
+	return retryWithOwnerAccess(e.BackingPath, e.Mode, func() error {
+		f, err := os.OpenFile(e.BackingPath, os.O_RDWR, 0)
+		if err != nil {
+			return err
+		}
+		return f.Close()
+	})
+}
+
 func (s *Store) Truncate(ctx context.Context, path string, size int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -584,15 +584,20 @@ func (e *Engine) Unlink(ctx context.Context, b *Blobs, path string, files openFi
 	return e.Overlay.Remove(ctx, path)
 }
 
-// pinOpenFiles points the open handles on path at its overlay file, if it has one.
+// pinOpenFiles points the open handles on path at its overlay file, if it
+// has one. It first lets a backing file an earlier version left read-only
+// open for writing, so the handles can write their copy. Where that fails,
+// as for root, another uid's file or a read-only file system, the handles
+// keep the read-only fallback.
 func (e *Engine) pinOpenFiles(ctx context.Context, path string, files openFiles) error {
-	if files == nil {
+	if files == nil || !files.hasOpenFile(path) {
 		return nil
 	}
 	ov, ok, err := e.Overlay.Lookup(ctx, path)
 	if err != nil || !ok || ov.IsDeleted() || ov.BackingPath == "" {
 		return err
 	}
+	_ = e.Overlay.GrantOwnerAccess(ctx, path)
 	return files.pinOpenFiles(path, ov.BackingPath)
 }
 

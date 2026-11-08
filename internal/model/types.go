@@ -345,6 +345,9 @@ type OverlayStore interface {
 	FlushFile(ctx context.Context, path string) error
 	SyncFile(ctx context.Context, path string) error
 	Truncate(ctx context.Context, path string, size int64) error
+	// GrantOwnerAccess lets path's backing file open for writing when an
+	// earlier version left it read-only.
+	GrantOwnerAccess(ctx context.Context, path string) error
 	Remove(ctx context.Context, path string) error
 	Rename(ctx context.Context, oldPath, newPath string, sourceTracked bool) error
 	RenameTree(ctx context.Context, oldPath, newPath string, sourceBasePaths, destinationBasePaths []string) error
