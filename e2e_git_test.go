@@ -464,6 +464,9 @@ func testE2EGitCheckoutBranchSwitch(t *testing.T, repo *mountedE2ERepo) {
 		"commit", "-m", "feature branch commit",
 	)
 	waitForBranchAndStatus(t, repo.mountPath, "feature", map[string]string{})
+	if branches := gitCmd(t, repo.mountPath, "branch", "--format=%(refname:short)"); branches != "feature\nmain\n" {
+		t.Fatalf("git branch = %q, want feature and main", branches)
+	}
 
 	gitCmd(t, repo.mountPath, "checkout", "main")
 	waitForBranchAndStatus(t, repo.mountPath, "main", map[string]string{})
