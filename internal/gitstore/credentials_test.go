@@ -3,6 +3,7 @@ package gitstore
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"io/fs"
 	"net/http"
@@ -724,7 +725,8 @@ func serveSSHFromLocalRepo(t *testing.T) (commit, contacted string) {
 
 // A remote URL's credentials authenticate the clone and the preparation fetch
 // through the environment's credential helper, and no file in the git dir
-// keeps them.
+// keeps them, plain or Basic-auth encoded. A token that is the URL's only
+// userinfo goes as both the username and the password.
 func TestCredentialedHTTPRemoteAuthenticatesWithoutStoringCredentials(t *testing.T) {
 	t.Parallel()
 	skip := t.Skipf
@@ -736,61 +738,79 @@ func TestCredentialedHTTPRemoteAuthenticatesWithoutStoringCredentials(t *testing
 	if _, err := os.Stat(backend); err != nil {
 		skip("no git-http-backend to serve HTTP: %v", err)
 	}
-	const user, password = "zq-user", "zq-password-7"
-	remote := gittest.PartialCloneRemote(t, map[string]string{"README.md": "hello\n"})
-	bare := strings.TrimPrefix(remote, "file://")
-	smartHTTP := &cgi.Handler{
-		Path:       backend,
-		Env:        []string{"GIT_PROJECT_ROOT=" + filepath.Dir(bare), "GIT_HTTP_EXPORT_ALL=1"},
-		InheritEnv: []string{"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "PATH"},
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if gotUser, gotPassword, ok := r.BasicAuth(); !ok || gotUser != user || gotPassword != password {
-			w.Header().Set("WWW-Authenticate", `Basic realm="test"`)
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		smartHTTP.ServeHTTP(w, r)
-	}))
-	t.Cleanup(server.Close)
-	remoteURL, err := url.Parse(server.URL + "/" + filepath.Base(bare))
-	if err != nil {
-		t.Fatal(err)
-	}
-	safeURL := remoteURL.String()
-	remoteURL.User = url.UserPassword(user, password)
+	for _, tt := range []struct {
+		name     string
+		userinfo *url.Userinfo
+		// user and password are the Basic auth the server requires.
+		user, password string
+	}{
+		{"user and password", url.UserPassword("zq-user", "zq-password-7"), "zq-user", "zq-password-7"},
+		{"token as the username", url.User("zq-token-7"), "zq-token-7", "zq-token-7"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			remote := gittest.PartialCloneRemote(t, map[string]string{"README.md": "hello\n"})
+			bare := strings.TrimPrefix(remote, "file://")
+			smartHTTP := &cgi.Handler{
+				Path:       backend,
+				Env:        []string{"GIT_PROJECT_ROOT=" + filepath.Dir(bare), "GIT_HTTP_EXPORT_ALL=1"},
+				InheritEnv: []string{"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"},
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if user, password, ok := r.BasicAuth(); !ok || user != tt.user || password != tt.password {
+					w.Header().Set("WWW-Authenticate", `Basic realm="test"`)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				smartHTTP.ServeHTTP(w, r)
+			}))
+			t.Cleanup(server.Close)
+			remoteURL, err := url.Parse(server.URL + "/" + filepath.Base(bare))
+			if err != nil {
+				t.Fatal(err)
+			}
+			safeURL := remoteURL.String()
+			remoteURL.User = tt.userinfo
 
-	gitDir := filepath.Join(t.TempDir(), "repo.git")
-	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{RemoteURL: remoteURL.String(), Branch: "main", FetchRef: "main"}}
-	store := New(nil)
-	defer store.Close()
-	if err := store.CloneBlobless(t.Context(), cfg); err != nil {
-		t.Fatalf("CloneBlobless: %v", err)
-	}
-	if err := store.FetchRefWithCredentials(t.Context(), cfg, cfg.FetchRef); err != nil {
-		t.Fatalf("FetchRefWithCredentials: %v", err)
-	}
-	want := strings.TrimSpace(runOutput(t, "git", "--git-dir", bare, "rev-parse", "main"))
-	if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", "HEAD", "refs/remotes/origin/main")); got != want+"\n"+want {
-		t.Fatalf("HEAD and origin/main = %q, want the remote's main %s", got, want)
-	}
-	if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "remote", "get-url", "origin")); got != safeURL {
-		t.Fatalf("origin = %q, want %q", got, safeURL)
-	}
-	err = filepath.WalkDir(gitDir, func(path string, entry fs.DirEntry, err error) error {
-		if err != nil || entry.IsDir() {
-			return err
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		if bytes.Contains(data, []byte(password)) || bytes.Contains(data, []byte(user)) {
-			t.Errorf("%s holds the remote's credentials", path)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
+			gitDir := filepath.Join(t.TempDir(), "repo.git")
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "x", GitDir: gitDir}, RepoSpec: model.RepoSpec{RemoteURL: remoteURL.String(), Branch: "main", FetchRef: "main"}}
+			store := New(nil)
+			defer store.Close()
+			if err := store.CloneBlobless(t.Context(), cfg); err != nil {
+				t.Fatalf("CloneBlobless: %v", err)
+			}
+			cloned := strings.TrimSpace(runOutput(t, "git", "--git-dir", bare, "rev-parse", "main"))
+			// The remote moves on, so only a fetch that ran lands its new commit.
+			next := strings.TrimSpace(runOutput(t, "git", "--git-dir", bare, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit-tree", "-p", cloned, "-m", "next", cloned+"^{tree}"))
+			run(t, "git", "--git-dir", bare, "update-ref", "refs/heads/main", next)
+			if err := store.FetchRefWithCredentials(t.Context(), cfg, cfg.FetchRef); err != nil {
+				t.Fatalf("FetchRefWithCredentials: %v", err)
+			}
+			if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", "HEAD", "refs/remotes/origin/main")); got != cloned+"\n"+next {
+				t.Fatalf("HEAD and origin/main = %q, want the cloned %s and the fetched %s", got, cloned, next)
+			}
+			if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "remote", "get-url", "origin")); got != safeURL {
+				t.Fatalf("origin = %q, want %q", got, safeURL)
+			}
+			secrets := []string{tt.user, tt.password, base64.StdEncoding.EncodeToString([]byte(tt.user + ":" + tt.password))}
+			err = filepath.WalkDir(gitDir, func(path string, entry fs.DirEntry, err error) error {
+				if err != nil || entry.IsDir() {
+					return err
+				}
+				data, err := os.ReadFile(path)
+				if err != nil {
+					return err
+				}
+				for _, secret := range secrets {
+					if bytes.Contains(data, []byte(secret)) {
+						t.Errorf("%s holds the remote's credentials", path)
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
