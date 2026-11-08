@@ -1795,8 +1795,7 @@ func TestSetattrOfUnlinkedOpenFileChangesItsCopy(t *testing.T) {
 
 // On an FSKit mount, artifact-fs checks permissions itself. A truncate of an
 // unlinked open file whose copy a chmod made 0444 fails with EACCES when it
-// does not come through a handle that may write, as it does for a file a path
-// names.
+// comes through no handle, as it does for a file a path names.
 func TestTruncateOfReadOnlyUnlinkedCopyChecksPermissions(t *testing.T) {
 	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644))
 	held := f.lookup(fuseops.RootInodeID, "file.txt")
@@ -1810,11 +1809,157 @@ func TestTruncateOfReadOnlyUnlinkedCopyChecksPermissions(t *testing.T) {
 		t.Fatalf("fchmod of the unlinked open file = %v", err)
 	}
 	zero := uint64(0)
-	if got := kernelErrno(checking.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: held, Handle: &open.Handle, Size: &zero})); got != syscall.EACCES {
-		t.Fatalf("ftruncate through the read-only handle = errno %v, want EACCES", got)
+	if got := kernelErrno(checking.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: held, Size: &zero})); got != syscall.EACCES {
+		t.Fatalf("truncate without a handle = errno %v, want EACCES", got)
 	}
 	if got := mustReadHandle(t, f, held, open.Handle); got != "blob-AAAA" {
 		t.Fatalf("the handle reads %q, want blob-AAAA kept", got)
+	}
+}
+
+// On an FSKit mount, a handle opened for writing before an fchmod to 0444 of
+// an unlinked open file still truncates and writes its copy.
+func TestWritableHandleOfUnlinkedFileKeepsWritingAfterFchmod(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	open := &fuseops.OpenFileOp{Inode: held, OpenFlags: syscall.O_RDWR}
+	if err := f.fs.OpenFile(f.ctx, open); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: open.Handle})
+	})
+	if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	checking := permissionCheckingFS{f.fs}
+	ro := os.FileMode(0o444)
+	if err := checking.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: held, Mode: &ro}); err != nil {
+		t.Fatalf("fchmod of the unlinked open file = %v", err)
+	}
+	two := uint64(2)
+	if err := checking.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: held, Handle: &open.Handle, Size: &two}); err != nil {
+		t.Fatalf("ftruncate through the writable handle = %v", err)
+	}
+	if err := checking.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Offset: 2, Data: []byte("zz")}); err != nil {
+		t.Fatalf("write through the writable handle = %v", err)
+	}
+	if got := mustReadHandle(t, f, held, open.Handle); got != "blzz" {
+		t.Fatalf("the handle reads %q, want blzz", got)
+	}
+}
+
+// A handle that opened a file's overlay file keeps it after a commit, whose
+// reconcile drops the overlay entry and removes that file. An unlink then
+// copies the base for the handles open on the path. Every one of them,
+// the older one too, must hold that one copy, so a write or an ftruncate
+// through one shows through the others, as through two descriptors of one
+// file. A write through the older handle between the commit and the unlink
+// goes by path, so the copy holds it.
+func TestPinnedHandlesOfOneFileShareOneCopy(t *testing.T) {
+	for _, write := range []bool{false, true} {
+		t.Run(fmt.Sprint("write after commit=", write), func(t *testing.T) {
+			f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644))
+			held := f.lookup(fuseops.RootInodeID, "file.txt")
+			writer := &fuseops.OpenFileOp{Inode: held, OpenFlags: syscall.O_RDWR}
+			if err := f.fs.OpenFile(f.ctx, writer); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: writer.Handle, Data: []byte("X")}); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: writer.Handle}); err != nil {
+				t.Fatal(err)
+			}
+			older := f.open(held)
+			want := mustReadHandle(t, f, held, older.Handle)
+			committed := baseFile("file.txt", blobOID(want), 0o100644)
+			committed.SizeBytes = int64(len(want))
+			f.switchTo(committed)
+			if err := os.WriteFile(f.blobs.pathsByOID[committed.ObjectOID], []byte(want), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok, err := f.fs.engine.Overlay.Lookup(f.ctx, "file.txt"); err != nil || ok {
+				t.Fatalf("overlay entry of file.txt after the commit = %t, %v; want it dropped", ok, err)
+			}
+			if write {
+				if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: older.Handle, Data: []byte("Y")}); err != nil {
+					t.Fatal(err)
+				}
+				want = "Y" + want[1:]
+			}
+			newer := f.open(f.lookup(fuseops.RootInodeID, "file.txt"))
+			if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: older.Handle, Data: []byte("Z")}); err != nil {
+				t.Fatal(err)
+			}
+			want = "Z" + want[1:]
+			for name, h := range map[string]fuseops.HandleID{"older": older.Handle, "newer": newer.Handle} {
+				if got := mustReadHandle(t, f, held, h); got != want {
+					t.Fatalf("after a write through the older handle, the %s one reads %q, want %q", name, got, want)
+				}
+			}
+			two := uint64(2)
+			if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: held, Handle: &newer.Handle, Size: &two}); err != nil {
+				t.Fatalf("ftruncate through the newer handle = %v", err)
+			}
+			for name, h := range map[string]fuseops.HandleID{"older": older.Handle, "newer": newer.Handle} {
+				if got := mustReadHandle(t, f, held, h); got != want[:2] {
+					t.Fatalf("after an ftruncate through the newer handle, the %s one reads %q, want %q", name, got, want[:2])
+				}
+			}
+		})
+	}
+}
+
+// A backing file that an earlier version left read-only opens only for
+// reading. When handles of an unlinked open file hold its copy through a
+// read-only descriptor and a writable one, an ftruncate goes through the
+// writable one, whichever handle opened first.
+func TestSetattrOfSharedCopyGoesThroughWritableDescriptor(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root opens a read-only file for writing")
+	}
+	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	writer := &fuseops.OpenFileOp{Inode: held, OpenFlags: syscall.O_RDWR}
+	if err := f.fs.OpenFile(f.ctx, writer); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: writer.Handle, Data: []byte("X")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: writer.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	ov, ok, err := f.fs.engine.Overlay.Lookup(f.ctx, "file.txt")
+	if err != nil || !ok {
+		t.Fatalf("overlay entry of file.txt = %t, %v", ok, err)
+	}
+	if err := os.Chmod(ov.BackingPath, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	readOnly := f.open(held)
+	if err := os.Chmod(ov.BackingPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writable := f.open(held)
+	if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	two := uint64(2)
+	if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: held, Handle: &writable.Handle, Size: &two}); err != nil {
+		t.Fatalf("ftruncate through the writable handle = %v", err)
+	}
+	for name, h := range map[string]fuseops.HandleID{"read-only": readOnly.Handle, "writable": writable.Handle} {
+		if got := mustReadHandle(t, f, held, h); got != "Xl" {
+			t.Fatalf("after the ftruncate, the %s handle reads %q, want Xl", name, got)
+		}
 	}
 }
 

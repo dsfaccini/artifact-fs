@@ -24,6 +24,7 @@ import (
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
 	"github.com/dsfaccini/fuse/fuseutil"
+	"golang.org/x/sys/unix"
 )
 
 // MountedFS matches tigrisfs's interface for mount lifecycle.
@@ -1037,9 +1038,16 @@ func (fs *ArtifactFuse) hasOpenFile(path string) bool {
 	return false
 }
 
-// pinOpenFiles points the handles open on path at backingPath. A detached
+// pinOpenFiles points the handles open on path at backingPath, so they all
+// share one copy. That includes a handle that holds another overlay file,
+// such as one a reconcile removed after a commit: a write through it goes by
+// path, so that file holds nothing the path's content lacks. A detached
 // handle no longer names path, so it keeps its own file.
 func (fs *ArtifactFuse) pinOpenFiles(path, backingPath string) error {
+	backing, err := os.Stat(backingPath)
+	if err != nil {
+		return err
+	}
 	fs.mu.RLock()
 	var handles []*FileHandle
 	for _, fh := range fs.fileHandles {
@@ -1053,7 +1061,12 @@ func (fs *ArtifactFuse) pinOpenFiles(path, backingPath string) error {
 	fs.mu.RUnlock()
 	for _, fh := range handles {
 		fh.mu.Lock()
-		if !fh.detached && (fh.cacheFile == nil || fh.cacheGeneration != -1) {
+		holdsBacking := false
+		if fh.cacheFile != nil && fh.cacheGeneration == -1 {
+			st, statErr := fh.cacheFile.Stat()
+			holdsBacking = statErr == nil && os.SameFile(st, backing)
+		}
+		if !fh.detached && !holdsBacking {
 			f, openErr := os.OpenFile(backingPath, os.O_RDWR, 0)
 			if openErr != nil {
 				f, openErr = os.Open(backingPath)
@@ -1444,17 +1457,22 @@ func (fs *ArtifactFuse) setInodeAttributes(ctx context.Context, op *fuseops.SetI
 // and returns ESTALE for an inode with no pinned handle, whose handles read
 // content no setattr may change. checkPermissions is as in setInodeAttributes.
 func (fs *ArtifactFuse) setPinnedAttributes(op *fuseops.SetInodeAttributesOp, checkPermissions bool) error {
+	type pinnedHandle struct {
+		id       fuseops.HandleID
+		fh       *FileHandle
+		writable bool
+	}
 	fs.mu.RLock()
 	ref := fs.inodes[op.Inode]
 	var mode uint32
 	if ref != nil {
 		mode = ref.Mode
 	}
-	var pinned []*FileHandle
-	for _, fh := range fs.fileHandles {
+	var pinned []pinnedHandle
+	for id, fh := range fs.fileHandles {
 		fh.mu.Lock()
 		if fh.inode.ID == op.Inode && fh.detached && fh.pinned && fh.cacheFile != nil {
-			pinned = append(pinned, fh)
+			pinned = append(pinned, pinnedHandle{id, fh, openForWriting(fh.cacheFile)})
 		}
 		fh.mu.Unlock()
 	}
@@ -1467,8 +1485,22 @@ func (fs *ArtifactFuse) setPinnedAttributes(op *fuseops.SetInodeAttributesOp, ch
 			return err
 		}
 	}
-	for _, fh := range pinned {
-		if err := fh.setCopyAttributes(op.Size, op.Mtime); err != nil {
+	// Handles share their copy, so each copy changes once, through a
+	// descriptor that may write where one holds it: one that a backing file
+	// left read-only made read-only cannot truncate.
+	slices.SortFunc(pinned, func(a, b pinnedHandle) int {
+		if a.writable != b.writable {
+			if a.writable {
+				return -1
+			}
+			return 1
+		}
+		return cmp.Compare(a.id, b.id)
+	})
+	var changed []os.FileInfo
+	for _, p := range pinned {
+		var err error
+		if changed, err = p.fh.changeCopy(op.Size, op.Mtime, changed); err != nil {
 			return err
 		}
 	}
@@ -1486,35 +1518,60 @@ func (fs *ArtifactFuse) setPinnedAttributes(op *fuseops.SetInodeAttributesOp, ch
 	return nil
 }
 
-// setCopyAttributes truncates fh's own copy to size and sets its mtime, each
-// unless nil. No reply reports the copy's atime, so it takes the mtime too.
-// The copy keeps the mtime to the microsecond. A handle released meanwhile
-// holds no copy, and gets no change.
-func (fh *FileHandle) setCopyAttributes(size *uint64, mtime *time.Time) error {
+// changeCopy truncates fh's own copy to size and sets its mtime, each unless
+// nil, and returns changed with the copy added. It leaves alone a copy that
+// changed holds, which another handle shares, and a handle released
+// meanwhile, which holds no copy. No reply reports the copy's atime, so it
+// takes the mtime too. The copy keeps the mtime to the microsecond.
+func (fh *FileHandle) changeCopy(size *uint64, mtime *time.Time, changed []os.FileInfo) ([]os.FileInfo, error) {
+	if size == nil && mtime == nil {
+		return changed, nil
+	}
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
 	f := fh.cacheFile
 	if f == nil {
-		return nil
+		return changed, nil
+	}
+	st, err := f.Stat()
+	if err != nil || slices.ContainsFunc(changed, func(c os.FileInfo) bool { return os.SameFile(c, st) }) {
+		return changed, err
 	}
 	if size != nil {
 		if err := f.Truncate(int64(*size)); err != nil {
-			return err
+			return changed, err
 		}
 	}
-	if mtime == nil {
-		return nil
+	if mtime != nil {
+		tv := syscall.NsecToTimeval(mtime.UnixNano())
+		if err := controlFile(f, func(fd int) error { return syscall.Futimes(fd, []syscall.Timeval{tv, tv}) }); err != nil {
+			return changed, err
+		}
 	}
+	return append(changed, st), nil
+}
+
+// openForWriting reports whether f's descriptor was opened for writing.
+func openForWriting(f *os.File) bool {
+	var flags int
+	err := controlFile(f, func(fd int) (err error) {
+		flags, err = unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+		return err
+	})
+	return err == nil && flags&unix.O_ACCMODE != unix.O_RDONLY
+}
+
+// controlFile runs op on f's descriptor.
+func controlFile(f *os.File, op func(fd int) error) error {
 	rc, err := f.SyscallConn()
 	if err != nil {
 		return err
 	}
-	tv := syscall.NsecToTimeval(mtime.UnixNano())
-	var futimesErr error
-	if err := rc.Control(func(fd uintptr) { futimesErr = syscall.Futimes(int(fd), []syscall.Timeval{tv, tv}) }); err != nil {
+	var opErr error
+	if err := rc.Control(func(fd uintptr) { opErr = op(int(fd)) }); err != nil {
 		return err
 	}
-	return futimesErr
+	return opErr
 }
 
 func (fs *ArtifactFuse) ForgetInode(_ context.Context, op *fuseops.ForgetInodeOp) error {

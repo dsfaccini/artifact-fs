@@ -549,12 +549,12 @@ the file's mode and the size and times of that content, and returns `ESTALE`
 when its handles hold none. Linux fetches an open file's attributes before a
 read once they expire, so a read through such a file keeps working. An unlink of
 a file's path or a rename over it through the mount gives the file's open
-handles their own copy. A write or `setattr` through the stale file, such as
-`ftruncate`, `fchmod` or `futimens`, then changes that copy, and `getattr`
-reports the change. The copy keeps a time that `setattr` sets to the
-microsecond. Without such a copy, a write or `setattr` returns `ESTALE`. A
-lookup below a stale directory misses. Numbers last for one mount: a remount or
-a daemon restart numbers paths again.
+handles one copy of their own, which they share. A write or `setattr` through
+the stale file, such as `ftruncate`, `fchmod` or `futimens`, then changes that
+copy, and `getattr` reports the change. The copy keeps a time that `setattr`
+sets to the microsecond. Without such a copy, a write or `setattr` returns
+`ESTALE`. A lookup below a stale directory misses. Numbers last for one mount: a
+remount or a daemon restart numbers paths again.
 
 The mount keeps one mapping for each existing path that the kernel has looked
 up or that an op made through the mount. After each HEAD change, it finds the
