@@ -1670,6 +1670,177 @@ func TestGetattrOfHeldInodeAnswersFromItsContent(t *testing.T) {
 	})
 }
 
+// An unlink of a path, or a rename over it, can arrive with no lookup first
+// after a switch brought the path back as another file and before that
+// switch's pass. The held inode is retired first, so its handles keep the
+// content they held and are not pinned to a copy of the other file.
+func TestUnlinkOrRenameOverChangedReturnedPathKeepsHandleContent(t *testing.T) {
+	for _, op := range []string{"unlink", "rename over"} {
+		t.Run(op, func(t *testing.T) {
+			f := newCacheFixtureOn(t, BackendFSKit, baseFile("file.txt", "blob-A", 0o100644))
+			held := f.lookup(fuseops.RootInodeID, "file.txt")
+			open := f.open(held)
+			if op == "rename over" {
+				create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "other.txt", Mode: 0o644}
+				if err := f.fs.CreateFile(f.ctx, create); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.switchTo()
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			f.switchTo(baseFile("file.txt", "blob-BBBB", 0o100644))
+			var err error
+			if op == "unlink" {
+				err = f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"})
+			} else {
+				err = f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "other.txt", NewParent: fuseops.RootInodeID, NewName: "file.txt"})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, err := readHandle(f, held, open.Handle); err != nil || got != "blob-A" {
+				t.Fatalf("read through the held handle after the %s = %q, %v; want blob-A, which it held", op, got, err)
+			}
+			if got := kernelErrno(f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Data: []byte("X")})); got != syscall.ESTALE {
+				t.Fatalf("write through the held handle after the %s = errno %v, want ESTALE", op, got)
+			}
+		})
+	}
+}
+
+// getattr of a held inode reports the size of what its handle reads, even
+// when the handle cached an older generation than the last attributes the
+// kernel received. When handles read different content, the most recently
+// opened one decides, every time.
+func TestGetattrSizeMatchesWhatTheHandleReads(t *testing.T) {
+	getattrSize := func(t *testing.T, f *cacheFixture, id fuseops.InodeID) uint64 {
+		t.Helper()
+		op := &fuseops.GetInodeAttributesOp{Inode: id}
+		if err := f.fs.GetInodeAttributes(f.ctx, op); err != nil {
+			t.Fatalf("getattr of inode %d = %v", id, err)
+		}
+		return op.Attributes.Size
+	}
+	switchAndPass := func(t *testing.T, f *cacheFixture, nodes ...model.BaseNode) {
+		t.Helper()
+		f.switchTo(nodes...)
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("own copy written after unlink", func(t *testing.T) {
+		f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
+		held := f.lookup(fuseops.RootInodeID, "file.txt")
+		open := f.open(held)
+		if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: open.Handle, Offset: 6, Data: []byte("-longer")}); err != nil {
+			t.Fatal(err)
+		}
+		if got, size := mustReadHandle(t, f, held, open.Handle), getattrSize(t, f, held); size != uint64(len(got)) {
+			t.Fatalf("getattr size %d, the handle reads %q", size, got)
+		}
+	})
+	t.Run("path came back changed", func(t *testing.T) {
+		f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
+		held := f.lookup(fuseops.RootInodeID, "file.txt")
+		open := f.open(held)
+		switchAndPass(t, f)
+		switchAndPass(t, f, baseFile("file.txt", "blob-CCCCCCCCCC", 0o100644))
+		if got, size := mustReadHandle(t, f, held, open.Handle), getattrSize(t, f, held); size != uint64(len(got)) {
+			t.Fatalf("getattr size %d, the handle reads %q", size, got)
+		}
+	})
+	t.Run("handle cached an older generation", func(t *testing.T) {
+		f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
+		held := f.lookup(fuseops.RootInodeID, "file.txt")
+		open := f.open(held)
+		mustReadHandle(t, f, held, open.Handle)
+		switchAndPass(t, f, baseFile("file.txt", "blob-BBBBBBBBBBBB", 0o100644))
+		f.getattr(held)
+		switchAndPass(t, f)
+		switchAndPass(t, f, baseFile("file.txt", "blob-C", 0o100644))
+		if got, size := mustReadHandle(t, f, held, open.Handle), getattrSize(t, f, held); size != uint64(len(got)) {
+			t.Fatalf("getattr size %d, the handle reads %q", size, got)
+		}
+	})
+	t.Run("two handles read different blobs", func(t *testing.T) {
+		f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
+		held := f.lookup(fuseops.RootInodeID, "file.txt")
+		older := f.open(held)
+		mustReadHandle(t, f, held, older.Handle)
+		switchAndPass(t, f, baseFile("file.txt", "blob-BBBBBBBB", 0o100644))
+		f.getattr(held)
+		newer := f.open(held)
+		mustReadHandle(t, f, held, newer.Handle)
+		switchAndPass(t, f, baseFile("file.txt", "blob-DDDDDDDDDDDDDDDD", 0o100644))
+		f.getattr(held)
+		switchAndPass(t, f)
+		switchAndPass(t, f, baseFile("file.txt", "blob-C", 0o100644))
+		want := mustReadHandle(t, f, held, newer.Handle)
+		for range 20 {
+			if size := getattrSize(t, f, held); size != uint64(len(want)) {
+				t.Fatalf("getattr size %d, the newest handle reads %q", size, want)
+			}
+		}
+	})
+}
+
+// A create handle holds no file. Once a commit drops the file's overlay entry
+// and a HEAD change keeps its path away, the inode holds no content to answer
+// a getattr from. It answers ESTALE, not ENOENT, which would make the macFUSE
+// kernel extension revoke the vnode; a write through the handle still
+// recreates the path.
+func TestGetattrOfAwayInodeWithNoContentReturnsESTALE(t *testing.T) {
+	other := baseFile("other.txt", "blob-O", 0o100644)
+	f := newCacheFixture(t, other)
+	create := &fuseops.CreateFileOp{Parent: fuseops.RootInodeID, Name: "file.txt", Mode: 0o644}
+	if err := f.fs.CreateFile(f.ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	held := create.Entry.Child
+	if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: create.Handle, Data: []byte("data\n")}); err != nil {
+		t.Fatal(err)
+	}
+	for _, nodes := range [][]model.BaseNode{{other, baseFile("file.txt", blobOID("data\n"), 0o100644)}, {other}} {
+		f.switchTo(nodes...)
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := kernelErrno(f.fs.GetInodeAttributes(f.ctx, &fuseops.GetInodeAttributesOp{Inode: held})); got != syscall.ESTALE {
+		t.Fatalf("getattr while file.txt is away = errno %v, want ESTALE", got)
+	}
+	if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: held, Handle: create.Handle, Offset: 5, Data: []byte("more\n")}); err != nil {
+		t.Fatalf("write through the create handle = %v", err)
+	}
+	if got := f.lookup(fuseops.RootInodeID, "file.txt"); got != held {
+		t.Fatalf("file.txt, which the write recreated, looks up as inode %d, want %d", got, held)
+	}
+}
+
+// readHandle reads up to 64 bytes through handle h of inode.
+func readHandle(f *cacheFixture, inode fuseops.InodeID, h fuseops.HandleID) (string, error) {
+	read := &fuseops.ReadFileOp{Inode: inode, Handle: h, Size: 64, Dst: make([]byte, 64)}
+	err := f.fs.ReadFile(f.ctx, read)
+	return string(read.Dst[:read.BytesRead]), err
+}
+
+func mustReadHandle(t *testing.T, f *cacheFixture, inode fuseops.InodeID, h fuseops.HandleID) string {
+	t.Helper()
+	got, err := readHandle(f, inode, h)
+	if err != nil {
+		t.Fatalf("read through handle %d of inode %d: %v", h, inode, err)
+	}
+	return got
+}
+
 // openErrno opens id and returns the errno the kernel receives, releasing the
 // handle an open made. A retired inode gets ESTALE.
 func openErrno(f *cacheFixture, id fuseops.InodeID) syscall.Errno {

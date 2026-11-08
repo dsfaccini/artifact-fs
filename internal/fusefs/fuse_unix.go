@@ -3,6 +3,7 @@
 package fusefs
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -353,9 +355,11 @@ func (fs *ArtifactFuse) settleLocked(id fuseops.InodeID, path string, current Id
 }
 
 // settleUnmappedBelow decides each unmapped inode at or below path whose path
-// exists again, with settleLocked. A rename of path then moves such an inode
-// as a mapped one, or not at all. An unmapped inode whose path is still
-// missing moves with the rename. The caller holds handleOps exclusively.
+// exists again, with settleLocked, before an unlink or a rename reaches path.
+// A rename of path then moves such an inode as a mapped one, or not at all,
+// and an unlink or rename over path pins no handle of an inode whose path
+// came back as another file. An unmapped inode whose path is still missing
+// moves with a rename. The caller holds handleOps exclusively.
 func (fs *ArtifactFuse) settleUnmappedBelow(path string) error {
 	fs.mu.RLock()
 	var held []pathMapping
@@ -765,10 +769,13 @@ func (fs *ArtifactFuse) markWritten(id fuseops.InodeID, path string) {
 }
 
 // heldAttrs returns the attributes of the content that id's handles read,
-// for an inode whose path is away or that is retired: the size and time of the
-// overlay file or own copy a handle holds, or else the base attributes the
-// kernel last received, which the handles read at InodeRef.Gen. It returns
-// false when id holds neither.
+// for an inode whose path is away or that is retired. A detached handle reads
+// the file it holds, and an undetached one its overlay file, or else the base
+// content at InodeRef.Gen, whose attributes the kernel last received. When
+// handles read different content, the most recently opened handle that reads
+// any decides. A held file's size comes from a stat of the file it reads; a
+// base blob keeps the mtime last reported, its commit time. heldAttrs returns
+// false when no handle reads content and the inode holds no base content.
 func (fs *ArtifactFuse) heldAttrs(id fuseops.InodeID) (Attrs, bool) {
 	fs.mu.RLock()
 	ref := fs.inodes[id]
@@ -777,29 +784,39 @@ func (fs *ArtifactFuse) heldAttrs(id fuseops.InodeID) (Attrs, bool) {
 		return Attrs{}, false
 	}
 	held := *ref
-	var handles []*FileHandle
-	for _, fh := range fs.fileHandles {
+	type openHandle struct {
+		id fuseops.HandleID
+		fh *FileHandle
+	}
+	var handles []openHandle
+	for hid, fh := range fs.fileHandles {
 		if fh.inode.ID == id {
-			handles = append(handles, fh)
+			handles = append(handles, openHandle{hid, fh})
 		}
 	}
 	fs.mu.RUnlock()
-	for _, fh := range handles {
-		fh.mu.Lock()
+	slices.SortFunc(handles, func(a, b openHandle) int { return cmp.Compare(b.id, a.id) })
+	base := Attrs{Type: held.Type, Mode: held.Mode, Size: held.Size, Mtime: held.Mtime, Ctime: held.Mtime, Gen: held.Gen, Blob: held.Blob}
+	for _, h := range handles {
+		h.fh.mu.Lock()
+		f, gen, detached := h.fh.cacheFile, h.fh.cacheGeneration, h.fh.detached
 		var st os.FileInfo
 		var err error
-		if fh.cacheFile != nil && fh.cacheGeneration == -1 {
-			st, err = fh.cacheFile.Stat()
+		if f != nil && (detached || gen == -1) {
+			st, err = f.Stat()
 		}
-		fh.mu.Unlock()
-		if st != nil && err == nil {
+		h.fh.mu.Unlock()
+		switch {
+		case st != nil && err == nil && gen == -1:
 			return Attrs{Type: held.Type, Mode: held.Mode, Size: st.Size(), Mtime: st.ModTime(), Ctime: st.ModTime()}, true
+		case st != nil && err == nil:
+			base.Size = st.Size()
+			return base, true
+		case !detached && held.Gen != 0:
+			return base, true
 		}
 	}
-	if held.Gen == 0 {
-		return Attrs{}, false
-	}
-	return Attrs{Type: held.Type, Mode: held.Mode, Size: held.Size, Mtime: held.Mtime, Ctime: held.Mtime, Gen: held.Gen, Blob: held.Blob}, true
+	return base, held.Gen != 0 && len(handles) == 0
 }
 
 // setReported records attrs as what the kernel last received for id. When
@@ -1308,9 +1325,13 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 			err = fs.setReported(op.Inode, attrs)
 		}
 		if errors.Is(err, iofs.ErrNotExist) || errors.Is(err, syscall.ESTALE) {
-			if held, ok := fs.heldAttrs(op.Inode); ok {
-				attrs, err = held, nil
+			held, ok := fs.heldAttrs(op.Inode)
+			if !ok {
+				// ENOENT would make the macFUSE kernel extension revoke the
+				// vnode, though a write through it still recreates the path.
+				return syscall.ESTALE
 			}
+			attrs, err = held, nil
 		}
 		if err != nil {
 			return err
@@ -1890,6 +1911,11 @@ func (fs *ArtifactFuse) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error 
 		if isGitfile(parent, op.Name) {
 			return syscall.EPERM
 		}
+		// Retire a held inode whose path came back as another file before
+		// pinOpenFiles points its handles at a copy of that file.
+		if err := fs.settleUnmappedBelow(childPath); err != nil {
+			return err
+		}
 		if err := fs.engine.Unlink(ctx, b, childPath, fs); err != nil {
 			return err
 		}
@@ -1917,8 +1943,10 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 		oldPath := cleanChildPath(oldParent.Path, op.OldName)
 		newPath := cleanChildPath(newParent.Path, op.NewName)
 		// A kernel that renames a name it cached sends no lookup first.
-		if err := fs.settleUnmappedBelow(oldPath); err != nil {
-			return err
+		for _, path := range []string{oldPath, newPath} {
+			if err := fs.settleUnmappedBelow(path); err != nil {
+				return err
+			}
 		}
 		if err := fs.engine.Rename(ctx, b, oldPath, newPath, fs); err != nil {
 			return err
