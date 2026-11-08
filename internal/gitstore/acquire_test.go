@@ -1323,13 +1323,22 @@ func TestRefreshWithoutTheTrackingRefLetsPreparationMoveTheBranch(t *testing.T) 
 }
 
 // A verified source refreshes into its tracking ref, and ahead/behind
-// compares HEAD with it, with the same --depth case as a tag fetch ref.
+// compares HEAD with it. With --depth, each refresh passes --depth, so a
+// source moved by --depth commits reports 0/0. Without --depth, a source
+// force-pushed to unrelated history reads as diverged.
 func TestComputeAheadBehindOfAVerifiedSource(t *testing.T) {
 	for _, tt := range []struct {
-		depth  int
-		behind int
-	}{{0, 1}, {1, 0}} {
-		t.Run(fmt.Sprintf("depth %d", tt.depth), func(t *testing.T) {
+		name      string
+		depth     int
+		unrelated bool
+		ahead     int
+		behind    int
+	}{
+		{"forward", 0, false, 0, 1},
+		{"forward with depth 1", 1, false, 0, 0},
+		{"unrelated history", 0, true, 1, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
 			tmp := t.TempDir()
 			work, _ := newFetchFixture(t, tmp)
 			run(t, "git", "-C", filepath.Join(tmp, "origin.git"), "config", "uploadpack.allowFilter", "true")
@@ -1344,14 +1353,18 @@ func TestComputeAheadBehindOfAVerifiedSource(t *testing.T) {
 			if _, err := store.PrepareSource(ctx, cfg, model.SourceRequirement{Ref: cfg.Branch, RequiredCommit: tip, Depth: tt.depth}); err != nil {
 				t.Fatal(err)
 			}
+			if tt.unrelated {
+				run(t, "git", "-C", work, "checkout", "-q", "--orphan", "unrelated")
+				run(t, "git", "-C", work, "rm", "-rq", "--cached", ".")
+			}
 			commit(t, work, "NEXT.md")
-			run(t, "git", "-C", work, "push", "-q", "origin", "HEAD:main")
+			run(t, "git", "-C", work, "push", "-q", "-f", "origin", "HEAD:main")
 			if err := store.FetchNonInteractive(ctx, cfg); err != nil {
 				t.Fatal(err)
 			}
 			ahead, behind, diverged, err := store.ComputeAheadBehind(ctx, cfg)
-			if err != nil || ahead != 0 || behind != tt.behind || diverged {
-				t.Fatalf("ahead/behind/diverged = %d/%d/%t, %v; want 0/%d/false", ahead, behind, diverged, err, tt.behind)
+			if err != nil || ahead != tt.ahead || behind != tt.behind || diverged != tt.unrelated {
+				t.Fatalf("ahead/behind/diverged = %d/%d/%t, %v; want %d/%d/%t", ahead, behind, diverged, err, tt.ahead, tt.behind, tt.unrelated)
 			}
 		})
 	}

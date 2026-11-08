@@ -121,10 +121,11 @@ func (s *Store) ComputeAheadBehind(ctx context.Context, repo model.RepoConfig) (
 		}
 		return 0, 0, false, err
 	}
-	// A verified source's refresh passes --depth, which cuts each new tip off
+	// With --depth, every refresh of a verified source passes --depth. That
+	// cuts a tip that moved by --depth commits or more, or was rewritten, off
 	// from HEAD. Without a common ancestor, its counts would read as a
 	// divergence, so it reports 0/0.
-	if repo.RequiredCommit != "" {
+	if repo.RequiredCommit != "" && repo.HistoryDepth > 0 {
 		if _, err := runGit(ctx, repo.GitDir, "merge-base", "HEAD", tracking); err != nil {
 			if exitErr, ok := errors.AsType[*gitCommandError](err); ok && exitErr.exitCode == 1 {
 				return 0, 0, false, nil
