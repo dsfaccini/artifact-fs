@@ -216,14 +216,15 @@ func (s *Store) lazyFetchEnv() ([]string, error) {
 // has no ssh, because Git then reaches no SSH remote either. The Store writes
 // the program in a directory of its own under its temp directory, and Close
 // removes it. Pooled git cat-file --batch processes keep the program's path
-// until Close, so the daemon sets the temp directory under the state root,
-// which ensureStateRoot checks and no temp cleaner reaches. The Store reuses
-// the program only while the program and its directory have mode 0700, belong
-// to the effective uid, and are not symlinks. Otherwise it writes the program
-// in a new directory: something can remove the old one, and in the system
-// temp directory another local user can then make one at its path.
-// batchModeSSH holds s.mu only to read and set sshWrapperDir and closed, so a
-// slow file system stalls no other Store operation.
+// until Close, so daemon.New and daemon.NewController set the temp directory
+// under the state root, which ensureStateRoot checks and no temp cleaner
+// reaches. The Store reuses the program only while the program and its
+// directory have mode 0700, belong to the effective uid, and are not
+// symlinks. Otherwise it writes the program in a new directory: something can
+// remove the old one, and in the system temp directory another local user can
+// then make one at its path. batchModeSSH holds s.mu only to read and set
+// sshWrapperDir and closed, so a slow file system stalls no other Store
+// operation.
 func (s *Store) batchModeSSH() (string, error) {
 	s.mu.Lock()
 	closed, dir := s.closed, s.sshWrapperDir

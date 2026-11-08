@@ -71,6 +71,18 @@ func ensureStateRoot(root string) (string, error) {
 	return resolved, nil
 }
 
+// emptyDaemonTempDir empties config/tmp/daemon under root and returns it. Call
+// it only while holding the daemon lock. Only the daemon that holds the lock
+// uses the directory, so what is there a daemon left that never closed its
+// git store. The CLI's git stores use config/tmp itself, at the same time.
+func emptyDaemonTempDir(root string) (string, error) {
+	dir := filepath.Join(root, "config", "tmp", "daemon")
+	if err := os.RemoveAll(dir); err != nil {
+		return "", err
+	}
+	return dir, os.Mkdir(dir, 0o700)
+}
+
 func checkPrivateDir(path string) error {
 	var st unix.Stat_t
 	if err := unix.Stat(path, &st); err != nil {

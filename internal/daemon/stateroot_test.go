@@ -96,7 +96,8 @@ func TestStateRootDirectoriesArePrivate(t *testing.T) {
 }
 
 // The SSH wrapper that Git runs lives under the state root, which
-// ensureStateRoot checks, and not in the system temp directory.
+// ensureStateRoot checks, and not in the system temp directory. The daemon's
+// lives in config/tmp/daemon, which New empties.
 func TestSSHWrapperLivesUnderTheStateRoot(t *testing.T) {
 	gittest.IsolatePrompts(t)
 	tmp := t.TempDir()
@@ -109,24 +110,73 @@ func TestSSHWrapperLivesUnderTheStateRoot(t *testing.T) {
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("TMPDIR", shared)
-	ctl, err := NewController(t.Context(), filepath.Join(tmp, "state"), discardLogger())
+	for _, tt := range []struct {
+		name string
+		// open returns a controller on root and the directory, relative to
+		// the state root, where its git store writes the SSH wrapper.
+		open func(t *testing.T, root string) (*Controller, string)
+	}{
+		{"controller", func(t *testing.T, root string) (*Controller, string) {
+			ctl, err := NewController(t.Context(), root, discardLogger())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { ctl.Close() })
+			return ctl, filepath.Join("config", "tmp")
+		}},
+		{"daemon", func(t *testing.T, root string) (*Controller, string) {
+			svc, err := New(t.Context(), root, discardLogger())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { svc.Close() })
+			return svc.ctl(), filepath.Join("config", "tmp", "daemon")
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctl, tempDir := tt.open(t, filepath.Join(tmp, tt.name))
+			if err := ctl.AddRepo(t.Context(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main"}, Enabled: true}); err != nil {
+				t.Fatal(err)
+			}
+			entries, err := os.ReadDir(shared)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("the system temp directory holds %s; want nothing", entries[0].Name())
+			}
+			wrappers, err := filepath.Glob(filepath.Join(ctl.root, tempDir, "artifact-fs-ssh-*", "ssh"))
+			if err != nil || len(wrappers) != 1 {
+				t.Fatalf("SSH wrappers in %s = %q, %v; want one", tempDir, wrappers, err)
+			}
+		})
+	}
+}
+
+// New empties config/tmp/daemon, which only the daemon that holds the lock
+// uses, so a daemon that stopped without closing its git store leaves nothing
+// there for long. It leaves the rest of config/tmp, which the CLI's git
+// stores use at the same time.
+func TestNewEmptiesTheDaemonTempDir(t *testing.T) {
+	t.Parallel()
+	root := filepath.Join(t.TempDir(), "state")
+	daemonTemp := filepath.Join(root, "config", "tmp", "daemon")
+	cliEntry := filepath.Join(root, "config", "tmp", "artifact-fs-ssh-cli")
+	for _, dir := range []string{filepath.Join(daemonTemp, "artifact-fs-ssh-left"), cliEntry} {
+		if err := errors.Join(os.MkdirAll(dir, 0o700), os.WriteFile(filepath.Join(dir, "ssh"), []byte("#!/bin/sh\n"), 0o700)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	svc, err := New(t.Context(), root, discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ctl.Close()
-	if err := ctl.AddRepo(t.Context(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main"}, Enabled: true}); err != nil {
-		t.Fatal(err)
+	defer svc.Close()
+	if entries, err := os.ReadDir(daemonTemp); err != nil || len(entries) != 0 {
+		t.Fatalf("%s after New = %v, %v; want an empty directory", daemonTemp, entries, err)
 	}
-	entries, err := os.ReadDir(shared)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("the system temp directory holds %s; want nothing", entries[0].Name())
-	}
-	wrappers, err := filepath.Glob(filepath.Join(ctl.root, "config", "tmp", "artifact-fs-ssh-*", "ssh"))
-	if err != nil || len(wrappers) != 1 {
-		t.Fatalf("SSH wrappers under the state root = %q, %v; want one", wrappers, err)
+	if _, err := os.Stat(filepath.Join(cliEntry, "ssh")); err != nil {
+		t.Fatalf("New removed the CLI's SSH wrapper: %v", err)
 	}
 }
 

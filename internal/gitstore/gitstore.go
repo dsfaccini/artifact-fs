@@ -24,8 +24,8 @@ type Store struct {
 	gitRetryDelays []time.Duration
 	// rollbackContext makes the context of one rollback. Tests replace it.
 	rollbackContext func(context.Context) (context.Context, context.CancelFunc)
-	// tempDir holds the directories the Store makes for Git to run files
-	// from; "" means the system temp directory.
+	// tempDir holds the SSH wrapper's directory and the bootstrap's private
+	// worktree; "" means the system temp directory.
 	tempDir string
 	// sshWrapperDir holds the wrapper batchModeSSH writes; Close removes it.
 	sshWrapperDir string
@@ -76,9 +76,9 @@ func (s *Store) Close() {
 	}
 }
 
-// SetTempDir sets the directory under which the Store makes the files Git
-// runs: the SSH wrapper, and the hooks of the bootstrap's private worktree.
-// Call it before the Store runs Git.
+// SetTempDir sets the directory under which the Store makes the SSH wrapper
+// that Git runs, and the hooks directory Git reads during the fsmonitor
+// bootstrap, which the Store keeps empty. Call it before the Store runs Git.
 func (s *Store) SetTempDir(dir string) {
 	s.tempDir = dir
 }
