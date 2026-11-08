@@ -1492,8 +1492,10 @@ func overlayEntryMatchesBase(e model.OverlayEntry, base model.BaseNode) (bool, e
 	return model.FileMatchesBlobOID(e.BackingPath, base.ObjectOID)
 }
 
+// DirtyCount counts the overlay's entries. Every entry, a delete included,
+// changes the base.
 func (s *Store) DirtyCount(ctx context.Context) (int64, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM overlay_entries WHERE kind <> ?`, model.OverlayKindDelete)
+	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM overlay_entries`)
 	var c int64
 	err := row.Scan(&c)
 	return c, err

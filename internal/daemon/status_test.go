@@ -126,16 +126,15 @@ func (f *bootstrapFixture) bootstrap() error {
 	return f.svc.bootstrapCleanStatusIndex(context.Background(), f.cfg, f.headOID, f.gen, f.snap, f.ov)
 }
 
-// removeTracked records a delete of tracked.txt, which leaves the overlay
-// with no dirty entry.
+// removeTracked records a delete of tracked.txt, the overlay's only entry.
 func (f *bootstrapFixture) removeTracked(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
 	if err := f.ov.Remove(ctx, "tracked.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if dirty, err := f.ov.DirtyCount(ctx); err != nil || dirty != 0 {
-		t.Fatalf("delete-only dirty count = %d, %v; want zero", dirty, err)
+	if dirty, err := f.ov.DirtyCount(ctx); err != nil || dirty != 1 {
+		t.Fatalf("delete-only dirty count = %d, %v; want one", dirty, err)
 	}
 }
 

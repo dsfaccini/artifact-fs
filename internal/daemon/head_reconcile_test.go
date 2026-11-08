@@ -339,6 +339,40 @@ func TestStatusReportsPublishedAndServedGenerationsAfterOverlayFailure(t *testin
 	}
 }
 
+// A delete-only overlay is dirty. A HEAD change that removes the deleted path
+// makes the delete stale, and the reconcile prunes it.
+func TestStatusReportsADeleteOnlyOverlayDirtyUntilReconcilePrunesIt(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	if err := f.svc.registry.AddRepo(f.ctx, f.rt.cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.rt.overlay.Remove(f.ctx, "README.md"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := f.svc.ctl().Status(f.ctx, f.rt.cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.DirtyOverlay {
+		t.Fatal("status of a delete-only overlay reports it clean")
+	}
+	runCmd(t, "git", "-C", f.workDir, "rm", "-q", "-f", "README.md")
+	if err := os.WriteFile(filepath.Join(f.workDir, "other.txt"), []byte("other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", f.workDir, "add", "other.txt")
+	runCmd(t, "git", "-C", f.workDir, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "drop README")
+	without := strings.TrimSpace(runCmdOutput(t, "git", "-C", f.workDir, "rev-parse", "HEAD"))
+	f.signal()
+	f.waitForHead(without, "main", f.oldGen+1)
+	if st, err = f.svc.ctl().Status(f.ctx, f.rt.cfg.Name); err != nil {
+		t.Fatal(err)
+	}
+	if st.DirtyOverlay {
+		t.Fatal("status reports the overlay dirty after the reconcile pruned its stale delete")
+	}
+}
+
 func TestHeadReconcileRestoresPersistedStateWhenHEADReturnsAfterOverlayFailure(t *testing.T) {
 	f := newHeadReconcileFixture(t)
 	f.updateMain(f.nextOID)

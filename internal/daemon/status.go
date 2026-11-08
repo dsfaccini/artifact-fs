@@ -71,7 +71,7 @@ func persistedStatus(ctx context.Context, cfg model.RepoConfig, rec model.RepoRu
 		if _, statErr := os.Stat(cfg.OverlayDBPath); statErr == nil {
 			if db, err := meta.OpenDB(cfg.OverlayDBPath); err == nil {
 				var count int64
-				if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM overlay_entries WHERE kind <> 'delete'`).Scan(&count); err == nil {
+				if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM overlay_entries`).Scan(&count); err == nil {
 					st.DirtyOverlay = count > 0
 				}
 				db.Close()
