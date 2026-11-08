@@ -2078,6 +2078,56 @@ func TestOpenOverlappedOnceKeepsItsBlobPastAPrune(t *testing.T) {
 	}
 }
 
+// An open that a close of cached files overlapped on every attempt registers
+// without its file, so its handle opens its blob at its inode's generation
+// at its first read. A HEAD change can remove the path first. A prune that
+// keeps the generations the mount reports for open files must leave the
+// handle its blob.
+func TestOpenWithoutItsFileKeepsItsBlobPastAPrune(t *testing.T) {
+	other := baseFile("other.txt", "blob-OTHER", 0o100644)
+	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644), other)
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	writeOtherDuringOpens(t, f, f.lookup(fuseops.RootInodeID, "other.txt"), openAttempts)
+	open := f.open(held)
+	f.switchTo(other)
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.snap.PruneGenerations(f.ctx, f.resolver.Generation(), f.mount.OpenFileGenerations()...); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustReadHandle(t, f, held, open.Handle); got != "blob-AAAA" {
+		t.Fatalf("after the HEAD change and the prune, the handle reads %q, want blob-AAAA", got)
+	}
+}
+
+// An unlink through the mount retires an open file's inode, and its handle
+// then reads its own copy, never a generation. A prune that keeps the
+// generations the mount reports for open files must still prune the one the
+// inode read: a file that stays open after its unlink keeps none.
+func TestPruneDropsTheGenerationOfAnUnlinkedOpenFile(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "blob-AAAA", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "file.txt")
+	open := f.open(held)
+	if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "file.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	read := f.resolver.Generation()
+	f.switchTo(baseFile("other.txt", "blob-OTHER", 0o100644))
+	if _, ok, err := f.snap.LookupNode(f.ctx, read, "file.txt"); err != nil || !ok {
+		t.Fatalf("file.txt in generation %d before the prune = %t, %v", read, ok, err)
+	}
+	if err := f.snap.PruneGenerations(f.ctx, f.resolver.Generation(), f.mount.OpenFileGenerations()...); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := f.snap.LookupNode(f.ctx, read, "file.txt"); err != nil || ok {
+		t.Fatalf("file.txt in generation %d after the prune = %t, %v, want pruned", read, ok, err)
+	}
+	if got := mustReadHandle(t, f, held, open.Handle); got != "blob-AAAA" {
+		t.Fatalf("after the prune, the unlinked file's handle reads %q, want blob-AAAA", got)
+	}
+}
+
 // An unlink pins an open file's handle to its own copy and detaches it. No
 // overlay entry names that copy, so the switch pass must leave a detached
 // handle's file open: the handle still reads its writes after a HEAD change.

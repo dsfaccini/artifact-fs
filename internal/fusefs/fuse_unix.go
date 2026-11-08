@@ -47,6 +47,9 @@ type MountedFS interface {
 	// generation switch, holding no lock an op takes. FSKit takes no
 	// invalidations, so it only retires numbers and closes files there.
 	InvalidateChanged() error
+	// OpenFileGenerations returns the snapshot generations that open files
+	// read. A prune keeps them.
+	OpenFileGenerations() []int64
 }
 
 // CacheTTL is how long the kernel may cache the entries, negative entries and
@@ -840,6 +843,22 @@ func (fs *ArtifactFuse) requireInode(id fuseops.InodeID, missing error) (*InodeR
 	snapshot := *ref
 	fs.mu.RUnlock()
 	return &snapshot, nil
+}
+
+// OpenFileGenerations returns, once each, the generation of each inode that
+// an open file handle is on. A handle reads its inode's generation: it opens
+// the blob there again when it holds no descriptor of it. A retired inode's
+// handles read their own copies, so its generation is left out.
+func (fs *ArtifactFuse) OpenFileGenerations() []int64 {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	var gens []int64
+	for _, fh := range fs.fileHandles {
+		if ref := fs.inodes[fh.inode.ID]; ref != nil && !ref.Stale && ref.Gen != 0 && !slices.Contains(gens, ref.Gen) {
+			gens = append(gens, ref.Gen)
+		}
+	}
+	return gens
 }
 
 func (fs *ArtifactFuse) inodeGeneration(id fuseops.InodeID) int64 {
@@ -2360,6 +2379,8 @@ func (m *mountedFSWrapper) Backend() string { return m.backend }
 func (m *mountedFSWrapper) InvalidateChanged() error {
 	return m.fs.invalidateChanged(m.backend != BackendFSKit)
 }
+
+func (m *mountedFSWrapper) OpenFileGenerations() []int64 { return m.fs.OpenFileGenerations() }
 
 // fuseMount is fuse.MountContext. Package tests replace it so they cannot mount.
 var fuseMount = fuse.MountContext
