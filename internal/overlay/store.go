@@ -201,6 +201,22 @@ func (s *Store) Close() error {
 	return errors.Join(flushErr, s.db.Close())
 }
 
+// testHookBetweenReads, when set, runs in a read between its two reads: the
+// pending writes and the committed entries. Keep each call between the two
+// reads: the test catches a call that no longer runs, not a moved one.
+var testHookBetweenReads func()
+
+// testHookBetweenCommitAndForget, when set, runs in a flush between its commit
+// of the pending writes and its forgetting them. Keep each call between the
+// two steps: the test catches a call that no longer runs, not a moved one.
+var testHookBetweenCommitAndForget func()
+
+func runHook(hook func()) {
+	if hook != nil {
+		hook()
+	}
+}
+
 // overlayCols is the column list for overlay_entries queries. Keep in sync with
 // the Scan call in queryEntries and the single-row scan in Lookup.
 const overlayCols = `path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path`
@@ -214,6 +230,7 @@ func (s *Store) Lookup(ctx context.Context, path string) (model.OverlayEntry, bo
 		values = *p
 	}
 	s.pendingMu.Unlock()
+	runHook(testHookBetweenReads)
 	e, ok, err := s.lookupCommitted(ctx, path)
 	if ok && pending {
 		values.apply(&e)
@@ -555,6 +572,7 @@ func (s *Store) flushLocked(ctx context.Context, paths []string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	runHook(testHookBetweenCommitAndForget)
 	var closeErrs []error
 	s.pendingMu.Lock()
 	for _, path := range flushed {
@@ -593,6 +611,7 @@ func (s *Store) SyncFile(ctx context.Context, path string) error {
 	if err := s.commitSizeAndTimesDurable(ctx, e); err != nil {
 		return err
 	}
+	runHook(testHookBetweenCommitAndForget)
 	s.pendingMu.Lock()
 	p := s.pending[path]
 	delete(s.pending, path)
@@ -1649,6 +1668,7 @@ func (s *Store) HasEntryBelow(ctx context.Context, path string) (bool, error) {
 // queryEntries runs an arbitrary overlay query and scans the results.
 func (s *Store) queryEntries(ctx context.Context, query string, args ...any) ([]model.OverlayEntry, error) {
 	pending := s.pendingValues()
+	runHook(testHookBetweenReads)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err

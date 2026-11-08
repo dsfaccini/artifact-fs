@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1932,95 +1931,146 @@ func TestNewCommitsWritesAProcessLeftUncommitted(t *testing.T) {
 	}
 }
 
-// A Lookup that runs while another handle's close flushes must still report
-// the size of writes that completed before the Lookup began.
-func TestLookupDuringFlushShowsCompletedWrites(t *testing.T) {
-	s, _ := testStore(t)
-	ctx := context.Background()
-	createWithContent(t, s, "f.txt", "x")
-	if err := s.FlushFile(ctx, "f.txt"); err != nil {
-		t.Fatal(err)
+// setHook sets *hook to fn for the rest of the test. fn clears it on its first
+// call, so a read or flush that fn runs does not reach it again.
+func setHook(t *testing.T, hook *func(), fn func()) {
+	t.Helper()
+	*hook = func() {
+		*hook = nil
+		fn()
 	}
-	size := int64(1)
-	stale := 0
-	for i := range 3000 {
-		// First write commits size+1; the second is coalesced to size+2.
-		for range 2 {
-			if _, err := s.WriteFile(ctx, "f.txt", size, []byte("y")); err != nil {
-				t.Fatal(err)
+	t.Cleanup(func() { *hook = nil })
+}
+
+// A read must report the size of every write that completed before it began,
+// however a flush interleaves with its two reads.
+func TestReadAcrossAFlushShowsCompletedWrites(t *testing.T) {
+	ctx := context.Background()
+	reads := map[string]func(*Store) (int64, error){
+		"Lookup": func(s *Store) (int64, error) {
+			e, _, err := s.Lookup(ctx, "d/f.txt")
+			return e.SizeBytes, err
+		},
+		"ListByPrefix": func(s *Store) (int64, error) {
+			entries, err := s.ListByPrefix(ctx, "d")
+			if err != nil || len(entries) != 1 {
+				return 0, fmt.Errorf("ListByPrefix(d) = %+v, %v", entries, err)
 			}
-			size++
-		}
-		done := make(chan error, 1)
-		go func() { done <- s.FlushFile(ctx, "f.txt") }()
-	loop:
-		for {
-			select {
-			case err := <-done:
-				if err != nil {
+			return entries[0].SizeBytes, nil
+		},
+	}
+	flushes := map[string]func(*Store) error{
+		"FlushFile":       func(s *Store) error { return s.FlushFile(ctx, "d/f.txt") },
+		"SyncFile":        func(s *Store) error { return s.SyncFile(ctx, "d/f.txt") },
+		"unrelated Mkdir": func(s *Store) error { return s.Mkdir(ctx, "other", 0o755) },
+	}
+	for readName, read := range reads {
+		for flushName, flush := range flushes {
+			// The committed size is 2 and the pending size 3.
+			setup := func(t *testing.T) *Store {
+				s, _ := testStore(t)
+				createWithContent(t, s, "d/f.txt", "x")
+				if err := s.FlushFile(ctx, "d/f.txt"); err != nil {
 					t.Fatal(err)
 				}
-				break loop
-			default:
+				for off := int64(1); off < 3; off++ {
+					if _, err := s.WriteFile(ctx, "d/f.txt", off, []byte("y")); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return s
 			}
-			e, ok, err := s.Lookup(ctx, "f.txt")
-			if err != nil || !ok {
-				t.Fatal(ok, err)
-			}
-			if e.SizeBytes != size {
-				stale++
-				if stale == 1 {
-					t.Logf("iteration %d: Lookup size %d after writes reached %d", i, e.SizeBytes, size)
+			check := func(t *testing.T, size int64, err error) {
+				t.Helper()
+				if err != nil || size != 3 {
+					t.Errorf("%s = %d, %v; want 3, the size of the completed writes", readName, size, err)
 				}
 			}
+			t.Run(fmt.Sprintf("%s spans %s", readName, flushName), func(t *testing.T) {
+				s := setup(t)
+				ran := false
+				setHook(t, &testHookBetweenReads, func() {
+					ran = true
+					if err := flush(s); err != nil {
+						t.Error(err)
+					}
+				})
+				size, err := read(s)
+				if !ran {
+					t.Fatalf("%s never reached the step between its two reads", readName)
+				}
+				check(t, size, err)
+			})
+			t.Run(fmt.Sprintf("%s inside %s", readName, flushName), func(t *testing.T) {
+				s := setup(t)
+				ran := false
+				setHook(t, &testHookBetweenCommitAndForget, func() {
+					ran = true
+					size, err := read(s)
+					check(t, size, err)
+				})
+				if err := flush(s); err != nil {
+					t.Fatal(err)
+				}
+				if !ran {
+					t.Fatalf("%s never reached the step between its commit and its forget", flushName)
+				}
+			})
 		}
-	}
-	if stale > 0 {
-		t.Fatalf("%d Lookups during a flush returned a size older than completed writes", stale)
 	}
 }
 
-// An unrelated mutation flushes every pending path, so a stat of a file being
-// written can go stale while another process creates a directory.
-func TestLookupDuringUnrelatedMkdirShowsCompletedWrites(t *testing.T) {
+// Reads copy the pending writes under pendingMu, because writes and flushes
+// change them from another goroutine. The race detector reports an unlocked
+// read. Most writes take the path that touches only pendingMu: every query
+// locks the database/sql pool's mutex, which orders the writer's earlier
+// accesses before the reader's later ones and hides them from the detector.
+func TestReadsCopyPendingWritesUnderTheLock(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
-	createWithContent(t, s, "f.txt", "x")
-	if err := s.FlushFile(ctx, "f.txt"); err != nil {
-		t.Fatal(err)
-	}
-	size := int64(1)
-	stale := 0
-	for i := range 2000 {
-		for range 2 {
-			if _, err := s.WriteFile(ctx, "f.txt", size, []byte("y")); err != nil {
-				t.Fatal(err)
-			}
-			size++
-		}
-		done := make(chan error, 1)
-		go func() { done <- s.Mkdir(ctx, "d"+strconv.Itoa(i), 0o755) }()
-	loop:
-		for {
-			select {
-			case err := <-done:
-				if err != nil {
-					t.Fatal(err)
+	createWithContent(t, s, "d/f.txt", "x")
+	done := make(chan struct{})
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for off := int64(1); ; off += 100 {
+			for i := range int64(100) {
+				if _, err := s.WriteFile(ctx, "d/f.txt", off+i, []byte("y")); err != nil {
+					t.Error(err)
+					return
 				}
-				break loop
+			}
+			if err := s.FlushFile(ctx, "d/f.txt"); err != nil {
+				t.Error(err)
+				return
+			}
+			if off == 1 {
+				close(started)
+			}
+			select {
+			case <-done:
+				return
 			default:
 			}
-			e, _, err := s.Lookup(ctx, "f.txt")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if e.SizeBytes != size {
-				stale++
-			}
 		}
+	}()
+	defer func() {
+		close(done)
+		<-stopped
+	}()
+	select {
+	case <-started:
+	case <-stopped:
+		t.FailNow()
 	}
-	if stale > 0 {
-		t.Fatalf("%d Lookups during an unrelated Mkdir returned a size older than completed writes", stale)
+	for range 20 {
+		if _, ok, err := s.Lookup(ctx, "d/f.txt"); err != nil || !ok {
+			t.Fatalf("Lookup(d/f.txt) = %v, %v; want the file", ok, err)
+		}
+		if entries, err := s.ListByPrefix(ctx, "d"); err != nil || len(entries) != 1 {
+			t.Fatalf("ListByPrefix(d) = %+v, %v; want d/f.txt", entries, err)
+		}
 	}
 }
 
@@ -2043,55 +2093,6 @@ func TestListByPrefixShowsUnflushedWriteSize(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].SizeBytes != 9 {
 		t.Fatalf("ListByPrefix(d) = %+v, want d/f.txt with size 9", entries)
-	}
-}
-
-// A listing that runs while a flush commits must report the size of writes
-// that completed before the listing began.
-func TestListByPrefixDuringFlushShowsCompletedWrites(t *testing.T) {
-	s, _ := testStore(t)
-	ctx := context.Background()
-	createWithContent(t, s, "d/f.txt", "x")
-	if err := s.FlushFile(ctx, "d/f.txt"); err != nil {
-		t.Fatal(err)
-	}
-	size := int64(1)
-	stale, calls := 0, 0
-	for i := range 3000 {
-		for range 2 {
-			if _, err := s.WriteFile(ctx, "d/f.txt", size, []byte("y")); err != nil {
-				t.Fatal(err)
-			}
-			size++
-		}
-		done := make(chan error, 1)
-		go func() { done <- s.FlushFile(ctx, "d/f.txt") }()
-	loop:
-		for {
-			select {
-			case err := <-done:
-				if err != nil {
-					t.Fatal(err)
-				}
-				break loop
-			default:
-			}
-			entries, err := s.ListByPrefix(ctx, "d")
-			if err != nil || len(entries) != 1 {
-				t.Fatal(entries, err)
-			}
-			calls++
-			if entries[0].SizeBytes != size {
-				stale++
-				if stale == 1 {
-					t.Logf("iteration %d: listed size %d after writes reached %d", i, entries[0].SizeBytes, size)
-				}
-			}
-		}
-	}
-	t.Logf("%d listings", calls)
-	if stale > 0 {
-		t.Fatalf("%d listings during a flush returned a size older than completed writes", stale)
 	}
 }
 
