@@ -27,14 +27,20 @@ func requireControlSocket(t *testing.T, root string) {
 
 // shortTempDir is a TempDir short enough for a state root whose control
 // socket path fits sun_path. A t.TempDir() on macOS lies under /var/folders,
-// and the daemon there skips the socket, so a CLI nudge never reaches it.
+// and the daemon there skips the socket, so a CLI nudge never reaches it. Its
+// cleanup fails the test, as t.TempDir's does, so a goroutine or a child
+// process that still writes into the directory shows.
 func shortTempDir(t *testing.T) string {
 	t.Helper()
 	tmp, err := os.MkdirTemp("/tmp", "afs")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(tmp) })
+	t.Cleanup(func() {
+		if err := os.RemoveAll(tmp); err != nil {
+			t.Errorf("shortTempDir cleanup: %v", err)
+		}
+	})
 	return tmp
 }
 
