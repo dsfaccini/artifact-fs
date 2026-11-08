@@ -51,9 +51,10 @@ type delayedUnmountFailure struct {
 	release chan struct{}
 }
 
-func (m *delayedUnmountFailure) Backend() string            { return "fake" }
-func (m *delayedUnmountFailure) InvalidateChanged() error   { return nil }
-func (m *delayedUnmountFailure) Join(context.Context) error { return nil }
+func (m *delayedUnmountFailure) Backend() string              { return "fake" }
+func (m *delayedUnmountFailure) InvalidateChanged() error     { return nil }
+func (m *delayedUnmountFailure) OpenFileGenerations() []int64 { return nil }
+func (m *delayedUnmountFailure) Join(context.Context) error   { return nil }
 
 func (m *delayedUnmountFailure) Unmount(context.Context) error {
 	close(m.started)
@@ -939,12 +940,8 @@ func TestHeadReconcileKeepsRetiredGenerationReadable(t *testing.T) {
 				t.Fatalf("LookUpInode: %v", err)
 			}
 
-			f.updateMain(f.nextOID)
-			f.signal()
-			f.waitForHead(f.nextOID, "main", f.oldGen+1)
-			f.updateMain(f.lastOID)
-			f.signal()
-			f.waitForHead(f.lastOID, "main", f.oldGen+2)
+			f.moveHEAD(f.nextOID, f.oldGen+1)
+			f.moveHEAD(f.lastOID, f.oldGen+2)
 
 			open := &fuseops.OpenFileOp{Inode: lookup.Entry.Child}
 			if err := fs.OpenFile(f.ctx, open); err != nil {
@@ -959,6 +956,162 @@ func TestHeadReconcileKeepsRetiredGenerationReadable(t *testing.T) {
 			}
 			if got := string(bytes.Join(read.Data, nil)); got != tt.want {
 				t.Fatalf("read through the inode looked up before both switches = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// moveHEAD moves main to oid, then waits until the runtime serves it as
+// generation gen and the reconcile, with its prune, has ended.
+func (f *headReconcileFixture) moveHEAD(oid string, gen int64) {
+	f.t.Helper()
+	f.updateMain(oid)
+	f.signal()
+	f.waitForHead(oid, "main", gen)
+	f.rt.headMu.Lock()
+	f.rt.headMu.Unlock()
+}
+
+// emptyCommit commits the empty tree as a child of parent.
+func (f *headReconcileFixture) emptyCommit(parent, message string) string {
+	f.t.Helper()
+	tree := strings.TrimSpace(runCmdOutput(f.t, "git", "-C", f.workDir, "hash-object", "-w", "-t", "tree", "/dev/null"))
+	return strings.TrimSpace(runCmdOutput(f.t, "git", "-C", f.workDir, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit-tree", tree, "-p", parent, "-m", message))
+}
+
+// servingMount stands in for a serving mount of fs.
+type servingMount struct {
+	*fakeMountedFS
+	fs *fusefs.ArtifactFuse
+}
+
+func (m *servingMount) OpenFileGenerations() []int64 { return m.fs.OpenFileGenerations() }
+
+// openFileFixture serves its runtime through fs, which the test drives with
+// FUSE ops. Its retention window lapses at once.
+type openFileFixture struct {
+	*headReconcileFixture
+	fs *fusefs.ArtifactFuse
+}
+
+func newOpenFileFixture(t *testing.T) *openFileFixture {
+	t.Helper()
+	f := newHeadReconcileFixture(t)
+	f.svc.generationRetention = time.Nanosecond
+	repo := f.rt.cfg
+	repo.BlobCacheDir = t.TempDir()
+	h := hydrator.New(f.svc.git)
+	h.Start(1, repo.RepoPaths)
+	t.Cleanup(h.Stop)
+	fs := fusefs.NewArtifactFuse(repo.RepoPaths, &fusefs.Engine{Resolver: f.rt.resolver, Repo: repo.RepoPaths, Overlay: f.rt.overlay, Hydrator: h})
+	f.svc.mu.Lock()
+	f.rt.mfs, f.rt.mount = &servingMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, fs: fs}, mountServing
+	f.svc.mu.Unlock()
+	return &openFileFixture{headReconcileFixture: f, fs: fs}
+}
+
+func (f *openFileFixture) lookupReadme() fuseops.InodeID {
+	f.t.Helper()
+	op := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "README.md"}
+	if err := f.fs.LookUpInode(f.ctx, op); err != nil {
+		f.t.Fatalf("LookUpInode: %v", err)
+	}
+	return op.Entry.Child
+}
+
+func (f *openFileFixture) open(inode fuseops.InodeID) (fuseops.HandleID, error) {
+	op := &fuseops.OpenFileOp{Inode: inode}
+	if err := f.fs.OpenFile(f.ctx, op); err != nil {
+		return 0, err
+	}
+	f.t.Cleanup(func() {
+		_ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: op.Handle})
+	})
+	return op.Handle, nil
+}
+
+func (f *openFileFixture) read(inode fuseops.InodeID, handle fuseops.HandleID) (string, error) {
+	op := &fuseops.ReadFileOp{Inode: inode, Handle: handle, Size: 64}
+	if err := f.fs.ReadFile(f.ctx, op); err != nil {
+		return "", err
+	}
+	return string(bytes.Join(op.Data, nil)), nil
+}
+
+// A HEAD change removes the path of a file that stays open. The kernel still
+// holds the file's inode, so it can open the inode again, as FSKit does
+// through a name it still caches. The prune at a later HEAD change must keep
+// the generation the inode reads while the file is open, so the new open
+// reads the file. It must still prune each other generation outside the
+// retention window: a file that never closes keeps one generation.
+func TestHeadReconcileKeepsTheGenerationOfAnOpenFile(t *testing.T) {
+	t.Parallel()
+	f := newOpenFileFixture(t)
+	inode := f.lookupReadme()
+	if _, err := f.open(inode); err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	gone := f.emptyCommit(f.oldOID, "gone")
+	stillGone := f.emptyCommit(gone, "still gone")
+	f.moveHEAD(gone, f.oldGen+1)
+	f.moveHEAD(stillGone, f.oldGen+2)
+
+	again, err := f.open(inode)
+	if err != nil {
+		t.Fatalf("open of the held inode after the prune = %v, want the file", err)
+	}
+	if got, err := f.read(inode, again); err != nil || got != "old\n" {
+		t.Fatalf("read through the new handle = %q, %v, want %q", got, err, "old\n")
+	}
+
+	if _, ok := lookupNode(t, f.rt.snapshot, f.oldGen+1, "."); !ok {
+		t.Fatalf("generation %d is gone before the next HEAD change", f.oldGen+1)
+	}
+	f.moveHEAD(f.emptyCommit(stillGone, "gone again"), f.oldGen+3)
+	for gen, want := range map[int64]bool{f.oldGen: true, f.oldGen + 1: false, f.oldGen + 2: true, f.oldGen + 3: true} {
+		if _, ok := lookupNode(t, f.rt.snapshot, gen, "."); ok != want {
+			t.Errorf("generation %d kept = %t, want %t", gen, ok, want)
+		}
+	}
+}
+
+// A handle keeps a descriptor of the blob it opened while its inode reads the
+// blob's generation. Once a getattr reports a newer generation, the handle
+// opens the blob there at its next read. The prune at a later HEAD change must
+// keep that generation while the handle is open, so the read matches the size
+// the getattr reported, whether the path then changed or vanished.
+func TestHeadReconcileKeepsTheGenerationAnOpenFileReopensAt(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name  string
+		later func(*openFileFixture) []string
+	}{
+		{name: "blob changed", later: func(f *openFileFixture) []string { return []string{f.lastOID, f.oldOID} }},
+		{name: "path removed", later: func(f *openFileFixture) []string {
+			gone := f.emptyCommit(f.nextOID, "gone")
+			return []string{gone, f.emptyCommit(gone, "still gone")}
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			f := newOpenFileFixture(t)
+			inode := f.lookupReadme()
+			handle, err := f.open(inode)
+			if err != nil {
+				t.Fatalf("OpenFile: %v", err)
+			}
+			f.moveHEAD(f.nextOID, f.oldGen+1)
+			getattr := &fuseops.GetInodeAttributesOp{Inode: inode}
+			if err := f.fs.GetInodeAttributes(f.ctx, getattr); err != nil {
+				t.Fatalf("GetInodeAttributes: %v", err)
+			}
+			for i, oid := range tt.later(f) {
+				f.moveHEAD(oid, f.oldGen+2+int64(i))
+			}
+
+			got, err := f.read(inode, handle)
+			if err != nil || got != "next\n" || uint64(len(got)) != getattr.Attributes.Size {
+				t.Fatalf("read through the handle = %q, %v, want %q, the content getattr sized at %d bytes", got, err, "next\n", getattr.Attributes.Size)
 			}
 		})
 	}

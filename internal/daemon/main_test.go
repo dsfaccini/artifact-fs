@@ -54,8 +54,9 @@ type fakeMountedFS struct {
 	unmounted   chan struct{}
 }
 
-func (m *fakeMountedFS) Backend() string          { return "fake" }
-func (m *fakeMountedFS) InvalidateChanged() error { return nil }
+func (m *fakeMountedFS) Backend() string              { return "fake" }
+func (m *fakeMountedFS) InvalidateChanged() error     { return nil }
+func (m *fakeMountedFS) OpenFileGenerations() []int64 { return nil }
 
 func (m *fakeMountedFS) Join(ctx context.Context) error {
 	select {
