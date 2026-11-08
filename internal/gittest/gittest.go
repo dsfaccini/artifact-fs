@@ -2,10 +2,13 @@
 package gittest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -71,6 +74,86 @@ func RequireConfigIsolated(t *testing.T) {
 	out, err := exec.Command("git", "config", "--get-all", "gittest.scope").Output()
 	if len(out) != 0 || err == nil {
 		t.Fatalf("git read gittest.scope = %q from a machine config; TestMain must call gittest.IsolateConfig", out)
+	}
+}
+
+// raceExitSleepOff is the GORACE that DisableRaceExitSleep sets.
+const raceExitSleepOff = "atexit_sleep_ms=0"
+
+// raceExitSleep is how long a race-built binary sleeps after it exits 0, by
+// default.
+const raceExitSleep = time.Second
+
+// DisableRaceExitSleep stops each race-built binary this process starts from
+// sleeping raceExitSleep after it exits 0. It leaves a GORACE the caller set.
+// Call it from TestMain in a package whose test binary git runs as the
+// FSMonitor hook: there the sleep adds a second to every git command that
+// reads the index.
+func DisableRaceExitSleep() {
+	if _, ok := os.LookupEnv("GORACE"); !ok {
+		os.Setenv("GORACE", raceExitSleepOff)
+	}
+}
+
+// RequireHookSkipsRaceExitSleep fails t unless git status in worktree runs
+// its core.fsmonitor hook, the hook exits 0, and it returns before
+// raceExitSleep ends, which holds in a race build only after
+// DisableRaceExitSleep ran.
+func RequireHookSkipsRaceExitSleep(t *testing.T, worktree string) {
+	t.Helper()
+	if v, ok := os.LookupEnv("GORACE"); ok && v != raceExitSleepOff {
+		t.Skipf("GORACE=%q from the caller decides the exit sleep", v)
+	}
+	out, err := exec.Command("git", "-C", worktree, "config", "--get", "core.fsmonitor").Output()
+	if err != nil {
+		t.Fatalf("read core.fsmonitor: %v", err)
+	}
+	hook := strings.TrimSpace(string(out))
+	trace := filepath.Join(t.TempDir(), "trace2.json")
+	cmd := exec.Command("git", "-C", worktree, "status", "--short")
+	cmd.Env = append(os.Environ(), "GIT_TRACE2_EVENT="+trace)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git status: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type child struct {
+		sid string
+		id  int
+	}
+	hooks := map[child]bool{}
+	ran := false
+	for line := range bytes.Lines(data) {
+		var ev struct {
+			Event   string   `json:"event"`
+			SID     string   `json:"sid"`
+			ChildID int      `json:"child_id"`
+			Argv    []string `json:"argv"`
+			Code    int      `json:"code"`
+			TRel    float64  `json:"t_rel"`
+		}
+		if err := json.Unmarshal(line, &ev); err != nil {
+			t.Fatalf("trace2 event %q: %v", line, err)
+		}
+		c := child{ev.SID, ev.ChildID}
+		switch {
+		case ev.Event == "child_start" && len(ev.Argv) > 0 && ev.Argv[0] == hook:
+			hooks[c] = true
+		case ev.Event == "child_exit" && hooks[c]:
+			ran = true
+			// Only an exit 0 sleeps, so a failed hook proves nothing.
+			if ev.Code != 0 {
+				t.Fatalf("FSMonitor hook exited %d, want 0", ev.Code)
+			}
+			if ev.TRel >= raceExitSleep.Seconds() {
+				t.Fatalf("FSMonitor hook took %.2fs, at least the race runtime's exit sleep; TestMain must call gittest.DisableRaceExitSleep", ev.TRel)
+			}
+		}
+	}
+	if !ran {
+		t.Fatalf("git status ran no FSMonitor hook %s", hook)
 	}
 }
 
