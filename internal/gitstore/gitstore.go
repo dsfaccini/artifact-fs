@@ -105,7 +105,10 @@ func (s *Store) SetBatchPoolSize(n int) {
 // DETACHED. Git reads HEAD once for the ref and once for the commit, and a
 // HEAD write between the two would pair one state's commit with the next
 // state's ref. So it reads the ref before and after the commit, until both
-// reads agree.
+// reads agree. A switch away and back between the two ref reads also
+// satisfies that, and pairs the other state's commit with the ref. The
+// daemon's check after each reconcile, servesHEAD, serves HEAD again once
+// the switching stops.
 func (s *Store) ResolveHEAD(ctx context.Context, repo model.RepoConfig) (oid string, ref string, err error) {
 	ref = headRef(ctx, repo)
 	for {

@@ -309,8 +309,10 @@ func TestHeadReconcileLoopEndsWhenItsRuntimeStopsMidReconcile(t *testing.T) {
 	f.svc.mu.Lock()
 	f.rt.stopping = true
 	f.svc.mu.Unlock()
-	f.rt.headMu.Unlock()
+	// Cancel first. A check of HEAD that ran before the cancel would find
+	// HEAD served and end the loop with or without the guard.
 	f.cancel()
+	f.rt.headMu.Unlock()
 	f.rt.workers.Wait()
 }
 
