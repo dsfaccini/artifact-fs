@@ -375,7 +375,38 @@ func TestAddRepoSyncFreshCloneServesFetchRef(t *testing.T) {
 	}
 }
 
-// A clone's refspec maps only --ref's branch, and Git sets an upstream only
+// switchCloneToFeature registers remote's ref with add-repo, which clones it
+// --single-branch, runs between on the clone's git dir, then registers the
+// repo again with --fetch-ref feature. It returns the stored config and the
+// second add-repo's error.
+func switchCloneToFeature(t *testing.T, svc *Service, remote, ref string, between func(gitDir string)) (model.RepoConfig, error) {
+	t.Helper()
+	ctx := context.Background()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: ref}, Enabled: true}
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	between(got.GitDir)
+	cfg.FetchRef = "feature"
+	addErr := svc.ctl().AddRepo(ctx, cfg)
+	if got, err = svc.registry.GetRepo(ctx, cfg.Name); err != nil {
+		t.Fatal(err)
+	}
+	return got, addErr
+}
+
+// upstreamOf returns the upstream ref of gitDir's branch and the remote that
+// holds it.
+func upstreamOf(t *testing.T, gitDir, branch string) string {
+	t.Helper()
+	return strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "for-each-ref", "--format=%(upstream) %(upstream:remotename)", "refs/heads/"+branch))
+}
+
+// A clone's refspec maps only --ref's branch, and Git tracks a branch only
 // through a refspec that maps it. A preparation that moves the clone to
 // another branch adds that branch to origin's refspec, so the branch tracks
 // its remote branch: a plain git pull merges it rather than --ref's branch,
@@ -386,24 +417,15 @@ func TestSwitchedBranchTracksItsRemoteBranch(t *testing.T) {
 	tmp := t.TempDir()
 	remote := filepath.Join(tmp, "remote")
 	feature := newBranchedRemote(t, remote)
-	bare := filepath.Join(tmp, "origin.git")
-	runCmd(t, "git", "clone", "-q", "--bare", remote, bare)
 	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer svc.Close()
-	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + bare, Branch: "main"}, Enabled: true}
-	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
-		t.Fatal(err)
-	}
-	mainTip := commitFile(t, remote, "MAIN.md", "main\n")
-	runCmd(t, "git", "-C", remote, "push", "-q", bare, "main")
-	cfg.FetchRef = "feature"
-	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
-		t.Fatal(err)
-	}
-	got, err := svc.registry.GetRepo(ctx, "repo")
+	var mainTip string
+	got, err := switchCloneToFeature(t, svc, remote, "main", func(string) {
+		mainTip = commitFile(t, remote, "MAIN.md", "main\n")
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,11 +443,9 @@ func TestSwitchedBranchTracksItsRemoteBranch(t *testing.T) {
 		t.Fatalf("git reset: %v\n%s", err, out)
 	}
 	// pull.rebase=false makes Git merge diverged branches instead of refusing.
-	if out, err := git("-c", "pull.rebase=false", "pull", "-q"); err != nil {
-		t.Errorf("git pull: %v\n%s", err, out)
-	}
-	if head, _ := git("rev-parse", "HEAD"); head != feature {
-		t.Errorf("HEAD after git pull = %s, want feature %s; main is %s", head, feature, mainTip)
+	out, err := git("-c", "pull.rebase=false", "pull", "-q")
+	if head, _ := git("rev-parse", "HEAD"); err != nil || head != feature {
+		t.Errorf("git pull left HEAD at %s, want feature %s; main is %s; pull error %v\n%s", head, feature, mainTip, err, out)
 	}
 	if err := os.WriteFile(filepath.Join(worktree, "LOCAL.md"), []byte("local\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -442,7 +462,7 @@ func TestSwitchedBranchTracksItsRemoteBranch(t *testing.T) {
 		t.Errorf("git push: %v\n%s", err, out)
 	}
 	local, _ := git("rev-parse", "HEAD")
-	if pushed := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", bare, "rev-parse", "refs/heads/feature")); pushed != local {
+	if pushed := strings.TrimSpace(runCmdOutput(t, "git", "-C", remote, "rev-parse", "refs/heads/feature")); pushed != local {
 		t.Errorf("remote feature = %s after git push, want %s", pushed, local)
 	}
 	if _, err := svc.ctl().Prepare(ctx, "repo"); err != nil {
@@ -451,6 +471,29 @@ func TestSwitchedBranchTracksItsRemoteBranch(t *testing.T) {
 	refspecs := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", got.GitDir, "config", "--get-all", "remote.origin.fetch"))
 	if want := "+refs/heads/main:refs/remotes/origin/main\n+refs/heads/feature:refs/remotes/origin/feature"; refspecs != want {
 		t.Fatalf("origin's refspecs after a second preparation:\n%s\nwant:\n%s", refspecs, want)
+	}
+}
+
+// A local branch named origin/feature makes the name origin/feature
+// ambiguous, so preparation names the tracking ref in full.
+func TestSwitchedBranchTracksOriginBesideALocalOriginSlashBranch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	newBranchedRemote(t, remote)
+	runCmd(t, "git", "-C", remote, "branch", "origin/feature", "main")
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	got, err := switchCloneToFeature(t, svc, remote, "refs/heads/origin/feature", func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upstream := upstreamOf(t, got.GitDir, "feature"); upstream != "refs/remotes/origin/feature origin" {
+		t.Fatalf("feature's upstream = %q, want refs/remotes/origin/feature on origin", upstream)
 	}
 }
 
@@ -476,11 +519,119 @@ func TestPreparationKeepsARefspecPatternThatMapsTheBranch(t *testing.T) {
 	if err := svc.prepareAsync(ctx, got, 1); err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
-	if upstream := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "rev-parse", "--abbrev-ref", "master@{upstream}")); upstream != "origin/master" {
-		t.Fatalf("master's upstream = %q, want origin/master", upstream)
+	if upstream := upstreamOf(t, gitDir, "master"); upstream != "refs/remotes/origin/master origin" {
+		t.Fatalf("master's upstream = %q, want refs/remotes/origin/master on origin", upstream)
 	}
 	if refspecs := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "config", "--get-all", "remote.origin.fetch")); refspecs != "+refs/heads/*:refs/remotes/origin/*" {
 		t.Fatalf("origin's refspecs = %q, want only +refs/heads/*:refs/remotes/origin/*", refspecs)
+	}
+}
+
+// A remote added with --mirror=push has no fetch refspec, and git remote
+// set-branches would add +refs/feature:refs/feature, which maps no branch.
+// Preparation adds the branch's own line once, so a plain git fetch works.
+func TestPreparedGitDirWithAPushMirrorTracksTheFetchedBranch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	newBranchedRemote(t, remote)
+	gitDir := filepath.Join(tmp, "prepared.git")
+	runCmd(t, "git", "init", "-q", "--separate-git-dir", gitDir, "--initial-branch", "feature", filepath.Join(tmp, "prepared"))
+	runCmd(t, "git", "--git-dir", gitDir, "remote", "add", "--mirror=push", "origin", "file://"+remote)
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: gitDir}, RepoSpec: model.RepoSpec{Branch: "feature", PreparedGitDir: true, FetchRef: "feature"}, Enabled: true}
+	for i := range 2 {
+		if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := svc.registry.GetRepo(ctx, cfg.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.prepareAsync(ctx, got, 1); err != nil {
+			t.Fatalf("preparation %d: %v", i+1, err)
+		}
+		if got, err = svc.registry.GetRepo(ctx, cfg.Name); err != nil {
+			t.Fatal(err)
+		}
+		if got.PrepareState != model.PrepareStateReady {
+			t.Fatalf("prepare state after preparation %d = %q, want %q", i+1, got.PrepareState, model.PrepareStateReady)
+		}
+	}
+	if upstream := upstreamOf(t, gitDir, "feature"); upstream != "refs/remotes/origin/feature origin" {
+		t.Fatalf("feature's upstream = %q, want refs/remotes/origin/feature on origin", upstream)
+	}
+	if refspecs := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "config", "--get-all", "remote.origin.fetch")); refspecs != "+refs/heads/feature:refs/remotes/origin/feature" {
+		t.Fatalf("origin's refspecs = %q, want only +refs/heads/feature:refs/remotes/origin/feature", refspecs)
+	}
+	runCmd(t, "git", "--git-dir", gitDir, "fetch", "-q", "origin")
+}
+
+// When Git cannot track the fetched branch on origin, even through the
+// branch's own refspec line, add-repo fails with Git's error, and the repo's
+// prepare_error holds it. Git applies a negative refspec to the tracking ref
+// that a pattern line maps. A retried preparation adds no second line.
+func TestPreparationFailsWhenGitCannotTrackTheBranch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	newBranchedRemote(t, remote)
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	got, err := switchCloneToFeature(t, svc, remote, "main", func(gitDir string) {
+		runCmd(t, "git", "--git-dir", gitDir, "config", "--replace-all", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+		runCmd(t, "git", "--git-dir", gitDir, "config", "--add", "remote.origin.fetch", "^refs/heads/feature")
+	})
+	const gitErr = "starting point 'refs/remotes/origin/feature' is not a branch"
+	if err == nil || !strings.Contains(err.Error(), gitErr) {
+		t.Fatalf("add-repo error = %v, want Git's %q", err, gitErr)
+	}
+	if !strings.Contains(got.PrepareError, gitErr) {
+		t.Fatalf("prepare_error = %q, want Git's %q", got.PrepareError, gitErr)
+	}
+	if _, err := svc.ctl().Prepare(ctx, "repo"); err == nil || !strings.Contains(err.Error(), gitErr) {
+		t.Fatalf("second preparation error = %v, want Git's %q", err, gitErr)
+	}
+	refspecs := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", got.GitDir, "config", "--get-all", "remote.origin.fetch"))
+	if want := "+refs/heads/*:refs/remotes/origin/*\n^refs/heads/feature\n+refs/heads/feature:refs/remotes/origin/feature"; refspecs != want {
+		t.Fatalf("origin's refspecs after a second preparation:\n%s\nwant:\n%s", refspecs, want)
+	}
+}
+
+// Git tracks a branch on whichever remote's refspec maps its tracking ref.
+// When another remote maps refs/remotes/origin/*, preparation leaves the
+// branch no upstream on that remote. Once it adds the branch to origin's
+// refspec, both remotes map the ref, and Git refuses as ambiguous.
+func TestPreparationDoesNotTrackAnotherRemote(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	newBranchedRemote(t, remote)
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	got, err := switchCloneToFeature(t, svc, remote, "main", func(gitDir string) {
+		runCmd(t, "git", "--git-dir", gitDir, "remote", "add", "fork", remote)
+		runCmd(t, "git", "--git-dir", gitDir, "config", "--replace-all", "remote.fork.fetch", "+refs/heads/*:refs/remotes/origin/*")
+	})
+	if out, _ := exec.Command("git", "--git-dir", got.GitDir, "config", "--get-regexp", `^branch\.feature\.`).CombinedOutput(); len(out) != 0 {
+		t.Errorf("branch feature's config:\n%s\nwant none", out)
+	}
+	const gitErr = "ambiguous information for ref"
+	if err == nil || !strings.Contains(err.Error(), gitErr) {
+		t.Errorf("add-repo error = %v, want Git's %q", err, gitErr)
 	}
 }
 

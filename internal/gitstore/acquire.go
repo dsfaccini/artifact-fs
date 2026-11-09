@@ -595,43 +595,49 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 	return trackRemoteBranch(ctx, repo.GitDir, target.branch)
 }
 
-// trackRemoteBranch sets branch's upstream to origin's branch. Git sets an
-// upstream only through one of origin's fetch refspecs that maps the branch,
-// and a --single-branch clone's refspec maps only the branch it cloned, so
-// trackRemoteBranch first adds branch to the refspec when no line maps it.
-// Without the upstream, a plain git pull merges the refspec's first branch.
+// trackRemoteBranch sets branch's upstream to origin's branch. Git tracks a
+// branch only through a fetch refspec that maps it, and a --single-branch
+// clone's refspec maps only the branch it cloned. When Git cannot track the
+// branch on origin, trackRemoteBranch adds the branch's own line to origin's
+// refspec and tries once more. Without the upstream, a plain git pull on a
+// --single-branch clone pulls the cloned branch into the current one.
 func trackRemoteBranch(ctx context.Context, gitDir, branch string) error {
+	if setOriginUpstream(ctx, gitDir, branch) == nil {
+		return nil
+	}
+	refspec := "+refs/heads/" + branch + ":refs/remotes/origin/" + branch
 	refspecs, err := configEntries(ctx, gitDir, `^remote\.origin\.fetch$`)
 	if err != nil {
 		return err
 	}
-	if !slices.ContainsFunc(refspecs, func(e configEntry) bool {
-		return refspecMaps(e.value, "refs/heads/"+branch, "refs/remotes/origin/"+branch)
-	}) {
-		if _, err := runGit(ctx, gitDir, "remote", "set-branches", "--add", "--", "origin", branch); err != nil {
+	if !slices.ContainsFunc(refspecs, func(e configEntry) bool { return e.value == refspec }) {
+		if _, err := runGit(ctx, gitDir, "config", "--add", "remote.origin.fetch", refspec); err != nil {
 			return err
 		}
 	}
-	_, err = runGit(ctx, gitDir, "branch", "--set-upstream-to", "origin/"+branch, "--", branch)
-	return err
+	return setOriginUpstream(ctx, gitDir, branch)
 }
 
-// refspecMaps reports whether the fetch refspec spec fetches src into dst. A
-// pattern's * matches any text, as in Git.
-func refspecMaps(spec, src, dst string) bool {
-	from, to, ok := strings.Cut(strings.TrimPrefix(spec, "+"), ":")
-	if !ok || strings.HasPrefix(spec, "^") {
-		return false
+// setOriginUpstream sets branch's upstream to refs/remotes/origin/<branch>.
+// The full name keeps a local branch named origin/<branch> from making the
+// name ambiguous. Git tracks the branch on whichever remote's refspec maps
+// that ref, so setOriginUpstream removes an upstream on another remote and
+// fails.
+func setOriginUpstream(ctx context.Context, gitDir, branch string) error {
+	if _, err := runGit(ctx, gitDir, "branch", "--set-upstream-to", "refs/remotes/origin/"+branch, "--", branch); err != nil {
+		return err
 	}
-	fromPrefix, fromSuffix, fromPattern := strings.Cut(from, "*")
-	toPrefix, toSuffix, toPattern := strings.Cut(to, "*")
-	if !fromPattern || !toPattern {
-		return from == src && to == dst
+	remote, err := runGit(ctx, gitDir, "config", "--get", "branch."+branch+".remote")
+	if err != nil {
+		return err
 	}
-	if len(src) < len(fromPrefix)+len(fromSuffix) || !strings.HasPrefix(src, fromPrefix) || !strings.HasSuffix(src, fromSuffix) {
-		return false
+	if remote == "origin" {
+		return nil
 	}
-	return toPrefix+src[len(fromPrefix):len(src)-len(fromSuffix)]+toSuffix == dst
+	if _, err := runGit(ctx, gitDir, "branch", "--unset-upstream", "--", branch); err != nil {
+		return err
+	}
+	return fmt.Errorf("git tracks branch %s on remote %s, not origin", branch, remote)
 }
 
 func refOIDOrZero(ctx context.Context, gitDir string, refName string) (string, error) {
