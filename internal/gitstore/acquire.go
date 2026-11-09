@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -591,10 +592,52 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 		indexErr := s.restoreIndex(ctx, repo.GitDir, oid, oldOID, err)
 		return errors.Join(indexErr, restoreRef(ctx, repo.GitDir, refName, oldBranchOID, oid))
 	}
-	if _, err := runGit(ctx, repo.GitDir, "branch", "--set-upstream-to", "origin/"+target.branch, target.branch); err != nil {
-		s.logger.WarnContext(ctx, "set upstream failed", "repo", repo.Name, "error", err)
+	return trackRemoteBranch(ctx, repo.GitDir, target.branch)
+}
+
+// trackRemoteBranch sets branch's upstream to origin's branch. Git tracks a
+// branch only through a fetch refspec that maps it, and a --single-branch
+// clone's refspec maps only the branch it cloned. When Git cannot track the
+// branch on origin, trackRemoteBranch adds the branch's own line to origin's
+// refspec and tries once more. Without the upstream, a plain git pull on a
+// --single-branch clone pulls the cloned branch into the current one.
+func trackRemoteBranch(ctx context.Context, gitDir, branch string) error {
+	if setOriginUpstream(ctx, gitDir, branch) == nil {
+		return nil
 	}
-	return nil
+	refspec := "+refs/heads/" + branch + ":refs/remotes/origin/" + branch
+	refspecs, err := configEntries(ctx, gitDir, `^remote\.origin\.fetch$`)
+	if err != nil {
+		return err
+	}
+	if !slices.ContainsFunc(refspecs, func(e configEntry) bool { return e.value == refspec }) {
+		if _, err := runGit(ctx, gitDir, "config", "--add", "remote.origin.fetch", refspec); err != nil {
+			return err
+		}
+	}
+	return setOriginUpstream(ctx, gitDir, branch)
+}
+
+// setOriginUpstream sets branch's upstream to refs/remotes/origin/<branch>.
+// The full name keeps a local branch named origin/<branch> from making the
+// name ambiguous. Git tracks the branch on whichever remote's refspec maps
+// that ref, so setOriginUpstream removes an upstream on another remote and
+// fails.
+func setOriginUpstream(ctx context.Context, gitDir, branch string) error {
+	if _, err := runGit(ctx, gitDir, "branch", "--set-upstream-to", "refs/remotes/origin/"+branch, "--", branch); err != nil {
+		return err
+	}
+	remote, err := runGit(ctx, gitDir, "config", "--get", "branch."+branch+".remote")
+	if err != nil {
+		return err
+	}
+	if remote == "origin" {
+		return nil
+	}
+	if _, err := runGit(ctx, gitDir, "branch", "--unset-upstream", "--", branch); err != nil {
+		return err
+	}
+	return fmt.Errorf("git tracks branch %s on remote %s, not origin", branch, remote)
 }
 
 func refOIDOrZero(ctx context.Context, gitDir string, refName string) (string, error) {
