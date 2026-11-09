@@ -375,6 +375,115 @@ func TestAddRepoSyncFreshCloneServesFetchRef(t *testing.T) {
 	}
 }
 
+// A clone's refspec maps only --ref's branch, and Git sets an upstream only
+// through a refspec that maps it. A preparation that moves the clone to
+// another branch adds that branch to origin's refspec, so the branch tracks
+// its remote branch: a plain git pull merges it rather than --ref's branch,
+// git push pushes to it, and git status counts commits ahead of it.
+func TestSwitchedBranchTracksItsRemoteBranch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	feature := newBranchedRemote(t, remote)
+	bare := filepath.Join(tmp, "origin.git")
+	runCmd(t, "git", "clone", "-q", "--bare", remote, bare)
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + bare, Branch: "main"}, Enabled: true}
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	mainTip := commitFile(t, remote, "MAIN.md", "main\n")
+	runCmd(t, "git", "-C", remote, "push", "-q", bare, "main")
+	cfg.FetchRef = "feature"
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Package tests never mount, so Git runs in a plain worktree of the git dir.
+	worktree := filepath.Join(tmp, "worktree")
+	if err := os.Mkdir(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) (string, error) {
+		args = append([]string{"--git-dir", got.GitDir, "--work-tree", worktree, "-c", "user.name=test", "-c", "user.email=test@example.com"}, args...)
+		out, err := exec.Command("git", args...).CombinedOutput()
+		return strings.TrimSpace(string(out)), err
+	}
+	if out, err := git("reset", "-q", "--hard"); err != nil {
+		t.Fatalf("git reset: %v\n%s", err, out)
+	}
+	// pull.rebase=false makes Git merge diverged branches instead of refusing.
+	if out, err := git("-c", "pull.rebase=false", "pull", "-q"); err != nil {
+		t.Errorf("git pull: %v\n%s", err, out)
+	}
+	if head, _ := git("rev-parse", "HEAD"); head != feature {
+		t.Errorf("HEAD after git pull = %s, want feature %s; main is %s", head, feature, mainTip)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "LOCAL.md"), []byte("local\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "LOCAL.md"}, {"commit", "-q", "-m", "local"}} {
+		if out, err := git(args...); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if status, _ := git("status", "-sb"); status != "## feature...origin/feature [ahead 1]" {
+		t.Errorf("git status -sb = %q, want ## feature...origin/feature [ahead 1]", status)
+	}
+	if out, err := git("push", "-q"); err != nil {
+		t.Errorf("git push: %v\n%s", err, out)
+	}
+	local, _ := git("rev-parse", "HEAD")
+	if pushed := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", bare, "rev-parse", "refs/heads/feature")); pushed != local {
+		t.Errorf("remote feature = %s after git push, want %s", pushed, local)
+	}
+	if _, err := svc.ctl().Prepare(ctx, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	refspecs := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", got.GitDir, "config", "--get-all", "remote.origin.fetch"))
+	if want := "+refs/heads/main:refs/remotes/origin/main\n+refs/heads/feature:refs/remotes/origin/feature"; refspecs != want {
+		t.Fatalf("origin's refspecs after a second preparation:\n%s\nwant:\n%s", refspecs, want)
+	}
+}
+
+// A refspec pattern that maps the branch counts, so preparation adds none.
+func TestPreparationKeepsARefspecPatternThatMapsTheBranch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmp := t.TempDir()
+	gitDir := createPreparedGitDir(t, tmp)
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", GitDir: gitDir}, RepoSpec: model.RepoSpec{Branch: "master", PreparedGitDir: true, FetchRef: "master"}, Enabled: true}
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.prepareAsync(ctx, got, 1); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if upstream := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "rev-parse", "--abbrev-ref", "master@{upstream}")); upstream != "origin/master" {
+		t.Fatalf("master's upstream = %q, want origin/master", upstream)
+	}
+	if refspecs := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", gitDir, "config", "--get-all", "remote.origin.fetch")); refspecs != "+refs/heads/*:refs/remotes/origin/*" {
+		t.Fatalf("origin's refspecs = %q, want only +refs/heads/*:refs/remotes/origin/*", refspecs)
+	}
+}
+
 // --depth bounds the history every preparation transfers, also when it
 // fetches a fetch ref other than the source ref.
 func TestSyncPreparationFetchRefKeepsHistoryDepth(t *testing.T) {
@@ -598,9 +707,10 @@ func TestFetchNowOfAPreparedGitDirWithOnlyAFetchRef(t *testing.T) {
 	requireRefreshedBehind(t, svc, 1)
 }
 
-// A clone's refspec names only --ref. With another fetch ref, the fetch
-// command fetches the fetch ref, which the clone serves, and leaves --ref's
-// branch alone; ahead/behind compares HEAD with the fetch ref.
+// A clone's refspec names --ref, and preparation adds another fetch ref's
+// branch. The fetch command fetches only the fetch ref, which the clone
+// serves, and leaves --ref's branch alone; ahead/behind compares HEAD with the
+// fetch ref.
 func TestFetchNowOfACloneWithAnotherFetchRef(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()

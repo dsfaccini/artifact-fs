@@ -39,6 +39,7 @@ func TestPrepareFetchedBranchPreservesStagedEntries(t *testing.T) {
 	run(t, "git", "-C", repo, "commit", "-m", "feature")
 	featureOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
 	run(t, "git", "-C", repo, "checkout", "main")
+	run(t, "git", "-C", repo, "remote", "add", "origin", repo)
 	run(t, "git", "-C", repo, "update-ref", "refs/remotes/origin/feature", featureOID)
 	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("staged\n"), 0o644); err != nil {
 		t.Fatal(err)

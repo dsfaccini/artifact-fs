@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -591,10 +592,46 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 		indexErr := s.restoreIndex(ctx, repo.GitDir, oid, oldOID, err)
 		return errors.Join(indexErr, restoreRef(ctx, repo.GitDir, refName, oldBranchOID, oid))
 	}
-	if _, err := runGit(ctx, repo.GitDir, "branch", "--set-upstream-to", "origin/"+target.branch, target.branch); err != nil {
-		s.logger.WarnContext(ctx, "set upstream failed", "repo", repo.Name, "error", err)
+	return trackRemoteBranch(ctx, repo.GitDir, target.branch)
+}
+
+// trackRemoteBranch sets branch's upstream to origin's branch. Git sets an
+// upstream only through one of origin's fetch refspecs that maps the branch,
+// and a --single-branch clone's refspec maps only the branch it cloned, so
+// trackRemoteBranch first adds branch to the refspec when no line maps it.
+// Without the upstream, a plain git pull merges the refspec's first branch.
+func trackRemoteBranch(ctx context.Context, gitDir, branch string) error {
+	refspecs, err := configEntries(ctx, gitDir, `^remote\.origin\.fetch$`)
+	if err != nil {
+		return err
 	}
-	return nil
+	if !slices.ContainsFunc(refspecs, func(e configEntry) bool {
+		return refspecMaps(e.value, "refs/heads/"+branch, "refs/remotes/origin/"+branch)
+	}) {
+		if _, err := runGit(ctx, gitDir, "remote", "set-branches", "--add", "--", "origin", branch); err != nil {
+			return err
+		}
+	}
+	_, err = runGit(ctx, gitDir, "branch", "--set-upstream-to", "origin/"+branch, "--", branch)
+	return err
+}
+
+// refspecMaps reports whether the fetch refspec spec fetches src into dst. A
+// pattern's * matches any text, as in Git.
+func refspecMaps(spec, src, dst string) bool {
+	from, to, ok := strings.Cut(strings.TrimPrefix(spec, "+"), ":")
+	if !ok || strings.HasPrefix(spec, "^") {
+		return false
+	}
+	fromPrefix, fromSuffix, fromPattern := strings.Cut(from, "*")
+	toPrefix, toSuffix, toPattern := strings.Cut(to, "*")
+	if !fromPattern || !toPattern {
+		return from == src && to == dst
+	}
+	if len(src) < len(fromPrefix)+len(fromSuffix) || !strings.HasPrefix(src, fromPrefix) || !strings.HasSuffix(src, fromSuffix) {
+		return false
+	}
+	return toPrefix+src[len(fromPrefix):len(src)-len(fromSuffix)]+toSuffix == dst
 }
 
 func refOIDOrZero(ctx context.Context, gitDir string, refName string) (string, error) {
