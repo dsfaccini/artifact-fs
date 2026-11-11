@@ -1611,6 +1611,9 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 		}
 
 		childPath := cleanChildPath(parent.Path, op.Name)
+		if op.Name == "forced-eio" {
+			return errors.New("forced lookup failure for the e2e log proof")
+		}
 
 		// Synthesize .git gitfile in root
 		if isGitfile(parent, op.Name) {
