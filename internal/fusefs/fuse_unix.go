@@ -163,6 +163,9 @@ type ArtifactFuse struct {
 	// testHookBeforeAddFileHandle, when set, runs in an open between its
 	// Engine.OpenFile and its addFileHandle.
 	testHookBeforeAddFileHandle func()
+	// testHookResolvePerPath, when set, decides in place of resolvesPerPath
+	// whether the switch pass resolves its held paths one at a time.
+	testHookResolvePerPath func() bool
 }
 
 type InodeRef struct {
@@ -175,8 +178,10 @@ type InodeRef struct {
 	Gen int64
 	// ReadGen is the generation that base reads serve, so their length
 	// matches the size the kernel holds after a HEAD change. The path has the
-	// identity last reported there. It is Gen, or a later generation the
-	// switch pass found that identity in. It is 0 when Gen is.
+	// identity last reported there. It is Gen, a later generation the switch
+	// pass found that identity in, or the generation the path came back at
+	// with that identity when the unmapped inode mapped back. It is 0 when Gen
+	// is.
 	ReadGen int64
 	// Blob is the Attrs.Blob last reported for this inode. Type, Mode and Blob
 	// are the identity the kernel holds.
@@ -332,7 +337,7 @@ func (fs *ArtifactFuse) allocInode(path string, attrs Attrs) *InodeRef {
 	id, ok := fs.pathToInode[path]
 	if held, found := fs.unmapped[path]; !ok && found {
 		if fs.inodes[held].returnsAs(attrs.identity()) {
-			fs.mapLocked(held, path)
+			fs.mapLocked(held, path, attrs.Gen)
 			id, ok = held, true
 		} else {
 			fs.retireLocked(held)
@@ -419,20 +424,25 @@ func (fs *ArtifactFuse) retireRetypedLocked(id fuseops.InodeID, path string) {
 	fs.retireLocked(id)
 }
 
-// mapLocked maps path back to id, an unmapped inode whose path came back.
-// Caller must hold fs.mu write lock.
-func (fs *ArtifactFuse) mapLocked(id fuseops.InodeID, path string) {
+// mapLocked maps path back to id, an unmapped inode whose path came back with
+// id's identity at generation gen. A base read through id then serves gen: a
+// rename can have moved id while it was unmapped, so id's ReadGen can lack
+// path. Caller must hold fs.mu write lock.
+func (fs *ArtifactFuse) mapLocked(id fuseops.InodeID, path string, gen int64) {
 	fs.pathToInode[path] = id
 	delete(fs.unmapped, path)
+	if ref := fs.inodes[id]; ref != nil && ref.Gen != 0 {
+		ref.ReadGen = gen
+	}
 }
 
 // settleLocked decides id, unmapped at path, now that path exists with
-// identity current. It maps id back when no other inode holds the path and
-// returnsAs accepts current, and retires id otherwise. It reports whether id
-// got the path back. Caller must hold fs.mu write lock.
-func (fs *ArtifactFuse) settleLocked(id fuseops.InodeID, path string, current Identity) bool {
+// identity current at generation gen. It maps id back when no other inode
+// holds the path and returnsAs accepts current, and retires id otherwise. It
+// reports whether id got the path back. Caller must hold fs.mu write lock.
+func (fs *ArtifactFuse) settleLocked(id fuseops.InodeID, path string, current Identity, gen int64) bool {
 	if _, mapped := fs.pathToInode[path]; !mapped && fs.inodes[id].returnsAs(current) {
-		fs.mapLocked(id, path)
+		fs.mapLocked(id, path, gen)
 		return true
 	}
 	fs.retireLocked(id)
@@ -455,7 +465,7 @@ func (fs *ArtifactFuse) settleUnmappedBelow(path string) error {
 	}
 	fs.mu.RUnlock()
 	for _, m := range held {
-		current, exists, err := fs.engine.Identity(m.path)
+		current, gen, exists, err := fs.engine.IdentityAt(m.path)
 		if err != nil {
 			return err
 		}
@@ -464,7 +474,7 @@ func (fs *ArtifactFuse) settleUnmappedBelow(path string) error {
 		}
 		fs.mu.Lock()
 		if fs.unmapped[m.path] == m.id {
-			fs.settleLocked(m.id, m.path, current)
+			fs.settleLocked(m.id, m.path, current, gen)
 		}
 		fs.mu.Unlock()
 	}
@@ -691,6 +701,14 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // invalidation: the kernel holds nothing for it. A failure skips only what it
 // concerns, and the first one is returned.
 //
+// The pass reads the overlay once, and finds each held inode's identity with
+// Engine.Identities: it diffs the generation each inode's base identity was
+// reported at with the current one, and resolves only the paths the diff
+// names, so its cost follows the change, not the number of inodes held. When
+// no mapping needs only the existence check and resolvesPerPath finds the
+// overlay large next to the held paths, it resolves each held path on its own
+// instead, without reading the overlay.
+//
 // An inode whose base identity the current generation still has reads that
 // generation from then on, so a prune need not keep the one it read. The
 // pass advances InodeRef.ReadGen for each inode it compares and finds
@@ -770,6 +788,30 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			firstErr = fmt.Errorf("%s: %w", what, err)
 		}
 	}
+	held := make([]KernelIdentity, 0, len(inodes)+len(opened))
+	for _, k := range slices.Concat(inodes, opened) {
+		held = append(held, KernelIdentity{Path: k.path, Identity: k.reported, Gen: k.readGen})
+	}
+	// Only the whole overlay answers the existence check, so the pass reads it
+	// whenever a mapping needs that check. Otherwise it reads it unless
+	// resolving each held path costs less.
+	var view OverlayView
+	viewed := false
+	if len(existenceOnly) > 0 || !fs.resolvesPerPath(len(held)) {
+		var err error
+		view, err = fs.engine.ReadOverlay(context.Background())
+		failed(err, "list the overlay")
+		viewed = err == nil
+	}
+	var currents []MergedIdentity
+	if viewed {
+		currents = fs.engine.Identities(view, held)
+	} else {
+		for _, h := range held {
+			id, exists, err := fs.engine.Identity(h.Path)
+			currents = append(currents, MergedIdentity{Identity: id, Exists: exists, Err: err})
+		}
+	}
 	var entries []kernelEntry
 	// changed holds each held inode the pass invalidates. An entry
 	// invalidation leaves the kernel's attributes and pages of the inode, so
@@ -785,8 +827,9 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// unchanged holds each inode whose base identity the path still has, to
 	// read gen from then on.
 	var unchanged []known
-	for _, k := range inodes {
-		current, exists, err := fs.engine.Identity(k.path)
+	for i, k := range inodes {
+		c := currents[i]
+		current, exists, err := c.Identity, c.Exists, c.Err
 		if err != nil {
 			failed(err, "resolve "+k.path)
 			continue
@@ -809,8 +852,9 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			unchanged = append(unchanged, k)
 		}
 	}
-	for _, k := range opened {
-		current, exists, err := fs.engine.Identity(k.path)
+	for i, k := range opened {
+		c := currents[len(inodes)+i]
+		current, exists, err := c.Identity, c.Exists, c.Err
 		if err != nil {
 			failed(err, "resolve "+k.path)
 			continue
@@ -825,9 +869,16 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// The name of an unmapped inode already left the kernel, through the op
 	// or the pass that unmapped it, so a retired one needs only its inode
 	// invalidated.
-	var remap, retire []pathMapping
+	var retire []pathMapping
+	// remap holds each inode to map back, with the generation its path came
+	// back at.
+	type remapping struct {
+		pathMapping
+		gen int64
+	}
+	var remap []remapping
 	for _, u := range returning {
-		current, exists, err := fs.engine.Identity(u.path)
+		current, gen, exists, err := fs.engine.IdentityAt(u.path)
 		if err != nil {
 			failed(err, "resolve "+u.path)
 			continue
@@ -835,7 +886,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		switch {
 		case !exists:
 		case u.ref.returnsAs(current):
-			remap = append(remap, u.pathMapping)
+			remap = append(remap, remapping{u.pathMapping, gen})
 		default:
 			retire = append(retire, u.pathMapping)
 			changed = append(changed, u.id)
@@ -845,8 +896,12 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	for i, m := range existenceOnly {
 		paths[i] = m.path
 	}
-	missing, err := fs.engine.MissingPaths(context.Background(), paths)
-	failed(err, "list parents")
+	var missing []string
+	if viewed {
+		var err error
+		missing, err = fs.engine.MissingPathsIn(view, paths)
+		failed(err, "list parents")
+	}
 	gone := make(map[string]bool, len(missing))
 	for _, p := range missing {
 		gone[p] = true
@@ -866,7 +921,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// removes it from unmapped.
 	for _, m := range remap {
 		if _, mapped := fs.pathToInode[m.path]; !mapped && fs.unmapped[m.path] == m.id {
-			fs.mapLocked(m.id, m.path)
+			fs.mapLocked(m.id, m.path, m.gen)
 		}
 	}
 	for _, m := range retire {
@@ -932,6 +987,25 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		sent(notifier.InvalidateInode(id, 0, 0), fmt.Sprintf("inode %d", id))
 	}
 	return firstErr
+}
+
+// perPathOverlayRatio is the most overlay entries per held path for which the
+// switch pass reads the whole overlay. Past it, resolving each held path one
+// at a time costs less: over BenchmarkSwitchPass's tree, with 100 and with
+// 400 held paths, the two cost the same at 9 to 10 entries per held path.
+const perPathOverlayRatio = 9
+
+// resolvesPerPath reports whether the switch pass resolves each of its held
+// paths one at a time instead of reading the whole overlay: whether the
+// overlay holds more than perPathOverlayRatio entries per held path. It
+// counts at most one entry past that.
+func (fs *ArtifactFuse) resolvesPerPath(held int) bool {
+	if fs.testHookResolvePerPath != nil {
+		return fs.testHookResolvePerPath()
+	}
+	limit := perPathOverlayRatio*held + 1
+	n, err := fs.engine.CountOverlayEntries(context.Background(), limit)
+	return err == nil && n == limit
 }
 
 // openedBlobLocked records that an open of id serves blob, which is empty for
@@ -1130,7 +1204,7 @@ func (fs *ArtifactFuse) setReported(id fuseops.InodeID, attrs Attrs) error {
 	if ref == nil {
 		return nil
 	}
-	if fs.unmapped[ref.Path] == id && !fs.settleLocked(id, ref.Path, attrs.identity()) {
+	if fs.unmapped[ref.Path] == id && !fs.settleLocked(id, ref.Path, attrs.identity(), attrs.Gen) {
 		return syscall.ESTALE
 	}
 	if ref.Type != attrs.Type {
@@ -2263,7 +2337,7 @@ func (fs *ArtifactFuse) reachPath(id fuseops.InodeID, path string, exclusive boo
 // back with id's identity maps back to id. Any other path belongs to another
 // file, so id is retired and the op gets ESTALE.
 func (fs *ArtifactFuse) claimPath(id fuseops.InodeID, path string) error {
-	current, exists, err := fs.engine.Identity(path)
+	current, gen, exists, err := fs.engine.IdentityAt(path)
 	if err != nil {
 		return err
 	}
@@ -2278,7 +2352,7 @@ func (fs *ArtifactFuse) claimPath(id fuseops.InodeID, path string) error {
 	case ok && mapped == id, !ok && !exists:
 		return nil
 	case !ok && ref.returnsAs(current):
-		fs.mapLocked(id, path)
+		fs.mapLocked(id, path, gen)
 		return nil
 	}
 	fs.retireLocked(id)

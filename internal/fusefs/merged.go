@@ -237,45 +237,77 @@ func mergeChildren(path string, children []model.BaseNode, ovEntries []model.Ove
 	return out
 }
 
-// MissingPaths returns those of paths that the merged view lacks, as the
-// listing of each one's parent directory shows it. It reads the overlay once
-// and the snapshot children of each parent once, which costs far less than
-// resolving each path. A parent whose listing fails leaves its children out of
-// the result, and the first such error is returned.
-func (r *Resolver) MissingPaths(ctx context.Context, paths []string) ([]string, error) {
-	if len(paths) == 0 {
-		return nil, nil
-	}
-	byDir := map[string][]string{}
-	for _, p := range paths {
-		dir := model.CleanPath(filepath.Dir(p))
-		byDir[dir] = append(byDir[dir], p)
-	}
+// OverlayView is every overlay entry from one read, sorted by path, with the
+// generation that readers resolved against at the read.
+type OverlayView struct {
+	gen     int64
+	entries []model.OverlayEntry
+}
+
+// ReadOverlay reads every overlay entry together with the generation.
+func (r *Resolver) ReadOverlay(ctx context.Context) (OverlayView, error) {
 	r.transition.RLock()
 	gen := r.Generation()
 	entries, err := r.Overlay.ListByPrefix(ctx, ".")
 	r.transition.RUnlock()
 	if err != nil {
+		return OverlayView{}, err
+	}
+	slices.SortFunc(entries, func(a, b model.OverlayEntry) int { return strings.Compare(a.Path, b.Path) })
+	return OverlayView{gen: gen, entries: entries}, nil
+}
+
+// entry returns the entry at path.
+func (v OverlayView) entry(path string) (model.OverlayEntry, bool) {
+	i, found := slices.BinarySearchFunc(v.entries, path, func(e model.OverlayEntry, p string) int { return strings.Compare(e.Path, p) })
+	if !found {
+		return model.OverlayEntry{}, false
+	}
+	return v.entries[i], true
+}
+
+// below returns the entries below dir. Sorted by path, they are one run,
+// which below finds without copying them.
+func (v OverlayView) below(dir string) []model.OverlayEntry {
+	if dir == "." {
+		return v.entries
+	}
+	from := func(prefix string) int {
+		return sort.Search(len(v.entries), func(i int) bool { return v.entries[i].Path >= prefix })
+	}
+	// '0' follows '/', so [dir/, dir0) holds exactly the paths below dir.
+	return v.entries[from(dir+"/"):from(dir+"0")]
+}
+
+// MissingPaths returns those of paths that the merged view lacks, as the
+// listing of each one's parent directory shows it. See MissingPathsIn.
+func (r *Resolver) MissingPaths(ctx context.Context, paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	v, err := r.ReadOverlay(ctx)
+	if err != nil {
 		return nil, err
 	}
-	// Sorted by path, the entries below a directory are one run, which below
-	// finds without copying them.
-	slices.SortFunc(entries, func(a, b model.OverlayEntry) int { return strings.Compare(a.Path, b.Path) })
-	below := func(dir string) []model.OverlayEntry {
-		if dir == "." {
-			return entries
-		}
-		from := func(prefix string) int {
-			return sort.Search(len(entries), func(i int) bool { return entries[i].Path >= prefix })
-		}
-		// '0' follows '/', so [dir/, dir0) holds exactly the paths below dir.
-		return entries[from(dir+"/"):from(dir+"0")]
+	return r.MissingPathsIn(v, paths)
+}
+
+// MissingPathsIn returns those of paths that the merged view of v lacks, as
+// the listing of each one's parent directory shows it. It lists the snapshot
+// children of each parent once, which costs far less than resolving each
+// path. A parent whose listing fails leaves its children out of the result,
+// and the first such error is returned.
+func (r *Resolver) MissingPathsIn(v OverlayView, paths []string) ([]string, error) {
+	byDir := map[string][]string{}
+	for _, p := range paths {
+		dir := model.CleanPath(filepath.Dir(p))
+		byDir[dir] = append(byDir[dir], p)
 	}
 	var missing []string
 	var firstErr error
 	for dir, kids := range byDir {
 		// A published generation never changes, so its listing needs no lock.
-		children, err := r.Snapshot.ListChildren(gen, dir)
+		children, err := r.Snapshot.ListChildren(v.gen, dir)
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("list %s: %w", dir, err)
@@ -283,7 +315,7 @@ func (r *Resolver) MissingPaths(ctx context.Context, paths []string) ([]string, 
 			continue
 		}
 		names := map[string]bool{}
-		for _, e := range mergeChildren(dir, children, below(dir)) {
+		for _, e := range mergeChildren(dir, children, v.below(dir)) {
 			names[e.Name] = true
 		}
 		for _, p := range kids {
@@ -293,4 +325,112 @@ func (r *Resolver) MissingPaths(ctx context.Context, paths []string) ([]string, 
 		}
 	}
 	return missing, firstErr
+}
+
+// listCutoff is the most paths below a changed directory for which
+// ChangedPaths returns them all rather than list the directory: resolving
+// them takes a query each, and listing the directory two, one per generation.
+const listCutoff = 2
+
+// ChangedPaths returns those of paths whose base type, mode or blob can
+// differ between generations from and to: each that the generations give
+// different ones or only one of them holds, and each below a changed
+// directory that it does not list. It walks down from the root, listing a
+// directory's children in both generations when more than listCutoff of
+// paths lie below it. A directory with the same tree ID in both generations
+// holds the same entries in both, so no path below it changed. ok is false
+// when from holds no root entries, as after a prune.
+func (r *Resolver) ChangedPaths(from, to int64, paths []string) (changed map[string]bool, ok bool, err error) {
+	sorted := slices.Sorted(slices.Values(paths))
+	// below counts the paths below each directory above one of them.
+	below := map[string]int{}
+	for _, p := range sorted {
+		for d := filepath.Dir(p); ; d = filepath.Dir(d) {
+			below[d]++
+			if d == "." {
+				break
+			}
+		}
+	}
+	changed = map[string]bool{}
+	walk := func(dirs []string, dir string) []string {
+		switch n := below[dir]; {
+		case n > listCutoff:
+			return append(dirs, dir)
+		case n > 0:
+			at := func(prefix string) int {
+				i, _ := slices.BinarySearch(sorted, prefix)
+				return i
+			}
+			// '0' follows '/', so [dir/, dir0) holds exactly the paths below dir.
+			for _, p := range sorted[at(dir+"/"):at(dir+"0")] {
+				changed[p] = true
+			}
+		}
+		return dirs
+	}
+	for dirs := []string{"."}; len(dirs) > 0; {
+		dir := dirs[len(dirs)-1]
+		dirs = dirs[:len(dirs)-1]
+		before, err := r.Snapshot.ListChildren(from, dir)
+		if err != nil || dir == "." && len(before) == 0 {
+			return nil, false, err
+		}
+		after, err := r.Snapshot.ListChildren(to, dir)
+		if err != nil {
+			return nil, false, err
+		}
+		added := make(map[string]model.BaseNode, len(after))
+		for _, n := range after {
+			added[n.Path] = n
+		}
+		for _, a := range before {
+			b, kept := added[a.Path]
+			delete(added, a.Path)
+			if !kept || a.Type != b.Type || a.Mode != b.Mode || baseBlob(a) != baseBlob(b) {
+				changed[a.Path] = true
+			}
+			if (a.Type == "dir" || kept && b.Type == "dir") && !(kept && sameTree(a, b)) {
+				dirs = walk(dirs, a.Path)
+			}
+		}
+		for _, b := range added {
+			changed[b.Path] = true
+			if b.Type == "dir" {
+				dirs = walk(dirs, b.Path)
+			}
+		}
+	}
+	// A prune deletes a generation in one statement, so from still holding
+	// its root entries shows every listing above read it whole.
+	if before, err := r.Snapshot.ListChildren(from, "."); err != nil || len(before) == 0 {
+		return nil, false, err
+	}
+	return changed, true, nil
+}
+
+// sameTree reports whether a and b are directories with the same tree ID,
+// which gives them the same entries. An empty ID identifies no tree.
+func sameTree(a, b model.BaseNode) bool {
+	return a.Type == "dir" && b.Type == "dir" && a.ObjectOID != "" && a.ObjectOID == b.ObjectOID
+}
+
+// resolveIn resolves path as resolvePath does, against v: the overlay as v
+// read it, and the generation it read with it.
+func (r *Resolver) resolveIn(v OverlayView, path string) (ResolvedNode, error) {
+	if ov, ok := v.entry(path); ok {
+		if ov.IsDeleted() {
+			return ResolvedNode{}, fs.ErrNotExist
+		}
+		return ResolvedNode{FromOverlay: true, Overlay: ov}, nil
+	}
+	if n, ok, err := r.Snapshot.LookupNode(context.Background(), v.gen, path); err != nil {
+		return ResolvedNode{}, err
+	} else if ok {
+		return ResolvedNode{Base: n}, nil
+	}
+	if len(v.below(path)) > 0 {
+		return ResolvedNode{Base: implicitDir(path)}, nil
+	}
+	return ResolvedNode{}, fs.ErrNotExist
 }

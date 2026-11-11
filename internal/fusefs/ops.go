@@ -240,7 +240,20 @@ func (a Attrs) identity() Identity {
 // Identity returns the identity of path in the merged view, and false when
 // path does not exist. It hydrates nothing.
 func (e *Engine) Identity(path string) (Identity, bool, error) {
-	n, err := e.Resolver.ResolvePath(path)
+	return nodeIdentity(e.Resolver.ResolvePath(path))
+}
+
+// IdentityAt is Identity, and also returns the generation it resolved
+// against.
+func (e *Engine) IdentityAt(path string) (Identity, int64, bool, error) {
+	n, gen, _, err := e.Resolver.ResolvePathState(path)
+	id, exists, err := nodeIdentity(n, err)
+	return id, gen, exists, err
+}
+
+// nodeIdentity returns the identity of n, which a resolve returned with err,
+// and false when the resolve found nothing.
+func nodeIdentity(n ResolvedNode, err error) (Identity, bool, error) {
 	if errors.Is(err, fs.ErrNotExist) {
 		return Identity{}, false, nil
 	}
@@ -251,6 +264,101 @@ func (e *Engine) Identity(path string) (Identity, bool, error) {
 		return Identity{Type: n.Overlay.NodeType(), Perm: n.Overlay.Mode & 0o777}, true, nil
 	}
 	return Identity{Type: n.Base.Type, Perm: normalizeMode(n.Base.Mode, n.Base.Type) & 0o777, Blob: baseBlob(n.Base)}, true, nil
+}
+
+// KernelIdentity is the identity the kernel holds for a path, as a reply
+// last reported it.
+type KernelIdentity struct {
+	Path     string
+	Identity Identity
+	// Gen is a generation whose base gave the path Identity, or 0 when the
+	// overlay gave it. A directory that only overlay entries below it imply
+	// counts as given by the base.
+	Gen int64
+}
+
+// MergedIdentity is a path's identity in the merged view, and whether the
+// path exists. Err says why it could not be resolved.
+type MergedIdentity struct {
+	Identity Identity
+	Exists   bool
+	Err      error
+}
+
+// CountOverlayEntries returns the number of overlay entries, counting at most
+// limit.
+func (e *Engine) CountOverlayEntries(ctx context.Context, limit int) (int, error) {
+	return e.Resolver.Overlay.CountEntries(ctx, limit)
+}
+
+// ReadOverlay reads every overlay entry together with the generation that
+// readers resolve against.
+func (e *Engine) ReadOverlay(ctx context.Context) (OverlayView, error) {
+	return e.Resolver.ReadOverlay(ctx)
+}
+
+// Identities returns the identity of each of held's paths in the merged view
+// of v, in held's order, as Identity does, but against v. A path with no
+// overlay entry has the base identity it had at its Gen, unless the diff of
+// its Gen and v's generation names it. So Identities resolves only the
+// paths that diff names, those the overlay gave, and those whose diff failed
+// or found Gen pruned. A directory with no overlay entries below it can have
+// been implied by entries since removed, so Identities checks that it still
+// exists. It hydrates nothing.
+func (e *Engine) Identities(v OverlayView, held []KernelIdentity) []MergedIdentity {
+	out := make([]MergedIdentity, len(held))
+	resolve := func(i int) {
+		id, exists, err := nodeIdentity(e.Resolver.resolveIn(v, held[i].Path))
+		out[i] = MergedIdentity{Identity: id, Exists: exists, Err: err}
+	}
+	var kept []int
+	byGen := map[int64][]int{}
+	for i, h := range held {
+		if _, ok := v.entry(h.Path); ok || h.Gen == 0 {
+			resolve(i)
+		} else if h.Gen == v.gen {
+			kept = append(kept, i)
+		} else {
+			byGen[h.Gen] = append(byGen[h.Gen], i)
+		}
+	}
+	for gen, idx := range byGen {
+		paths := make([]string, len(idx))
+		for j, i := range idx {
+			paths[j] = held[i].Path
+		}
+		changed, ok, err := e.Resolver.ChangedPaths(gen, v.gen, paths)
+		for _, i := range idx {
+			if err != nil || !ok || changed[held[i].Path] {
+				resolve(i)
+			} else {
+				kept = append(kept, i)
+			}
+		}
+	}
+	var dirs []string
+	var dirIdx []int
+	for _, i := range kept {
+		if h := held[i]; h.Identity.Type != "dir" || len(v.below(h.Path)) > 0 {
+			out[i] = MergedIdentity{Identity: h.Identity, Exists: true}
+		} else {
+			dirs, dirIdx = append(dirs, h.Path), append(dirIdx, i)
+		}
+	}
+	missing, err := e.Resolver.MissingPathsIn(v, dirs)
+	gone := make(map[string]bool, len(missing))
+	for _, p := range missing {
+		gone[p] = true
+	}
+	for _, i := range dirIdx {
+		switch {
+		case err != nil:
+			resolve(i)
+		case !gone[held[i].Path]:
+			out[i] = MergedIdentity{Identity: held[i].Identity, Exists: true}
+		}
+	}
+	return out
 }
 
 // baseBlob returns the blob of a base file or symlink, and empty for a directory.
@@ -301,6 +409,12 @@ func (e *Engine) ReadDir(ctx context.Context, path string) ([]ReaddirEntry, int6
 // nothing. See Resolver.MissingPaths.
 func (e *Engine) MissingPaths(ctx context.Context, paths []string) ([]string, error) {
 	return e.Resolver.MissingPaths(ctx, paths)
+}
+
+// MissingPathsIn returns those of paths that the merged view of v lacks. It
+// hydrates nothing. See Resolver.MissingPathsIn.
+func (e *Engine) MissingPathsIn(v OverlayView, paths []string) ([]string, error) {
+	return e.Resolver.MissingPathsIn(v, paths)
 }
 
 // ensureOverlay promotes a base file to the overlay (copy-on-write from its
