@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -592,7 +593,7 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 		indexErr := s.restoreIndex(ctx, repo.GitDir, oid, oldOID, err)
 		return errors.Join(indexErr, restoreRef(ctx, repo.GitDir, refName, oldBranchOID, oid))
 	}
-	return trackRemoteBranch(ctx, repo.GitDir, target.branch)
+	return s.trackRemoteBranch(ctx, repo, target.branch)
 }
 
 // trackRemoteBranch sets branch's upstream to origin's branch. Git tracks a
@@ -600,44 +601,67 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 // clone's refspec maps only the branch it cloned. When Git cannot track the
 // branch on origin, trackRemoteBranch adds the branch's own line to origin's
 // refspec and tries once more. Without the upstream, a plain git pull on a
-// --single-branch clone pulls the cloned branch into the current one.
-func trackRemoteBranch(ctx context.Context, gitDir, branch string) error {
-	if setOriginUpstream(ctx, gitDir, branch) == nil {
-		return nil
+// --single-branch clone pulls the cloned branch into the current one. When Git
+// still refuses, as when a negative refspec excludes the branch from a pattern
+// line, trackRemoteBranch logs a warning with the fix and returns nil, so
+// preparation serves the branch without an upstream on origin.
+func (s *Store) trackRemoteBranch(ctx context.Context, repo model.RepoConfig, branch string) error {
+	refusal, err := setOriginUpstream(ctx, repo.GitDir, branch)
+	if err != nil || refusal == nil {
+		return err
 	}
 	refspec := "+refs/heads/" + branch + ":refs/remotes/origin/" + branch
-	refspecs, err := configEntries(ctx, gitDir, `^remote\.origin\.fetch$`)
+	refspecs, err := configEntries(ctx, repo.GitDir, `^remote\.origin\.fetch$`)
 	if err != nil {
 		return err
 	}
 	if !slices.ContainsFunc(refspecs, func(e configEntry) bool { return e.value == refspec }) {
-		if _, err := runGit(ctx, gitDir, "config", "--add", "remote.origin.fetch", refspec); err != nil {
+		if _, err := runGit(ctx, repo.GitDir, "config", "--add", "remote.origin.fetch", refspec); err != nil {
 			return err
 		}
 	}
-	return setOriginUpstream(ctx, gitDir, branch)
+	if refusal, err = setOriginUpstream(ctx, repo.GitDir, branch); err != nil || refusal == nil {
+		return err
+	}
+	tracking := "refs/remotes/origin/" + branch
+	s.logger.WarnContext(ctx, "git cannot track the fetched branch on origin",
+		"repo", auth.RedactLogString(repo.Name),
+		"branch", branch,
+		"error", auth.RedactLogString(refusal.Error()),
+		"fix", fmt.Sprintf("make origin's fetch refspec, and no other remote's, map refs/heads/%s to %s, for example by removing a negative refspec that excludes the branch, then run: git --git-dir %s branch --set-upstream-to %s -- %s",
+			branch, tracking, shellQuote(repo.GitDir), shellQuote(tracking), shellQuote(branch)))
+	return nil
 }
 
 // setOriginUpstream sets branch's upstream to refs/remotes/origin/<branch>.
 // The full name keeps a local branch named origin/<branch> from making the
 // name ambiguous. Git tracks the branch on whichever remote's refspec maps
-// that ref, so setOriginUpstream removes an upstream on another remote and
-// fails.
-func setOriginUpstream(ctx context.Context, gitDir, branch string) error {
+// that ref, so setOriginUpstream removes an upstream on another remote. It
+// returns Git's refusal, or the upstream it removed, as refusal, and every
+// other failure as err.
+func setOriginUpstream(ctx context.Context, gitDir, branch string) (refusal, err error) {
 	if _, err := runGit(ctx, gitDir, "branch", "--set-upstream-to", "refs/remotes/origin/"+branch, "--", branch); err != nil {
-		return err
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		return err, nil
 	}
 	remote, err := runGit(ctx, gitDir, "config", "--get", "branch."+branch+".remote")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if remote == "origin" {
-		return nil
+		return nil, nil
 	}
 	if _, err := runGit(ctx, gitDir, "branch", "--unset-upstream", "--", branch); err != nil {
-		return err
+		return nil, err
 	}
-	return fmt.Errorf("git tracks branch %s on remote %s, not origin", branch, remote)
+	return fmt.Errorf("git tracks branch %s on remote %s, not origin", branch, remote), nil
+}
+
+// shellQuote quotes s as one POSIX shell word.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func refOIDOrZero(ctx context.Context, gitDir string, refName string) (string, error) {

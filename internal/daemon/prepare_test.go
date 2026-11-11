@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -572,52 +573,137 @@ func TestPreparedGitDirWithAPushMirrorTracksTheFetchedBranch(t *testing.T) {
 	runCmd(t, "git", "--git-dir", gitDir, "fetch", "-q", "origin")
 }
 
-// When Git cannot track the fetched branch on origin, even through the
-// branch's own refspec line, add-repo fails with Git's error, and the repo's
-// prepare_error holds it. Git applies a negative refspec to the tracking ref
-// that a pattern line maps. A retried preparation adds no second line.
-func TestPreparationFailsWhenGitCannotTrackTheBranch(t *testing.T) {
+// untrackedBranchWarnings returns the warnings that preparation logged in
+// logs, one JSON record per line, because Git could not track the fetched
+// branch on origin.
+func untrackedBranchWarnings(t *testing.T, logs *lockedBuffer) []map[string]any {
+	t.Helper()
+	var warnings []map[string]any
+	for line := range strings.Lines(logs.String()) {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		if record["msg"] == "git cannot track the fetched branch on origin" {
+			warnings = append(warnings, record)
+		}
+	}
+	return warnings
+}
+
+// requireUntrackedBranchWarning fails t unless warning names repo's branch
+// feature, carries Git's refusal gitErr, and gives the fix for gitDir.
+func requireUntrackedBranchWarning(t *testing.T, warning map[string]any, gitDir, gitErr string) {
+	t.Helper()
+	fix := "make origin's fetch refspec, and no other remote's, map refs/heads/feature to refs/remotes/origin/feature, for example by removing a negative refspec that excludes the branch, then run: git --git-dir '" + gitDir + "' branch --set-upstream-to 'refs/remotes/origin/feature' -- 'feature'"
+	if warning["level"] != "WARN" || warning["repo"] != "repo" || warning["branch"] != "feature" || warning["fix"] != fix {
+		t.Errorf("warning = %v, want level WARN, repo repo, branch feature and fix %q", warning, fix)
+	}
+	if got, _ := warning["error"].(string); !strings.Contains(got, gitErr) {
+		t.Errorf("warning error = %q, want Git's %q", got, gitErr)
+	}
+}
+
+// Git applies a negative refspec to the tracking ref that a pattern line maps,
+// so it cannot track the fetched branch on origin even through the branch's
+// own line. Preparation then warns with the fix and serves the branch without
+// an upstream. A plain git pull refuses for want of one, rather than merging
+// the cloned branch. A second preparation adds no second line.
+func TestPreparationServesABranchGitCannotTrack(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	remote := filepath.Join(tmp, "remote")
-	newBranchedRemote(t, remote)
-	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	feature := newBranchedRemote(t, remote)
+	logs := &lockedBuffer{}
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewJSONHandler(logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer svc.Close()
-	got, err := switchCloneToFeature(t, svc, remote, "main", func(gitDir string) {
-		runCmd(t, "git", "--git-dir", gitDir, "config", "--replace-all", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
-		runCmd(t, "git", "--git-dir", gitDir, "config", "--add", "remote.origin.fetch", "^refs/heads/feature")
-	})
-	const gitErr = "starting point 'refs/remotes/origin/feature' is not a branch"
-	if err == nil || !strings.Contains(err.Error(), gitErr) {
-		t.Fatalf("add-repo error = %v, want Git's %q", err, gitErr)
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main"}, Enabled: true}
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(got.PrepareError, gitErr) {
-		t.Fatalf("prepare_error = %q, want Git's %q", got.PrepareError, gitErr)
+	got, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := svc.ctl().Prepare(ctx, "repo"); err == nil || !strings.Contains(err.Error(), gitErr) {
-		t.Fatalf("second preparation error = %v, want Git's %q", err, gitErr)
+	runCmd(t, "git", "--git-dir", got.GitDir, "config", "--replace-all", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+	runCmd(t, "git", "--git-dir", got.GitDir, "config", "--add", "remote.origin.fetch", "^refs/heads/feature")
+	// main diverges from feature, so a pull that merged main would commit a merge.
+	mainTip := commitFile(t, remote, "MAIN.md", "main\n")
+	cfg.FetchRef = "feature"
+	for i := range 2 {
+		if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+			t.Fatal(err)
+		}
+		if got, err = svc.registry.GetRepo(ctx, cfg.Name); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.prepareAsync(ctx, got, 1); err != nil {
+			t.Fatalf("preparation %d: %v", i+1, err)
+		}
+		if got, err = svc.registry.GetRepo(ctx, cfg.Name); err != nil {
+			t.Fatal(err)
+		}
+		if got.PrepareState != model.PrepareStateReady || got.PrepareError != "" {
+			t.Fatalf("preparation %d left state %q, error %q, want %q", i+1, got.PrepareState, got.PrepareError, model.PrepareStateReady)
+		}
+	}
+	if oid, ref := publishedHead(t, got); oid != feature || ref != "feature" {
+		t.Fatalf("published %s at %q, want feature %s", oid, ref, feature)
+	}
+	warnings := untrackedBranchWarnings(t, logs)
+	if len(warnings) != 2 {
+		t.Fatalf("two preparations logged %d untracked-branch warnings, want 2: %s", len(warnings), logs.String())
+	}
+	for _, warning := range warnings {
+		requireUntrackedBranchWarning(t, warning, got.GitDir, "starting point 'refs/remotes/origin/feature' is not a branch")
+	}
+	if upstream := upstreamOf(t, got.GitDir, "feature"); upstream != "" {
+		t.Errorf("feature's upstream = %q, want none", upstream)
 	}
 	refspecs := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", got.GitDir, "config", "--get-all", "remote.origin.fetch"))
 	if want := "+refs/heads/*:refs/remotes/origin/*\n^refs/heads/feature\n+refs/heads/feature:refs/remotes/origin/feature"; refspecs != want {
 		t.Fatalf("origin's refspecs after a second preparation:\n%s\nwant:\n%s", refspecs, want)
+	}
+	// Package tests never mount, so Git runs in a plain worktree of the git dir.
+	worktree := filepath.Join(tmp, "worktree")
+	if err := os.Mkdir(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) (string, error) {
+		args = append([]string{"--git-dir", got.GitDir, "--work-tree", worktree, "-c", "user.name=test", "-c", "user.email=test@example.com"}, args...)
+		out, err := exec.Command("git", args...).CombinedOutput()
+		return strings.TrimSpace(string(out)), err
+	}
+	if out, err := git("reset", "-q", "--hard"); err != nil {
+		t.Fatalf("git reset: %v\n%s", err, out)
+	}
+	// pull.rebase=false makes Git merge diverged branches instead of refusing.
+	out, err := git("-c", "pull.rebase=false", "pull", "-q")
+	if err == nil || !strings.Contains(out, "There is no tracking information for the current branch") {
+		t.Errorf("git pull: error %v, want Git's refusal for want of tracking information\n%s", err, out)
+	}
+	if head, _ := git("rev-parse", "HEAD"); head != feature {
+		t.Errorf("git pull left HEAD at %s, want feature %s; main is %s", head, feature, mainTip)
 	}
 }
 
 // Git tracks a branch on whichever remote's refspec maps its tracking ref.
 // When another remote maps refs/remotes/origin/*, preparation leaves the
 // branch no upstream on that remote. Once it adds the branch to origin's
-// refspec, both remotes map the ref, and Git refuses as ambiguous.
+// refspec, both remotes map the ref, and Git refuses as ambiguous, so
+// preparation warns and serves the branch without an upstream.
 func TestPreparationDoesNotTrackAnotherRemote(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	remote := filepath.Join(tmp, "remote")
 	newBranchedRemote(t, remote)
-	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	logs := &lockedBuffer{}
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewJSONHandler(logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -626,13 +712,17 @@ func TestPreparationDoesNotTrackAnotherRemote(t *testing.T) {
 		runCmd(t, "git", "--git-dir", gitDir, "remote", "add", "fork", remote)
 		runCmd(t, "git", "--git-dir", gitDir, "config", "--replace-all", "remote.fork.fetch", "+refs/heads/*:refs/remotes/origin/*")
 	})
+	if err != nil {
+		t.Fatalf("add-repo: %v", err)
+	}
 	if out, _ := exec.Command("git", "--git-dir", got.GitDir, "config", "--get-regexp", `^branch\.feature\.`).CombinedOutput(); len(out) != 0 {
 		t.Errorf("branch feature's config:\n%s\nwant none", out)
 	}
-	const gitErr = "ambiguous information for ref"
-	if err == nil || !strings.Contains(err.Error(), gitErr) {
-		t.Errorf("add-repo error = %v, want Git's %q", err, gitErr)
+	warnings := untrackedBranchWarnings(t, logs)
+	if len(warnings) != 1 {
+		t.Fatalf("add-repo logged %d untracked-branch warnings, want 1: %s", len(warnings), logs.String())
 	}
+	requireUntrackedBranchWarning(t, warnings[0], got.GitDir, "ambiguous information for ref")
 }
 
 // --depth bounds the history every preparation transfers, also when it
