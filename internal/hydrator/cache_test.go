@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -134,7 +135,8 @@ func TestFailedBlobWriteNeverReachesTheCachePath(t *testing.T) {
 
 // One worker copies maxInstallBatch+2 prefetch blobs and pauses in the last
 // copy. By then the first maxInstallBatch blobs are installed as one full
-// batch, and the next blob waits staged until a read of it installs it.
+// batch, and the next blob waits staged until a read of it installs it. A read
+// that ends while the install waits for the counters lock returns at once.
 func TestStagedBlobsInstallAtAFullBatchOrARead(t *testing.T) {
 	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
 	payload := []byte("content")
@@ -181,6 +183,23 @@ func TestStagedBlobsInstallAtAFullBatchOrARead(t *testing.T) {
 	if _, err := os.Stat(blobcache.Path(cfg.BlobCacheDir, next.ObjectOID)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("blob after the full batch: stat err %v; want it staged, not installed", err)
 	}
+	// While another process holds the counters lock, a read of the staged
+	// blob still ends with its context.
+	lock, err := os.Open(filepath.Join(cfg.BlobCacheDir, "stats"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := h.EnsureHydrated(ctx, cfg, taskBaseNode(next)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled read of the staged blob = %v, want context.Canceled", err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
 	path, size, err := h.EnsureHydrated(context.Background(), cfg, taskBaseNode(next))
 	if err != nil {
 		t.Fatal(err)
@@ -191,5 +210,46 @@ func TestStagedBlobsInstallAtAFullBatchOrARead(t *testing.T) {
 	want := blobcache.Stats{Blobs: full.Blobs + 1, Bytes: full.Bytes + 7}
 	if st, err := blobcache.ReadStats(cfg.BlobCacheDir); err != nil || st != want {
 		t.Fatalf("cache stats after the read = %+v, %v; want %+v", st, err, want)
+	}
+}
+
+// A read's blob installs as soon as it is copied. The worker then copies a
+// prefetch, which pauses, and the read has already returned.
+func TestReadInstallsItsBlobBeforeTheNextCopy(t *testing.T) {
+	cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
+	read := model.BaseNode{RepoID: cfg.ID, Path: "read.txt", ObjectOID: strings.Repeat("1", 40), SizeState: "known", SizeBytes: 7}
+	prefetch := model.HydrationTask{RepoID: cfg.ID, Path: "prefetch.txt", ObjectOID: strings.Repeat("2", 40), SizeState: "known", SizeBytes: 7, Priority: PriorityLikelyText, Reason: "prefetch", EnqueuedAt: time.Now()}
+	copying := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	h := New(&fakeBlobFetcher{payload: []byte("content"), blobToCache: func(ctx context.Context, oid string) error {
+		if oid != prefetch.ObjectOID {
+			return nil
+		}
+		close(copying)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}})
+	defer h.Stop()
+	readDone := make(chan error, 1)
+	go func() {
+		_, _, err := h.EnsureHydrated(context.Background(), cfg, read)
+		readDone <- err
+	}()
+	// Queue the read before the worker starts, so the worker copies it first.
+	waitForQueued(t, h, taskKey(cfg.ID, read.ObjectOID))
+	h.EnqueueBatch([]model.HydrationTask{prefetch})
+	h.Start(1, cfg)
+	<-copying
+
+	if err := <-readDone; err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(blobcache.Path(cfg.BlobCacheDir, read.ObjectOID)); err != nil || string(data) != "content" {
+		t.Fatalf("read's cached blob = %q, %v; want content", data, err)
 	}
 }

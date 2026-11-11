@@ -284,7 +284,7 @@ func TestCrashDuringInstallLeavesCountersToARecount(t *testing.T) {
 	}
 	dir := t.TempDir()
 	install(t, dir, strings.Repeat("a", 40), 10, time.Now())
-	cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$")
+	cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$", "-test.timeout=60s")
 	cmd.Env = append(os.Environ(), "BLOBCACHE_TEST_CRASH_DIR="+dir)
 	out, err := cmd.CombinedOutput()
 	var exit *exec.ExitError

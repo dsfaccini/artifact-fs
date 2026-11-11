@@ -151,8 +151,8 @@ func Recount(dir string) (Stats, error) {
 	return st, err
 }
 
-// ReadStats returns dir's counters. A directory that has no counters yet is
-// recounted once.
+// ReadStats returns dir's counters. It recounts a directory whose counters are
+// missing or pending.
 func ReadStats(dir string) (Stats, error) {
 	if strings.TrimSpace(dir) == "" {
 		return Stats{}, nil

@@ -60,8 +60,9 @@ type stagedBlob struct {
 	size int64
 }
 
-// maxInstallBatch caps the blobs one Install moves, which bounds how long it
-// holds the cache's counters lock.
+// maxInstallBatch is the number of staged blobs at which a worker installs
+// them, which bounds how long one Install holds the cache's counters lock.
+// Other workers can stage a blob each before that Install takes the batch.
 const maxInstallBatch = 64
 
 // maxVerified bounds Service.verified, so a long-lived daemon that serves many
@@ -234,7 +235,6 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoPaths, node
 		if raised {
 			s.signalWork()
 		}
-		s.installIfStaged(key)
 		return s.awaitHydration(ctx, key, ch)
 	}
 	if size, ok, err := s.validateCachedBlob(ctx, repo, cachePath, node); err != nil {
@@ -267,7 +267,6 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoPaths, node
 	if signal {
 		s.signalWork()
 	}
-	s.installIfStaged(key)
 	return s.awaitHydration(ctx, key, ch)
 }
 
@@ -298,7 +297,10 @@ func (s *Service) raiseForReadLocked(key string) bool {
 	return true
 }
 
+// awaitHydration waits for key's hydration. When key's blob is staged, it
+// installs the staged blobs first, so a read does not wait for their batch.
 func (s *Service) awaitHydration(ctx context.Context, key string, ch chan result) (cachePath string, size int64, err error) {
+	s.installIfStaged(key)
 	select {
 	case <-ctx.Done():
 		// Remove our channel from the wait list so the worker doesn't
@@ -793,14 +795,21 @@ func (s *Service) hydrate(repo model.RepoPaths, task model.HydrationTask) {
 	}
 }
 
-// installIfStaged installs the staged blobs when key's blob is among them, so
-// a read that joins a staged blob does not wait for its batch.
+// installIfStaged installs the staged blobs when key's blob is among them. It
+// installs on its own goroutine, so a read waiting on key still ends with its
+// context while Install waits for the cache's counters lock.
 func (s *Service) installIfStaged(key string) {
 	s.mu.Lock()
-	staged := slices.ContainsFunc(s.staged, func(b stagedBlob) bool { return b.key == key })
+	staged := !s.stopped && slices.ContainsFunc(s.staged, func(b stagedBlob) bool { return b.key == key })
+	if staged {
+		s.background.Add(1)
+	}
 	s.mu.Unlock()
 	if staged {
-		s.installStaged()
+		go func() {
+			defer s.background.Done()
+			s.installStaged()
+		}()
 	}
 }
 
@@ -820,13 +829,13 @@ func (s *Service) installStaged() {
 		for _, b := range batch[:n] {
 			s.finishInstalled(dir, b)
 		}
-		if err == nil {
-			return
+		if err != nil {
+			failed := batch[n]
+			_ = os.Remove(failed.path)
+			s.finishHydration(failed.key, result{err: fmt.Errorf("hydrate %s: %w", failed.task.Path, err)})
+			n++
 		}
-		failed := batch[n]
-		_ = os.Remove(failed.path)
-		s.finishHydration(failed.key, result{err: fmt.Errorf("hydrate %s: %w", failed.task.Path, err)})
-		batch = batch[n+1:]
+		batch = batch[n:]
 	}
 }
 
