@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -913,6 +914,88 @@ func TestHeadReconcileInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 	f.signal()
 	if gen := <-mount.gens; gen != f.oldGen+1 {
 		t.Fatalf("mount invalidated while the resolver served generation %d, want the new generation %d", gen, f.oldGen+1)
+	}
+}
+
+// A prepare of an async repo can land after the repo's first preparation made
+// it ready: Controller.Prepare reads the repo as preparing, and BeginPrepare
+// checks only the config. The kernel then caches entries from the open gate,
+// and the late preparation moves HEAD to the remote's new tip. Its activation
+// must invalidate the kernel's caches once the resolver serves the new
+// generation, before it opens the gate.
+func TestLateAsyncPrepareInvalidatesKernelCacheAfterSwitch(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	runCmd(t, "git", "init", "--initial-branch", "main", remote)
+	commitFile(t, remote, "README.md", "one\n")
+	runCmd(t, "git", "-C", remote, "config", "uploadpack.allowFilter", "true")
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = svc.Close() }()
+	gens := make(chan int64, 1)
+	svc.mount = func(_, _ context.Context, _ model.RepoPaths, engine *fusefs.Engine, _ *fusefs.ReadyGate, _ *slog.Logger, _ func(string) string) (fusefs.MountedFS, error) {
+		return &invalidatingMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, resolver: engine.Resolver, gens: gens}, nil
+	}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + remote, Branch: "main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Hour}, Enabled: true}
+	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	svc.prepareWorkers.Wait()
+	ready, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := runningRuntime(svc, ready.ID)
+	if ready.PrepareState != model.PrepareStateReady || rt == nil {
+		t.Fatalf("after the first preparation: prepare state %q, runtime %v; want ready and running", ready.PrepareState, rt)
+	}
+	svc.mu.Lock()
+	firstGen, gate := rt.head.gen, rt.gate
+	svc.mu.Unlock()
+	select {
+	case <-gens:
+	default:
+	}
+
+	next := commitFile(t, remote, "README.md", "two\n")
+	if err := svc.registry.BeginPrepare(ctx, ready, model.PrepareStatePreparing, "late"); err != nil {
+		t.Fatal(err)
+	}
+	// reconcileHEAD runs under headMu, so only the activation can switch the
+	// resolver until the gate opens. The activation's prune waits for headMu.
+	rt.headMu.Lock()
+	if err := svc.syncRepos(ctx); err != nil {
+		rt.headMu.Unlock()
+		t.Fatal(err)
+	}
+	gateErr := gate.Wait(ctx)
+	var invalidated []int64
+	select {
+	case gen := <-gens:
+		invalidated = append(invalidated, gen)
+	default:
+	}
+	rt.headMu.Unlock()
+	if gateErr != nil {
+		t.Fatalf("gate after the late preparation = %v, want open", gateErr)
+	}
+	svc.prepareWorkers.Wait()
+
+	svc.mu.Lock()
+	served := rt.head
+	svc.mu.Unlock()
+	if runningRuntime(svc, ready.ID) != rt || served.oid != next || served.gen == firstGen {
+		t.Fatalf("after the late preparation the runtime serves %s at generation %d, want the same runtime serving %s at a generation after %d", served.oid, served.gen, next, firstGen)
+	}
+	if want := []int64{served.gen}; !slices.Equal(invalidated, want) {
+		t.Fatalf("mount invalidated at generations %v before the gate opened, want %v, the generation the activation switched to", invalidated, want)
 	}
 }
 
