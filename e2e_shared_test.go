@@ -32,13 +32,6 @@ const kernelCacheExpiry = 1500 * time.Millisecond
 func TestE2ESharedMount(t *testing.T) {
 	shared := newSharedE2ERepo(t)
 	shared.runReadOnly(t, "GitCleanState", testE2EGitCleanState)
-	shared.runReadOnly(t, "ProofForcedEIOPrintsLocationAndReplies", func(t *testing.T, repo *mountedE2ERepo) {
-		if _, err := os.Stat(filepath.Join(repo.mountPath, "README.md")); err != nil {
-			t.Fatal(err)
-		}
-		_, err := os.Stat(filepath.Join(repo.mountPath, "forced-eio"))
-		t.Fatalf("proof: stat forced-eio = %v; the log above must show its located fuse error and the reply records", err)
-	})
 	shared.runReadOnly(t, "GitConcurrentReads", testE2EGitConcurrentReads)
 	shared.run(t, "KernelCacheFollowsHEADMoveOutsideTheMount", testE2EKernelCacheFollowsHEADMoveOutsideTheMount)
 	shared.run(t, "GitStatusDetectsSameSizeRewriteAfterMtimeRestore", testE2EGitStatusDetectsSameSizeRewriteAfterMtimeRestore)
