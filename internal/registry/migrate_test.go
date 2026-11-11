@@ -14,11 +14,12 @@ import (
 )
 
 // fullRepoRow sets every column the 25971f7 schema has but
-// remote_url_secret_ref, and fullRepo is the config it reads back as.
+// remote_url_secret_ref, and fullRepo is the config it reads back as, with
+// the warning threshold migration 6 gives an existing row.
 const fullRepoRow = `INSERT INTO repos (repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, adopt_gitdir, fetch_ref, prepare_state, prepare_error, mount_error, required_commit, history_depth, refresh_disabled, acquired_ref, acquired_commit, acquired_at_ns, config_version, created_at_ns, updated_at_ns)
 	VALUES ('repo', 'repo', '/mnt', '/mnt/repo', 'https://example.com/repo.git', 'https://example.com/repo.git', 'main', 0, 1500000000, '/git/repo', '/overlay/repo', '/cache/repo', '/meta/repo.sqlite', '/overlay/repo/meta.sqlite', 1, 1, 1, 'main', 'failed', 'clone failed', 'mount failed', '0123456789012345678901234567890123456789', 1, 1, 'refs/heads/main', '0123456789012345678901234567890123456789', 7, 'version-1', 1, 1)`
 
-var fullRepo = model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", MountRoot: "/mnt", MountPath: "/mnt/repo", GitDir: "/git/repo", OverlayDir: "/overlay/repo", BlobCacheDir: "/cache/repo", MetaDBPath: "/meta/repo.sqlite", OverlayDBPath: "/overlay/repo/meta.sqlite"}, RepoSpec: model.RepoSpec{RemoteURL: "https://example.com/repo.git", RemoteURLRedacted: "https://example.com/repo.git", Branch: "main", PreparedGitDir: true, AdoptGitDir: true, FetchRef: "main", RequiredCommit: "0123456789012345678901234567890123456789", HistoryDepth: 1}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: 1500 * time.Millisecond, RemoteRefreshDisabled: true}, Enabled: true, PrepareState: "failed", PrepareError: "clone failed", AcquiredRef: "refs/heads/main", AcquiredCommit: "0123456789012345678901234567890123456789", AcquiredAt: time.Unix(0, 7), ConfigVersion: "version-1"}
+var fullRepo = model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", MountRoot: "/mnt", MountPath: "/mnt/repo", GitDir: "/git/repo", OverlayDir: "/overlay/repo", BlobCacheDir: "/cache/repo", MetaDBPath: "/meta/repo.sqlite", OverlayDBPath: "/overlay/repo/meta.sqlite"}, RepoSpec: model.RepoSpec{RemoteURL: "https://example.com/repo.git", RemoteURLRedacted: "https://example.com/repo.git", Branch: "main", PreparedGitDir: true, AdoptGitDir: true, FetchRef: "main", RequiredCommit: "0123456789012345678901234567890123456789", HistoryDepth: 1}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: 1500 * time.Millisecond, RemoteRefreshDisabled: true}, Enabled: true, PrepareState: "failed", PrepareError: "clone failed", AcquiredRef: "refs/heads/main", AcquiredCommit: "0123456789012345678901234567890123456789", AcquiredAt: time.Unix(0, 7), ConfigVersion: "version-1", WarnKeptGenerations: 50}
 
 // fullRepoWithRequest is fullRepo with the mount request a migrated row can hold.
 var fullRepoWithRequest = func() model.RepoConfig { cfg := fullRepo; cfg.MountRequest = "request-1"; return cfg }()
@@ -117,7 +118,7 @@ var legacyRegistries = map[string]struct {
 			`INSERT INTO repos (repo_id, name, mount_root, mount_path, remote_url_redacted, remote_url_secret_ref, branch, refresh_interval_seconds, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, created_at_ns, updated_at_ns)
 			VALUES ('repo', 'repo', '/mnt', '/mnt/repo', 'https://example.com/repo.git', 'secret-ref', 'main', 45, '/git/repo', '/overlay/repo', '/cache/repo', '/meta/repo.sqlite', '/overlay/repo/meta.sqlite', 1, 1, 1)`,
 		},
-		want: model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", MountRoot: "/mnt", MountPath: "/mnt/repo", GitDir: "/git/repo", OverlayDir: "/overlay/repo", BlobCacheDir: "/cache/repo", MetaDBPath: "/meta/repo.sqlite", OverlayDBPath: "/overlay/repo/meta.sqlite"}, RepoSpec: model.RepoSpec{RemoteURLRedacted: "https://example.com/repo.git", Branch: "refs/heads/main", FetchRef: "refs/heads/main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: 45 * time.Second}, Enabled: true},
+		want: model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", MountRoot: "/mnt", MountPath: "/mnt/repo", GitDir: "/git/repo", OverlayDir: "/overlay/repo", BlobCacheDir: "/cache/repo", MetaDBPath: "/meta/repo.sqlite", OverlayDBPath: "/overlay/repo/meta.sqlite"}, RepoSpec: model.RepoSpec{RemoteURLRedacted: "https://example.com/repo.git", Branch: "refs/heads/main", FetchRef: "refs/heads/main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: 45 * time.Second}, Enabled: true, WarnKeptGenerations: 50},
 	},
 	// main before migrations.
 	"25971f7": {
@@ -285,6 +286,22 @@ var legacyRegistries = map[string]struct {
 			`PRAGMA user_version = 5`,
 		},
 		want: fullRepoWithRequests,
+	},
+	// This schema, after migration 6.
+	"user_version 6": {
+		stmts: []string{
+			reposTableV3,
+			`ALTER TABLE repos ADD COLUMN prepare_request TEXT NOT NULL DEFAULT ''`,
+			repoRuntimeTableV3,
+			`ALTER TABLE repo_runtime ADD COLUMN claims_leftover INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE repos ADD COLUMN warn_kept_generations INTEGER NOT NULL DEFAULT 50`,
+			`ALTER TABLE repo_runtime ADD COLUMN kept_generations INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE repo_runtime ADD COLUMN kept_generations_warning TEXT NOT NULL DEFAULT ''`,
+			fullRepoRow,
+			`UPDATE repos SET mount_request = 'request-1', prepare_request = 'prepare-1', warn_kept_generations = 7`,
+			`PRAGMA user_version = 6`,
+		},
+		want: func() model.RepoConfig { cfg := fullRepoWithRequests; cfg.WarnKeptGenerations = 7; return cfg }(),
 	},
 }
 

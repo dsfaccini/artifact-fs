@@ -92,6 +92,7 @@ func (s *Service) runtimeState(rt *repoRuntime, cleared ...string) func(*model.R
 		rec.BehindCount = rt.fetch.behind
 		rec.Diverged = rt.fetch.diverged
 		rec.MountRequest = rt.cfg.MountRequest
+		rec.KeptGenerations, rec.KeptGenerationsWarning = rt.kept, rt.keptWarning
 		for _, phase := range cleared {
 			clearFailure(rec, phase)
 		}

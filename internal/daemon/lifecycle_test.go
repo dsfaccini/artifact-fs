@@ -48,8 +48,9 @@ func (m *hangingUnmountMount) Unmount(context.Context) error {
 	return nil
 }
 
-func (m *hangingUnmountMount) InvalidateChanged() error     { return nil }
-func (m *hangingUnmountMount) OpenFileGenerations() []int64 { return nil }
+func (m *hangingUnmountMount) InvalidateChanged() error            { return nil }
+func (m *hangingUnmountMount) OpenFileGenerations() []int64        { return nil }
+func (m *hangingUnmountMount) OpenFilePIDs([]int64) map[uint32]int { return nil }
 
 // An unmount that hangs on one repo's dead mount stalls only that repo: the
 // daemon reports the stop it cannot carry out and still mounts another repo.
@@ -909,9 +910,10 @@ type busyOnceMount struct {
 	exit  chan struct{}
 }
 
-func (m *busyOnceMount) Backend() string              { return "fake" }
-func (m *busyOnceMount) InvalidateChanged() error     { return nil }
-func (m *busyOnceMount) OpenFileGenerations() []int64 { return nil }
+func (m *busyOnceMount) Backend() string                     { return "fake" }
+func (m *busyOnceMount) InvalidateChanged() error            { return nil }
+func (m *busyOnceMount) OpenFileGenerations() []int64        { return nil }
+func (m *busyOnceMount) OpenFilePIDs([]int64) map[uint32]int { return nil }
 
 func (m *busyOnceMount) Join(ctx context.Context) error {
 	select {
@@ -1642,9 +1644,10 @@ func (t *byPathMountTable) recorded() []string {
 	return slices.Clone(t.calls)
 }
 
-func (m *byPathMount) Backend() string              { return "fake" }
-func (m *byPathMount) InvalidateChanged() error     { return nil }
-func (m *byPathMount) OpenFileGenerations() []int64 { return nil }
+func (m *byPathMount) Backend() string                     { return "fake" }
+func (m *byPathMount) InvalidateChanged() error            { return nil }
+func (m *byPathMount) OpenFileGenerations() []int64        { return nil }
+func (m *byPathMount) OpenFilePIDs([]int64) map[uint32]int { return nil }
 
 func (m *byPathMount) Join(ctx context.Context) error {
 	select {

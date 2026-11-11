@@ -53,6 +53,10 @@ type RepoConfig struct {
 	PrepareRequest string
 	// MountRequest identifies the latest unmount or remount the CLI asked for.
 	MountRequest string
+	// WarnKeptGenerations is how many older snapshot generations a prune may
+	// keep for open files before the daemon warns. Like RefreshPolicy, it is
+	// not part of the repo's prepare identity.
+	WarnKeptGenerations int
 }
 
 // RepoPaths names a repo and locates its state on this machine.
@@ -120,6 +124,12 @@ type RepoRuntimeRecord struct {
 	// daemon left at the repo's mount point, so the next daemon claims it too.
 	ClaimsLeftover bool
 	UpdatedAt      time.Time
+	// KeptGenerations is how many generations older than the ones a prune
+	// must keep the last prune kept because open files read them.
+	// KeptGenerationsWarning describes them while they number at least the
+	// repo's WarnKeptGenerations, and is empty otherwise.
+	KeptGenerations        int
+	KeptGenerationsWarning string
 }
 
 type RepoRuntimeState struct {
@@ -160,6 +170,11 @@ type RepoRuntimeState struct {
 	LastErrorAt         time.Time
 	NextRetryAt         time.Time
 	Attempts            int
+	// KeptGenerations and KeptGenerationsWarning are the daemon's record of
+	// them, and WarnKeptGenerations the registered threshold.
+	KeptGenerations        int
+	WarnKeptGenerations    int
+	KeptGenerationsWarning string
 }
 
 // PrepareState is where a repo's preparation stands. The empty state is a
@@ -286,6 +301,7 @@ type Registry interface {
 	GetRepo(ctx context.Context, name string) (RepoConfig, error)
 	ListRepos(ctx context.Context) ([]RepoConfig, error)
 	UpdateRefresh(ctx context.Context, repoID RepoID, policy RefreshPolicy) error
+	UpdateWarnKeptGenerations(ctx context.Context, repoID RepoID, count int) error
 	BeginPrepare(ctx context.Context, cfg RepoConfig, state PrepareState, request string) error
 	UpdatePrepareStateForRequest(ctx context.Context, cfg RepoConfig, state PrepareState, prepareErr string) error
 	RecordAcquisition(ctx context.Context, cfg RepoConfig, source PreparedSource) error

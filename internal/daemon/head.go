@@ -3,8 +3,15 @@ package daemon
 import (
 	"cmp"
 	"context"
+	"fmt"
+	"maps"
+	"slices"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 )
 
@@ -126,12 +133,16 @@ func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, co
 // that rt, when not nil, retired within the retention window, and those its
 // serving mount's open files read. An inode whose attributes the kernel received
 // before a switch keeps reading the generation they came from until it asks
-// again.
+// again. It then records the generations it kept for open files.
 func (s *Service) pruneGenerations(ctx context.Context, rt *repoRuntime, snap *snapshot.Store, keepFrom int64) error {
 	var open []int64
+	var mfs fusefs.MountedFS
 	if rt != nil {
 		s.mu.Lock()
-		mfs, serving := rt.mfs, rt.mount == mountServing
+		serving := rt.mount == mountServing
+		if serving {
+			mfs = rt.mfs
+		}
 		s.mu.Unlock()
 		if serving {
 			open = mfs.OpenFileGenerations()
@@ -149,7 +160,89 @@ func (s *Service) pruneGenerations(ctx context.Context, rt *repoRuntime, snap *s
 		rt.retired = retired
 		rt.retiredMu.Unlock()
 	}
-	return snap.PruneGenerations(ctx, keepFrom, open...)
+	if err := snap.PruneGenerations(ctx, keepFrom, open...); err != nil || rt == nil {
+		return err
+	}
+	var kept []int64
+	for _, gen := range open {
+		if gen < keepFrom {
+			kept = append(kept, gen)
+		}
+	}
+	s.recordKeptGenerations(ctx, rt, snap, mfs, kept)
+	return nil
+}
+
+// recordKeptGenerations records kept, the generations a prune of rt kept
+// only because open files of mfs read them. While they number at least the
+// repo's WarnKeptGenerations, it records a warning, and it logs the warning
+// once as their count reaches that threshold. It logs again only after their
+// count fell below it.
+func (s *Service) recordKeptGenerations(ctx context.Context, rt *repoRuntime, snap *snapshot.Store, mfs fusefs.MountedFS, kept []int64) {
+	s.mu.Lock()
+	cfg := rt.cfg
+	s.mu.Unlock()
+	var warning string
+	var attrs []any
+	if len(kept) > 0 && len(kept) >= cfg.WarnKeptGenerations {
+		warning, attrs = keptGenerationsWarning(ctx, cfg, snap, mfs, kept)
+	}
+	s.mu.Lock()
+	crossed := warning != "" && rt.keptWarning == ""
+	changed := rt.kept != len(kept) || rt.keptWarning != warning
+	rt.kept, rt.keptWarning = len(kept), warning
+	s.mu.Unlock()
+	if crossed {
+		s.logger.Warn(logKeptGenerations, attrs...)
+	}
+	if changed {
+		s.recordRuntimeState(rt)
+	}
+}
+
+// keptGenerationsWarning describes kept, as status shows it and as log
+// attributes. It lists no caller IDs on FSKit.
+func keptGenerationsWarning(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, mfs fusefs.MountedFS, kept []int64) (string, []any) {
+	raise := fmt.Sprintf("artifact-fs set-warn-kept-generations --name %s --count <n>", cfg.Name)
+	attrs := []any{"repo", cfg.Name, "kept_generations", len(kept), "warn_kept_generations", cfg.WarnKeptGenerations}
+	size := "of unknown size"
+	if bytes, err := snap.EstimateGenerationBytes(ctx, kept); err == nil {
+		size = fmt.Sprintf("about %.1f MB", float64(bytes)/1e6)
+		attrs = append(attrs, "estimated_bytes", bytes)
+	} else {
+		attrs = append(attrs, "estimate_error", err.Error())
+	}
+	pids := "unavailable on FSKit"
+	if mfs.Backend() != fusefs.BackendFSKit {
+		pids = formatOpenFilePIDs(mfs.OpenFilePIDs(kept))
+	}
+	attrs = append(attrs, "pids", pids,
+		"frees", "at the first HEAD change after these files close",
+		"raise_threshold", raise)
+	return fmt.Sprintf("open files keep %d older snapshot generations, %s, reaching the warning threshold %d; pids holding the files: %s; the generations free at the first HEAD change after the files close; raise the threshold with %s",
+		len(kept), size, cfg.WarnKeptGenerations, pids, raise), attrs
+}
+
+// formatOpenFilePIDs lists each caller ID with its open files, in ID order.
+// Linux reports the ID of the thread that opened the file, 0 when that thread
+// lies outside the daemon's PID namespace.
+func formatOpenFilePIDs(pids map[uint32]int) string {
+	var out []string
+	for _, pid := range slices.Sorted(maps.Keys(pids)) {
+		id := strconv.FormatUint(uint64(pid), 10)
+		if pid == 0 {
+			id = "unknown"
+		}
+		files := "open files"
+		if pids[pid] == 1 {
+			files = "open file"
+		}
+		out = append(out, fmt.Sprintf("%s (%d %s)", id, pids[pid], files))
+	}
+	if len(out) == 0 {
+		return "none open"
+	}
+	return strings.Join(out, ", ")
 }
 
 func (s *Service) signalHEADReconcile(rt *repoRuntime) {

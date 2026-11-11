@@ -479,9 +479,10 @@ func (m *blockingMountedFS) Join(ctx context.Context) error {
 	}
 }
 
-func (m *blockingMountedFS) Backend() string              { return "fake" }
-func (m *blockingMountedFS) InvalidateChanged() error     { return nil }
-func (m *blockingMountedFS) OpenFileGenerations() []int64 { return nil }
+func (m *blockingMountedFS) Backend() string                     { return "fake" }
+func (m *blockingMountedFS) InvalidateChanged() error            { return nil }
+func (m *blockingMountedFS) OpenFileGenerations() []int64        { return nil }
+func (m *blockingMountedFS) OpenFilePIDs([]int64) map[uint32]int { return nil }
 
 func (m *blockingMountedFS) Unmount(context.Context) error { return nil }
 

@@ -41,7 +41,7 @@ Repository-specific guidance for `artifact-fs`.
 - `config_version` identifies a registered config, and only a new registration changes it. Use it as the only token that a config is still current.
 - `prepare_request` identifies the latest prepare request, from `add-repo` or `prepare`. Write a preparation's outcome only while its `config_version` and its `prepare_request` are both current. Write the acquisition receipt while its `config_version` is current; the receipt belongs to the config, not to the request.
 - A prepare request never unmounts a repo. The daemon prepares an async repo again behind its runtime's gate. The CLI prepares a sync repo while the daemon keeps serving it.
-- Refresh settings are not part of a repo's prepare identity. `set-refresh` changes neither token.
+- Refresh settings and the kept-generations warning threshold are not part of a repo's prepare identity. `set-refresh` and `set-warn-kept-generations` change neither token.
 - `daemon` is long-running: it mounts registered repos and starts watcher, refresh, and hydrator workers.
 - The daemon holds a flock on `<root>/config/daemon.lock`. A second daemon on one state root fails. CLI commands probe that lock to learn whether a daemon runs.
 - The registry carries every request from the CLI to the daemon. The control socket only wakes the daemon.

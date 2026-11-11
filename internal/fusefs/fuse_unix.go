@@ -55,6 +55,10 @@ type MountedFS interface {
 	// OpenFileGenerations returns the snapshot generations that open files
 	// read. A prune keeps them.
 	OpenFileGenerations() []int64
+	// OpenFilePIDs counts the open file handles whose inodes read one of
+	// gens, by the ID the open op carried for its caller, 0 when it carried
+	// none.
+	OpenFilePIDs(gens []int64) map[uint32]int
 }
 
 // CacheTTL is how long the kernel may cache the entries, negative entries and
@@ -262,6 +266,8 @@ type FileHandle struct {
 	wrote bool
 	// writable says the handle's access mode allows writes.
 	writable bool
+	// pid is the caller ID the op that made the handle carried.
+	pid uint32
 }
 
 // ReaddirEntry holds child metadata, avoiding per-child Getattr or snapshot lookups.
@@ -964,6 +970,20 @@ func (fs *ArtifactFuse) OpenFileGenerations() []int64 {
 		}
 	}
 	return gens
+}
+
+// OpenFilePIDs counts each open file handle whose inode's read generation is
+// one of gens, by the caller ID its open carried.
+func (fs *ArtifactFuse) OpenFilePIDs(gens []int64) map[uint32]int {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	pids := make(map[uint32]int)
+	for _, fh := range fs.fileHandles {
+		if ref := fs.inodes[fh.inode.ID]; ref != nil && !ref.Stale && ref.Path != ".git" && slices.Contains(gens, ref.ReadGen) {
+			pids[fh.pid]++
+		}
+	}
+	return pids
 }
 
 // pinInode returns a copy of id's inode, or ESTALE for a retired or missing
@@ -2009,7 +2029,7 @@ func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, ch
 			}
 			fs.unpin(pinned)
 		}()
-		fh := &FileHandle{inode: ref, path: ref.Path, writable: !op.OpenFlags.IsReadOnly()}
+		fh := &FileHandle{inode: ref, path: ref.Path, writable: !op.OpenFlags.IsReadOnly(), pid: op.OpContext.Pid}
 		var access uint32
 		if checkPermissions && !created && ref.Path != ".git" {
 			access = ownerRead | ownerWrite
@@ -2306,7 +2326,7 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 		fs.mu.Lock()
 		ref := fs.createEntry(op.Parent, op.Name, childPath, Attrs{Type: "file", Mode: uint32(op.Mode)})
 		ref.CreateOpenPending = true
-		fh := &FileHandle{inode: ref, path: childPath, wrote: true, writable: !op.OpenFlags.IsReadOnly()}
+		fh := &FileHandle{inode: ref, path: childPath, wrote: true, writable: !op.OpenFlags.IsReadOnly(), pid: op.OpContext.Pid}
 		handle := fs.nextHandleID
 		fs.nextHandleID++
 		fs.fileHandles[handle] = fh
@@ -2559,6 +2579,9 @@ func (m *mountedFSWrapper) InvalidateChanged() error {
 }
 
 func (m *mountedFSWrapper) OpenFileGenerations() []int64 { return m.fs.OpenFileGenerations() }
+func (m *mountedFSWrapper) OpenFilePIDs(gens []int64) map[uint32]int {
+	return m.fs.OpenFilePIDs(gens)
+}
 
 // fuseMount is fuse.MountContext. Package tests replace it so they cannot mount.
 var fuseMount = fuse.MountContext
