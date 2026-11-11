@@ -291,27 +291,72 @@ func TestCrashDuringInstallLeavesCountersToARecount(t *testing.T) {
 	requireStats(t, dir, Stats{Blobs: 2, Bytes: 20})
 }
 
-// When Install moved a blob and cannot write the counters, the blob stays in
-// the cache and Install succeeds. The counters stay pending, so the next
-// reader recounts them.
-func TestFailedCounterWriteLeavesTheBlobServedAndCountersToARecount(t *testing.T) {
-	dir := t.TempDir()
-	install(t, dir, strings.Repeat("a", 40), 10, time.Now())
-	b := strings.Repeat("b", 40)
-	staged := stage(t, dir, b, 10)
-	// A closed stats file fails Install's counter write.
+// closeStatsAfterMove makes the next Install fail every write to the stats
+// file after its move.
+func closeStatsAfterMove(t *testing.T) {
 	testHookAfterInstallMove = func(stats *os.File) {
 		if err := stats.Close(); err != nil {
 			t.Error(err)
 		}
 	}
-	defer func() { testHookAfterInstallMove = nil }()
+	t.Cleanup(func() { testHookAfterInstallMove = nil })
+}
 
-	if err := Install(dir, b, staged); err != nil {
-		t.Fatalf("Install = %v; want nil for a blob already in the cache", err)
+// When Install moved a blob and cannot write the counters, the blob stays in
+// the cache and Install succeeds. Counters that were valid stay pending, and
+// counters that were missing stay missing, so the next reader recounts them.
+func TestFailedCounterWriteLeavesTheBlobServedAndCountersToARecount(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cached bool
+		want   Stats
+	}{
+		{"valid counters", true, Stats{Blobs: 2, Bytes: 20}},
+		// Install recounts missing counters after its move, and the recount's
+		// write fails.
+		{"missing counters", false, Stats{Blobs: 1, Bytes: 10}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.cached {
+				install(t, dir, strings.Repeat("a", 40), 10, time.Now())
+			}
+			b := strings.Repeat("b", 40)
+			staged := stage(t, dir, b, 10)
+			closeStatsAfterMove(t)
+
+			if err := Install(dir, b, staged); err != nil {
+				t.Fatalf("Install = %v; want nil for a blob already in the cache", err)
+			}
+			if got, err := os.ReadFile(Path(dir, b)); err != nil || string(got) != strings.Repeat("x", 10) {
+				t.Fatalf("cached blob = %q, %v; want its 10 bytes", got, err)
+			}
+			requireStats(t, dir, tc.want)
+		})
 	}
-	if got, err := os.ReadFile(Path(dir, b)); err != nil || string(got) != strings.Repeat("x", 10) {
-		t.Fatalf("cached blob = %q, %v; want its 10 bytes", got, err)
+}
+
+// A failed move leaves counters that an earlier install left pending to the
+// next reader's recount.
+func TestFailedMoveLeavesPendingCountersToARecount(t *testing.T) {
+	dir := t.TempDir()
+	install(t, dir, strings.Repeat("a", 40), 10, time.Now())
+	b := strings.Repeat("b", 40)
+	staged := stage(t, dir, b, 10)
+	closeStatsAfterMove(t)
+	if err := Install(dir, b, staged); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterInstallMove = nil
+	c := strings.Repeat("c", 40)
+	staged = stage(t, dir, c, 10)
+	// A directory at the cache path fails the rename of a file onto it.
+	if err := os.Mkdir(Path(dir, c), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Install(dir, c, staged); err == nil {
+		t.Fatal("Install onto a directory succeeded; want the rename error")
 	}
 	requireStats(t, dir, Stats{Blobs: 2, Bytes: 20})
 }

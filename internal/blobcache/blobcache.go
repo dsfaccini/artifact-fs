@@ -79,9 +79,10 @@ var testHookAfterInstallMove func(stats *os.File)
 
 // Install moves the staged blob into oid's cache path and counts it. A blob it
 // replaces leaves the counters. From the move until it writes the counters,
-// the stats file marks them pending, so after a crash in between the next
-// reader recounts. When it cannot count the moved blob or write the counters,
-// it leaves them pending too, because the blob is already in place.
+// the stats file marks them pending, so after a process crash in between the
+// next reader recounts. When it cannot count the moved blob or write the
+// counters, it leaves them to that recount too, because the blob is already
+// in place.
 func Install(dir, oid, staged string) error {
 	lock, err := lockStats(dir)
 	if err != nil {
@@ -124,8 +125,9 @@ func Install(dir, oid, staged string) error {
 
 // Recount moves blobs from the flat layout of earlier versions, <dir>/<oid>,
 // into their shards, and recounts the counters from the blobs on disk. The
-// hydrator runs it when it starts, which corrects counters that a crash
-// during an eviction, or a change made outside this package, left wrong.
+// hydrator runs it when it starts, which corrects counters that an OS crash,
+// a crash during an eviction, or a change made outside this package left
+// wrong.
 func Recount(dir string) (Stats, error) {
 	if strings.TrimSpace(dir) == "" {
 		return Stats{}, nil
