@@ -48,10 +48,20 @@ func TestGitIgnoresMachineConfig(t *testing.T) {
 // disableIdentityGuessing sets user.useConfigOnly for git in this process and
 // every process it starts, so a commit that names no identity fails instead of
 // taking one guessed from the user and host names. That covers the git the
-// daemon under test runs and the git that tests run in its mounts. It adds the
-// setting after any GIT_CONFIG_* entries the caller set.
+// daemon under test runs and the git that tests run in its mounts. Git drops
+// GIT_CONFIG_* for the upload-pack it runs for a file:// remote, which writes
+// no commits. It adds the
+// setting after any GIT_CONFIG_* entries the caller set, and exits when it
+// cannot read their count.
 func disableIdentityGuessing() {
-	n, _ := strconv.Atoi(os.Getenv("GIT_CONFIG_COUNT"))
+	n := 0
+	if count := os.Getenv("GIT_CONFIG_COUNT"); count != "" {
+		var err error
+		if n, err = strconv.Atoi(count); err != nil || n < 0 {
+			fmt.Fprintf(os.Stderr, "GIT_CONFIG_COUNT=%q is not a count of GIT_CONFIG_* entries\n", count)
+			os.Exit(2)
+		}
+	}
 	os.Setenv("GIT_CONFIG_KEY_"+strconv.Itoa(n), "user.useConfigOnly")
 	os.Setenv("GIT_CONFIG_VALUE_"+strconv.Itoa(n), "true")
 	os.Setenv("GIT_CONFIG_COUNT", strconv.Itoa(n+1))
