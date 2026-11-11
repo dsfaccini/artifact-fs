@@ -171,8 +171,10 @@ type InodeRef struct {
 	Gen int64
 	// ReadGen is the generation that base reads serve, so their length
 	// matches the size the kernel holds after a HEAD change. The path has the
-	// identity last reported there. It is Gen, or a later generation the
-	// switch pass found that identity in. It is 0 when Gen is.
+	// identity last reported there. It is Gen, a later generation the switch
+	// pass found that identity in, or the generation the path came back at
+	// with that identity when the unmapped inode mapped back. It is 0 when Gen
+	// is.
 	ReadGen int64
 	// Blob is the Attrs.Blob last reported for this inode. Type, Mode and Blob
 	// are the identity the kernel holds.
@@ -327,7 +329,7 @@ func (fs *ArtifactFuse) allocInode(path string, attrs Attrs) *InodeRef {
 	id, ok := fs.pathToInode[path]
 	if held, found := fs.unmapped[path]; !ok && found {
 		if fs.inodes[held].returnsAs(attrs.identity()) {
-			fs.mapLocked(held, path)
+			fs.mapLocked(held, path, attrs.Gen)
 			id, ok = held, true
 		} else {
 			fs.retireLocked(held)
@@ -414,20 +416,25 @@ func (fs *ArtifactFuse) retireRetypedLocked(id fuseops.InodeID, path string) {
 	fs.retireLocked(id)
 }
 
-// mapLocked maps path back to id, an unmapped inode whose path came back.
-// Caller must hold fs.mu write lock.
-func (fs *ArtifactFuse) mapLocked(id fuseops.InodeID, path string) {
+// mapLocked maps path back to id, an unmapped inode whose path came back with
+// id's identity at generation gen. A base read through id then serves gen: a
+// rename can have moved id while it was unmapped, so id's ReadGen can lack
+// path. Caller must hold fs.mu write lock.
+func (fs *ArtifactFuse) mapLocked(id fuseops.InodeID, path string, gen int64) {
 	fs.pathToInode[path] = id
 	delete(fs.unmapped, path)
+	if ref := fs.inodes[id]; ref != nil && ref.Gen != 0 {
+		ref.ReadGen = gen
+	}
 }
 
 // settleLocked decides id, unmapped at path, now that path exists with
-// identity current. It maps id back when no other inode holds the path and
-// returnsAs accepts current, and retires id otherwise. It reports whether id
-// got the path back. Caller must hold fs.mu write lock.
-func (fs *ArtifactFuse) settleLocked(id fuseops.InodeID, path string, current Identity) bool {
+// identity current at generation gen. It maps id back when no other inode
+// holds the path and returnsAs accepts current, and retires id otherwise. It
+// reports whether id got the path back. Caller must hold fs.mu write lock.
+func (fs *ArtifactFuse) settleLocked(id fuseops.InodeID, path string, current Identity, gen int64) bool {
 	if _, mapped := fs.pathToInode[path]; !mapped && fs.inodes[id].returnsAs(current) {
-		fs.mapLocked(id, path)
+		fs.mapLocked(id, path, gen)
 		return true
 	}
 	fs.retireLocked(id)
@@ -450,7 +457,7 @@ func (fs *ArtifactFuse) settleUnmappedBelow(path string) error {
 	}
 	fs.mu.RUnlock()
 	for _, m := range held {
-		current, exists, err := fs.engine.Identity(m.path)
+		current, gen, exists, err := fs.engine.IdentityAt(m.path)
 		if err != nil {
 			return err
 		}
@@ -459,7 +466,7 @@ func (fs *ArtifactFuse) settleUnmappedBelow(path string) error {
 		}
 		fs.mu.Lock()
 		if fs.unmapped[m.path] == m.id {
-			fs.settleLocked(m.id, m.path, current)
+			fs.settleLocked(m.id, m.path, current, gen)
 		}
 		fs.mu.Unlock()
 	}
@@ -842,9 +849,16 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// The name of an unmapped inode already left the kernel, through the op
 	// or the pass that unmapped it, so a retired one needs only its inode
 	// invalidated.
-	var remap, retire []pathMapping
+	var retire []pathMapping
+	// remap holds each inode to map back, with the generation its path came
+	// back at.
+	type remapping struct {
+		pathMapping
+		gen int64
+	}
+	var remap []remapping
 	for _, u := range returning {
-		current, exists, err := fs.engine.Identity(u.path)
+		current, gen, exists, err := fs.engine.IdentityAt(u.path)
 		if err != nil {
 			failed(err, "resolve "+u.path)
 			continue
@@ -852,7 +866,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		switch {
 		case !exists:
 		case u.ref.returnsAs(current):
-			remap = append(remap, u.pathMapping)
+			remap = append(remap, remapping{u.pathMapping, gen})
 		default:
 			retire = append(retire, u.pathMapping)
 			changed = append(changed, u.id)
@@ -887,7 +901,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// removes it from unmapped.
 	for _, m := range remap {
 		if _, mapped := fs.pathToInode[m.path]; !mapped && fs.unmapped[m.path] == m.id {
-			fs.mapLocked(m.id, m.path)
+			fs.mapLocked(m.id, m.path, m.gen)
 		}
 	}
 	for _, m := range retire {
@@ -1151,7 +1165,7 @@ func (fs *ArtifactFuse) setReported(id fuseops.InodeID, attrs Attrs) error {
 	if ref == nil {
 		return nil
 	}
-	if fs.unmapped[ref.Path] == id && !fs.settleLocked(id, ref.Path, attrs.identity()) {
+	if fs.unmapped[ref.Path] == id && !fs.settleLocked(id, ref.Path, attrs.identity(), attrs.Gen) {
 		return syscall.ESTALE
 	}
 	if ref.Type != attrs.Type {
@@ -2229,7 +2243,7 @@ func (fs *ArtifactFuse) reachPath(id fuseops.InodeID, path string, exclusive boo
 // back with id's identity maps back to id. Any other path belongs to another
 // file, so id is retired and the op gets ESTALE.
 func (fs *ArtifactFuse) claimPath(id fuseops.InodeID, path string) error {
-	current, exists, err := fs.engine.Identity(path)
+	current, gen, exists, err := fs.engine.IdentityAt(path)
 	if err != nil {
 		return err
 	}
@@ -2244,7 +2258,7 @@ func (fs *ArtifactFuse) claimPath(id fuseops.InodeID, path string) error {
 	case ok && mapped == id, !ok && !exists:
 		return nil
 	case !ok && ref.returnsAs(current):
-		fs.mapLocked(id, path)
+		fs.mapLocked(id, path, gen)
 		return nil
 	}
 	fs.retireLocked(id)

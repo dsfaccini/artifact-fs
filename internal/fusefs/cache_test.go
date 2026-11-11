@@ -779,3 +779,74 @@ func TestSwitchPassResolvesWhenAPruneOverlapsItsDiff(t *testing.T) {
 		t.Fatalf("invalidated entries = %v, want dir/gone.txt, which the switch removed", entries)
 	}
 }
+
+// A rename moves an unmapped inode below the renamed directory, and the inode
+// keeps the generation it was last reported at, which lacks its new path. When
+// the path comes back with the inode's identity, the pass maps it back. A
+// later switch that removes the path, while every directory above it keeps
+// its tree ID from that generation, still drops its name.
+func TestSwitchPassDropsRemappedInodeThatARenameMovedWhileUnmapped(t *testing.T) {
+	keep := baseFile("d/sub/keep", "keep", 0o100644)
+	other := baseFile("e/sub/other", "other", 0o100644)
+	f := newCacheFixture(t, baseDir("d", "d-1"), baseDir("d/sub", "dsub-1"), keep, baseFile("d/sub/x", "x", 0o100644), baseDir("e", "e-1"), baseDir("e/sub", "esub-1"), other)
+	var root fuseops.InodeID = fuseops.RootInodeID
+	d := f.lookup(root, "d")
+	sub := f.lookup(d, "sub")
+	x := f.lookup(sub, "x")
+	f.switchTo(baseDir("d", "d-2"), baseDir("d/sub", "dsub-2"), keep)
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	f.fs.mu.RLock()
+	unmapped := f.fs.unmapped["d/sub/x"] == x
+	f.fs.mu.RUnlock()
+	if !unmapped {
+		t.Fatal("d/sub/x is not unmapped after the switch that removed it")
+	}
+	if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: root, OldName: "d", NewParent: root, NewName: "e"}); err != nil {
+		t.Fatal(err)
+	}
+	f.switchTo(baseDir("e", "e-3"), baseDir("e/sub", "esub-3"), baseFile("e/sub/keep", "keep", 0o100644), baseFile("e/sub/x", "x", 0o100644))
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	f.fs.mu.RLock()
+	mapped := f.fs.pathToInode["e/sub/x"] == x
+	f.fs.mu.RUnlock()
+	if !mapped {
+		t.Fatal("e/sub/x, back with the moved inode's identity, did not map back to it")
+	}
+	_, before := f.notifier.recorded()
+	f.switchTo(baseDir("e", "e-1"), baseDir("e/sub", "esub-1"), other)
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if _, entries := f.notifier.recorded(); !slices.Equal(entries[len(before):], []kernelEntry{{sub, "x"}}) {
+		t.Fatalf("invalidated entries = %v, want e/sub/x, which the last switch removed", entries[len(before):])
+	}
+}
+
+// A rename that moves an unmapped inode leaves the generation its open file
+// reads, though that generation lacks the inode's new path: the file keeps
+// reading what it opened.
+func TestOpenFileOfAnUnmappedInodeReadsAfterARenameMovesIt(t *testing.T) {
+	f := newCacheFixture(t, baseDir("d", "d-1"), baseFile("d/keep", "keep", 0o100644), baseFile("d/x", "x-content", 0o100644))
+	var root fuseops.InodeID = fuseops.RootInodeID
+	d := f.lookup(root, "d")
+	x := f.lookup(d, "x")
+	open := f.open(x)
+	f.switchTo(baseDir("d", "d-2"), baseFile("d/keep", "keep", 0o100644))
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: root, OldName: "d", NewParent: root, NewName: "e"}); err != nil {
+		t.Fatal(err)
+	}
+	read := &fuseops.ReadFileOp{Inode: x, Handle: open.Handle, Size: 64, Dst: make([]byte, 64)}
+	if err := f.fs.ReadFile(f.ctx, read); err != nil {
+		t.Fatalf("read through the open file of the moved inode: %v", err)
+	}
+	if got := string(read.Dst[:read.BytesRead]); got != "x-content" {
+		t.Fatalf("read through the open file of the moved inode = %q, want %q", got, "x-content")
+	}
+}

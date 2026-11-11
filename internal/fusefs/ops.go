@@ -243,6 +243,14 @@ func (e *Engine) Identity(path string) (Identity, bool, error) {
 	return nodeIdentity(e.Resolver.ResolvePath(path))
 }
 
+// IdentityAt is Identity, and also returns the generation it resolved
+// against.
+func (e *Engine) IdentityAt(path string) (Identity, int64, bool, error) {
+	n, gen, _, err := e.Resolver.ResolvePathState(path)
+	id, exists, err := nodeIdentity(n, err)
+	return id, gen, exists, err
+}
+
 // nodeIdentity returns the identity of n, which a resolve returned with err,
 // and false when the resolve found nothing.
 func nodeIdentity(n ResolvedNode, err error) (Identity, bool, error) {

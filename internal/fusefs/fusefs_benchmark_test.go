@@ -501,11 +501,16 @@ func switchPassTree(changed int) (base, next []model.BaseNode, leaves, files []s
 	return build(0), build(changed), leaves, files
 }
 
-// countingNotifier counts the invalidations a pass sends.
-type countingNotifier struct{ inodes, entries int }
+// countingNotifier counts the invalidations a pass sends, and records the
+// inodes it invalidated since the last take.
+type countingNotifier struct {
+	inodes, entries int
+	invalidated     []fuseops.InodeID
+}
 
-func (n *countingNotifier) InvalidateInode(fuseops.InodeID, int64, int64) error {
+func (n *countingNotifier) InvalidateInode(id fuseops.InodeID, _, _ int64) error {
 	n.inodes++
+	n.invalidated = append(n.invalidated, id)
 	return nil
 }
 
@@ -514,25 +519,45 @@ func (n *countingNotifier) InvalidateEntry(fuseops.InodeID, string) error {
 	return nil
 }
 
+// untrackedEntries is the number of node_modules entries the 20,000-held
+// case adds to the 6,299 base inodes, the tree without its root.
+const untrackedEntries = 20_000 - 6_299
+
 // BenchmarkSwitchPass times the pass after a generation switch that tells
 // the kernel what changed, over the 6,300-entry tree of switchPassTree. Each
-// iteration switches between its two generations, which differ in changed
-// files. The kernel holds held inodes: files spread over the tree with the
+// iteration publishes the tree's other variant as a new generation, prunes
+// all but the last two, and switches to it, so changed files differ. The kernel holds held inodes: files spread over the tree with the
 // directories above them, or past the 6,300 base entries, every base entry
-// and untracked node_modules files and directories in the overlay. With one
-// change, the changed file is held. It reports the invalidations each pass
-// sends.
+// and untrackedEntries node_modules files and directories in the overlay.
+// With one change, the changed file is held. After each pass, the kernel
+// looks up each inode the pass invalidated again, outside the timed pass.
+// The unheld-overlay cases add the node_modules entries to the overlay
+// without holding them, and the forgotten case maps one of them to an inode
+// the kernel then forgets. It reports pass-ns/op, the time of the pass
+// alone, and the invalidations each pass sends.
 func BenchmarkSwitchPass(b *testing.B) {
 	for _, held := range []int{100, 2_000, 20_000} {
 		for _, changed := range []int{1, 500} {
 			b.Run(fmt.Sprintf("held=%d/changed=%d", held, changed), func(b *testing.B) {
-				benchSwitchPassHeld(b, held, changed)
+				benchSwitchPassHeld(b, held, changed, false, false)
 			})
 		}
 	}
+	for _, c := range []struct {
+		held      int
+		forgotten bool
+	}{{100, false}, {2_000, false}, {100, true}} {
+		name := fmt.Sprintf("held=%d/changed=1/unheld-overlay", c.held)
+		if c.forgotten {
+			name += "/1-forgotten"
+		}
+		b.Run(name, func(b *testing.B) {
+			benchSwitchPassHeld(b, c.held, 1, true, c.forgotten)
+		})
+	}
 }
 
-func benchSwitchPassHeld(b *testing.B, held, changed int) {
+func benchSwitchPassHeld(b *testing.B, held, changed int, unheldOverlay, forgotten bool) {
 	ctx := context.Background()
 	base, next, _, files := switchPassTree(changed)
 	snap, err := snapshot.New(ctx, filepath.Join(b.TempDir(), "snapshot.sqlite"))
@@ -541,10 +566,6 @@ func benchSwitchPassHeld(b *testing.B, held, changed int) {
 	}
 	b.Cleanup(func() { _ = snap.Close() })
 	first, err := snap.PublishGeneration(ctx, "first", "main", base)
-	if err != nil {
-		b.Fatal(err)
-	}
-	second, err := snap.PublishGeneration(ctx, "second", "main", next)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -567,6 +588,37 @@ func benchSwitchPassHeld(b *testing.B, held, changed int) {
 		slices.Reverse(chain)
 		paths = append(paths, chain...)
 	}
+	// untracked adds untrackedEntries node_modules entries to the overlay,
+	// and holds them when inKernel is true.
+	untracked := func(inKernel bool) {
+		made := map[string]bool{}
+		mkdir := func(d string) {
+			if made[d] {
+				return
+			}
+			made[d] = true
+			if err := ov.Mkdir(ctx, d, 0o755); err != nil {
+				b.Fatal(err)
+			}
+			if inKernel {
+				hold(d)
+			}
+		}
+		for i := 0; len(made) < untrackedEntries; i++ {
+			pkg := fmt.Sprintf("node_modules/pkg-%03d", i%500)
+			for _, d := range []string{"node_modules", pkg, pkg + "/lib"} {
+				mkdir(d)
+			}
+			f := fmt.Sprintf("%s/lib/file-%05d.js", pkg, i)
+			if _, err := ov.CreateFile(ctx, f, 0o644); err != nil {
+				b.Fatal(err)
+			}
+			made[f] = true
+			if inKernel {
+				hold(f)
+			}
+		}
+	}
 	if held < len(base) {
 		stride := len(files) / held
 		for i := 0; len(paths) < held; i += stride {
@@ -575,30 +627,14 @@ func benchSwitchPassHeld(b *testing.B, held, changed int) {
 		// The last file held may bring directories past held; the
 		// deepest go first, and no held path lies below them.
 		paths = paths[:held]
+		if unheldOverlay {
+			untracked(false)
+		}
 	} else {
 		for _, n := range base {
 			hold(n.Path)
 		}
-		if err := ov.Mkdir(ctx, "node_modules", 0o755); err != nil {
-			b.Fatal(err)
-		}
-		hold("node_modules")
-		for i := 0; len(paths) < held; i++ {
-			pkg := fmt.Sprintf("node_modules/pkg-%03d", i%500)
-			if !seen[pkg] {
-				for _, d := range []string{pkg, pkg + "/lib"} {
-					if err := ov.Mkdir(ctx, d, 0o755); err != nil {
-						b.Fatal(err)
-					}
-					hold(d)
-				}
-			}
-			f := fmt.Sprintf("%s/lib/file-%05d.js", pkg, i)
-			if _, err := ov.CreateFile(ctx, f, 0o644); err != nil {
-				b.Fatal(err)
-			}
-			hold(f)
-		}
+		untracked(true)
 	}
 	r := &Resolver{Snapshot: snap, Overlay: ov}
 	r.SetGeneration(first)
@@ -613,19 +649,53 @@ func benchSwitchPassHeld(b *testing.B, held, changed int) {
 		}
 		fs.allocInode(p, attrs)
 	}
+	var forget fuseops.InodeID
+	if forgotten {
+		forget = fs.allocInode("node_modules/pkg-000/lib/file-00000.js", Attrs{Type: "file", Mode: 0o644}).ID
+	}
 	fs.mu.Unlock()
-	gens := [2]int64{second, first}
-	b.ResetTimer()
-	for i := range b.N {
-		// The overlay holds only entries neither generation has, so a
-		// reconcile would change nothing.
-		r.SetGeneration(gens[i%2])
-		if err := fs.invalidateChanged(true); err != nil {
+	if forgotten {
+		if err := fs.ForgetInode(ctx, &fuseops.ForgetInodeOp{Inode: forget, N: 1}); err != nil {
 			b.Fatal(err)
 		}
 	}
+	variants := [2][]model.BaseNode{next, base}
+	var pass time.Duration
+	b.ResetTimer()
+	for i := range b.N {
+		gen, err := snap.PublishGeneration(ctx, "head", "main", variants[i%2])
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := snap.PruneGenerations(ctx, gen-1); err != nil {
+			b.Fatal(err)
+		}
+		// The overlay holds only entries neither generation has, so a
+		// reconcile would change nothing.
+		r.SetGeneration(gen)
+		start := time.Now()
+		if err := fs.invalidateChanged(true); err != nil {
+			b.Fatal(err)
+		}
+		pass += time.Since(start)
+		// A kernel looks up an invalidated inode again before it uses it.
+		for _, id := range notifier.invalidated {
+			fs.mu.RLock()
+			path := fs.inodes[id].Path
+			fs.mu.RUnlock()
+			attrs, err := fs.engine.Attrs(nil, path)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := fs.setReported(id, attrs); err != nil {
+				b.Fatal(err)
+			}
+		}
+		notifier.invalidated = notifier.invalidated[:0]
+	}
 	b.StopTimer()
 	b.ReportMetric(float64(len(paths)), "held")
+	b.ReportMetric(float64(pass.Nanoseconds())/float64(b.N), "pass-ns/op")
 	b.ReportMetric(float64(notifier.inodes)/float64(b.N), "inode-invals/op")
 	b.ReportMetric(float64(notifier.entries)/float64(b.N), "entry-invals/op")
 }

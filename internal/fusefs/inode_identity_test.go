@@ -1136,7 +1136,9 @@ func TestMkDirCannotLandInsideRmDir(t *testing.T) {
 // same paths as a merged listing of each directory: over overlay deletes, a
 // renamed base directory and file, implicit directories at the root and below
 // it, a directory replaced by a file and a file replaced by a directory.
-// Engine.Identity, which the switch pass uses for held inodes, must agree.
+// Engine.Identity, which the switch pass uses for unmapped inodes and negative
+// entries, must agree. So must resolveIn, which resolves each held path that
+// Engine.Identities resolves against one overlay read, with Engine.Identity.
 func TestMissingPathsMatchesPerDirectoryListings(t *testing.T) {
 	gen1 := []model.BaseNode{
 		baseDir("a", "a1"), baseFile("a/x.txt", "x", 0o100644), baseDir("a/b", "ab1"), baseFile("a/b/y.txt", "y", 0o100644),
@@ -1227,11 +1229,18 @@ func TestMissingPathsMatchesPerDirectoryListings(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Fatalf("MissingPaths = %v, merged listings of each parent = %v", got, want)
 	}
+	view, err := f.fs.engine.ReadOverlay(ctx)
+	must(err)
 	for _, p := range paths {
-		_, exists, err := f.fs.engine.Identity(p)
+		id, exists, err := f.fs.engine.Identity(p)
 		must(err)
 		if missing := slices.Contains(want, p); exists == missing {
 			t.Errorf("Identity(%q) exists = %t, but the merged listing of its parent says missing = %t", p, exists, missing)
+		}
+		inView, existsInView, err := nodeIdentity(f.resolver.resolveIn(view, p))
+		must(err)
+		if inView != id || existsInView != exists {
+			t.Errorf("resolveIn(%q) = %+v, exists %t; Identity = %+v, exists %t", p, inView, existsInView, id, exists)
 		}
 	}
 }
