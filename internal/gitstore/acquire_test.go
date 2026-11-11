@@ -1765,3 +1765,41 @@ func TestFetchRefAmbientFullRefPreparesDetachedHEAD(t *testing.T) {
 		t.Fatal("PR.md not found in prepared tree")
 	}
 }
+
+// A deadline that ends the retry of git branch --set-upstream-to fails the
+// preparation; it is no refusal of Git's to warn about. The fake exits 128 on
+// SIGTERM, as a refusal does, so only the context check tells them apart.
+func TestPrepareFetchedBranchFailsWhenTheTrackingRetryIsCanceled(t *testing.T) {
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	run(t, "git", "init", "-q", "--initial-branch", "main", remote)
+	run(t, "git", "-C", remote, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "init")
+	run(t, "git", "-C", remote, "branch", "feature")
+	repo := filepath.Join(tmp, "clone")
+	run(t, "git", "clone", "-q", "--single-branch", "-b", "main", remote, repo)
+	gitDir := filepath.Join(repo, ".git")
+	// A negative refspec keeps Git from tracking feature through any line.
+	run(t, "git", "--git-dir", gitDir, "config", "--replace-all", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+	run(t, "git", "--git-dir", gitDir, "config", "--add", "remote.origin.fetch", "^refs/heads/feature")
+	run(t, "git", "--git-dir", gitDir, "fetch", "-q", "origin", "+refs/heads/feature:refs/remotes/origin/feature")
+	first, retry := filepath.Join(tmp, "first-attempt"), filepath.Join(tmp, "retry")
+	wrapGit(t, tmp, "#!/bin/sh\n"+
+		"if [ \"$1 $2\" = 'branch --set-upstream-to' ]; then\n"+
+		"  if [ -e \"$AFS_FIRST\" ]; then trap 'exit 128' TERM; : > \"$AFS_RETRY\"; sleep 60 & wait $!; exit 0; fi\n"+
+		"  : > \"$AFS_FIRST\"\n"+
+		"fi\n"+
+		"exec \"$AFS_REAL_GIT\" \"$@\"\n")
+	t.Setenv("AFS_FIRST", first)
+	t.Setenv("AFS_RETRY", retry)
+	ctx, cancel := gittest.ExpireOnFile(t.Context(), retry)
+	defer cancel()
+	var logs bytes.Buffer
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", GitDir: gitDir}}
+	err := New(slog.New(slog.NewJSONHandler(&logs, nil))).PrepareFetchedBranch(ctx, cfg, "feature")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("PrepareFetchedBranch error = %v, want the deadline", err)
+	}
+	if strings.Contains(logs.String(), "git cannot track the fetched branch on origin") {
+		t.Fatalf("a canceled retry logged the untracked-branch warning:\n%s", logs.String())
+	}
+}
