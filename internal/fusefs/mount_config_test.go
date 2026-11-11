@@ -179,6 +179,13 @@ func TestOpErrorWithoutErrnoNamesItsInodeAndPath(t *testing.T) {
 		"blob-unsized": errors.New("fetch blob-unsized failed"),
 		"blob-sized":   errors.New("fetch blob-sized failed"),
 	}
+	create := &fuseops.CreateFileOp{Parent: dir, Name: "new.txt", Mode: 0o644}
+	if err := f.fs.CreateFile(f.ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	// A release flushes what its handle wrote. It names no inode, so its
+	// error names the handle's.
+	f.fs.engine.Overlay = &faultyOverlay{OverlayStore: f.fs.engine.Overlay, flushErr: errors.New("flush dir/new.txt failed")}
 	for _, c := range []struct {
 		op   string
 		err  error
@@ -186,6 +193,7 @@ func TestOpErrorWithoutErrnoNamesItsInodeAndPath(t *testing.T) {
 	}{
 		{"lookup", f.fs.LookUpInode(f.ctx, &fuseops.LookUpInodeOp{Parent: dir, Name: "unsized.txt"}), fmt.Sprintf("parent inode %d, path dir/unsized.txt: fetch blob-unsized failed", dir)},
 		{"open", f.fs.OpenFile(f.ctx, &fuseops.OpenFileOp{Inode: sized}), fmt.Sprintf("inode %d, path dir/sized.txt: fetch blob-sized failed", sized)},
+		{"release", f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}), fmt.Sprintf("inode %d, path dir/new.txt: flush dir/new.txt failed", create.Entry.Child)},
 	} {
 		if errno := kernelErrno(c.err); errno != syscall.EIO || c.err.Error() != c.want {
 			t.Errorf("%s = %v (errno %v), want %q (EIO)", c.op, c.err, errno, c.want)
@@ -227,6 +235,14 @@ type replyRecord struct {
 func replyOps(t *testing.T, f *cacheFixture) []replyRecord {
 	t.Helper()
 	gen := f.resolver.Generation()
+	// Before a repo's first snapshot the merged view holds no root, so the
+	// root's attributes are synthesized.
+	f.resolver.SetGeneration(0)
+	f.getattr(fuseops.RootInodeID)
+	f.resolver.SetGeneration(gen)
+	f.getattr(fuseops.RootInodeID)
+	git := f.lookup(fuseops.RootInodeID, ".git")
+	f.getattr(git)
 	dir := f.lookup(fuseops.RootInodeID, "secret")
 	f.getattr(dir)
 	if _, ok := readDirPlus(t, f.fs, dir)["file.txt"]; !ok {
@@ -254,10 +270,24 @@ func replyOps(t *testing.T, f *cacheFixture) []replyRecord {
 	if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Mode: &mode}); err != nil {
 		t.Fatal(err)
 	}
+	// An unlink retires the inode and pins its open handle to its own copy,
+	// so a getattr answers from heldAttrs, and a setattr changes the copy.
+	if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: dir, Name: "created.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	f.getattr(create.Entry.Child)
+	pinnedMode := os.FileMode(0o640)
+	if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Mode: &pinnedMode}); err != nil {
+		t.Fatal(err)
+	}
 	record := func(msg, op string, inode fuseops.InodeID, typ string, gen int64, path string) replyRecord {
 		return replyRecord{Level: "DEBUG", Msg: msg, Repo: "repo", Op: op, Inode: uint64(inode), Type: typ, Generation: gen, Path: path}
 	}
 	return []replyRecord{
+		record("fuse attr reply", "GetInodeAttributes", fuseops.RootInodeID, "dir", 0, "."),
+		record("fuse attr reply", "GetInodeAttributes", fuseops.RootInodeID, "dir", gen, "."),
+		record("fuse entry reply", "LookUpInode", git, "file", gen, ".git"),
+		record("fuse attr reply", "GetInodeAttributes", git, "file", gen, ".git"),
 		record("fuse entry reply", "LookUpInode", dir, "dir", gen, "REDACTED"),
 		record("fuse attr reply", "GetInodeAttributes", dir, "dir", gen, "REDACTED"),
 		record("fuse entry reply", "ReadDirPlus", file, "file", gen, "REDACTED/file.txt"),
@@ -265,6 +295,8 @@ func replyOps(t *testing.T, f *cacheFixture) []replyRecord {
 		record("fuse entry reply", "MkDir", mkdir.Entry.Child, "dir", 0, "REDACTED/new"),
 		record("fuse entry reply", "CreateFile", create.Entry.Child, "file", 0, "REDACTED/created.txt"),
 		record("fuse entry reply", "CreateSymlink", symlink.Entry.Child, "symlink", 0, "REDACTED/link"),
+		record("fuse attr reply", "SetInodeAttributes", create.Entry.Child, "file", 0, "REDACTED/created.txt"),
+		record("fuse attr reply", "GetInodeAttributes", create.Entry.Child, "file", 0, "REDACTED/created.txt"),
 		record("fuse attr reply", "SetInodeAttributes", create.Entry.Child, "file", 0, "REDACTED/created.txt"),
 	}
 }

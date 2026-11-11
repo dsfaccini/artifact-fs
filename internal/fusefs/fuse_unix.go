@@ -1671,6 +1671,8 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 		}
 
 		if ref.IsRoot {
+			// A synthesized reply logs the generation the mount serves.
+			var gen int64
 			if fs.engine != nil {
 				if attrs, err := fs.engine.Attrs(b, ref.Path); err == nil {
 					op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
@@ -1678,17 +1680,18 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 					fs.logReply(ctx, attrReply, "GetInodeAttributes", op.Inode, attrs)
 					return nil
 				}
+				gen = fs.engine.Generation()
 			}
 			op.Attributes = inodeAttrs(ref.Mode, 4096, "dir", fs.syntheticTime, fs.syntheticTime)
 			op.AttributesExpiration = attrExpiry(CacheTTL)
-			fs.logReply(ctx, attrReply, "GetInodeAttributes", op.Inode, Attrs{Type: "dir"})
+			fs.logReply(ctx, attrReply, "GetInodeAttributes", op.Inode, Attrs{Type: "dir", Gen: gen})
 			return nil
 		}
 
 		if ref.Path == ".git" {
 			op.Attributes = fs.gitFileAttrs()
 			op.AttributesExpiration = attrExpiry(time.Minute)
-			fs.logReply(ctx, attrReply, "GetInodeAttributes", op.Inode, Attrs{Type: "file"})
+			fs.logReply(ctx, attrReply, "GetInodeAttributes", op.Inode, Attrs{Type: "file", Gen: fs.engine.Generation()})
 			return nil
 		}
 
