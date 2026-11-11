@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -43,7 +44,25 @@ type Service struct {
 	verified    map[string]os.FileInfo
 	maxVerified int
 	active      map[string]struct{}
+	// staged holds copied blobs that wait to move into cacheDir, the cache
+	// the workers hydrate into, so one Install moves many of them under one
+	// lock on the cache's counters.
+	staged   []stagedBlob
+	cacheDir string
 }
+
+// stagedBlob is a blob copied into its staged file and not yet installed. Its
+// task stays active until installStaged finishes it.
+type stagedBlob struct {
+	key  string
+	task model.HydrationTask
+	path string
+	size int64
+}
+
+// maxInstallBatch caps the blobs one Install moves, which bounds how long it
+// holds the cache's counters lock.
+const maxInstallBatch = 64
 
 // maxVerified bounds Service.verified, so a long-lived daemon that serves many
 // blobs, including blobs evict-cache has since removed, keeps bounded memory.
@@ -116,6 +135,7 @@ func (s *Service) Start(workers int, repo model.RepoPaths) {
 		return
 	}
 	s.started = true
+	s.cacheDir = repo.BlobCacheDir
 	s.background.Add(workers)
 	s.mu.Unlock()
 	_, _ = blobcache.Recount(repo.BlobCacheDir)
@@ -214,6 +234,7 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoPaths, node
 		if raised {
 			s.signalWork()
 		}
+		s.installIfStaged(key)
 		return s.awaitHydration(ctx, key, ch)
 	}
 	if size, ok, err := s.validateCachedBlob(ctx, repo, cachePath, node); err != nil {
@@ -246,6 +267,7 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoPaths, node
 	if signal {
 		s.signalWork()
 	}
+	s.installIfStaged(key)
 	return s.awaitHydration(ctx, key, ch)
 }
 
@@ -576,6 +598,9 @@ func (s *Service) worker(repo model.RepoPaths, reserved bool) {
 				}
 				s.signalWork()
 			}
+			// Install the staged blobs before waiting, so none of them
+			// waits for the next enqueue.
+			s.installStaged()
 		}
 	}
 }
@@ -679,6 +704,8 @@ func (s *Service) fetchBatch(repo model.RepoPaths, batch []model.HydrationTask) 
 	for i, task := range missing {
 		oids[i] = task.ObjectOID
 	}
+	// Staged blobs must not wait for a download.
+	s.installStaged()
 	ctx, cancel := s.fetchContext()
 	// A failed batch leaves each blob to its own lazy fetch, so an object the
 	// remote refuses fails only its own task.
@@ -729,8 +756,10 @@ func (s *Service) takeQueued(key string) bool {
 	return true
 }
 
-// hydrate serves task from a valid cached blob, or else copies the blob into
-// the cache, fetching it if it is still missing.
+// hydrate serves task from a valid cached blob, or else copies the blob into a
+// staged file, fetching it if it is still missing, and stages it for
+// installStaged. A blob a read waits on installs at once, with the blobs
+// staged before it.
 func (s *Service) hydrate(repo model.RepoPaths, task model.HydrationTask) {
 	key := taskKey(task.RepoID, task.ObjectOID)
 	cachePath := cachePathFor(repo, task.ObjectOID)
@@ -750,28 +779,73 @@ func (s *Service) hydrate(repo model.RepoPaths, task model.HydrationTask) {
 	ctx, cancel := s.fetchContext()
 	defer cancel()
 	size, err := s.fetcher.BlobToCache(ctx, repo, task.ObjectOID, staged)
-	if err == nil {
-		err = blobcache.Install(repo.BlobCacheDir, task.ObjectOID, staged)
-	}
 	if err != nil {
 		_ = os.Remove(staged)
 		s.finishHydration(key, result{err: fmt.Errorf("hydrate %s: %w", task.Path, err)})
 		return
 	}
 	s.mu.Lock()
+	s.staged = append(s.staged, stagedBlob{key: key, task: task, path: staged, size: size})
+	install := len(s.wait[key]) > 0 || len(s.staged) >= maxInstallBatch
+	s.mu.Unlock()
+	if install {
+		s.installStaged()
+	}
+}
+
+// installIfStaged installs the staged blobs when key's blob is among them, so
+// a read that joins a staged blob does not wait for its batch.
+func (s *Service) installIfStaged(key string) {
+	s.mu.Lock()
+	staged := slices.ContainsFunc(s.staged, func(b stagedBlob) bool { return b.key == key })
+	s.mu.Unlock()
+	if staged {
+		s.installStaged()
+	}
+}
+
+// installStaged moves the staged blobs into the cache and finishes their
+// hydrations. A blob that fails to move fails only its own hydration.
+func (s *Service) installStaged() {
+	s.mu.Lock()
+	batch, dir := s.staged, s.cacheDir
+	s.staged = nil
+	s.mu.Unlock()
+	for len(batch) > 0 {
+		blobs := make([]blobcache.Staged, len(batch))
+		for i, b := range batch {
+			blobs[i] = blobcache.Staged{OID: b.task.ObjectOID, Path: b.path}
+		}
+		n, err := blobcache.Install(dir, blobs)
+		for _, b := range batch[:n] {
+			s.finishInstalled(dir, b)
+		}
+		if err == nil {
+			return
+		}
+		failed := batch[n]
+		_ = os.Remove(failed.path)
+		s.finishHydration(failed.key, result{err: fmt.Errorf("hydrate %s: %w", failed.task.Path, err)})
+		batch = batch[n+1:]
+	}
+}
+
+func (s *Service) finishInstalled(dir string, b stagedBlob) {
+	cachePath := blobcache.Path(dir, b.task.ObjectOID)
+	s.mu.Lock()
 	if s.stopped {
-		delete(s.active, key)
+		delete(s.active, b.key)
 		s.mu.Unlock()
 		return
 	}
 	if st, statErr := os.Stat(cachePath); statErr == nil {
-		s.rememberVerifiedLocked(key, st)
+		s.rememberVerifiedLocked(b.key, st)
 	}
-	waits := s.wait.take(key)
-	delete(s.active, key)
+	waits := s.wait.take(b.key)
+	delete(s.active, b.key)
 	s.mu.Unlock()
-	notifyWaiters(waits, result{cachePath: cachePath, size: size, err: nil})
-	s.notifyHydrated(task.RepoID, task.ObjectOID, size)
+	notifyWaiters(waits, result{cachePath: cachePath, size: b.size, err: nil})
+	s.notifyHydrated(b.task.RepoID, b.task.ObjectOID, b.size)
 }
 
 // fetchContext bounds a fetch so a stuck one cannot block a worker forever,

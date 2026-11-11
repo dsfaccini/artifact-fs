@@ -22,6 +22,9 @@ import (
 
 const (
 	statsName = "stats"
+	// statsSize is the size of the counters, two little-endian int64 values.
+	// A nonzero byte after them marks counters that an Install has not
+	// written yet.
 	statsSize = 16
 	// installPrefix names a staged blob. Counting and eviction skip it.
 	installPrefix = ".artifact-fs-install-"
@@ -70,38 +73,64 @@ func Stage(dir, oid string) (string, error) {
 	return name, nil
 }
 
-// Install moves the staged blob into oid's cache path and counts it. A blob it
-// replaces leaves the counters.
-func Install(dir, oid, staged string) error {
+// Staged is a blob in the file Stage reserved for it.
+type Staged struct {
+	OID  string
+	Path string
+}
+
+// testHookAfterInstallMove, when set, runs after Install moves each blob.
+var testHookAfterInstallMove func()
+
+// Install moves staged blobs into their cache paths in order and counts them,
+// all under one lock hold. A blob it replaces leaves the counters. It returns
+// how many blobs it moved and the error that stopped the next one. From its
+// first move until it writes the counters, the stats file marks them pending,
+// so after a crash in between the next reader recounts. When it cannot count
+// a moved blob or write the counters, it leaves them to that recount too.
+func Install(dir string, blobs []Staged) (int, error) {
 	lock, err := lockStats(dir)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer lock.Close()
 	st, valid, err := readStats(lock)
+	if err == nil && valid {
+		_, err = lock.WriteAt([]byte{1}, statsSize)
+	}
 	if err != nil {
-		return err
+		return 0, err
 	}
-	path := Path(dir, oid)
-	old, oldErr := os.Lstat(path)
-	if err := os.Rename(staged, path); err != nil {
-		return err
+	n := 0
+	for ; n < len(blobs); n++ {
+		path := Path(dir, blobs[n].OID)
+		old, oldErr := os.Lstat(path)
+		if err = os.Rename(blobs[n].Path, path); err != nil {
+			break
+		}
+		if testHookAfterInstallMove != nil {
+			testHookAfterInstallMove()
+		}
+		cur, curErr := os.Lstat(path)
+		if curErr != nil {
+			valid = false
+		}
+		if !valid {
+			continue
+		}
+		if oldErr == nil && old.Mode().IsRegular() {
+			st.Blobs--
+			st.Bytes -= old.Size()
+		}
+		st.Blobs++
+		st.Bytes += cur.Size()
 	}
-	if !valid {
-		_, _, err := recountLocked(context.Background(), dir, lock)
-		return err
+	if valid {
+		_ = writeStats(lock, st)
+	} else {
+		_, _, _ = recountLocked(context.Background(), dir, lock)
 	}
-	if oldErr == nil && old.Mode().IsRegular() {
-		st.Blobs--
-		st.Bytes -= old.Size()
-	}
-	cur, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	st.Blobs++
-	st.Bytes += cur.Size()
-	return writeStats(lock, st)
+	return n, err
 }
 
 // Recount moves blobs from the flat layout of earlier versions, <dir>/<oid>,
@@ -272,11 +301,12 @@ func lockStats(dir string) (*os.File, error) {
 	return f, nil
 }
 
-// readStats reads the counters. valid is false when the file holds none yet.
+// readStats reads the counters. valid is false when the file holds none yet,
+// or holds counters an Install left pending.
 func readStats(f *os.File) (st Stats, valid bool, err error) {
-	var buf [statsSize]byte
+	var buf [statsSize + 1]byte
 	n, err := f.ReadAt(buf[:], 0)
-	if n < statsSize {
+	if n < statsSize || buf[statsSize] != 0 {
 		if err != nil && !errors.Is(err, io.EOF) {
 			return Stats{}, false, err
 		}
@@ -287,8 +317,9 @@ func readStats(f *os.File) (st Stats, valid bool, err error) {
 	return st, true, nil
 }
 
+// writeStats writes the counters and clears their pending mark.
 func writeStats(f *os.File, st Stats) error {
-	var buf [statsSize]byte
+	var buf [statsSize + 1]byte
 	binary.LittleEndian.PutUint64(buf[:8], uint64(st.Blobs))
 	binary.LittleEndian.PutUint64(buf[8:], uint64(st.Bytes))
 	_, err := f.WriteAt(buf[:], 0)

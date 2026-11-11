@@ -51,7 +51,7 @@ func installBlob(t *testing.T, dir, oid, content string, accessed time.Time) {
 	if err := os.WriteFile(staged, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := blobcache.Install(dir, oid, staged); err != nil {
+	if _, err := blobcache.Install(dir, []blobcache.Staged{{OID: oid, Path: staged}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chtimes(blobcache.Path(dir, oid), accessed, accessed); err != nil {

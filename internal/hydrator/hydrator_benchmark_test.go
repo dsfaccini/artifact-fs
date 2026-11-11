@@ -504,3 +504,42 @@ func runBenchmarkGit(b *testing.B, dir string, args ...string) {
 		b.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 }
+
+// BenchmarkPrefetchSmallBlobs hydrates 5,000 queued small blobs that need no
+// fetch, with one worker and with the daemon's default four, and reports the
+// time per blob. It measures the per-blob cache bookkeeping, the counter
+// update included.
+func BenchmarkPrefetchSmallBlobs(b *testing.B) {
+	const objects = 5000
+	payload := []byte("small blob payload\n")
+	tasks := make([]model.HydrationTask, objects)
+	for i := range tasks {
+		tasks[i] = model.HydrationTask{
+			RepoID:     "repo",
+			Path:       fmt.Sprintf("dir/file-%04d.txt", i),
+			ObjectOID:  fmt.Sprintf("%040x", i+1),
+			SizeState:  "known",
+			SizeBytes:  int64(len(payload)),
+			Priority:   PriorityLikelyText,
+			Reason:     "prefetch",
+			EnqueuedAt: time.Now(),
+		}
+	}
+	for _, workers := range []int{1, 4} {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			for range b.N {
+				b.StopTimer()
+				cfg := model.RepoPaths{ID: "repo", BlobCacheDir: b.TempDir()}
+				h := New(&fakeBlobFetcher{payload: payload})
+				h.EnqueueBatch(tasks)
+				b.StartTimer()
+				h.Start(workers, cfg)
+				waitBenchmarkHydratorIdle(b, h, cfg.ID)
+				b.StopTimer()
+				h.Stop()
+				b.StartTimer()
+			}
+			b.ReportMetric(float64(b.Elapsed().Microseconds())/float64(b.N*objects), "us/blob")
+		})
+	}
+}

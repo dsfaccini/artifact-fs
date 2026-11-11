@@ -4,23 +4,32 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
 
-// install adds a blob of size bytes for oid, last accessed at accessed.
-func install(t *testing.T, dir, oid string, size int, accessed time.Time) string {
+// stage writes a blob of size bytes for oid to a staged file.
+func stage(t *testing.T, dir, oid string, size int) Staged {
 	t.Helper()
-	staged, err := Stage(dir, oid)
+	path, err := Stage(dir, oid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(staged, []byte(strings.Repeat("x", size)), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", size)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := Install(dir, oid, staged); err != nil {
+	return Staged{OID: oid, Path: path}
+}
+
+// install adds a blob of size bytes for oid, last accessed at accessed.
+func install(t *testing.T, dir, oid string, size int, accessed time.Time) string {
+	t.Helper()
+	if _, err := Install(dir, []Staged{stage(t, dir, oid, size)}); err != nil {
 		t.Fatal(err)
 	}
 	path := Path(dir, oid)
@@ -204,4 +213,83 @@ func TestInstallOverACachedBlobCountsItOnce(t *testing.T) {
 
 	install(t, dir, oid, 4, now)
 	requireStats(t, dir, Stats{Blobs: 1, Bytes: 4})
+}
+
+// statsLocked reports whether an open file holds dir's stats lock.
+func statsLocked(t *testing.T, dir string) bool {
+	t.Helper()
+	f, err := os.Open(filepath.Join(dir, statsName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if errors.Is(err, syscall.EWOULDBLOCK) {
+		return true
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return false
+}
+
+// A second installer that installs while a first is between its moves waits
+// for the first, so neither loses the other's blobs from the counters. Each
+// Install opens the stats file itself, so their locks exclude each other as
+// two processes' locks do.
+func TestConcurrentInstallersKeepCountersExact(t *testing.T) {
+	dir := t.TempDir()
+	a := strings.Repeat("a", 40)
+	install(t, dir, a, 10, time.Now())
+	first := []Staged{stage(t, dir, strings.Repeat("b", 40), 10), stage(t, dir, strings.Repeat("c", 40), 10)}
+	second := []Staged{stage(t, dir, strings.Repeat("d", 40), 10), stage(t, dir, a, 4)}
+	secondDone := make(chan error, 1)
+	var fired atomic.Bool
+	testHookAfterInstallMove = func() {
+		if !fired.CompareAndSwap(false, true) {
+			return
+		}
+		// While the first holds the lock, the second waits for it beside the
+		// first. Otherwise the second installs here, between the first's
+		// moves.
+		if statsLocked(t, dir) {
+			go func() {
+				_, err := Install(dir, second)
+				secondDone <- err
+			}()
+			return
+		}
+		_, err := Install(dir, second)
+		secondDone <- err
+	}
+	defer func() { testHookAfterInstallMove = nil }()
+
+	if n, err := Install(dir, first); n != 2 || err != nil {
+		t.Fatalf("first Install = %d, %v; want 2 blobs moved", n, err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second Install: %v", err)
+	}
+	requireStats(t, dir, Stats{Blobs: 4, Bytes: 34})
+}
+
+// A crash after Install moved a blob and before it wrote the counters leaves
+// them pending, so the next reader recounts them.
+func TestCrashDuringInstallLeavesCountersToARecount(t *testing.T) {
+	if dir := os.Getenv("BLOBCACHE_TEST_CRASH_DIR"); dir != "" {
+		blobs := []Staged{stage(t, dir, strings.Repeat("b", 40), 10), stage(t, dir, strings.Repeat("c", 40), 10)}
+		testHookAfterInstallMove = func() { os.Exit(3) }
+		n, err := Install(dir, blobs)
+		t.Fatalf("Install = %d, %v; want the process to exit after the first move", n, err)
+	}
+	dir := t.TempDir()
+	install(t, dir, strings.Repeat("a", 40), 10, time.Now())
+	cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$")
+	cmd.Env = append(os.Environ(), "BLOBCACHE_TEST_CRASH_DIR="+dir)
+	out, err := cmd.CombinedOutput()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 3 {
+		t.Fatalf("crashing installer = %v, output:\n%s\nwant exit status 3", err, out)
+	}
+	requireStats(t, dir, Stats{Blobs: 2, Bytes: 20})
 }
