@@ -595,7 +595,7 @@ func untrackedBranchWarnings(t *testing.T, logs *lockedBuffer) []map[string]any 
 // feature, carries Git's refusal gitErr, and gives the fix for gitDir.
 func requireUntrackedBranchWarning(t *testing.T, warning map[string]any, gitDir, gitErr string) {
 	t.Helper()
-	fix := "make origin's fetch refspec, and no other remote's, map refs/heads/feature to refs/remotes/origin/feature, for example by removing a negative refspec that excludes the branch, then run: git --git-dir '" + gitDir + "' branch --set-upstream-to 'refs/remotes/origin/feature' -- 'feature'"
+	fix := "make origin's fetch refspec, and no other remote's, map refs/heads/feature to refs/remotes/origin/feature, for example by removing a negative refspec that excludes the branch, then run: git --git-dir " + gitDir + " branch --set-upstream-to refs/remotes/origin/feature -- feature"
 	if warning["level"] != "WARN" || warning["repo"] != "repo" || warning["branch"] != "feature" || warning["fix"] != fix {
 		t.Errorf("warning = %v, want level WARN, repo repo, branch feature and fix %q", warning, fix)
 	}
@@ -701,7 +701,7 @@ func TestPreparationDoesNotTrackAnotherRemote(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
 	remote := filepath.Join(tmp, "remote")
-	newBranchedRemote(t, remote)
+	feature := newBranchedRemote(t, remote)
 	logs := &lockedBuffer{}
 	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewJSONHandler(logs, nil)))
 	if err != nil {
@@ -715,6 +715,9 @@ func TestPreparationDoesNotTrackAnotherRemote(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add-repo: %v", err)
 	}
+	if oid, ref := publishedHead(t, got); oid != feature || ref != "feature" || got.PrepareError != "" {
+		t.Fatalf("published %s at %q with prepare_error %q, want feature %s and no error", oid, ref, got.PrepareError, feature)
+	}
 	if out, _ := exec.Command("git", "--git-dir", got.GitDir, "config", "--get-regexp", `^branch\.feature\.`).CombinedOutput(); len(out) != 0 {
 		t.Errorf("branch feature's config:\n%s\nwant none", out)
 	}
@@ -723,6 +726,78 @@ func TestPreparationDoesNotTrackAnotherRemote(t *testing.T) {
 		t.Fatalf("add-repo logged %d untracked-branch warnings, want 1: %s", len(warnings), logs.String())
 	}
 	requireUntrackedBranchWarning(t, warnings[0], got.GitDir, "ambiguous information for ref")
+}
+
+// A config write that fails, as while another git holds the config lock,
+// fails the preparation: the warning covers only Git's refusal to track the
+// branch. The refspec line is what keeps a plain git pull from merging the
+// cloned branch, so a failure to add it fails too.
+func TestPreparationFailsWhenAConfigWriteFails(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// step is the git command during which the config is locked, from its
+		// run number at onward.
+		step     string
+		at       int
+		refspecs string
+	}{
+		{"refspec line", "config --add remote.origin.fetch", 1, "+refs/heads/main:refs/remotes/origin/main"},
+		{"retry", "branch --set-upstream-to", 2, "+refs/heads/main:refs/remotes/origin/main\n+refs/heads/feature:refs/remotes/origin/feature"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			tmp := t.TempDir()
+			remote := filepath.Join(tmp, "remote")
+			newBranchedRemote(t, remote)
+			logs := &lockedBuffer{}
+			svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewJSONHandler(logs, nil)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer svc.Close()
+			got, err := switchCloneToFeature(t, svc, remote, "main", func(string) {
+				// The fake holds the config lock while the step's real git runs,
+				// then releases it, as another git would.
+				script := "#!/bin/sh\n" +
+					"case \"$*\" in \"$AFS_LOCKED_STEP \"*)\n" +
+					"  echo >> \"$AFS_STEP_RUNS\"\n" +
+					"  if [ $(($(wc -l < \"$AFS_STEP_RUNS\"))) -ge \"$AFS_LOCKED_FROM\" ]; then\n" +
+					"    : > \"$GIT_DIR/config.lock\"; \"$AFS_REAL_GIT\" \"$@\"; status=$?; rm -f \"$GIT_DIR/config.lock\"; exit $status\n" +
+					"  fi;;\n" +
+					"esac\n" +
+					"exec \"$AFS_REAL_GIT\" \"$@\"\n"
+				bin := filepath.Join(tmp, "bin")
+				if err := os.Mkdir(bin, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				realGit, err := exec.LookPath("git")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("AFS_REAL_GIT", realGit)
+				t.Setenv("AFS_LOCKED_STEP", tc.step)
+				t.Setenv("AFS_LOCKED_FROM", fmt.Sprint(tc.at))
+				t.Setenv("AFS_STEP_RUNS", filepath.Join(tmp, "step-runs"))
+				t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			})
+			const lockErr = "could not lock config file"
+			if err == nil || !strings.Contains(err.Error(), lockErr) {
+				t.Fatalf("add-repo error = %v, want Git's %q", err, lockErr)
+			}
+			if !strings.Contains(got.PrepareError, lockErr) {
+				t.Fatalf("prepare_error = %q, want Git's %q", got.PrepareError, lockErr)
+			}
+			if refspecs := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", got.GitDir, "config", "--get-all", "remote.origin.fetch")); refspecs != tc.refspecs {
+				t.Fatalf("origin's refspecs:\n%s\nwant:\n%s", refspecs, tc.refspecs)
+			}
+			if warnings := untrackedBranchWarnings(t, logs); len(warnings) != 0 {
+				t.Fatalf("logged %d untracked-branch warnings, want none: %s", len(warnings), logs.String())
+			}
+		})
+	}
 }
 
 // --depth bounds the history every preparation transfers, also when it

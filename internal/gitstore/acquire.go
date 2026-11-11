@@ -629,7 +629,7 @@ func (s *Store) trackRemoteBranch(ctx context.Context, repo model.RepoConfig, br
 		"branch", branch,
 		"error", auth.RedactLogString(refusal.Error()),
 		"fix", fmt.Sprintf("make origin's fetch refspec, and no other remote's, map refs/heads/%s to %s, for example by removing a negative refspec that excludes the branch, then run: git --git-dir %s branch --set-upstream-to %s -- %s",
-			branch, tracking, shellQuote(repo.GitDir), shellQuote(tracking), shellQuote(branch)))
+			branch, tracking, shellScriptQuote(repo.GitDir), shellScriptQuote(tracking), shellScriptQuote(branch)))
 	return nil
 }
 
@@ -638,13 +638,14 @@ func (s *Store) trackRemoteBranch(ctx context.Context, repo model.RepoConfig, br
 // name ambiguous. Git tracks the branch on whichever remote's refspec maps
 // that ref, so setOriginUpstream removes an upstream on another remote. It
 // returns Git's refusal, or the upstream it removed, as refusal, and every
-// other failure as err.
+// other failure as err. Only exit code 128 under a live context is a refusal:
+// a failed config write exits 1, and a canceled command can exit with any code.
 func setOriginUpstream(ctx context.Context, gitDir, branch string) (refusal, err error) {
 	if _, err := runGit(ctx, gitDir, "branch", "--set-upstream-to", "refs/remotes/origin/"+branch, "--", branch); err != nil {
-		if ctx.Err() != nil {
-			return nil, err
+		if exitErr, ok := errors.AsType[*gitCommandError](err); ok && exitErr.exitCode == 128 && ctx.Err() == nil {
+			return err, nil
 		}
-		return err, nil
+		return nil, err
 	}
 	remote, err := runGit(ctx, gitDir, "config", "--get", "branch."+branch+".remote")
 	if err != nil {
@@ -657,11 +658,6 @@ func setOriginUpstream(ctx context.Context, gitDir, branch string) (refusal, err
 		return nil, err
 	}
 	return fmt.Errorf("git tracks branch %s on remote %s, not origin", branch, remote), nil
-}
-
-// shellQuote quotes s as one POSIX shell word.
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func refOIDOrZero(ctx context.Context, gitDir string, refName string) (string, error) {
