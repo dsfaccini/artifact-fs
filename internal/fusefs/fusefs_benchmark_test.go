@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -445,4 +446,186 @@ func BenchmarkMissingPathsOnePath(b *testing.B) {
 			}
 		})
 	}
+}
+
+// switchPassTree returns a generation of 6,300 entries shaped like a source
+// repository, as two variants: base, and next, which gives changed of base's
+// files, spread over the tree, new blobs. Its 525 directories of about 11
+// files lie in 5 top-level directories of 15 packages each. A directory's
+// object ID derives from its entries, as a Git tree ID does, so a changed
+// file changes the ID of every directory above it. It also returns base's
+// leaf directories and files, each sorted.
+func switchPassTree(changed int) (base, next []model.BaseNode, leaves, files []string) {
+	const entries = 6_300
+	dirs := []string{"src"}
+	for t := range 5 {
+		area := fmt.Sprintf("src/area-%d", t)
+		dirs = append(dirs, area)
+		for p := range 15 {
+			pkg := fmt.Sprintf("%s/package-%02d", area, p)
+			dirs = append(dirs, pkg)
+			for m := range 7 {
+				leaf := fmt.Sprintf("%s/module-%d", pkg, m)
+				dirs, leaves = append(dirs, leaf), append(leaves, leaf)
+			}
+		}
+	}
+	for i := range entries - 1 - len(dirs) {
+		files = append(files, fmt.Sprintf("%s/component-%04d.go", leaves[i%len(leaves)], i))
+	}
+	slices.Sort(files)
+	build := func(changes int) []model.BaseNode {
+		stride := len(files) / max(changes, 1)
+		kids := map[string][]model.BaseNode{}
+		for i, f := range files {
+			oid := fmt.Sprintf("%040x", i)
+			if i%stride == 0 && i/stride < changes {
+				oid = fmt.Sprintf("%040x", len(files)+i)
+			}
+			kids[filepath.Dir(f)] = append(kids[filepath.Dir(f)], model.BaseNode{Path: f, Type: "file", Mode: 0o100644, ObjectOID: oid, SizeState: "known", SizeBytes: 10})
+		}
+		// dirs lists each directory before those below it.
+		for _, d := range slices.Backward(dirs) {
+			var listing strings.Builder
+			for _, k := range kids[d] {
+				fmt.Fprintf(&listing, "%s %s\n", k.Path, k.ObjectOID)
+			}
+			kids[filepath.Dir(d)] = append(kids[filepath.Dir(d)], model.BaseNode{Path: d, Type: "dir", Mode: 0o40000, ObjectOID: blobOID(listing.String()), SizeState: "known"})
+		}
+		nodes := []model.BaseNode{{Path: ".", Type: "dir", Mode: 0o755, SizeState: "known"}}
+		for _, k := range kids {
+			nodes = append(nodes, k...)
+		}
+		return nodes
+	}
+	return build(0), build(changed), leaves, files
+}
+
+// countingNotifier counts the invalidations a pass sends.
+type countingNotifier struct{ inodes, entries int }
+
+func (n *countingNotifier) InvalidateInode(fuseops.InodeID, int64, int64) error {
+	n.inodes++
+	return nil
+}
+
+func (n *countingNotifier) InvalidateEntry(fuseops.InodeID, string) error {
+	n.entries++
+	return nil
+}
+
+// BenchmarkSwitchPass times the pass after a generation switch that tells
+// the kernel what changed, over the 6,300-entry tree of switchPassTree. Each
+// iteration switches between its two generations, which differ in changed
+// files. The kernel holds held inodes: files spread over the tree with the
+// directories above them, or past the 6,300 base entries, every base entry
+// and untracked node_modules files and directories in the overlay. With one
+// change, the changed file is held. It reports the invalidations each pass
+// sends.
+func BenchmarkSwitchPass(b *testing.B) {
+	for _, held := range []int{100, 2_000, 20_000} {
+		for _, changed := range []int{1, 500} {
+			b.Run(fmt.Sprintf("held=%d/changed=%d", held, changed), func(b *testing.B) {
+				benchSwitchPassHeld(b, held, changed)
+			})
+		}
+	}
+}
+
+func benchSwitchPassHeld(b *testing.B, held, changed int) {
+	ctx := context.Background()
+	base, next, _, files := switchPassTree(changed)
+	snap, err := snapshot.New(ctx, filepath.Join(b.TempDir(), "snapshot.sqlite"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = snap.Close() })
+	first, err := snap.PublishGeneration(ctx, "first", "main", base)
+	if err != nil {
+		b.Fatal(err)
+	}
+	second, err := snap.PublishGeneration(ctx, "second", "main", next)
+	if err != nil {
+		b.Fatal(err)
+	}
+	dir := b.TempDir()
+	ov, err := overlaystore.New(ctx, model.RepoPaths{ID: "bench", OverlayDir: dir, OverlayDBPath: filepath.Join(dir, "overlay.sqlite")})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = ov.Close() })
+	var paths []string
+	seen := map[string]bool{".": true}
+	// hold adds p and each directory above it the kernel does not yet hold,
+	// the directories first.
+	hold := func(p string) {
+		var chain []string
+		for q := p; !seen[q]; q = filepath.Dir(q) {
+			seen[q] = true
+			chain = append(chain, q)
+		}
+		slices.Reverse(chain)
+		paths = append(paths, chain...)
+	}
+	if held < len(base) {
+		stride := len(files) / held
+		for i := 0; len(paths) < held; i += stride {
+			hold(files[i])
+		}
+		// The last file held may bring directories past held; the
+		// deepest go first, and no held path lies below them.
+		paths = paths[:held]
+	} else {
+		for _, n := range base {
+			hold(n.Path)
+		}
+		if err := ov.Mkdir(ctx, "node_modules", 0o755); err != nil {
+			b.Fatal(err)
+		}
+		hold("node_modules")
+		for i := 0; len(paths) < held; i++ {
+			pkg := fmt.Sprintf("node_modules/pkg-%03d", i%500)
+			if !seen[pkg] {
+				for _, d := range []string{pkg, pkg + "/lib"} {
+					if err := ov.Mkdir(ctx, d, 0o755); err != nil {
+						b.Fatal(err)
+					}
+					hold(d)
+				}
+			}
+			f := fmt.Sprintf("%s/lib/file-%05d.js", pkg, i)
+			if _, err := ov.CreateFile(ctx, f, 0o644); err != nil {
+				b.Fatal(err)
+			}
+			hold(f)
+		}
+	}
+	r := &Resolver{Snapshot: snap, Overlay: ov}
+	r.SetGeneration(first)
+	fs := NewArtifactFuse(model.RepoPaths{}, &Engine{Resolver: r, Overlay: ov})
+	notifier := &countingNotifier{}
+	fs.setNotifier(notifier)
+	fs.mu.Lock()
+	for _, p := range paths {
+		attrs, err := fs.engine.Attrs(nil, p)
+		if err != nil {
+			b.Fatal(err)
+		}
+		fs.allocInode(p, attrs)
+	}
+	fs.mu.Unlock()
+	gens := [2]int64{second, first}
+	b.ResetTimer()
+	for i := range b.N {
+		// The overlay holds only entries neither generation has, so a
+		// reconcile would change nothing.
+		r.SetGeneration(gens[i%2])
+		if err := fs.invalidateChanged(true); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(len(paths)), "held")
+	b.ReportMetric(float64(notifier.inodes)/float64(b.N), "inode-invals/op")
+	b.ReportMetric(float64(notifier.entries)/float64(b.N), "entry-invals/op")
 }
