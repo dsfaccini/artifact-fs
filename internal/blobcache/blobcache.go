@@ -22,6 +22,9 @@ import (
 
 const (
 	statsName = "stats"
+	// statsSize is the size of the counters, two little-endian int64 values.
+	// A nonzero byte after them marks counters that an Install has not
+	// written yet.
 	statsSize = 16
 	// installPrefix names a staged blob. Counting and eviction skip it.
 	installPrefix = ".artifact-fs-install-"
@@ -70,8 +73,16 @@ func Stage(dir, oid string) (string, error) {
 	return name, nil
 }
 
+// testHookAfterInstallMove, when set, runs after Install moves a blob into
+// place, with the stats file Install holds locked.
+var testHookAfterInstallMove func(stats *os.File)
+
 // Install moves the staged blob into oid's cache path and counts it. A blob it
-// replaces leaves the counters.
+// replaces leaves the counters. Before the move it marks the counters pending
+// in the stats file, and it clears the mark when it writes them, so after a
+// process crash in between the next reader recounts. When it cannot count the moved blob or write the
+// counters, it leaves them to that recount too, because the blob is already
+// in place.
 func Install(dir, oid, staged string) error {
 	lock, err := lockStats(dir)
 	if err != nil {
@@ -79,36 +90,47 @@ func Install(dir, oid, staged string) error {
 	}
 	defer lock.Close()
 	st, valid, err := readStats(lock)
+	if err == nil && valid {
+		// Write the mark before the rename. A crash between a rename and a
+		// later mark would leave counters that miss the blob, with no mark
+		// to make the next reader recount.
+		_, err = lock.WriteAt([]byte{1}, statsSize)
+	}
 	if err != nil {
 		return err
 	}
 	path := Path(dir, oid)
 	old, oldErr := os.Lstat(path)
 	if err := os.Rename(staged, path); err != nil {
+		if valid {
+			_ = writeStats(lock, st)
+		}
 		return err
+	}
+	if testHookAfterInstallMove != nil {
+		testHookAfterInstallMove(lock)
 	}
 	if !valid {
-		_, _, err := recountLocked(context.Background(), dir, lock)
-		return err
+		_, _, _ = recountLocked(context.Background(), dir, lock)
+		return nil
 	}
-	if oldErr == nil && old.Mode().IsRegular() {
-		st.Blobs--
-		st.Bytes -= old.Size()
+	if cur, err := os.Lstat(path); err == nil {
+		if oldErr == nil && old.Mode().IsRegular() {
+			st.Blobs--
+			st.Bytes -= old.Size()
+		}
+		st.Blobs++
+		st.Bytes += cur.Size()
+		_ = writeStats(lock, st)
 	}
-	cur, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	st.Blobs++
-	st.Bytes += cur.Size()
-	return writeStats(lock, st)
+	return nil
 }
 
 // Recount moves blobs from the flat layout of earlier versions, <dir>/<oid>,
 // into their shards, and recounts the counters from the blobs on disk. The
-// hydrator runs it when it starts, which corrects counters that a crash
-// between a blob change and its counter update, or a change made outside
-// this package, left wrong.
+// hydrator runs it when it starts, which corrects counters that an OS crash,
+// a crash during an eviction, or a change made outside this package left
+// wrong.
 func Recount(dir string) (Stats, error) {
 	if strings.TrimSpace(dir) == "" {
 		return Stats{}, nil
@@ -122,8 +144,8 @@ func Recount(dir string) (Stats, error) {
 	return st, err
 }
 
-// ReadStats returns dir's counters. A directory that has no counters yet is
-// recounted once.
+// ReadStats returns dir's counters. It recounts a directory whose counters are
+// missing or pending.
 func ReadStats(dir string) (Stats, error) {
 	if strings.TrimSpace(dir) == "" {
 		return Stats{}, nil
@@ -272,11 +294,12 @@ func lockStats(dir string) (*os.File, error) {
 	return f, nil
 }
 
-// readStats reads the counters. valid is false when the file holds none yet.
+// readStats reads the counters. valid is false when the file holds none yet,
+// or holds counters an Install left pending.
 func readStats(f *os.File) (st Stats, valid bool, err error) {
-	var buf [statsSize]byte
+	var buf [statsSize + 1]byte
 	n, err := f.ReadAt(buf[:], 0)
-	if n < statsSize {
+	if n < statsSize || buf[statsSize] != 0 {
 		if err != nil && !errors.Is(err, io.EOF) {
 			return Stats{}, false, err
 		}
@@ -287,8 +310,9 @@ func readStats(f *os.File) (st Stats, valid bool, err error) {
 	return st, true, nil
 }
 
+// writeStats writes the counters and clears their pending mark.
 func writeStats(f *os.File, st Stats) error {
-	var buf [statsSize]byte
+	var buf [statsSize + 1]byte
 	binary.LittleEndian.PutUint64(buf[:8], uint64(st.Blobs))
 	binary.LittleEndian.PutUint64(buf[8:], uint64(st.Bytes))
 	_, err := f.WriteAt(buf[:], 0)

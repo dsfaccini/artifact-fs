@@ -92,6 +92,13 @@ func newCacheFixture(t *testing.T, nodes ...model.BaseNode) *cacheFixture {
 // newCacheFixtureOn mounts through backend, which only darwin acts on.
 func newCacheFixtureOn(t *testing.T, backend string, nodes ...model.BaseNode) *cacheFixture {
 	t.Helper()
+	return newLoggedCacheFixture(t, backend, slog.New(slog.DiscardHandler), unredacted, nodes...)
+}
+
+// newLoggedCacheFixture mounts through backend with logger and redact, as the
+// daemon passes them to MountRepoWithGate.
+func newLoggedCacheFixture(t *testing.T, backend string, logger *slog.Logger, redact func(string) string, nodes ...model.BaseNode) *cacheFixture {
+	t.Helper()
 	ctx := context.Background()
 	tmp := t.TempDir()
 	repo := model.RepoPaths{ID: "repo", Name: "repo", MountPath: t.TempDir(), OverlayDir: filepath.Join(tmp, "overlay"), OverlayDBPath: filepath.Join(tmp, "overlay.db")}
@@ -115,7 +122,7 @@ func newCacheFixtureOn(t *testing.T, backend string, nodes ...model.BaseNode) *c
 		return &fuse.MountedFileSystem{}, nil
 	}
 	t.Cleanup(func() { fuseMount = saved })
-	f.mount, err = MountRepoWithGate(context.Background(), context.Background(), repo, engine, nil, slog.New(slog.DiscardHandler), unredacted)
+	f.mount, err = MountRepoWithGate(context.Background(), context.Background(), repo, engine, nil, logger, redact)
 	if err != nil {
 		t.Fatal(err)
 	}

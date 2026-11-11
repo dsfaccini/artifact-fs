@@ -456,7 +456,7 @@ func withUnknownSize(n model.BaseNode) model.BaseNode {
 // faultyOverlay fails the overlay calls whose error is set.
 type faultyOverlay struct {
 	model.OverlayStore
-	createErr, removeErr, truncateErr, writeErr, mkdirErr, copyErr error
+	createErr, removeErr, truncateErr, writeErr, mkdirErr, flushErr, copyErr error
 }
 
 func (o *faultyOverlay) EnsureCopyOnWriteFrom(ctx context.Context, repo model.RepoPaths, path string, base model.BaseNode, src *os.File) (model.OverlayEntry, error) {
@@ -499,6 +499,13 @@ func (o *faultyOverlay) Mkdir(ctx context.Context, path string, mode uint32) err
 		return o.mkdirErr
 	}
 	return o.OverlayStore.Mkdir(ctx, path, mode)
+}
+
+func (o *faultyOverlay) FlushFile(ctx context.Context, path string) error {
+	if o.flushErr != nil {
+		return o.flushErr
+	}
+	return o.OverlayStore.FlushFile(ctx, path)
 }
 
 func TestOpErrorsReachKernelAsTheirErrno(t *testing.T) {

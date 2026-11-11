@@ -9,11 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
+	"github.com/cloudflare/artifact-fs/internal/logging"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
@@ -161,6 +164,179 @@ func TestMountRepoWithoutRedactRedactsDetectedRemotes(t *testing.T) {
 		if strings.Contains(rec.Error, "git.example.com") || !strings.Contains(rec.Error, "REDACTED_REMOTE") {
 			t.Fatalf("log error %q does not redact the remote", rec.Error)
 		}
+	}
+}
+
+// The fuse library replies EIO to an op error that carries no errno and logs
+// only the error's text. So the error names the op's inode and its path, and
+// for an op on a name, the parent's inode and the child's path.
+func TestOpErrorWithoutErrnoNamesItsInodeAndPath(t *testing.T) {
+	unsized := model.BaseNode{Path: "dir/unsized.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob-unsized", SizeState: "unknown"}
+	f := newCacheFixture(t, baseDir("dir", "tree"), unsized, baseFile("dir/sized.txt", "blob-sized", 0o100644))
+	dir := f.lookup(fuseops.RootInodeID, "dir")
+	sized := f.lookup(dir, "sized.txt")
+	f.blobs.errorsByOID = map[string]error{
+		"blob-unsized": errors.New("fetch blob-unsized failed"),
+		"blob-sized":   errors.New("fetch blob-sized failed"),
+	}
+	create := &fuseops.CreateFileOp{Parent: dir, Name: "new.txt", Mode: 0o644}
+	if err := f.fs.CreateFile(f.ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	// A release flushes what its handle wrote. It names no inode, so its
+	// error names the handle's.
+	f.fs.engine.Overlay = &faultyOverlay{OverlayStore: f.fs.engine.Overlay, flushErr: errors.New("flush dir/new.txt failed")}
+	for _, c := range []struct {
+		op   string
+		err  error
+		want string
+	}{
+		{"lookup", f.fs.LookUpInode(f.ctx, &fuseops.LookUpInodeOp{Parent: dir, Name: "unsized.txt"}), fmt.Sprintf("parent inode %d, path dir/unsized.txt: fetch blob-unsized failed", dir)},
+		{"open", f.fs.OpenFile(f.ctx, &fuseops.OpenFileOp{Inode: sized}), fmt.Sprintf("inode %d, path dir/sized.txt: fetch blob-sized failed", sized)},
+		{"release", f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}), fmt.Sprintf("inode %d, path dir/new.txt: flush dir/new.txt failed", create.Entry.Child)},
+	} {
+		if errno := kernelErrno(c.err); errno != syscall.EIO || c.err.Error() != c.want {
+			t.Errorf("%s = %v (errno %v), want %q (EIO)", c.op, c.err, errno, c.want)
+		}
+	}
+}
+
+// An op error that carries an errno reaches the kernel with it, as toErrno
+// returns it.
+func TestOpErrorWithErrnoKeepsIt(t *testing.T) {
+	f := newCacheFixture(t, baseDir("dir", "tree"))
+	for _, c := range []struct {
+		op    string
+		err   error
+		errno syscall.Errno
+		want  string
+	}{
+		{"mkdir of an existing name", f.fs.MkDir(f.ctx, &fuseops.MkDirOp{Parent: fuseops.RootInodeID, Name: "dir", Mode: 0o755}), syscall.EEXIST, "file exists: file already exists"},
+		{"rmdir of .git", f.fs.RmDir(f.ctx, &fuseops.RmDirOp{Parent: fuseops.RootInodeID, Name: ".git"}), syscall.EPERM, "operation not permitted"},
+	} {
+		if errno := kernelErrno(c.err); errno != c.errno || c.err.Error() != c.want {
+			t.Errorf("%s = %v (errno %v), want %q (%v)", c.op, c.err, errno, c.want, c.errno)
+		}
+	}
+}
+
+// replyRecord is a record logReply writes.
+type replyRecord struct {
+	Level, Msg, Repo, Op string
+	Inode                uint64
+	Type                 string
+	Generation           int64
+	Path                 string
+}
+
+// replyOps runs one op of each kind that replies with an entry or with
+// attributes, on a fixture that serves secret/file.txt. It returns the
+// records the ops should log at Debug, with each path through redactSecret.
+func replyOps(t *testing.T, f *cacheFixture) []replyRecord {
+	t.Helper()
+	gen := f.resolver.Generation()
+	// Before a repo's first snapshot the merged view holds no root, so the
+	// root's attributes are synthesized.
+	f.resolver.SetGeneration(0)
+	f.getattr(fuseops.RootInodeID)
+	f.resolver.SetGeneration(gen)
+	f.getattr(fuseops.RootInodeID)
+	git := f.lookup(fuseops.RootInodeID, ".git")
+	f.getattr(git)
+	dir := f.lookup(fuseops.RootInodeID, "secret")
+	f.getattr(dir)
+	if _, ok := readDirPlus(t, f.fs, dir)["file.txt"]; !ok {
+		t.Fatal("ReadDirPlus listed no file.txt")
+	}
+	// A path keeps its inode number, so the lookup names the inode the
+	// listing replied with.
+	file := f.lookup(dir, "file.txt")
+	mkdir := &fuseops.MkDirOp{Parent: dir, Name: "new", Mode: 0o755}
+	if err := f.fs.MkDir(f.ctx, mkdir); err != nil {
+		t.Fatal(err)
+	}
+	create := &fuseops.CreateFileOp{Parent: dir, Name: "created.txt", Mode: 0o644}
+	if err := f.fs.CreateFile(f.ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = f.fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: create.Handle})
+	})
+	symlink := &fuseops.CreateSymlinkOp{Parent: dir, Name: "link", Target: "file.txt"}
+	if err := f.fs.CreateSymlink(f.ctx, symlink); err != nil {
+		t.Fatal(err)
+	}
+	mode := os.FileMode(0o600)
+	if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Mode: &mode}); err != nil {
+		t.Fatal(err)
+	}
+	// An unlink retires the inode and pins its open handle to its own copy,
+	// so a getattr answers from heldAttrs, and a setattr changes the copy.
+	if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: dir, Name: "created.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	f.getattr(create.Entry.Child)
+	pinnedMode := os.FileMode(0o640)
+	if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: create.Entry.Child, Mode: &pinnedMode}); err != nil {
+		t.Fatal(err)
+	}
+	record := func(msg, op string, inode fuseops.InodeID, typ string, gen int64, path string) replyRecord {
+		return replyRecord{Level: "DEBUG", Msg: msg, Repo: "repo", Op: op, Inode: uint64(inode), Type: typ, Generation: gen, Path: path}
+	}
+	return []replyRecord{
+		record("fuse attr reply", "GetInodeAttributes", fuseops.RootInodeID, "dir", 0, "."),
+		record("fuse attr reply", "GetInodeAttributes", fuseops.RootInodeID, "dir", gen, "."),
+		record("fuse entry reply", "LookUpInode", git, "file", gen, ".git"),
+		record("fuse attr reply", "GetInodeAttributes", git, "file", gen, ".git"),
+		record("fuse entry reply", "LookUpInode", dir, "dir", gen, "REDACTED"),
+		record("fuse attr reply", "GetInodeAttributes", dir, "dir", gen, "REDACTED"),
+		record("fuse entry reply", "ReadDirPlus", file, "file", gen, "REDACTED/file.txt"),
+		record("fuse entry reply", "LookUpInode", file, "file", gen, "REDACTED/file.txt"),
+		record("fuse entry reply", "MkDir", mkdir.Entry.Child, "dir", 0, "REDACTED/new"),
+		record("fuse entry reply", "CreateFile", create.Entry.Child, "file", 0, "REDACTED/created.txt"),
+		record("fuse entry reply", "CreateSymlink", symlink.Entry.Child, "symlink", 0, "REDACTED/link"),
+		record("fuse attr reply", "SetInodeAttributes", create.Entry.Child, "file", 0, "REDACTED/created.txt"),
+		record("fuse attr reply", "GetInodeAttributes", create.Entry.Child, "file", 0, "REDACTED/created.txt"),
+		record("fuse attr reply", "SetInodeAttributes", create.Entry.Child, "file", 0, "REDACTED/created.txt"),
+	}
+}
+
+// redactSecret is a mount's redact that hides the word secret.
+func redactSecret(line string) string { return strings.ReplaceAll(line, "secret", "REDACTED") }
+
+// At Debug, each entry and attribute reply logs its op, the inode, its type,
+// the generation of its attributes, and its path, redacted as the fuse
+// library's lines are.
+func TestMountLogsEachReplyAtDebug(t *testing.T) {
+	var buf bytes.Buffer
+	f := newLoggedCacheFixture(t, BackendKernel, logging.NewJSONLogger(&buf, slog.LevelDebug), redactSecret, baseDir("secret", "tree"), baseFile("secret/file.txt", "blob-file", 0o100644))
+	want := replyOps(t, f)
+	var got []replyRecord
+	for line := range strings.SplitSeq(strings.TrimSpace(buf.String()), "\n") {
+		var rec replyRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line %q is not a JSON record: %v", line, err)
+		}
+		got = append(got, rec)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("reply records:\n%+v\nwant:\n%+v", got, want)
+	}
+}
+
+// Below Debug, a reply logs nothing and never reaches the mount's redact, so
+// a lookup or a getattr pays only the level check.
+func TestMountLogsNoReplyBelowDebug(t *testing.T) {
+	var buf bytes.Buffer
+	redacted := 0
+	redact := func(line string) string {
+		redacted++
+		return redactSecret(line)
+	}
+	f := newLoggedCacheFixture(t, BackendKernel, logging.NewJSONLogger(&buf, slog.LevelInfo), redact, baseDir("secret", "tree"), baseFile("secret/file.txt", "blob-file", 0o100644))
+	replyOps(t, f)
+	if buf.Len() != 0 || redacted != 0 {
+		t.Fatalf("at Info, replies logged %q and redacted %d strings, want nothing", buf.String(), redacted)
 	}
 }
 

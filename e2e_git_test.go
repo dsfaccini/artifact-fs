@@ -59,8 +59,8 @@ func (b *synchronizedBuffer) Reset() {
 
 // newE2ELogger returns the logger of an e2e daemon. It writes warnings and
 // errors to stderr, and every record from Debug up to logs. The fuse library
-// logs the error behind an op's EIO at Debug, and logFuseErrors prints it when
-// a test fails.
+// logs the error behind an op's EIO at Debug, and the mount logs each entry
+// and attribute reply there. logFuseRecords prints both when a test fails.
 func newE2ELogger(logs *synchronizedBuffer) *slog.Logger {
 	return slog.New(slog.NewMultiHandler(
 		logging.NewJSONLogger(os.Stderr, slog.LevelWarn).Handler(),
@@ -68,26 +68,27 @@ func newE2ELogger(logs *synchronizedBuffer) *slog.Logger {
 	))
 }
 
-// newTestE2ELogger returns a newE2ELogger whose fuse error lines t prints if it fails.
+// newTestE2ELogger returns a newE2ELogger whose fuse records t prints if it fails.
 func newTestE2ELogger(t *testing.T) *slog.Logger {
 	t.Helper()
 	logs := &synchronizedBuffer{}
 	t.Cleanup(func() {
 		if t.Failed() {
-			logFuseErrors(t, logs)
+			logFuseRecords(t, logs)
 		}
 	})
 	return newE2ELogger(logs)
 }
 
-// logFuseErrors logs each fuse error line of the daemon in logs.
-func logFuseErrors(t *testing.T, logs *synchronizedBuffer) {
+// logFuseRecords logs each fuse error, entry reply and attribute reply line of
+// the daemon in logs, in the order the daemon wrote them.
+func logFuseRecords(t *testing.T, logs *synchronizedBuffer) {
 	t.Helper()
 	if logs == nil {
 		return
 	}
 	for line := range strings.SplitSeq(logs.String(), "\n") {
-		if strings.Contains(line, `"msg":"fuse error"`) {
+		if strings.Contains(line, `"msg":"fuse error"`) || strings.Contains(line, `"msg":"fuse entry reply"`) || strings.Contains(line, `"msg":"fuse attr reply"`) {
 			t.Log("daemon: " + line)
 		}
 	}
@@ -173,7 +174,7 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 	}
 	t.Cleanup(func() {
 		if t.Failed() {
-			logFuseErrors(t, repo.logs)
+			logFuseRecords(t, repo.logs)
 		}
 		repo.close(t)
 	})
