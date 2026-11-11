@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"os"
@@ -339,33 +340,34 @@ func TestInvalidateChangedDropsVanishedNameLastReportedFromOverlay(t *testing.T)
 	}
 }
 
-// failingLookupOf fails the overlay lookup of each of paths.
+// failingLookupOf fails the snapshot lookup of each of paths.
 type failingLookupOf struct {
-	model.OverlayStore
+	model.SnapshotStore
 	paths []string
 }
 
-func (o failingLookupOf) Lookup(ctx context.Context, path string) (model.OverlayEntry, bool, error) {
-	if slices.Contains(o.paths, path) {
-		return model.OverlayEntry{}, false, errors.New("injected lookup failure")
+func (s failingLookupOf) LookupNode(ctx context.Context, gen int64, path string) (model.BaseNode, bool, error) {
+	if slices.Contains(s.paths, path) {
+		return model.BaseNode{}, false, errors.New("injected lookup failure")
 	}
-	return o.OverlayStore.Lookup(ctx, path)
+	return s.SnapshotStore.LookupNode(ctx, gen, path)
 }
 
 // A path whose identity cannot be resolved skips only its own invalidation,
 // and so does a negative entry whose name cannot be resolved. The pass still
 // invalidates every other changed inode, and returns the first error, which
-// here is the held inode's.
+// here is the held inode's. broken.txt changes in the switch, so the pass
+// resolves it: a path the switch leaves unchanged needs no resolve.
 func TestInvalidateChangedContinuesPastAResolveError(t *testing.T) {
-	f := newCacheFixture(t, baseFile("edited.txt", "edited-1", 0o100644), baseFile("broken.txt", "broken", 0o100644))
+	f := newCacheFixture(t, baseFile("edited.txt", "edited-1", 0o100644), baseFile("broken.txt", "broken-1", 0o100644))
 	var root fuseops.InodeID = fuseops.RootInodeID
 	edited := f.lookup(root, "edited.txt")
 	f.lookup(root, "broken.txt")
 	if child := f.lookup(root, "missing.txt"); child != 0 {
 		t.Fatalf("lookup of missing.txt = inode %d", child)
 	}
-	f.switchTo(baseFile("edited.txt", "edited-2", 0o100644), baseFile("broken.txt", "broken", 0o100644))
-	f.resolver.Overlay = failingLookupOf{OverlayStore: f.resolver.Overlay, paths: []string{"broken.txt", "missing.txt"}}
+	f.switchTo(baseFile("edited.txt", "edited-2", 0o100644), baseFile("broken.txt", "broken-2", 0o100644))
+	f.resolver.Snapshot = failingLookupOf{SnapshotStore: f.snap, paths: []string{"broken.txt", "missing.txt"}}
 
 	err := f.mount.InvalidateChanged()
 	if err == nil || !strings.Contains(err.Error(), "broken.txt") {
@@ -589,5 +591,140 @@ func TestSwitchPassSendsOnlyTheEntryOfAVanishedFile(t *testing.T) {
 	}
 	if got := f.lookup(fuseops.RootInodeID, "file.txt"); got != held {
 		t.Fatalf("file.txt came back unchanged as inode %d, want %d", got, held)
+	}
+}
+
+// A directory that a HEAD change leaves holding only untracked files is
+// implied by them. Once they are removed through the mount, it no longer
+// exists, though no later switch changes its path in the base. The next
+// switch pass still invalidates its name.
+func TestSwitchPassDropsImpliedDirectoryWhoseFilesWereRemoved(t *testing.T) {
+	keep := baseFile("keep.txt", "keep", 0o100644)
+	f := newCacheFixture(t, keep, baseDir("d", "d1"), baseFile("d/file.txt", "blob-A", 0o100644))
+	var root fuseops.InodeID = fuseops.RootInodeID
+	d := f.lookup(root, "d")
+	create := &fuseops.CreateFileOp{Parent: d, Name: "new.txt", Mode: 0o644}
+	if err := f.fs.CreateFile(f.ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+		t.Fatal(err)
+	}
+	f.switchTo(keep)
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.lookup(root, "d"); got != d {
+		t.Fatalf("d, implied by new.txt after the switch, looks up as inode %d, want %d", got, d)
+	}
+	if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: d, Name: "new.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	f.switchTo(keep, baseFile("other.txt", "other", 0o100644))
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if _, entries := f.notifier.recorded(); !slices.Equal(entries, []kernelEntry{{root, "d"}}) {
+		t.Fatalf("invalidated entries = %v, want d, which no file implies any more", entries)
+	}
+}
+
+// An inode whose path changed keeps the generation it was last reported at.
+// A prune can drop that generation, which leaves the pass no generation to
+// diff the current one with. It then resolves the inode's path.
+func TestSwitchPassResolvesInodeWhoseGenerationWasPruned(t *testing.T) {
+	keep := baseFile("keep.txt", "keep", 0o100644)
+	f := newCacheFixture(t, keep, baseFile("file.txt", "blob-A", 0o100644))
+	var root fuseops.InodeID = fuseops.RootInodeID
+	file := f.lookup(root, "file.txt")
+	f.switchTo(keep, baseFile("file.txt", "blob-B", 0o100644))
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if inodes, _ := f.notifier.recorded(); !slices.Equal(inodes, []fuseops.InodeID{file}) {
+		t.Fatalf("invalidated inodes = %v, want file.txt (%d)", inodes, file)
+	}
+	if err := f.snap.PruneGenerations(f.ctx, f.resolver.Generation()); err != nil {
+		t.Fatal(err)
+	}
+	f.switchTo(keep)
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if _, entries := f.notifier.recorded(); !slices.Equal(entries, []kernelEntry{{root, "file.txt"}}) {
+		t.Fatalf("invalidated entries = %v, want file.txt, which the last switch removed", entries)
+	}
+}
+
+// The pass diffs the generations from the root down to each path it checks,
+// through every directory above the path, whichever generation it last found
+// those directories unchanged at. It walks into a directory whose tree ID
+// changed, and into one without a tree ID. Here a/b/file.txt changes, which
+// leaves its inode at the first generation while the pass moves the other
+// paths to the second, and then it vanishes. The kernel holds enough of a/b
+// for the first diff to list a and a/b.
+func TestSwitchPassFindsChangesTwoDirectoriesDown(t *testing.T) {
+	for _, trees := range []bool{true, false} {
+		t.Run(fmt.Sprint("tree IDs=", trees), func(t *testing.T) {
+			dirs := func(gen int) []model.BaseNode {
+				var a, b string
+				if trees {
+					a, b = fmt.Sprint("a-", gen), fmt.Sprint("b-", gen)
+				}
+				return []model.BaseNode{baseFile("keep.txt", "keep", 0o100644), baseDir("a", a), baseDir("a/b", b), baseFile("a/b/x.txt", "x", 0o100644), baseFile("a/b/y.txt", "y", 0o100644)}
+			}
+			f := newCacheFixture(t, append(dirs(1), baseFile("a/b/file.txt", "blob-A", 0o100644))...)
+			a := f.lookup(fuseops.RootInodeID, "a")
+			b := f.lookup(a, "b")
+			f.lookup(b, "x.txt")
+			f.lookup(b, "y.txt")
+			file := f.lookup(b, "file.txt")
+			f.switchTo(append(dirs(2), baseFile("a/b/file.txt", "blob-B", 0o100644))...)
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if inodes, _ := f.notifier.recorded(); !slices.Equal(inodes, []fuseops.InodeID{file}) {
+				t.Fatalf("invalidated inodes = %v, want a/b/file.txt (%d)", inodes, file)
+			}
+			f.switchTo(append(dirs(3), baseFile("a/b/other.txt", "other", 0o100644))...)
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if _, entries := f.notifier.recorded(); !slices.Equal(entries, []kernelEntry{{b, "file.txt"}}) {
+				t.Fatalf("invalidated entries = %v, want a/b/file.txt, which the last switch removed", entries)
+			}
+		})
+	}
+}
+
+// A prune can drop an inode's generation while the pass diffs it with the
+// current one. Listings of the dropped generation then come back empty, and
+// a file that vanished would look unchanged. The pass finds the generation
+// gone after its diff, and resolves the inode's path instead.
+func TestSwitchPassResolvesWhenAPruneOverlapsItsDiff(t *testing.T) {
+	kept := []model.BaseNode{baseFile("dir/a.txt", "a", 0o100644), baseFile("dir/b.txt", "b", 0o100644)}
+	f := newCacheFixture(t, append(kept, baseDir("dir", "dir-1"), baseFile("dir/gone.txt", "gone", 0o100644))...)
+	dir := f.lookup(fuseops.RootInodeID, "dir")
+	for _, name := range []string{"a.txt", "b.txt", "gone.txt"} {
+		f.lookup(dir, name)
+	}
+	f.switchTo(append(kept, baseDir("dir", "dir-2"))...)
+	snap := &listingHook{SnapshotStore: f.snap}
+	f.resolver.Snapshot = snap
+	// The diff lists the root at both generations, then dir at the first.
+	prune := func() {
+		if err := f.snap.PruneGenerations(f.ctx, f.resolver.Generation()); err != nil {
+			t.Error(err)
+		}
+	}
+	snap.onList = func() { snap.onList = func() { snap.onList = prune } }
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if snap.onList != nil {
+		t.Fatal("the pass did not list dir at the first generation")
+	}
+	if _, entries := f.notifier.recorded(); !slices.Equal(entries, []kernelEntry{{dir, "gone.txt"}}) {
+		t.Fatalf("invalidated entries = %v, want dir/gone.txt, which the switch removed", entries)
 	}
 }

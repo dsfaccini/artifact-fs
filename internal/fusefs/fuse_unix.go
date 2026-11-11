@@ -686,6 +686,11 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // invalidation: the kernel holds nothing for it. A failure skips only what it
 // concerns, and the first one is returned.
 //
+// The pass reads the overlay once, and finds each held inode's identity with
+// Engine.Identities: it diffs the generation each inode's base identity was
+// reported at with the current one, and resolves only the paths the diff
+// names, so its cost follows the change, not the number of inodes held.
+//
 // An inode whose base identity the current generation still has reads that
 // generation from then on, so a prune need not keep the one it read. The
 // pass advances InodeRef.ReadGen for each inode it compares and finds
@@ -765,6 +770,21 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			firstErr = fmt.Errorf("%s: %w", what, err)
 		}
 	}
+	held := make([]KernelIdentity, 0, len(inodes)+len(opened))
+	for _, k := range slices.Concat(inodes, opened) {
+		held = append(held, KernelIdentity{Path: k.path, Identity: k.reported, Gen: k.readGen})
+	}
+	var currents []MergedIdentity
+	view, viewErr := fs.engine.ReadOverlay(context.Background())
+	if viewErr == nil {
+		currents = fs.engine.Identities(view, held)
+	} else {
+		failed(viewErr, "list the overlay")
+		for _, h := range held {
+			id, exists, err := fs.engine.Identity(h.Path)
+			currents = append(currents, MergedIdentity{Identity: id, Exists: exists, Err: err})
+		}
+	}
 	var entries []kernelEntry
 	// changed holds each held inode the pass invalidates. An entry
 	// invalidation leaves the kernel's attributes and pages of the inode, so
@@ -780,8 +800,9 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// unchanged holds each inode whose base identity the path still has, to
 	// read gen from then on.
 	var unchanged []known
-	for _, k := range inodes {
-		current, exists, err := fs.engine.Identity(k.path)
+	for i, k := range inodes {
+		c := currents[i]
+		current, exists, err := c.Identity, c.Exists, c.Err
 		if err != nil {
 			failed(err, "resolve "+k.path)
 			continue
@@ -804,8 +825,9 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			unchanged = append(unchanged, k)
 		}
 	}
-	for _, k := range opened {
-		current, exists, err := fs.engine.Identity(k.path)
+	for i, k := range opened {
+		c := currents[len(inodes)+i]
+		current, exists, err := c.Identity, c.Exists, c.Err
 		if err != nil {
 			failed(err, "resolve "+k.path)
 			continue
@@ -840,8 +862,12 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	for i, m := range existenceOnly {
 		paths[i] = m.path
 	}
-	missing, err := fs.engine.MissingPaths(context.Background(), paths)
-	failed(err, "list parents")
+	var missing []string
+	if viewErr == nil {
+		var err error
+		missing, err = fs.engine.MissingPathsIn(view, paths)
+		failed(err, "list parents")
+	}
 	gone := make(map[string]bool, len(missing))
 	for _, p := range missing {
 		gone[p] = true
