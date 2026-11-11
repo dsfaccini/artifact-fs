@@ -242,7 +242,7 @@ func newAsyncPreparedE2ERepo(t *testing.T, preparedGitDir string, fetchRef strin
 	}
 	t.Cleanup(func() {
 		if t.Failed() {
-			logFuseErrors(t, repo.logs)
+			logFuseRecords(t, repo.logs)
 		}
 		repo.close(t)
 	})
