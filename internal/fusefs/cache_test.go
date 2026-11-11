@@ -340,6 +340,57 @@ func TestInvalidateChangedDropsVanishedNameLastReportedFromOverlay(t *testing.T)
 	}
 }
 
+// A rename chain from a.txt through sub/b.txt, which the base lacks, to c.txt
+// leaves a rename entry at c.txt and a delete marker at a.txt and at sub/b.txt.
+// A switch to a commit of the rename that also adds sub/b.txt makes reconcile
+// drop all three, so c.txt resolves to its base blob and the base sub/b.txt
+// shows through. The switch pass invalidates the inode the kernel last saw from
+// the overlay at c.txt, and on Linux the negative entry it cached for
+// sub/b.txt.
+func TestInvalidateChangedFollowsReconcileOfACommittedRenameChain(t *testing.T) {
+	f := newCacheFixture(t, baseFile("a.txt", "a", 0o100644), baseDir("sub", "sub-1"))
+	var root fuseops.InodeID = fuseops.RootInodeID
+	moved := f.lookup(root, "a.txt")
+	sub := f.lookup(root, "sub")
+	if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: root, OldName: "a.txt", NewParent: sub, NewName: "b.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: sub, OldName: "b.txt", NewParent: root, NewName: "c.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if child := f.lookup(root, "c.txt"); child != moved {
+		t.Fatalf("lookup of c.txt after the renames = inode %d, want %d, the inode of a.txt", child, moved)
+	}
+	if child := f.lookup(sub, "b.txt"); child != 0 {
+		t.Fatalf("lookup of sub/b.txt after the renames = inode %d, want a miss", child)
+	}
+
+	f.switchTo(baseDir("sub", "sub-2"), baseFile("sub/b.txt", "b", 0o100644), baseFile("c.txt", blobOID("a"), 0o100644))
+	for _, path := range []string{"a.txt", "sub/b.txt", "c.txt"} {
+		if _, ok, err := f.resolver.Overlay.Lookup(f.ctx, path); err != nil || ok {
+			t.Fatalf("overlay holds %s after the switch to the committed rename: %t, %v", path, ok, err)
+		}
+	}
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+
+	inodes, entries := f.notifier.recorded()
+	if want := []fuseops.InodeID{moved}; !slices.Equal(inodes, want) {
+		t.Errorf("invalidated inodes = %v, want %v, the inode at c.txt", inodes, want)
+	}
+	var want []kernelEntry
+	if negativeLookupEntries {
+		want = []kernelEntry{{sub, "b.txt"}}
+	}
+	if !slices.Equal(entries, want) {
+		t.Errorf("invalidated entries = %v, want %v", entries, want)
+	}
+	if child := f.lookup(sub, "b.txt"); child == 0 {
+		t.Fatal("lookup of sub/b.txt after the switch missed, want the base file")
+	}
+}
+
 // failingLookupOf fails the snapshot lookup of each of paths.
 type failingLookupOf struct {
 	model.SnapshotStore
