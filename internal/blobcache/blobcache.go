@@ -78,9 +78,9 @@ func Stage(dir, oid string) (string, error) {
 var testHookAfterInstallMove func(stats *os.File)
 
 // Install moves the staged blob into oid's cache path and counts it. A blob it
-// replaces leaves the counters. From the move until it writes the counters,
-// the stats file marks them pending, so after a process crash in between the
-// next reader recounts. When it cannot count the moved blob or write the
+// replaces leaves the counters. Before the move it marks the counters pending
+// in the stats file, and it clears the mark when it writes them, so after a
+// process crash in between the next reader recounts. When it cannot count the moved blob or write the
 // counters, it leaves them to that recount too, because the blob is already
 // in place.
 func Install(dir, oid, staged string) error {
@@ -91,6 +91,9 @@ func Install(dir, oid, staged string) error {
 	defer lock.Close()
 	st, valid, err := readStats(lock)
 	if err == nil && valid {
+		// Write the mark before the rename. A crash between a rename and a
+		// later mark would leave counters that miss the blob, with no mark
+		// to make the next reader recount.
 		_, err = lock.WriteAt([]byte{1}, statsSize)
 	}
 	if err != nil {

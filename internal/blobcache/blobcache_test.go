@@ -237,7 +237,9 @@ func statsLocked(t *testing.T, dir string) bool {
 // A second installer that installs while a first is between its move and its
 // counter write waits for the first, so neither loses the other's blob from
 // the counters. Each Install opens the stats file itself, so their locks
-// exclude each other as two processes' locks do.
+// exclude each other as two processes' locks do. The pending mark relies on
+// that exclusion: a reader that saw the mark of a live install would recount,
+// and the install would then write counters it read before over the recount.
 func TestConcurrentInstallersKeepCountersExact(t *testing.T) {
 	dir := t.TempDir()
 	a, b := strings.Repeat("a", 40), strings.Repeat("b", 40)
