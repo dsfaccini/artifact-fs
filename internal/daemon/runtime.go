@@ -131,6 +131,10 @@ type repoRuntime struct {
 	stopping bool
 	// stop is the stop of the runtime that runs, nil otherwise.
 	stop *unmountOp
+	// kept and keptWarning are what the last prune recorded in
+	// KeptGenerations and KeptGenerationsWarning.
+	kept        int
+	keptWarning string
 	// retired holds the generations the resolver stopped serving, with when.
 	// retiredMu guards it, and is taken alone.
 	retiredMu sync.Mutex

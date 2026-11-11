@@ -87,6 +87,19 @@ func TestFormatStatusLineRedactsPrepareError(t *testing.T) {
 	}
 }
 
+// The kept-generations warning prints quoted, so the command that raises the
+// threshold keeps its spaces and can be pasted.
+func TestFormatStatusLineQuotesTheKeptGenerationsWarning(t *testing.T) {
+	warning := "open files keep 2 older snapshot generations, about 4.3 MB, reaching the warning threshold 2; pids holding the files: 4242 (2 open files); the generations free at the first HEAD change after the files close; raise the threshold with artifact-fs set-warn-kept-generations --name repo --count <n>"
+	st := model.RepoRuntimeState{KeptGenerations: 2, WarnKeptGenerations: 2, KeptGenerationsWarning: warning}
+
+	got := formatStatusLine(st)
+	want := ` kept_generations=2 warn_kept_generations=2 kept_generations_warning="open files keep 2 older snapshot generations, about 4.3 MB, reaching the warning threshold 2; pids holding the files: 4242 (2 open files); the generations free at the first HEAD change after the files close; raise the threshold with artifact-fs set-warn-kept-generations --name repo --count <n>"`
+	if !strings.HasSuffix(got, want) {
+		t.Fatalf("status line %q, want it to end with %q", got, want)
+	}
+}
+
 func TestAddRepoAsyncCLIRegistersWithoutClone(t *testing.T) {
 	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
 	var stdout, stderr bytes.Buffer
@@ -325,6 +338,42 @@ func TestSetRefreshCLIStoresThePolicy(t *testing.T) {
 	}
 	if got, want := registeredRepo(t, root, "repo").RefreshPolicy, (model.RefreshPolicy{RefreshInterval: 90 * time.Second}); got != want {
 		t.Fatalf("after refused intervals, stored policy = %+v, want %+v", got, want)
+	}
+}
+
+// add-repo stores the kept-generations warning threshold, 50 by default,
+// set-warn-kept-generations changes it, and status prints it.
+func TestWarnKeptGenerationsCLIStoresTheThreshold(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ARTIFACT_FS_ROOT", root)
+	for name, args := range map[string][]string{"default": nil, "explicit": {"--warn-kept-generations", "7"}} {
+		if _, stderr, code := runCLI(t, append([]string{"add-repo", "--name", name, "--remote", "https://github.com/example/repo.git", "--async"}, args...)...); code != 0 {
+			t.Fatalf("add-repo %s exit = %d, stderr=%q", name, code, stderr)
+		}
+	}
+	if got := registeredRepo(t, root, "default").WarnKeptGenerations; got != 50 {
+		t.Fatalf("threshold add-repo stored by default = %d, want 50", got)
+	}
+	if got := registeredRepo(t, root, "explicit").WarnKeptGenerations; got != 7 {
+		t.Fatalf("threshold add-repo --warn-kept-generations 7 stored = %d, want 7", got)
+	}
+	if _, stderr, code := runCLI(t, "add-repo", "--name", "zero", "--remote", "https://github.com/example/repo.git", "--async", "--warn-kept-generations", "0"); code == 0 || !strings.Contains(stderr, "--warn-kept-generations must be positive") {
+		t.Fatalf("add-repo --warn-kept-generations 0 exit = %d, stderr=%q; want a refusal", code, stderr)
+	}
+
+	stdout, stderr, code := runCLI(t, "set-warn-kept-generations", "--name", "explicit", "--count", "80")
+	if code != 0 || stdout != "updated warn-kept-generations explicit 80\n" {
+		t.Fatalf("set-warn-kept-generations exit = %d, stdout=%q, stderr=%q", code, stdout, stderr)
+	}
+	if _, stderr, code := runCLI(t, "set-warn-kept-generations", "--name", "explicit", "--count", "0"); code == 0 || !strings.Contains(stderr, "must be positive") {
+		t.Fatalf("set-warn-kept-generations --count 0 exit = %d, stderr=%q; want a refusal", code, stderr)
+	}
+	if got := registeredRepo(t, root, "explicit").WarnKeptGenerations; got != 80 {
+		t.Fatalf("threshold after set-warn-kept-generations = %d, want 80", got)
+	}
+	stdout, stderr, code = runCLI(t, "status", "--name", "explicit")
+	if code != 0 || !strings.HasSuffix(stdout, " kept_generations=0 warn_kept_generations=80 kept_generations_warning=none\n") {
+		t.Fatalf("status exit = %d, stdout=%q, stderr=%q; want the kept count, the threshold and no warning", code, stdout, stderr)
 	}
 }
 

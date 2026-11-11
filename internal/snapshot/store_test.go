@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -204,6 +205,40 @@ func TestGenerationCleanup(t *testing.T) {
 		if _, ok := lookupNode(t, s, gen, "f.txt"); ok != want {
 			t.Fatalf("generation %d holds f.txt = %v, want %v after pruning below 2", gen, ok, want)
 		}
+	}
+}
+
+// The estimate of generations that hold equal trees splits the used pages
+// evenly between them. Pages a prune freed are not used.
+func TestEstimateGenerationBytesSharesTheUsedPages(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	nodes := make([]model.BaseNode, 2000)
+	for i := range nodes {
+		nodes[i] = model.BaseNode{Path: fmt.Sprintf("dir/file-%04d.go", i), Type: "file", Mode: 0o644, ObjectOID: strings.Repeat("ab", 20), SizeState: "known"}
+	}
+	for range 3 {
+		if _, err := s.PublishGeneration(ctx, "h", "main", nodes); err != nil {
+			t.Fatal(err)
+		}
+	}
+	estimate := func(gens ...int64) int64 {
+		t.Helper()
+		bytes, err := s.EstimateGenerationBytes(ctx, gens)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bytes
+	}
+	all, one := estimate(1, 2, 3), estimate(2)
+	if all <= 0 || one*3 > all || one*3 < all-2 {
+		t.Fatalf("estimate of generation 2 = %d and of all three = %d, want a third of a positive total", one, all)
+	}
+	if err := s.PruneGenerations(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	if left := estimate(2, 3); left >= all || left <= 0 {
+		t.Fatalf("estimate of the two generations a prune left = %d, want less than the %d of all three", left, all)
 	}
 }
 

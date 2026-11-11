@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"io"
@@ -51,10 +52,11 @@ type delayedUnmountFailure struct {
 	release chan struct{}
 }
 
-func (m *delayedUnmountFailure) Backend() string              { return "fake" }
-func (m *delayedUnmountFailure) InvalidateChanged() error     { return nil }
-func (m *delayedUnmountFailure) OpenFileGenerations() []int64 { return nil }
-func (m *delayedUnmountFailure) Join(context.Context) error   { return nil }
+func (m *delayedUnmountFailure) Backend() string                     { return "fake" }
+func (m *delayedUnmountFailure) InvalidateChanged() error            { return nil }
+func (m *delayedUnmountFailure) OpenFileGenerations() []int64        { return nil }
+func (m *delayedUnmountFailure) OpenFilePIDs([]int64) map[uint32]int { return nil }
+func (m *delayedUnmountFailure) Join(context.Context) error          { return nil }
 
 func (m *delayedUnmountFailure) Unmount(context.Context) error {
 	close(m.started)
@@ -981,19 +983,26 @@ func (f *headReconcileFixture) emptyCommit(parent, message string) string {
 	return strings.TrimSpace(runCmdOutput(f.t, "git", "-C", f.workDir, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit-tree", tree, "-p", parent, "-m", message))
 }
 
-// servingMount stands in for a serving mount of fs.
+// servingMount stands in for a serving mount of fs on backend, the fake
+// backend when empty.
 type servingMount struct {
 	*fakeMountedFS
-	fs *fusefs.ArtifactFuse
+	fs      *fusefs.ArtifactFuse
+	backend string
 }
 
+func (m *servingMount) Backend() string              { return cmp.Or(m.backend, m.fakeMountedFS.Backend()) }
 func (m *servingMount) OpenFileGenerations() []int64 { return m.fs.OpenFileGenerations() }
+func (m *servingMount) OpenFilePIDs(gens []int64) map[uint32]int {
+	return m.fs.OpenFilePIDs(gens)
+}
 
 // openFileFixture serves its runtime through fs, which the test drives with
 // FUSE ops. Its retention window lapses at once.
 type openFileFixture struct {
 	*headReconcileFixture
-	fs *fusefs.ArtifactFuse
+	fs    *fusefs.ArtifactFuse
+	mount *servingMount
 }
 
 func newOpenFileFixture(t *testing.T) *openFileFixture {
@@ -1006,10 +1015,11 @@ func newOpenFileFixture(t *testing.T) *openFileFixture {
 	h.Start(1, repo.RepoPaths)
 	t.Cleanup(h.Stop)
 	fs := fusefs.NewArtifactFuse(repo.RepoPaths, &fusefs.Engine{Resolver: f.rt.resolver, Repo: repo.RepoPaths, Overlay: f.rt.overlay, Hydrator: h})
+	mount := &servingMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, fs: fs}
 	f.svc.mu.Lock()
-	f.rt.mfs, f.rt.mount = &servingMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, fs: fs}, mountServing
+	f.rt.mfs, f.rt.mount = mount, mountServing
 	f.svc.mu.Unlock()
-	return &openFileFixture{headReconcileFixture: f, fs: fs}
+	return &openFileFixture{headReconcileFixture: f, fs: fs, mount: mount}
 }
 
 func (f *openFileFixture) lookupReadme() fuseops.InodeID {

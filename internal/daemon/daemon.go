@@ -16,6 +16,10 @@ import (
 
 const DefaultHydrationConcurrency = 4
 
+// DefaultWarnKeptGenerations is the kept-generations warning threshold of a
+// repo add-repo registers without --warn-kept-generations.
+const DefaultWarnKeptGenerations = 50
+
 const (
 	defaultPrepareTimeout    = 30 * time.Minute
 	headPollInterval         = 500 * time.Millisecond
@@ -75,6 +79,7 @@ const (
 	logRepoPreparationCanceled   = "repo preparation canceled"
 	logRepoPrepareStatusWriteErr = "repo prepare status write failed"
 	logRepoConfigChanged         = "repo config changed, remounting"
+	logKeptGenerations           = "open files keep old snapshot generations"
 )
 
 // core is what the CLI controller and the daemon share: the state root, the

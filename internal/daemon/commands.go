@@ -87,6 +87,10 @@ func (s *core) normalizeRepoConfig(cfg *model.RepoConfig, opts AddRepoOptions) e
 	if cfg.RefreshInterval <= 0 {
 		cfg.RefreshInterval = 30 * time.Second
 	}
+	if cfg.WarnKeptGenerations < 0 {
+		return errors.New("--warn-kept-generations must be positive")
+	}
+	cfg.WarnKeptGenerations = cmp.Or(cfg.WarnKeptGenerations, DefaultWarnKeptGenerations)
 	s.fillPaths(cfg)
 	for _, path := range []*string{&cfg.MountRoot, &cfg.MountPath, &cfg.GitDir, &cfg.OverlayDir, &cfg.BlobCacheDir, &cfg.MetaDBPath, &cfg.OverlayDBPath} {
 		abs, err := filepath.Abs(*path)
@@ -185,6 +189,22 @@ func (s *Controller) SetRefresh(ctx context.Context, name string, policy model.R
 	}
 	// The daemon applies the new policy at its next registry sync.
 	return s.registry.UpdateRefresh(ctx, cfg.ID, policy)
+}
+
+// SetWarnKeptGenerations changes name's kept-generations warning threshold.
+// The daemon applies it from the first prune after its next registry sync.
+func (s *Controller) SetWarnKeptGenerations(ctx context.Context, name string, count int) error {
+	cfg, err := s.registry.GetRepo(ctx, name)
+	if err != nil {
+		return err
+	}
+	return s.registry.UpdateWarnKeptGenerations(ctx, cfg.ID, count)
+}
+
+func (s *Service) updateRuntimeWarnKeptGenerations(rt *repoRuntime, count int) {
+	s.mu.Lock()
+	rt.cfg.WarnKeptGenerations = count
+	s.mu.Unlock()
 }
 
 func (s *Service) updateRuntimeRefresh(rt *repoRuntime, policy model.RefreshPolicy) {

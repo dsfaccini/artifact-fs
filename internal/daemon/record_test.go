@@ -123,9 +123,10 @@ type exitingMount struct {
 	err  error
 }
 
-func (m *exitingMount) Backend() string              { return "fake" }
-func (m *exitingMount) InvalidateChanged() error     { return nil }
-func (m *exitingMount) OpenFileGenerations() []int64 { return nil }
+func (m *exitingMount) Backend() string                     { return "fake" }
+func (m *exitingMount) InvalidateChanged() error            { return nil }
+func (m *exitingMount) OpenFileGenerations() []int64        { return nil }
+func (m *exitingMount) OpenFilePIDs([]int64) map[uint32]int { return nil }
 
 func (m *exitingMount) Join(ctx context.Context) error {
 	select {

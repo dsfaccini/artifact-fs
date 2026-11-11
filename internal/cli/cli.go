@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +73,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				&ucli.StringFlag{Name: "git-dir", Usage: "explicit git dir path"},
 				&ucli.StringFlag{Name: "blob-cache-dir", Usage: "directory for hydrated blobs; may be shared between repositories"},
 				&ucli.StringFlag{Name: "fetch-ref", Usage: "ref to fetch and serve; defaults to --ref; cannot be combined with --require-commit"},
+				&ucli.IntFlag{Name: "warn-kept-generations", Value: daemon.DefaultWarnKeptGenerations, Usage: "warn when open files keep this many older snapshot generations"},
 			},
 			Action: withController(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Controller) error {
 				name := strings.TrimSpace(c.String("name"))
@@ -125,6 +127,9 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				if err != nil {
 					return err
 				}
+				if c.Int("warn-kept-generations") < 1 {
+					return fmt.Errorf("--warn-kept-generations must be positive")
+				}
 				cfg := model.RepoConfig{
 					RepoPaths: model.RepoPaths{
 						Name:         name,
@@ -146,7 +151,8 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 						RefreshInterval:       d,
 						RemoteRefreshDisabled: strings.EqualFold(refreshValue, "never"),
 					},
-					Enabled: true,
+					Enabled:             true,
+					WarnKeptGenerations: c.Int("warn-kept-generations"),
 				}
 				if err := svc.AddRepoWithOptions(ctx, cfg, daemon.AddRepoOptions{Async: async}); err != nil {
 					return err
@@ -271,6 +277,25 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			}),
 		},
 		{
+			Name:  "set-warn-kept-generations",
+			Usage: "update the number of older snapshot generations open files keep before the daemon warns",
+			Flags: []ucli.Flag{
+				&ucli.StringFlag{Name: "name", Usage: "repo name (required)"},
+				&ucli.IntFlag{Name: "count", Required: true, Usage: "warning threshold (required)"},
+			},
+			Action: withController(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Controller) error {
+				name := strings.TrimSpace(c.String("name"))
+				if name == "" {
+					return fmt.Errorf("--name required")
+				}
+				if err := svc.SetWarnKeptGenerations(ctx, name, c.Int("count")); err != nil {
+					return err
+				}
+				fmt.Fprintf(stdout, "updated warn-kept-generations %s %d\n", name, c.Int("count"))
+				return nil
+			}),
+		},
+		{
 			Name:  "evict-cache",
 			Usage: "evict least recently accessed blobs until the blob cache fits a byte budget",
 			Flags: []ucli.Flag{
@@ -371,14 +396,15 @@ func formatStatusLine(st model.RepoRuntimeState) string {
 	if st.RemoteRefreshDisabled {
 		remoteRefresh = "disabled"
 	}
-	return fmt.Sprintf("repo=%s state=%s head=%s ref=%s source_ref=%s required_commit=%s acquisition=%s base_commit=%s served_commit=%s served_generation=%d published_commit=%s published_generation=%d phase=%s remote_refresh=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s prepare_error=%s mount_error=%s last_error=%s last_error_phase=%s last_error_at=%s next_retry=%s attempts=%d hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
+	return fmt.Sprintf("repo=%s state=%s head=%s ref=%s source_ref=%s required_commit=%s acquisition=%s base_commit=%s served_commit=%s served_generation=%d published_commit=%s published_generation=%d phase=%s remote_refresh=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s prepare_error=%s mount_error=%s last_error=%s last_error_phase=%s last_error_at=%s next_retry=%s attempts=%d hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t kept_generations=%d warn_kept_generations=%d kept_generations_warning=%s",
 		st.RepoID, st.State, st.CurrentHEADOID, st.CurrentHEADRef, st.SourceRef, requiredCommit, acquisition, st.CurrentHEADOID,
 		formatNone(st.ServedHEADOID), st.ServedGeneration, formatNone(st.PublishedHEADOID), st.PublishedGeneration, formatNone(st.Phase), remoteRefresh,
 		st.AheadCount, st.BehindCount, st.Diverged,
 		formatLastFetchAt(st.LastFetchAt), formatLastFetchResult(st.LastFetchResult),
 		formatStatusError(st.PrepareError), formatStatusError(st.MountError),
 		formatStatusError(st.LastError), formatNone(st.LastErrorPhase), formatStatusTime(st.LastErrorAt), formatStatusTime(st.NextRetryAt), st.Attempts,
-		st.HydratedBlobCount, st.HydratedBlobBytes, st.DirtyOverlay)
+		st.HydratedBlobCount, st.HydratedBlobBytes, st.DirtyOverlay,
+		st.KeptGenerations, st.WarnKeptGenerations, formatStatusText(st.KeptGenerationsWarning))
 }
 
 func formatNone(v string) string {
@@ -414,6 +440,15 @@ func formatStatusError(err string) string {
 		return "none"
 	}
 	return strings.Join(strings.Fields(auth.RedactString(err)), "_")
+}
+
+// formatStatusText prints text as one double-quoted, Go-escaped value, so a
+// command inside it keeps its spaces and can be pasted.
+func formatStatusText(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return "none"
+	}
+	return strconv.Quote(auth.RedactString(text))
 }
 
 func stubCommand(name, usage string, stdout io.Writer) *ucli.Command {

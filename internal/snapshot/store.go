@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -125,6 +126,43 @@ func (s *Store) PruneGenerations(ctx context.Context, keepFrom int64, keep ...in
 		from = max(from, to+1)
 	}
 	return nil
+}
+
+// EstimateGenerationBytes estimates the bytes gens take in the database: its
+// used pages, times the share of base_nodes rows gens hold. It counts the
+// rows of gens and of the table, so it reads every index entry once.
+func (s *Store) EstimateGenerationBytes(ctx context.Context, gens []int64) (int64, error) {
+	if len(gens) == 0 {
+		return 0, nil
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	args := make([]any, len(gens))
+	for i, gen := range gens {
+		args[i] = gen
+	}
+	var rows, total, pages, free, pageSize int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM base_nodes WHERE generation IN (?`+strings.Repeat(",?", len(gens)-1)+`)`, args...).Scan(&rows); err != nil {
+		return 0, err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM base_nodes`).Scan(&total); err != nil {
+		return 0, err
+	}
+	for _, pragma := range []struct {
+		name string
+		dst  *int64
+	}{{"page_count", &pages}, {"freelist_count", &free}, {"page_size", &pageSize}} {
+		if err := tx.QueryRowContext(ctx, `PRAGMA `+pragma.name).Scan(pragma.dst); err != nil {
+			return 0, err
+		}
+	}
+	if total == 0 {
+		return 0, nil
+	}
+	return (pages - free) * pageSize * rows / total, nil
 }
 
 func (s *Store) CurrentGeneration(ctx context.Context) (int64, error) {

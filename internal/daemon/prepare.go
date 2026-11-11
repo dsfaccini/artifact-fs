@@ -417,12 +417,22 @@ func (s *Service) activatePrepared(ctx context.Context, res *prepared) error {
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	err := s.withCurrentPrepare(cleanupCtx, cfg, func() error {
-		s.mu.Lock()
-		rt := s.running[cfg.ID]
-		s.mu.Unlock()
-		return s.pruneGenerations(cleanupCtx, rt, res.snap, min(res.prevGen, res.gen-1))
-	})
+	s.mu.Lock()
+	rt := s.running[cfg.ID]
+	s.mu.Unlock()
+	// A runtime's prunes run under its headMu, so they record its kept
+	// generations one at a time. Take headMu before the repo config lock: a
+	// reconcile can hold headMu through its git commands, and the wait must
+	// not hold the config lock that CLI commands take.
+	err := func() error {
+		if rt != nil {
+			rt.headMu.Lock()
+			defer rt.headMu.Unlock()
+		}
+		return s.withCurrentPrepare(cleanupCtx, cfg, func() error {
+			return s.pruneGenerations(cleanupCtx, rt, res.snap, min(res.prevGen, res.gen-1))
+		})
+	}()
 	if err != nil && !errors.Is(err, registry.ErrRepoChanged) {
 		s.logger.Warn("snapshot generation cleanup failed", "repo", cfg.Name, "error", err)
 	}
