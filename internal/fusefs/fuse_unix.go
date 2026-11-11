@@ -792,8 +792,9 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	for _, k := range slices.Concat(inodes, opened) {
 		held = append(held, KernelIdentity{Path: k.path, Identity: k.reported, Gen: k.readGen})
 	}
-	// The pass reads the whole overlay, unless no mapping needs only the
-	// existence check and resolving each held path costs less.
+	// Only the whole overlay answers the existence check, so the pass reads it
+	// whenever a mapping needs that check. Otherwise it reads it unless
+	// resolving each held path costs less.
 	var view OverlayView
 	viewed := false
 	if len(existenceOnly) > 0 || !fs.resolvesPerPath(len(held)) {

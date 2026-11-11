@@ -996,6 +996,46 @@ func TestSwitchPassReadsTheOverlayOnlyWhenThatCostsLess(t *testing.T) {
 	}
 }
 
+// Only the overlay read checks that a dormant mapping's path still exists, so
+// a dormant mapping makes the switch pass read it even where the overlay is
+// large next to the held paths. A path that a switch removed then comes back
+// with a new number.
+func TestSwitchPassUnmapsVanishedDormantPathWhereTheOverlayIsLarge(t *testing.T) {
+	held, forgotten := baseFile("held.txt", "held", 0o100644), baseFile("forgotten.txt", "forgotten", 0o100644)
+	f := newCacheFixture(t, held, forgotten)
+	for i := range perPathOverlayRatio + 1 {
+		if _, err := f.resolver.Overlay.CreateFile(f.ctx, fmt.Sprintf("untracked/f%d", i), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ov := hookOverlay(f)
+	read := false
+	ov.beforeList = func() { read = true }
+	var root fuseops.InodeID = fuseops.RootInodeID
+	f.lookup(root, "held.txt")
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if read {
+		t.Fatalf("the pass read the overlay of %d entries for one held path and no dormant mapping", perPathOverlayRatio+1)
+	}
+	ov.beforeList = nil
+	old := f.lookup(root, "forgotten.txt")
+	forget(t, f.fs, old)
+
+	f.switchTo(held)
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	f.switchTo(held, forgotten)
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.lookup(root, "forgotten.txt"); got == 0 || got == old {
+		t.Fatalf("forgotten.txt = inode %d after a switch removed it and another brought it back, want a new number, not %d", got, old)
+	}
+}
+
 // A failed op through the mount can map an unmapped inode back before it
 // fails: an unlink or a rename first settles the unmapped inodes at and below
 // its path, and a write through the inode claims its path. The inode then
