@@ -156,6 +156,10 @@ type ArtifactFuse struct {
 	// the mount publishes it after ops may have started.
 	notifier kernelNotifier
 
+	// log takes the replies logReply logs. It discards them unless the mount
+	// set it.
+	log fuseLog
+
 	// testHookBeforeAddFileHandle, when set, runs in an open between its
 	// Engine.OpenFile and its addFileHandle.
 	testHookBeforeAddFileHandle func()
@@ -309,6 +313,7 @@ func NewArtifactFuse(repo model.RepoPaths, engine *Engine) *ArtifactFuse {
 		negatives:      make(map[kernelEntry]time.Time),
 		retypedNames:   make(map[kernelEntry]fuseops.InodeID),
 		openPins:       make(map[int64]int),
+		log:            fuseLog{logger: slog.New(slog.DiscardHandler)},
 	}
 	root := &InodeRef{ID: fuseops.RootInodeID, Path: ".", Type: "dir", Mode: 0o755, Refcnt: 1, IsRoot: true}
 	fs.inodes[fuseops.RootInodeID] = root
@@ -1512,14 +1517,52 @@ func (fs *ArtifactFuse) StatFS(_ context.Context, op *fuseops.StatFSOp) error {
 	return nil
 }
 
-// shared runs op through Engine.Do holding handleOps shared, and exclusive
-// holding it exclusively. Both return the error the kernel receives.
-func (fs *ArtifactFuse) shared(ctx context.Context, op func(context.Context, *Blobs) error) error {
-	return toErrno(ctx, fs.engine.Do(ctx, fs.handleOps.RLocker(), op))
+// shared runs op, an op on at, through Engine.Do holding handleOps shared,
+// and exclusive holding it exclusively. Both return the error the kernel
+// receives, from opError.
+func (fs *ArtifactFuse) shared(ctx context.Context, at opTarget, op func(context.Context, *Blobs) error) error {
+	return fs.opError(ctx, at, fs.engine.Do(ctx, fs.handleOps.RLocker(), op))
 }
 
-func (fs *ArtifactFuse) exclusive(ctx context.Context, op func(context.Context, *Blobs) error) error {
-	return toErrno(ctx, fs.engine.Do(ctx, &fs.handleOps, op))
+func (fs *ArtifactFuse) exclusive(ctx context.Context, at opTarget, op func(context.Context, *Blobs) error) error {
+	return fs.opError(ctx, at, fs.engine.Do(ctx, &fs.handleOps, op))
+}
+
+// opTarget is what an op names: an inode, or the name in a directory inode.
+type opTarget struct {
+	inode fuseops.InodeID
+	name  string
+}
+
+// opError returns the error the kernel receives for err, an error of an op on
+// at, from toErrno. The fuse library replies EIO to an error that carries no
+// errno and logs only the error's text, so opError adds at's inode and its
+// path to such an error. An error that carries an errno stays as toErrno
+// returns it.
+func (fs *ArtifactFuse) opError(ctx context.Context, at opTarget, err error) error {
+	err = toErrno(ctx, err)
+	if err == nil {
+		return nil
+	}
+	if _, ok := errors.AsType[syscall.Errno](err); ok {
+		return err
+	}
+	fs.mu.RLock()
+	ref := fs.inodes[at.inode]
+	var path string
+	if ref != nil {
+		path = ref.Path
+	}
+	fs.mu.RUnlock()
+	switch {
+	case at.name == "" && ref == nil:
+		return fmt.Errorf("inode %d: %w", at.inode, err)
+	case at.name == "":
+		return fmt.Errorf("inode %d, path %s: %w", at.inode, path, err)
+	case ref == nil:
+		return fmt.Errorf("parent inode %d, name %s: %w", at.inode, at.name, err)
+	}
+	return fmt.Errorf("parent inode %d, path %s: %w", at.inode, cleanChildPath(path, at.name), err)
 }
 
 // toErrno returns the error the kernel receives for an op error. The fuse
@@ -1561,7 +1604,7 @@ func isRequestCancellation(ctx context.Context, err error) bool {
 // a write through that inode then finishes recreating the path first. A
 // lookup of a missing path runs shared, so polling it stalls no other op.
 func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInodeOp) error {
-	return fs.sharedUnlessUnmapped(ctx, func(_ context.Context, b *Blobs, exclusive bool) error {
+	return fs.sharedUnlessUnmapped(ctx, opTarget{op.Parent, op.Name}, func(_ context.Context, b *Blobs, exclusive bool) error {
 		parent, err := fs.requireInode(op.Parent, syscall.ENOENT)
 		if err != nil {
 			return err
@@ -1571,12 +1614,14 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 
 		// Synthesize .git gitfile in root
 		if isGitfile(parent, op.Name) {
+			attrs := Attrs{Type: "file", Mode: 0o644, Gen: fs.engine.Generation()}
 			fs.mu.Lock()
-			ref := fs.allocEntry(op.Parent, op.Name, ".git", Attrs{Type: "file", Mode: 0o644, Gen: fs.engine.Generation()})
+			ref := fs.allocEntry(op.Parent, op.Name, ".git", attrs)
 			fs.mu.Unlock()
 			op.Entry.Child = ref.ID
 			op.Entry.Attributes = fs.gitFileAttrs()
 			setChildEntryExpiry(&op.Entry, time.Minute)
+			fs.logReply(ctx, entryReply, "LookUpInode", ref.ID, attrs)
 			return nil
 		}
 
@@ -1602,6 +1647,7 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 		op.Entry.Child = ref.ID
 		op.Entry.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
 		setChildEntryExpiry(&op.Entry, CacheTTL)
+		fs.logReply(ctx, entryReply, "LookUpInode", ref.ID, attrs)
 		return nil
 	})
 }
@@ -1611,7 +1657,7 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 // read, from heldAttrs. Linux fetches attributes before a read once they
 // expire, so a read through such a file needs a reply that is not an error.
 func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetInodeAttributesOp) error {
-	return fs.shared(ctx, func(_ context.Context, b *Blobs) error {
+	return fs.shared(ctx, opTarget{inode: op.Inode}, func(_ context.Context, b *Blobs) error {
 		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 		if err != nil {
 			held, ok := fs.heldAttrs(op.Inode)
@@ -1620,6 +1666,7 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 			}
 			op.Attributes = inodeAttrs(held.Mode, uint64(held.Size), held.Type, held.Mtime, held.Ctime)
 			op.AttributesExpiration = attrExpiry(CacheTTL)
+			fs.logReply(ctx, attrReply, "GetInodeAttributes", op.Inode, held)
 			return nil
 		}
 
@@ -1628,17 +1675,20 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 				if attrs, err := fs.engine.Attrs(b, ref.Path); err == nil {
 					op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
 					op.AttributesExpiration = attrExpiry(CacheTTL)
+					fs.logReply(ctx, attrReply, "GetInodeAttributes", op.Inode, attrs)
 					return nil
 				}
 			}
 			op.Attributes = inodeAttrs(ref.Mode, 4096, "dir", fs.syntheticTime, fs.syntheticTime)
 			op.AttributesExpiration = attrExpiry(CacheTTL)
+			fs.logReply(ctx, attrReply, "GetInodeAttributes", op.Inode, Attrs{Type: "dir"})
 			return nil
 		}
 
 		if ref.Path == ".git" {
 			op.Attributes = fs.gitFileAttrs()
 			op.AttributesExpiration = attrExpiry(time.Minute)
+			fs.logReply(ctx, attrReply, "GetInodeAttributes", op.Inode, Attrs{Type: "file"})
 			return nil
 		}
 
@@ -1660,6 +1710,7 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 		}
 		op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
 		op.AttributesExpiration = attrExpiry(CacheTTL)
+		fs.logReply(ctx, attrReply, "GetInodeAttributes", op.Inode, attrs)
 		return nil
 	})
 }
@@ -1673,10 +1724,10 @@ func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetI
 // handle whose access mode allows writes. A change whose path does not map to
 // the inode holds handleOps exclusively, as a write does.
 func (fs *ArtifactFuse) setInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp, checkPermissions bool) error {
-	return fs.sharedUnlessUnmapped(ctx, func(ctx context.Context, b *Blobs, exclusive bool) error {
+	return fs.sharedUnlessUnmapped(ctx, opTarget{inode: op.Inode}, func(ctx context.Context, b *Blobs, exclusive bool) error {
 		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 		if err != nil {
-			return fs.setPinnedAttributes(op, checkPermissions)
+			return fs.setPinnedAttributes(ctx, op, checkPermissions)
 		}
 		if ref.Path == ".git" {
 			return syscall.EPERM
@@ -1712,6 +1763,7 @@ func (fs *ArtifactFuse) setInodeAttributes(ctx context.Context, op *fuseops.SetI
 		}
 		op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
 		op.AttributesExpiration = attrExpiry(CacheTTL)
+		fs.logReply(ctx, attrReply, "SetInodeAttributes", op.Inode, attrs)
 		return nil
 	})
 }
@@ -1723,7 +1775,7 @@ func (fs *ArtifactFuse) setInodeAttributes(ctx context.Context, op *fuseops.SetI
 // go to InodeRef.Mode, where heldAttrs reads them. It answers with heldAttrs,
 // and returns ESTALE for an inode with no pinned handle, whose handles read
 // content no setattr may change. checkPermissions is as in setInodeAttributes.
-func (fs *ArtifactFuse) setPinnedAttributes(op *fuseops.SetInodeAttributesOp, checkPermissions bool) error {
+func (fs *ArtifactFuse) setPinnedAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp, checkPermissions bool) error {
 	type pinnedHandle struct {
 		id fuseops.HandleID
 		fh *FileHandle
@@ -1772,6 +1824,7 @@ func (fs *ArtifactFuse) setPinnedAttributes(op *fuseops.SetInodeAttributesOp, ch
 	}
 	op.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
 	op.AttributesExpiration = attrExpiry(CacheTTL)
+	fs.logReply(ctx, attrReply, "SetInodeAttributes", op.Inode, attrs)
 	return nil
 }
 
@@ -1837,7 +1890,7 @@ func (fs *ArtifactFuse) ForgetInode(_ context.Context, op *fuseops.ForgetInodeOp
 }
 
 func (fs *ArtifactFuse) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) error {
-	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+	return fs.shared(ctx, opTarget{inode: op.Inode}, func(ctx context.Context, _ *Blobs) error {
 		ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 		if err != nil {
 			return err
@@ -1881,7 +1934,7 @@ func (fs *ArtifactFuse) listDirHandle(ctx context.Context, dh *DirHandle, offset
 }
 
 func (fs *ArtifactFuse) ReadDir(ctx context.Context, op *fuseops.ReadDirOp) error {
-	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+	return fs.shared(ctx, opTarget{inode: op.Inode}, func(ctx context.Context, _ *Blobs) error {
 		dh, err := fs.dirHandle(op.Handle)
 		if err != nil {
 			return err
@@ -1915,7 +1968,7 @@ func (fs *ArtifactFuse) ReadDir(ctx context.Context, op *fuseops.ReadDirOp) erro
 // listing that names a path holding an unmapped inode holds handleOps
 // exclusively.
 func (fs *ArtifactFuse) ReadDirPlus(ctx context.Context, op *fuseops.ReadDirPlusOp) error {
-	return fs.sharedUnlessUnmapped(ctx, func(ctx context.Context, _ *Blobs, exclusive bool) error {
+	return fs.sharedUnlessUnmapped(ctx, opTarget{inode: op.Inode}, func(ctx context.Context, _ *Blobs, exclusive bool) error {
 		dh, err := fs.dirHandle(op.Handle)
 		if err != nil {
 			return err
@@ -1935,7 +1988,7 @@ func (fs *ArtifactFuse) ReadDirPlus(ctx context.Context, op *fuseops.ReadDirPlus
 		for i := offset; i < len(dh.entries); i++ {
 			e := dh.entries[i]
 			childPath := cleanChildPath(dh.inode.Path, e.Name)
-			entry := fs.childEntryFromReaddir(dh.inode.ID, childPath, dh.gen, dh.commitTime, e)
+			entry, attrs := fs.childEntryFromReaddir(dh.inode.ID, childPath, dh.gen, dh.commitTime, e)
 			dirent := fuseutil.DirentPlus{
 				Dirent: fuseutil.Dirent{
 					Offset: fuseops.DirOffset(i + 1),
@@ -1951,19 +2004,23 @@ func (fs *ArtifactFuse) ReadDirPlus(ctx context.Context, op *fuseops.ReadDirPlus
 				break
 			}
 			op.BytesRead += n
+			fs.logReply(ctx, entryReply, "ReadDirPlus", entry.Child, attrs)
 		}
 		return nil
 	})
 }
 
-func (fs *ArtifactFuse) childEntryFromReaddir(parent fuseops.InodeID, path string, gen, commitTime int64, e ReaddirEntry) fuseops.ChildInodeEntry {
+// childEntryFromReaddir returns the entry of e, the child at path, and the
+// attrs it recorded for the entry.
+func (fs *ArtifactFuse) childEntryFromReaddir(parent fuseops.InodeID, path string, gen, commitTime int64, e ReaddirEntry) (fuseops.ChildInodeEntry, Attrs) {
 	if path == ".git" {
+		attrs := Attrs{Type: "file", Mode: 0o644, Gen: gen}
 		fs.mu.Lock()
-		ref := fs.allocEntry(parent, e.Name, path, Attrs{Type: "file", Mode: 0o644, Gen: gen})
+		ref := fs.allocEntry(parent, e.Name, path, attrs)
 		fs.mu.Unlock()
 		entry := fuseops.ChildInodeEntry{Child: ref.ID, Attributes: fs.gitFileAttrs()}
 		setChildEntryExpiry(&entry, time.Minute)
-		return entry
+		return entry, attrs
 	}
 	mode, size, typ, mtime, ctime := readdirAttrs(e, gen, commitTime)
 	attrs := Attrs{Type: typ, Mode: mode}
@@ -1979,7 +2036,7 @@ func (fs *ArtifactFuse) childEntryFromReaddir(parent fuseops.InodeID, path strin
 		Attributes: inodeAttrs(mode, uint64(size), typ, mtime, ctime),
 	}
 	setChildEntryExpiry(&entry, CacheTTL)
-	return entry
+	return entry, attrs
 }
 
 func readdirAttrs(e ReaddirEntry, gen, commitTime int64) (mode uint32, size int64, typ string, mtime time.Time, ctime time.Time) {
@@ -2017,7 +2074,7 @@ func (fs *ArtifactFuse) openFile(ctx context.Context, op *fuseops.OpenFileOp, ch
 	// Engine.Do does with no lock held, until the next run pins.
 	var carried int64
 	defer func() { fs.unpin(carried) }()
-	return fs.shared(ctx, func(ctx context.Context, b *Blobs) (err error) {
+	return fs.shared(ctx, opTarget{inode: op.Inode}, func(ctx context.Context, b *Blobs) (err error) {
 		ref, pinned, err := fs.pinInode(op.Inode, carried)
 		carried = 0
 		if err != nil {
@@ -2130,7 +2187,7 @@ func (fs *ArtifactFuse) addFileHandle(id fuseops.InodeID, fh *FileHandle, blob s
 }
 
 func (fs *ArtifactFuse) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) error {
-	return fs.shared(ctx, func(ctx context.Context, b *Blobs) error {
+	return fs.shared(ctx, opTarget{inode: op.Inode}, func(ctx context.Context, b *Blobs) error {
 		fh, err := fs.fileHandle(op.Handle)
 		if err != nil {
 			return err
@@ -2173,13 +2230,13 @@ func (fs *ArtifactFuse) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) er
 // op reaches the path through.
 var errUnmappedPath = errors.New("path does not map to the inode")
 
-// sharedUnlessUnmapped runs op holding handleOps shared, and again holding it
-// exclusively when op returns errUnmappedPath, so no other op runs alongside
-// it. op learns which way it runs.
-func (fs *ArtifactFuse) sharedUnlessUnmapped(ctx context.Context, op func(ctx context.Context, b *Blobs, exclusive bool) error) error {
-	err := fs.shared(ctx, func(ctx context.Context, b *Blobs) error { return op(ctx, b, false) })
+// sharedUnlessUnmapped runs op, an op on at, holding handleOps shared, and
+// again holding it exclusively when op returns errUnmappedPath, so no other op
+// runs alongside it. op learns which way it runs.
+func (fs *ArtifactFuse) sharedUnlessUnmapped(ctx context.Context, at opTarget, op func(ctx context.Context, b *Blobs, exclusive bool) error) error {
+	err := fs.shared(ctx, at, func(ctx context.Context, b *Blobs) error { return op(ctx, b, false) })
 	if errors.Is(err, errUnmappedPath) {
-		err = fs.exclusive(ctx, func(ctx context.Context, b *Blobs) error { return op(ctx, b, true) })
+		err = fs.exclusive(ctx, at, func(ctx context.Context, b *Blobs) error { return op(ctx, b, true) })
 	}
 	return err
 }
@@ -2228,7 +2285,7 @@ func (fs *ArtifactFuse) claimPath(id fuseops.InodeID, path string) error {
 // WriteFile writes through a handle. A write whose path does not map to the
 // handle's inode can recreate the path, so it holds handleOps exclusively.
 func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) error {
-	return fs.sharedUnlessUnmapped(ctx, func(ctx context.Context, b *Blobs, exclusive bool) error {
+	return fs.sharedUnlessUnmapped(ctx, opTarget{inode: op.Inode}, func(ctx context.Context, b *Blobs, exclusive bool) error {
 		return fs.writeFile(ctx, b, op, exclusive)
 	})
 }
@@ -2312,7 +2369,7 @@ func (fs *ArtifactFuse) mapsTo(path string, id fuseops.InodeID) bool {
 // exclusively: a write through that inode that already reached the path then
 // finishes first, and does not land in the created file.
 func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp) error {
-	return fs.sharedUnlessUnmapped(ctx, func(ctx context.Context, _ *Blobs, exclusive bool) error {
+	return fs.sharedUnlessUnmapped(ctx, opTarget{op.Parent, op.Name}, func(ctx context.Context, _ *Blobs, exclusive bool) error {
 		_, childPath, err := fs.childPath(op.Parent, op.Name)
 		if err != nil {
 			return err
@@ -2323,8 +2380,9 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 		if err := fs.engine.Create(ctx, childPath, uint32(op.Mode)); err != nil {
 			return err
 		}
+		attrs := Attrs{Type: "file", Mode: uint32(op.Mode)}
 		fs.mu.Lock()
-		ref := fs.createEntry(op.Parent, op.Name, childPath, Attrs{Type: "file", Mode: uint32(op.Mode)})
+		ref := fs.createEntry(op.Parent, op.Name, childPath, attrs)
 		ref.CreateOpenPending = true
 		fh := &FileHandle{inode: ref, path: childPath, wrote: true, writable: !op.OpenFlags.IsReadOnly(), pid: op.OpContext.Pid}
 		handle := fs.nextHandleID
@@ -2337,12 +2395,13 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 		op.Entry.Attributes = inodeAttrs(uint32(op.Mode), 0, "file", now, now)
 		setChildEntryExpiry(&op.Entry, CacheTTL)
 		op.Handle = handle
+		fs.logReply(ctx, entryReply, "CreateFile", ref.ID, attrs)
 		return nil
 	})
 }
 
 func (fs *ArtifactFuse) CreateSymlink(ctx context.Context, op *fuseops.CreateSymlinkOp) error {
-	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+	return fs.shared(ctx, opTarget{op.Parent, op.Name}, func(ctx context.Context, _ *Blobs) error {
 		_, childPath, err := fs.childPath(op.Parent, op.Name)
 		if err != nil {
 			return err
@@ -2353,20 +2412,22 @@ func (fs *ArtifactFuse) CreateSymlink(ctx context.Context, op *fuseops.CreateSym
 		if err := fs.engine.Symlink(ctx, childPath, op.Target); err != nil {
 			return err
 		}
+		attrs := Attrs{Type: "symlink", Mode: 0o120000}
 		fs.mu.Lock()
-		ref := fs.createEntry(op.Parent, op.Name, childPath, Attrs{Type: "symlink", Mode: 0o120000})
+		ref := fs.createEntry(op.Parent, op.Name, childPath, attrs)
 		fs.mu.Unlock()
 
 		op.Entry.Child = ref.ID
 		now := time.Now()
 		op.Entry.Attributes = inodeAttrs(0o120000, uint64(len(op.Target)), "symlink", now, now)
 		setChildEntryExpiry(&op.Entry, CacheTTL)
+		fs.logReply(ctx, entryReply, "CreateSymlink", ref.ID, attrs)
 		return nil
 	})
 }
 
 func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
-	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+	return fs.shared(ctx, opTarget{op.Parent, op.Name}, func(ctx context.Context, _ *Blobs) error {
 		_, childPath, err := fs.childPath(op.Parent, op.Name)
 		if err != nil {
 			return err
@@ -2374,20 +2435,22 @@ func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
 		if err := fs.engine.Mkdir(ctx, childPath, uint32(op.Mode)); err != nil {
 			return err
 		}
+		attrs := Attrs{Type: "dir", Mode: uint32(op.Mode)}
 		fs.mu.Lock()
-		ref := fs.createEntry(op.Parent, op.Name, childPath, Attrs{Type: "dir", Mode: uint32(op.Mode)})
+		ref := fs.createEntry(op.Parent, op.Name, childPath, attrs)
 		fs.mu.Unlock()
 
 		op.Entry.Child = ref.ID
 		now := time.Now()
 		op.Entry.Attributes = inodeAttrs(uint32(op.Mode)|uint32(os.ModeDir), 4096, "dir", now, now)
 		setChildEntryExpiry(&op.Entry, CacheTTL)
+		fs.logReply(ctx, entryReply, "MkDir", ref.ID, attrs)
 		return nil
 	})
 }
 
 func (fs *ArtifactFuse) RmDir(ctx context.Context, op *fuseops.RmDirOp) error {
-	return fs.exclusive(ctx, func(ctx context.Context, _ *Blobs) error {
+	return fs.exclusive(ctx, opTarget{op.Parent, op.Name}, func(ctx context.Context, _ *Blobs) error {
 		parent, childPath, err := fs.childPath(op.Parent, op.Name)
 		if err != nil {
 			return err
@@ -2404,7 +2467,7 @@ func (fs *ArtifactFuse) RmDir(ctx context.Context, op *fuseops.RmDirOp) error {
 }
 
 func (fs *ArtifactFuse) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error {
-	return fs.exclusive(ctx, func(ctx context.Context, b *Blobs) error {
+	return fs.exclusive(ctx, opTarget{op.Parent, op.Name}, func(ctx context.Context, b *Blobs) error {
 		parent, childPath, err := fs.childPath(op.Parent, op.Name)
 		if err != nil {
 			return err
@@ -2428,7 +2491,7 @@ func (fs *ArtifactFuse) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error 
 }
 
 func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error {
-	return fs.exclusive(ctx, func(ctx context.Context, b *Blobs) error {
+	return fs.exclusive(ctx, opTarget{op.OldParent, op.OldName}, func(ctx context.Context, b *Blobs) error {
 		defer fs.renaming()()
 		oldParent, err := fs.requireInode(op.OldParent, syscall.ENOENT)
 		if err != nil {
@@ -2482,14 +2545,14 @@ func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlink
 	}
 	target, err := fs.engine.ReadSymlink(ctx, ref.Path)
 	if err != nil {
-		return toErrno(ctx, err)
+		return fs.opError(ctx, opTarget{inode: op.Inode}, err)
 	}
 	op.Target = target
 	return nil
 }
 
 func (fs *ArtifactFuse) FlushFile(ctx context.Context, op *fuseops.FlushFileOp) error {
-	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+	return fs.shared(ctx, opTarget{inode: op.Inode}, func(ctx context.Context, _ *Blobs) error {
 		fh, err := fs.fileHandle(op.Handle)
 		if err != nil {
 			return err
@@ -2512,7 +2575,7 @@ func (fs *ArtifactFuse) flushHandle(ctx context.Context, fh *FileHandle) error {
 }
 
 func (fs *ArtifactFuse) SyncFile(ctx context.Context, op *fuseops.SyncFileOp) error {
-	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+	return fs.shared(ctx, opTarget{inode: op.Inode}, func(ctx context.Context, _ *Blobs) error {
 		fh, err := fs.fileHandle(op.Handle)
 		if err != nil {
 			return err
@@ -2536,8 +2599,10 @@ func (fs *ArtifactFuse) SyncFile(ctx context.Context, op *fuseops.SyncFileOp) er
 	})
 }
 
+// ReleaseFileHandle names no inode, so an error names the handle's inode.
 func (fs *ArtifactFuse) ReleaseFileHandle(ctx context.Context, op *fuseops.ReleaseFileHandleOp) error {
-	return fs.shared(ctx, func(ctx context.Context, _ *Blobs) error {
+	var at opTarget
+	err := fs.engine.Do(ctx, fs.handleOps.RLocker(), func(ctx context.Context, _ *Blobs) error {
 		fs.mu.Lock()
 		fh := fs.fileHandles[op.Handle]
 		delete(fs.fileHandles, op.Handle)
@@ -2545,10 +2610,12 @@ func (fs *ArtifactFuse) ReleaseFileHandle(ctx context.Context, op *fuseops.Relea
 		if fh == nil {
 			return nil
 		}
+		at.inode = fh.inode.ID
 		err := fs.flushHandle(ctx, fh)
 		fh.release()
 		return err
 	})
+	return fs.opError(ctx, at, err)
 }
 
 func (fs *ArtifactFuse) GetXattr(_ context.Context, _ *fuseops.GetXattrOp) error {
@@ -2622,15 +2689,47 @@ func (fs permissionCheckingFS) SetInodeAttributes(ctx context.Context, op *fuseo
 // Notifiers of two mount attempts apart.
 var newNotifier = fuse.NewNotifier
 
-// fuseErrorLog writes each line the fuse library logs to logger, redacted by
+// fuseLog writes each line the fuse library logs to logger, redacted by
 // redact. A bug the library answered with EIO goes out as an error. A short
 // FSKit read the library answered with EIO goes out as a warning. Any other op
 // error, which the library logs for expected errnos such as EEXIST too, goes
 // out at Debug. Anything else, such as a failed reply, goes out as a warning.
-type fuseErrorLog struct {
+// It takes the replies ArtifactFuse.logReply logs too.
+type fuseLog struct {
 	logger *slog.Logger
 	repo   string
 	redact func(string) string
+}
+
+// The messages of the records logReply writes.
+const (
+	entryReply = "fuse entry reply"
+	attrReply  = "fuse attr reply"
+)
+
+// logReply logs at Debug that op replied with attrs for inode id: in an entry
+// when msg is entryReply, as its attributes when msg is attrReply. The record
+// carries the inode's path, redacted as fuseLog redacts the library's lines.
+// Lookups and getattrs reply on every call, so logReply reads nothing and
+// builds no record unless the logger takes Debug. Callers hold no fs.mu.
+func (fs *ArtifactFuse) logReply(ctx context.Context, msg, op string, id fuseops.InodeID, attrs Attrs) {
+	if !fs.log.logger.Enabled(ctx, slog.LevelDebug) {
+		return
+	}
+	fs.mu.RLock()
+	var path string
+	if ref := fs.inodes[id]; ref != nil {
+		path = ref.Path
+	}
+	fs.mu.RUnlock()
+	fs.log.logger.LogAttrs(ctx, slog.LevelDebug, msg,
+		slog.String("repo", fs.log.repo),
+		slog.String("op", op),
+		slog.Uint64("inode", uint64(id)),
+		slog.String("type", attrs.Type),
+		slog.Int64("generation", attrs.Gen),
+		slog.String("path", fs.log.redact(path)),
+	)
 }
 
 // fuseBugLine matches the op error lines the fuse library writes for a
@@ -2644,7 +2743,7 @@ var fuseBugLine = regexp.MustCompile(`^Op 0x[0-9a-f]+ \S+\] -> \w+: (panic: |"fu
 // which it answers with EIO.
 var fuseShortReadLine = regexp.MustCompile(`^Op 0x[0-9a-f]+ \*fuseops\.ReadFileOp\] -> Error: "read of inode \d+ at offset \d+ returned \d+ bytes, want \d+ for size \d+: `)
 
-func (l fuseErrorLog) Write(p []byte) (int, error) {
+func (l fuseLog) Write(p []byte) (int, error) {
 	msg := strings.TrimSuffix(string(p), "\n")
 	level := slog.LevelWarn
 	switch {
@@ -2713,8 +2812,9 @@ func mountWithBackend(backend string, mount func(fskit bool) (*fuse.MountedFileS
 // MountRepoWithGate mounts repo, gated by gate unless it is nil. ctx bounds
 // the wait for the mount: when it ends first, the error is an AbandonedMount.
 // opCtx is the parent of every op's context, so ending it cancels the ops in
-// flight. The fuse library's error lines go to logger, after redact removes
-// what a log must not show, such as the repo's remote. A nil redact
+// flight. The fuse library's error lines, and at Debug each entry and
+// attribute reply, go to logger, after redact removes what a log must not
+// show, such as the repo's remote. A nil redact
 // redacts only what auth.RedactLogString detects.
 func MountRepoWithGate(ctx, opCtx context.Context, repo model.RepoPaths, engine *Engine, gate *ReadyGate, logger *slog.Logger, redact func(string) string) (MountedFS, error) {
 	if redact == nil {
@@ -2725,12 +2825,13 @@ func MountRepoWithGate(ctx, opCtx context.Context, repo model.RepoPaths, engine 
 		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
 	}
 	fsint := NewArtifactFuse(repo, engine)
+	fsint.log = fuseLog{logger: logger, repo: repo.Name, redact: redact}
 
 	mountCfg := fuse.MountConfig{
 		FSName:                  FSName(repo.Name),
 		Subtype:                 FSSubtype,
 		DisableWritebackCaching: true,
-		ErrorLogger:             log.New(fuseErrorLog{logger: logger, repo: repo.Name, redact: redact}, "", 0),
+		ErrorLogger:             log.New(fsint.log, "", 0),
 		OpContext:               opCtx,
 	}
 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.

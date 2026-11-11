@@ -165,7 +165,7 @@ func (s *sharedE2ERepo) runSubtest(t *testing.T, name string, test func(*testing
 		// Runs before release, which clears the logs.
 		t.Cleanup(func() {
 			if t.Failed() {
-				logFuseErrors(t, s.repo.logs)
+				logFuseRecords(t, s.repo.logs)
 			}
 		})
 		test(t, s.repo)
