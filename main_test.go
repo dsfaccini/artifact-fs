@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -26,6 +29,7 @@ func TestMain(m *testing.M) {
 	if os.Getenv("AFS_E2E_REPO") == "" {
 		gittest.IsolateConfig()
 	}
+	disableIdentityGuessing()
 	gittest.DisableRaceExitSleep()
 	code := m.Run()
 	if os.Getenv("AFS_RUN_E2E_TESTS") == "1" {
@@ -39,4 +43,36 @@ func TestGitIgnoresMachineConfig(t *testing.T) {
 		t.Skip("AFS_E2E_REPO keeps the machine's Git config for its credential helper")
 	}
 	gittest.RequireConfigIsolated(t)
+}
+
+// disableIdentityGuessing sets user.useConfigOnly for git in this process and
+// every process it starts, so a commit that names no identity fails instead of
+// taking one guessed from the user and host names. That covers the git the
+// daemon under test runs and the git that tests run in its mounts. It adds the
+// setting after any GIT_CONFIG_* entries the caller set.
+func disableIdentityGuessing() {
+	n, _ := strconv.Atoi(os.Getenv("GIT_CONFIG_COUNT"))
+	os.Setenv("GIT_CONFIG_KEY_"+strconv.Itoa(n), "user.useConfigOnly")
+	os.Setenv("GIT_CONFIG_VALUE_"+strconv.Itoa(n), "true")
+	os.Setenv("GIT_CONFIG_COUNT", strconv.Itoa(n+1))
+}
+
+func TestGitCommitNeedsAConfiguredIdentity(t *testing.T) {
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "init", "-q", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	cmd := exec.Command("git", "-C", repo, "commit", "--allow-empty", "-m", "no identity")
+	// An identity variable, or the machine config that AFS_E2E_REPO keeps,
+	// would give the commit an identity. LC_ALL=C keeps git's message English.
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "GIT_AUTHOR_") && !strings.HasPrefix(kv, "GIT_COMMITTER_") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	cmd.Env = append(cmd.Env, "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1", "LC_ALL=C")
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "auto-detection is disabled") {
+		t.Fatalf("git commit with no identity: err = %v, want it refused because user.useConfigOnly disables auto-detection\n%s", err, out)
+	}
 }
