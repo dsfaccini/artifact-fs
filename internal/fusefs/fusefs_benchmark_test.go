@@ -533,8 +533,9 @@ const untrackedEntries = 20_000 - 6_299
 // looks up each inode the pass invalidated again, outside the timed pass.
 // The unheld-overlay cases add the node_modules entries to the overlay
 // without holding them, and the forgotten case maps one of them to an inode
-// the kernel then forgets. It reports pass-ns/op, the time of the pass
-// alone, and the invalidations each pass sends.
+// the kernel then forgets. It reports pass-ns/op and pass-cpu-ns/op, the wall
+// and process CPU time of the pass alone, and the invalidations each pass
+// sends. CPU time is steadier than wall time on a loaded machine.
 func BenchmarkSwitchPass(b *testing.B) {
 	for _, held := range []int{100, 2_000, 20_000} {
 		for _, changed := range []int{1, 500} {
@@ -660,7 +661,7 @@ func benchSwitchPassHeld(b *testing.B, held, changed int, unheldOverlay, forgott
 		}
 	}
 	variants := [2][]model.BaseNode{next, base}
-	var pass time.Duration
+	var pass, passCPU time.Duration
 	b.ResetTimer()
 	for i := range b.N {
 		gen, err := snap.PublishGeneration(ctx, "head", "main", variants[i%2])
@@ -673,11 +674,11 @@ func benchSwitchPassHeld(b *testing.B, held, changed int, unheldOverlay, forgott
 		// The overlay holds only entries neither generation has, so a
 		// reconcile would change nothing.
 		r.SetGeneration(gen)
-		start := time.Now()
+		start, startCPU := time.Now(), cpuTime(b)
 		if err := fs.invalidateChanged(true); err != nil {
 			b.Fatal(err)
 		}
-		pass += time.Since(start)
+		pass, passCPU = pass+time.Since(start), passCPU+cpuTime(b)-startCPU
 		// A kernel looks up an invalidated inode again before it uses it.
 		for _, id := range notifier.invalidated {
 			fs.mu.RLock()
@@ -696,6 +697,7 @@ func benchSwitchPassHeld(b *testing.B, held, changed int, unheldOverlay, forgott
 	b.StopTimer()
 	b.ReportMetric(float64(len(paths)), "held")
 	b.ReportMetric(float64(pass.Nanoseconds())/float64(b.N), "pass-ns/op")
+	b.ReportMetric(float64(passCPU.Nanoseconds())/float64(b.N), "pass-cpu-ns/op")
 	b.ReportMetric(float64(notifier.inodes)/float64(b.N), "inode-invals/op")
 	b.ReportMetric(float64(notifier.entries)/float64(b.N), "entry-invals/op")
 }

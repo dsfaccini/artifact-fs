@@ -285,6 +285,12 @@ type MergedIdentity struct {
 	Err      error
 }
 
+// CountOverlayEntries returns the number of overlay entries, counting at most
+// limit.
+func (e *Engine) CountOverlayEntries(ctx context.Context, limit int) (int, error) {
+	return e.Resolver.Overlay.CountEntries(ctx, limit)
+}
+
 // ReadOverlay reads every overlay entry together with the generation that
 // readers resolve against.
 func (e *Engine) ReadOverlay(ctx context.Context) (OverlayView, error) {

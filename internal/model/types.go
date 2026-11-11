@@ -375,6 +375,9 @@ type OverlayStore interface {
 	ListByPrefix(ctx context.Context, prefix string) ([]OverlayEntry, error)
 	// HasEntryBelow reports whether an entry of any kind lies below path.
 	HasEntryBelow(ctx context.Context, path string) (bool, error)
+	// CountEntries returns the number of entries of any kind, counting at
+	// most limit.
+	CountEntries(ctx context.Context, limit int) (int, error)
 }
 
 type Hydrator interface {

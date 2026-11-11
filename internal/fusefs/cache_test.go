@@ -11,6 +11,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -848,5 +849,196 @@ func TestOpenFileOfAnUnmappedInodeReadsAfterARenameMovesIt(t *testing.T) {
 	}
 	if got := string(read.Dst[:read.BytesRead]); got != "x-content" {
 		t.Fatalf("read through the open file of the moved inode = %q, want %q", got, "x-content")
+	}
+}
+
+// The switch pass reads the whole overlay and diffs the generations, or
+// resolves each held path on its own. Either way it sends the kernel the same
+// invalidations, retires the same inodes and moves the same read
+// generations.
+func TestSwitchPassDoesTheSameWithAndWithoutTheOverlayRead(t *testing.T) {
+	type outcome struct {
+		inodes, entries []string
+		gens            []int64
+		swapRetired     bool
+	}
+	run := func(t *testing.T, perPath bool) outcome {
+		f := newCacheFixture(t,
+			baseFile("same.txt", "same", 0o100644),
+			baseFile("edited.txt", "edited-1", 0o100644),
+			baseFile("chmod.sh", "chmod", 0o100644),
+			baseFile("gone.txt", "gone", 0o100644),
+			baseFile("swap", "swap", 0o100644),
+			baseDir("dir", "dir-1"),
+			baseFile("dir/kept.txt", "kept", 0o100644),
+			baseDir("olddir", "olddir"),
+			baseFile("olddir/child.txt", "child", 0o100644),
+			baseFile("written.txt", "blob-a", 0o100644),
+			baseDir("d", "d-1"),
+			baseFile("d/file.txt", "file", 0o100644),
+		)
+		f.fs.testHookResolvePerPath = func() bool { return perPath }
+		var root fuseops.InodeID = fuseops.RootInodeID
+		names := map[fuseops.InodeID]string{}
+		lookup := func(parent fuseops.InodeID, path string) fuseops.InodeID {
+			id := f.lookup(parent, filepath.Base(path))
+			names[id] = path
+			return id
+		}
+		for _, p := range []string{"same.txt", "edited.txt", "chmod.sh", "gone.txt", "swap", "dir", "olddir", "written.txt", "d"} {
+			lookup(root, p)
+		}
+		dirs := map[string]fuseops.InodeID{".": root}
+		for id, p := range names {
+			dirs[p] = id
+		}
+		lookup(dirs["dir"], "dir/kept.txt")
+		lookup(dirs["olddir"], "olddir/child.txt")
+		f.open(dirs["same.txt"])
+		written := dirs["written.txt"]
+		if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: written, Handle: f.openRW(written).Handle, Data: []byte("xxxxxx")}); err != nil {
+			t.Fatal(err)
+		}
+		create := &fuseops.CreateFileOp{Parent: dirs["d"], Name: "new.txt", Mode: 0o644}
+		if err := f.fs.CreateFile(f.ctx, create); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.fs.ReleaseFileHandle(f.ctx, &fuseops.ReleaseFileHandleOp{Handle: create.Handle}); err != nil {
+			t.Fatal(err)
+		}
+		names[create.Entry.Child] = "d/new.txt"
+		names[root] = "."
+
+		f.switchTo(
+			baseFile("same.txt", "same", 0o100644),
+			baseFile("edited.txt", "edited-2", 0o100644),
+			baseFile("chmod.sh", "chmod", 0o100755),
+			baseDir("swap", "swap"),
+			baseFile("swap/inner.txt", "inner", 0o100644),
+			baseDir("dir", "dir-2"),
+			baseFile("dir/kept.txt", "kept", 0o100644),
+			baseFile("dir/fresh.txt", "fresh", 0o100644),
+			baseFile("written.txt", blobOID("xxxxxx"), 0o100644),
+		)
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
+		var got outcome
+		inodes, entries := f.notifier.recorded()
+		for _, id := range inodes {
+			got.inodes = append(got.inodes, names[id])
+		}
+		for _, e := range entries {
+			got.entries = append(got.entries, names[e.parent]+" "+e.name)
+		}
+		slices.Sort(got.inodes)
+		slices.Sort(got.entries)
+		got.gens = f.fs.OpenFileGenerations()
+		got.swapRetired = f.lookup(root, "swap") != dirs["swap"]
+		return got
+	}
+	want := outcome{
+		inodes:      []string{"chmod.sh", "edited.txt", "swap", "written.txt"},
+		entries:     []string{". gone.txt", ". olddir", ". swap", "olddir child.txt"},
+		gens:        []int64{2},
+		swapRetired: true,
+	}
+	for _, perPath := range []bool{false, true} {
+		t.Run(fmt.Sprint("per path=", perPath), func(t *testing.T) {
+			if got := run(t, perPath); !reflect.DeepEqual(got, want) {
+				t.Fatalf("pass = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+// The switch pass reads the whole overlay while the overlay holds at most
+// perPathOverlayRatio entries per held path, and whenever a mapping needs only
+// the existence check, which reads the overlay anyway. Otherwise it resolves
+// each held path on its own.
+func TestSwitchPassReadsTheOverlayOnlyWhenThatCostsLess(t *testing.T) {
+	f := newCacheFixture(t, baseFile("a.txt", "a", 0o100644), baseFile("b.txt", "b", 0o100644))
+	for i := range perPathOverlayRatio + 1 {
+		if _, err := f.resolver.Overlay.CreateFile(f.ctx, fmt.Sprintf("untracked/f%d", i), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ov := hookOverlay(f)
+	listed := func() bool {
+		t.Helper()
+		read := false
+		ov.beforeList = func() { read = true }
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
+		ov.beforeList = nil
+		return read
+	}
+	var root fuseops.InodeID = fuseops.RootInodeID
+	f.lookup(root, "a.txt")
+	if listed() {
+		t.Fatalf("the pass read the overlay of %d entries for one held path", perPathOverlayRatio+1)
+	}
+	b := f.lookup(root, "b.txt")
+	if !listed() {
+		t.Fatalf("the pass did not read the overlay of %d entries for two held paths", perPathOverlayRatio+1)
+	}
+	forget(t, f.fs, b)
+	if !listed() {
+		t.Fatal("the pass did not read the overlay for the existence check of b.txt, which the kernel forgot")
+	}
+}
+
+// A failed op through the mount can map an unmapped inode back before it
+// fails: an unlink or a rename first settles the unmapped inodes at and below
+// its path, and a write through the inode claims its path. The inode then
+// reads the generation its path came back at, so a later switch that removes
+// the path, while every directory above it keeps its tree ID from the
+// generation the inode was reported at, still drops its name.
+func TestSwitchPassDropsInodeThatAFailedOpMappedBack(t *testing.T) {
+	for _, op := range []string{"unlink", "write"} {
+		t.Run(op, func(t *testing.T) {
+			keep := baseFile("d/sub/keep", "keep", 0o100644)
+			other := baseFile("e/sub/other", "other", 0o100644)
+			f := newCacheFixture(t, baseDir("d", "d-1"), baseDir("d/sub", "dsub-1"), keep, baseFile("d/sub/x", "x", 0o100644), baseDir("e", "e-1"), baseDir("e/sub", "esub-1"), other)
+			var root fuseops.InodeID = fuseops.RootInodeID
+			d := f.lookup(root, "d")
+			sub := f.lookup(d, "sub")
+			x := f.lookup(sub, "x")
+			handle := f.openRW(x).Handle
+			f.switchTo(baseDir("d", "d-2"), baseDir("d/sub", "dsub-2"), keep)
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: root, OldName: "d", NewParent: root, NewName: "e"}); err != nil {
+				t.Fatal(err)
+			}
+			f.switchTo(baseDir("e", "e-3"), baseDir("e/sub", "esub-3"), baseFile("e/sub/keep", "keep", 0o100644), baseFile("e/sub/x", "x", 0o100644))
+			ov := &faultyOverlay{OverlayStore: f.resolver.Overlay, removeErr: syscall.EIO, copyErr: syscall.EIO}
+			f.resolver.Overlay, f.fs.engine.Overlay = ov, ov
+			var err error
+			if op == "write" {
+				err = f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: x, Handle: handle, Data: []byte("y")})
+			} else {
+				err = f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: sub, Name: "x"})
+			}
+			if err == nil {
+				t.Fatalf("%s succeeded, want a failure", op)
+			}
+			f.fs.mu.RLock()
+			mapped := f.fs.pathToInode["e/sub/x"] == x
+			f.fs.mu.RUnlock()
+			if !mapped {
+				t.Fatalf("e/sub/x, back with the moved inode's identity, did not map back to it in the failed %s", op)
+			}
+			_, before := f.notifier.recorded()
+			f.switchTo(baseDir("e", "e-1"), baseDir("e/sub", "esub-1"), other)
+			if err := f.mount.InvalidateChanged(); err != nil {
+				t.Fatal(err)
+			}
+			if _, entries := f.notifier.recorded(); !slices.Equal(entries[len(before):], []kernelEntry{{sub, "x"}}) {
+				t.Fatalf("invalidated entries = %v, want e/sub/x, which the last switch removed", entries[len(before):])
+			}
+		})
 	}
 }

@@ -159,6 +159,9 @@ type ArtifactFuse struct {
 	// testHookBeforeAddFileHandle, when set, runs in an open between its
 	// Engine.OpenFile and its addFileHandle.
 	testHookBeforeAddFileHandle func()
+	// testHookResolvePerPath, when set, decides in place of resolvesPerPath
+	// whether the switch pass resolves its held paths one at a time.
+	testHookResolvePerPath func() bool
 }
 
 type InodeRef struct {
@@ -696,7 +699,10 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // The pass reads the overlay once, and finds each held inode's identity with
 // Engine.Identities: it diffs the generation each inode's base identity was
 // reported at with the current one, and resolves only the paths the diff
-// names, so its cost follows the change, not the number of inodes held.
+// names, so its cost follows the change, not the number of inodes held. When
+// no mapping needs only the existence check and resolvesPerPath finds the
+// overlay large next to the held paths, it resolves each held path on its own
+// instead, without reading the overlay.
 //
 // An inode whose base identity the current generation still has reads that
 // generation from then on, so a prune need not keep the one it read. The
@@ -781,12 +787,20 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	for _, k := range slices.Concat(inodes, opened) {
 		held = append(held, KernelIdentity{Path: k.path, Identity: k.reported, Gen: k.readGen})
 	}
+	// The pass reads the whole overlay, unless no mapping needs only the
+	// existence check and resolving each held path costs less.
+	var view OverlayView
+	viewed := false
+	if len(existenceOnly) > 0 || !fs.resolvesPerPath(len(held)) {
+		var err error
+		view, err = fs.engine.ReadOverlay(context.Background())
+		failed(err, "list the overlay")
+		viewed = err == nil
+	}
 	var currents []MergedIdentity
-	view, viewErr := fs.engine.ReadOverlay(context.Background())
-	if viewErr == nil {
+	if viewed {
 		currents = fs.engine.Identities(view, held)
 	} else {
-		failed(viewErr, "list the overlay")
 		for _, h := range held {
 			id, exists, err := fs.engine.Identity(h.Path)
 			currents = append(currents, MergedIdentity{Identity: id, Exists: exists, Err: err})
@@ -877,7 +891,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		paths[i] = m.path
 	}
 	var missing []string
-	if viewErr == nil {
+	if viewed {
 		var err error
 		missing, err = fs.engine.MissingPathsIn(view, paths)
 		failed(err, "list parents")
@@ -967,6 +981,25 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		sent(notifier.InvalidateInode(id, 0, 0), fmt.Sprintf("inode %d", id))
 	}
 	return firstErr
+}
+
+// perPathOverlayRatio is the most overlay entries per held path for which the
+// switch pass reads the whole overlay. Past it, resolving each held path one
+// at a time costs less: over BenchmarkSwitchPass's tree, with 100 and with
+// 400 held paths, the two cost the same at 9 to 10 entries per held path.
+const perPathOverlayRatio = 9
+
+// resolvesPerPath reports whether the switch pass resolves each of its held
+// paths one at a time instead of reading the whole overlay: whether the
+// overlay holds more than perPathOverlayRatio entries per held path. It
+// counts at most one entry past that.
+func (fs *ArtifactFuse) resolvesPerPath(held int) bool {
+	if fs.testHookResolvePerPath != nil {
+		return fs.testHookResolvePerPath()
+	}
+	limit := perPathOverlayRatio*held + 1
+	n, err := fs.engine.CountOverlayEntries(context.Background(), limit)
+	return err == nil && n == limit
 }
 
 // openedBlobLocked records that an open of id serves blob, which is empty for

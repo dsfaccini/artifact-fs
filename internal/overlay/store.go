@@ -1678,6 +1678,14 @@ func (s *Store) HasEntryBelow(ctx context.Context, path string) (bool, error) {
 	return err == nil, err
 }
 
+// CountEntries returns the number of entries of any kind, counting at most
+// limit. It reads at most limit rows of an index.
+func (s *Store) CountEntries(ctx context.Context, limit int) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM (SELECT 1 FROM overlay_entries LIMIT ?)`, limit).Scan(&n)
+	return n, err
+}
+
 // queryEntries runs an arbitrary overlay query and scans the results.
 func (s *Store) queryEntries(ctx context.Context, query string, args ...any) ([]model.OverlayEntry, error) {
 	pending := s.pendingValues()
