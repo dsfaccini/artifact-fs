@@ -175,7 +175,7 @@ Check the state of a mounted repo with `status`:
 | `next_retry` / `attempts` | When the daemon retries the failed phase, and how many times in a row it failed; `next_retry` is `none` when no daemon runs |
 | `hydrated_blobs` / `hydrated_bytes` | Blob count and bytes in the repo's blob cache, read from counters kept with the cache (see [Evicting the blob cache](#evicting-the-blob-cache)) |
 | `overlay_dirty` | `true` if the overlay holds a created, modified or renamed file, a symlink, a directory, or the delete of a path that `base_commit` has. The delete of a path `base_commit` lacks, such as an editor's removed swap file, does not count. In a repo that follows HEAD, a delete counts until a HEAD change removes its path. A `--require-commit` repo does not follow HEAD, so its deletes count for as long as the overlay holds them |
-| `kept_generations` / `kept_generations_warning` | How many generations older than the ones a prune must keep the daemon's last prune kept because open files read them, and the warning it raised while they number at least `warn_kept_generations` (see [Generations that open files keep](#generations-that-open-files-keep)); `0`/`none` when no daemon runs the repo |
+| `kept_generations` / `kept_generations_warning` | How many generations, older than the ones a prune must keep, the daemon's last prune kept because open files read them; and the warning it raised while they number at least `warn_kept_generations`, in double quotes, so the command it names can be pasted (see [Generations that open files keep](#generations-that-open-files-keep)). `0` and `none` when no daemon runs the repo |
 | `warn_kept_generations` | The repo's kept-generations warning threshold (`add-repo --warn-kept-generations`, default 50) |
 | `last_fetch` / `result` | Result (`ok` or `failed`) of the daemon's last remote refresh, with the time of its last successful one; or `ok` with the time of a later fetch that left `FETCH_HEAD` filled, such as a `fetch` command that succeeded; otherwise `never`. Git empties `FETCH_HEAD` when a fetch starts, so a fetch that is still running or failed before it received the remote's objects does not count |
 
@@ -539,21 +539,23 @@ content, and an open of a file whose path a HEAD change removed fails with
 
 ### Generations that open files keep
 
-Each open file keeps the generation its inode reads, as described above. A prune frees that generation at the first HEAD change after the file closes, or after its inode moves to a later generation. An open file stays on an older generation when a HEAD change removed its path, or changed it and nothing asked for its attributes since. A long-lived editor or language server in an active repo can so keep many generations. One generation of a 6,300-entry tree takes about 2 MB of the snapshot database.
+Each open file keeps the generation its inode reads, as described above. A prune frees that generation at the first HEAD change after the file closes, or after its inode moves to a later generation. An open file stays on an older generation when a HEAD change removed its path, or changed it and nothing asked for its attributes since. A long-lived editor or language server in an active repo can so keep many generations. One generation of a 6,300-entry tree takes about 1.5 to 2 MB of the snapshot database, depending on its path lengths.
 
 When the generations a prune keeps only for open files reach the repo's threshold, the daemon logs one warning:
 
 ```json
-{"level":"WARN","msg":"open files keep old snapshot generations","repo":"workers-sdk","kept_generations":50,"warn_kept_generations":50,"estimated_bytes":106400000,"pids":"4242 (49 open files), 5151 (1 open file)","frees":"at the first HEAD change after these files close","raise_threshold":"artifact-fs set-warn-kept-generations --name workers-sdk --count <n>"}
+{"time":"2026-07-16T14:00:00Z","level":"WARN","msg":"open files keep old snapshot generations","repo":"workers-sdk","kept_generations":50,"warn_kept_generations":50,"estimated_bytes":106400000,"pids":"4242 (49 open files), 5151 (1 open file)","frees":"at the first HEAD change after these files close","raise_threshold":"artifact-fs set-warn-kept-generations --name workers-sdk --count <n>"}
 ```
 
 It logs nothing more while the count stays at or above the threshold. It logs again only after a prune found the count below the threshold and a later one found it at the threshold again. `status` shows the count after every prune, and the warning while the count is at or above the threshold.
 
-- `estimated_bytes` is the database's used pages times the share of its `base_nodes` rows those generations hold. The daemon counts those rows at each prune while the count is at or above the threshold: about 25 ms for 50 generations of 6,300 entries on a laptop. A failed estimate logs `estimate_error` instead.
-- `pids` lists, for each caller ID the open ops carried, how many of the open files reading those generations it opened. Linux reports the ID of the thread that opened the file, and 0, listed as `unknown`, for a thread outside the daemon's PID namespace. On FSKit the daemon lists no caller IDs, and `pids` is `unavailable on FSKit`.
+- `estimated_bytes` is the database's used pages times the share of its `base_nodes` rows those generations hold. The daemon counts those rows at each prune while the count is at or above the threshold. The cost grows with the database's rows: about 23 ms for 52 generations of 6,300 entries on a laptop, and about 94 ms for 52 of 25,000. A failed estimate logs `estimate_error` instead.
+- `pids` lists each process that opened the files reading those generations, with how many it opened. A Linux FUSE op carries the opening thread's ID ([req.c](https://github.com/torvalds/linux/blob/03973f7f3556b769a3dd5104f166614d446351c9/fs/fuse/req.c#L17)), which the daemon resolves to its process through the `Tgid` line of `/proc/<id>/status`. An ID whose `/proc` entry the daemon cannot read shows as `thread <id>`. Linux sends 0, listed as `unknown`, for a thread outside the daemon's PID namespace.
+- The macFUSE kernel extension sends the process ID ([fuse_ipc.c](https://github.com/osxfuse/kext/blob/534773bd3135f04b7f6fb801faa2f8991daf4a6b/osxfuse/fuse_ipc.c#L927)). It reuses one FUSE file handle per file and access mode, and sends OPEN only for the first opener ([fuse_vnops.c](https://github.com/osxfuse/kext/blob/534773bd3135f04b7f6fb801faa2f8991daf4a6b/osxfuse/fuse_vnops.c#L2334-L2338)). So `pids` names the first opener of each file and access mode.
+- On FSKit the daemon lists no caller IDs, and `pids` is `unavailable on FSKit`.
 - Pruned generations free their pages for later generations; the database file does not shrink.
 
-Set the threshold with `add-repo --warn-kept-generations <n>`, or change it with `artifact-fs set-warn-kept-generations --name <repo> --count <n>`. The daemon applies a change from the first prune after its next registry sync.
+Set the threshold with `add-repo --warn-kept-generations <n>`. Running `add-repo` again on a registered repo registers it anew, which remounts it and closes its open files. So change the threshold of a live repo with `artifact-fs set-warn-kept-generations --name <repo> --count <n>`. The daemon applies a change from the first prune after its next registry sync.
 
 ### Inode numbers
 

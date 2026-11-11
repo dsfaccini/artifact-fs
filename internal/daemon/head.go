@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"os"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -133,7 +135,8 @@ func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, co
 // that rt, when not nil, retired within the retention window, and those its
 // serving mount's open files read. An inode whose attributes the kernel received
 // before a switch keeps reading the generation they came from until it asks
-// again. It then records the generations it kept for open files.
+// again. It then records the generations it kept for open files. The caller
+// holds rt.headMu when rt is not nil, so prunes record them one at a time.
 func (s *Service) pruneGenerations(ctx context.Context, rt *repoRuntime, snap *snapshot.Store, keepFrom int64) error {
 	var open []int64
 	var mfs fusefs.MountedFS
@@ -214,7 +217,9 @@ func keptGenerationsWarning(ctx context.Context, cfg model.RepoConfig, snap *sna
 	}
 	pids := "unavailable on FSKit"
 	if mfs.Backend() != fusefs.BackendFSKit {
-		pids = formatOpenFilePIDs(mfs.OpenFilePIDs(kept))
+		pids = formatOpenFilePIDs(mfs.OpenFilePIDs(kept), func(id uint32) (uint32, bool) {
+			return openerProcess(runtime.GOOS, os.ReadFile, id)
+		})
 	}
 	attrs = append(attrs, "pids", pids,
 		"frees", "at the first HEAD change after these files close",
@@ -223,26 +228,70 @@ func keptGenerationsWarning(ctx context.Context, cfg model.RepoConfig, snap *sna
 		len(kept), size, cfg.WarnKeptGenerations, pids, raise), attrs
 }
 
-// formatOpenFilePIDs lists each caller ID with its open files, in ID order.
-// Linux reports the ID of the thread that opened the file, 0 when that thread
-// lies outside the daemon's PID namespace.
-func formatOpenFilePIDs(pids map[uint32]int) string {
+// opener is the process that opened files, or the thread when its process
+// is unknown.
+type opener struct {
+	id     uint32
+	thread bool
+}
+
+// formatOpenFilePIDs lists each process that opened the files pids counts by
+// caller ID, with its open files, in ID order. process resolves a caller ID
+// to its process, and reports false when the ID stays a thread ID. An ID of
+// 0, which Linux sends for a thread outside the daemon's PID namespace, is
+// unknown.
+func formatOpenFilePIDs(pids map[uint32]int, process func(uint32) (uint32, bool)) string {
+	files := make(map[opener]int)
+	for id, n := range pids {
+		o := opener{id: id}
+		if id != 0 {
+			pid, ok := process(id)
+			o = opener{id: pid, thread: !ok}
+		}
+		files[o] += n
+	}
 	var out []string
-	for _, pid := range slices.Sorted(maps.Keys(pids)) {
-		id := strconv.FormatUint(uint64(pid), 10)
-		if pid == 0 {
+	for _, o := range slices.SortedFunc(maps.Keys(files), func(a, b opener) int { return cmp.Compare(a.id, b.id) }) {
+		id := strconv.FormatUint(uint64(o.id), 10)
+		switch {
+		case o.id == 0:
 			id = "unknown"
+		case o.thread:
+			id = "thread " + id
 		}
-		files := "open files"
-		if pids[pid] == 1 {
-			files = "open file"
+		noun := "open files"
+		if files[o] == 1 {
+			noun = "open file"
 		}
-		out = append(out, fmt.Sprintf("%s (%d %s)", id, pids[pid], files))
+		out = append(out, fmt.Sprintf("%s (%d %s)", id, files[o], noun))
 	}
 	if len(out) == 0 {
 		return "none open"
 	}
 	return strings.Join(out, ", ")
+}
+
+// openerProcess returns the process that id, the caller ID of a FUSE op on
+// goos, names. Linux sends the calling thread's ID, so openerProcess reads
+// its thread group from /proc/<id>/status with readFile, and reports false
+// when it cannot: id then stays a thread ID. The macFUSE kernel extension
+// sends the process ID.
+func openerProcess(goos string, readFile func(string) ([]byte, error), id uint32) (uint32, bool) {
+	if goos != "linux" {
+		return id, true
+	}
+	status, err := readFile(fmt.Sprintf("/proc/%d/status", id))
+	if err != nil {
+		return id, false
+	}
+	for line := range strings.Lines(string(status)) {
+		if value, ok := strings.CutPrefix(line, "Tgid:"); ok {
+			if tgid, err := strconv.ParseUint(strings.TrimSpace(value), 10, 32); err == nil {
+				return uint32(tgid), true
+			}
+		}
+	}
+	return id, false
 }
 
 func (s *Service) signalHEADReconcile(rt *repoRuntime) {

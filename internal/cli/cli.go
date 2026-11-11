@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -403,7 +404,7 @@ func formatStatusLine(st model.RepoRuntimeState) string {
 		formatStatusError(st.PrepareError), formatStatusError(st.MountError),
 		formatStatusError(st.LastError), formatNone(st.LastErrorPhase), formatStatusTime(st.LastErrorAt), formatStatusTime(st.NextRetryAt), st.Attempts,
 		st.HydratedBlobCount, st.HydratedBlobBytes, st.DirtyOverlay,
-		st.KeptGenerations, st.WarnKeptGenerations, formatStatusError(st.KeptGenerationsWarning))
+		st.KeptGenerations, st.WarnKeptGenerations, formatStatusText(st.KeptGenerationsWarning))
 }
 
 func formatNone(v string) string {
@@ -439,6 +440,15 @@ func formatStatusError(err string) string {
 		return "none"
 	}
 	return strings.Join(strings.Fields(auth.RedactString(err)), "_")
+}
+
+// formatStatusText prints text as one double-quoted, Go-escaped value, so a
+// command inside it keeps its spaces and can be pasted.
+func formatStatusText(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return "none"
+	}
+	return strconv.Quote(auth.RedactString(text))
 }
 
 func stubCommand(name, usage string, stdout io.Writer) *ucli.Command {

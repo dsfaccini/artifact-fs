@@ -87,6 +87,19 @@ func TestFormatStatusLineRedactsPrepareError(t *testing.T) {
 	}
 }
 
+// The kept-generations warning prints quoted, so the command that raises the
+// threshold keeps its spaces and can be pasted.
+func TestFormatStatusLineQuotesTheKeptGenerationsWarning(t *testing.T) {
+	warning := "open files keep 2 older snapshot generations, about 4.3 MB, reaching the warning threshold 2; pids holding the files: 4242 (2 open files); the generations free at the first HEAD change after the files close; raise the threshold with artifact-fs set-warn-kept-generations --name repo --count <n>"
+	st := model.RepoRuntimeState{KeptGenerations: 2, WarnKeptGenerations: 2, KeptGenerationsWarning: warning}
+
+	got := formatStatusLine(st)
+	want := ` kept_generations=2 warn_kept_generations=2 kept_generations_warning="open files keep 2 older snapshot generations, about 4.3 MB, reaching the warning threshold 2; pids holding the files: 4242 (2 open files); the generations free at the first HEAD change after the files close; raise the threshold with artifact-fs set-warn-kept-generations --name repo --count <n>"`
+	if !strings.HasSuffix(got, want) {
+		t.Fatalf("status line %q, want it to end with %q", got, want)
+	}
+}
+
 func TestAddRepoAsyncCLIRegistersWithoutClone(t *testing.T) {
 	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
 	var stdout, stderr bytes.Buffer
