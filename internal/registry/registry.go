@@ -179,6 +179,10 @@ func New(ctx context.Context, dbPath string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// testHookBeforeReadRepoNew, when set, runs in ReadRepo before it opens the
+// registry with New.
+var testHookBeforeReadRepoNew func()
+
 // ReadRepo returns what GetRepo on a store New opened at dbPath returns. A
 // registry that has every migration it reads with meta.OpenForReading, so
 // the fsmonitor hook pays for neither OpenDB's pragmas nor its WAL switch.
@@ -199,6 +203,9 @@ func ReadRepo(ctx context.Context, dbPath, name string) (model.RepoConfig, error
 	// the hook on every command.
 	if meta.IsBusy(err) {
 		return model.RepoConfig{}, err
+	}
+	if testHookBeforeReadRepoNew != nil {
+		testHookBeforeReadRepoNew()
 	}
 	s, err := New(ctx, dbPath)
 	if err != nil {
