@@ -523,11 +523,19 @@ func newHookService(t *testing.T, mountPath string) (*Service, model.RepoConfig)
 	return svc, cfg
 }
 
-// hookAnswer returns the hook's raw answer, its token and its paths.
+// hookAnswer returns the hook's raw answer for the repo newHookService
+// registers, its token and its paths.
 func hookAnswer(t *testing.T, svc *Service, since string) ([]byte, string, []string) {
 	t.Helper()
+	return hookAnswerFor(t, svc, "repo", since)
+}
+
+// hookAnswerFor returns the hook's raw answer for the repo named name, its
+// token and its paths.
+func hookAnswerFor(t *testing.T, svc *Service, name, since string) ([]byte, string, []string) {
+	t.Helper()
 	var out bytes.Buffer
-	if err := FSMonitorHook(t.Context(), svc.root, "repo", since, &out); err != nil {
+	if err := FSMonitorHook(t.Context(), svc.root, name, since, &out); err != nil {
 		t.Fatal(err)
 	}
 	fields := strings.Split(strings.TrimSuffix(out.String(), "\x00"), "\x00")
@@ -940,5 +948,75 @@ func TestFSMonitorHookRescansUnlessTokenAndMountAreCurrent(t *testing.T) {
 				t.Fatalf("git status = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// A HEAD move that writes no work tree file, as git update-ref makes, changes
+// what the mount serves. Git trusts each index entry the hook does not name, so
+// the hook must name every path whose served content the switch changed.
+func TestFSMonitorHookNamesThePathsAGenerationSwitchChanged(t *testing.T) {
+	t.Parallel()
+	f := newHeadReconcileFixture(t)
+	ctx := f.ctx
+	write := func(path, content string) {
+		t.Helper()
+		full := filepath.Join(f.workDir, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	remove := func(path string) {
+		t.Helper()
+		if err := os.Remove(filepath.Join(f.workDir, path)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The fixture's index and work tree hold its last commit.
+	runCmd(t, "git", "-C", f.workDir, "reset", "-q", "--hard", f.oldOID)
+	write("gone.txt", "gone\n")
+	write("src/b.txt", "b\n")
+	base := f.commitToMain("base")
+	write("src/b.txt", "b2\n")
+	remove("gone.txt")
+	write("src/new.txt", "new\n")
+	next := f.commitToMain("next")
+	// The work tree mirrors the mount, which serves base.
+	runCmd(t, "git", "-C", f.workDir, "reset", "-q", "--hard", base)
+	f.moveHEAD(base, f.oldGen+1)
+
+	cfg := f.rt.cfg
+	cfg.MountPath = "/" // always in the mount table, so it stands in for a live mount
+	cfg.ConfigVersion = "v1"
+	if err := f.svc.registry.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	answer, token, _ := hookAnswerFor(t, f.svc, cfg.Name, "other-hook:1")
+	if _, status := gitStatusWithAnswer(t, f.workDir, answer); status != "" {
+		t.Fatalf("status after a rescan = %q, want clean", status)
+	}
+	answer, since, _ := hookAnswerFor(t, f.svc, cfg.Name, token)
+	if queried, status := gitStatusWithAnswer(t, f.workDir, answer); queried != token || status != "" {
+		t.Fatalf("status after an empty delta = %q from token %q, want clean from %q", status, queried, token)
+	}
+
+	f.moveHEAD(next, f.oldGen+2)
+	// The mount serves next, and the index still holds base.
+	write("src/b.txt", "b2\n")
+	remove("gone.txt")
+	write("src/new.txt", "new\n")
+	answer, _, paths := hookAnswerFor(t, f.svc, cfg.Name, since)
+	queried, status := gitStatusWithAnswer(t, f.workDir, answer)
+	truth := runCmdOutput(t, "git", "-C", f.workDir, "-c", "core.fsmonitor=false", "status", "--porcelain")
+	if want := "AD gone.txt\nMM src/b.txt\nD  src/new.txt\n?? src/new.txt\n"; truth != want {
+		t.Fatalf("status with fsmonitor off = %q, want %q", truth, want)
+	}
+	if queried != since || status != truth {
+		t.Errorf("status = %q from token %q, want %q from %q, as with fsmonitor off", status, queried, truth, since)
+	}
+	if want := []string{"gone.txt", "src/b.txt", "src/new.txt"}; !reflect.DeepEqual(paths, want) {
+		t.Errorf("paths after the switch = %q, want %q", paths, want)
 	}
 }
