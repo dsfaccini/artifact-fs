@@ -179,6 +179,31 @@ func New(ctx context.Context, dbPath string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// ReadRepo returns what GetRepo on a store New opened at dbPath returns. A
+// registry that has every migration it reads with meta.OpenForReading, so
+// the fsmonitor hook pays for neither OpenDB's pragmas nor its WAL switch.
+// Any other registry it opens with New, which migrates it.
+func ReadRepo(ctx context.Context, dbPath, name string) (model.RepoConfig, error) {
+	db, err := meta.OpenForReading(dbPath)
+	if err != nil {
+		return model.RepoConfig{}, err
+	}
+	defer db.Close()
+	migrated, err := meta.Migrated(ctx, db, migrations)
+	if err != nil {
+		return model.RepoConfig{}, fmt.Errorf("open %s: %w", dbPath, err)
+	}
+	if migrated {
+		return (&Store{db: db}).GetRepo(ctx, name)
+	}
+	s, err := New(ctx, dbPath)
+	if err != nil {
+		return model.RepoConfig{}, err
+	}
+	defer s.Close()
+	return s.GetRepo(ctx, name)
+}
+
 func (s *Store) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
 	now := time.Now().UnixNano()
 	var acquiredAtNS int64

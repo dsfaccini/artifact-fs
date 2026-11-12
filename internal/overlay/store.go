@@ -1589,16 +1589,17 @@ type Changes struct {
 	Paths []string
 }
 
-// ReadChangesSince reads the change log of an existing overlay database
-// without the migrations that New runs, so it never takes the write lock. ok is false when the database, its change log or a trigger that
-// feeds the log is missing.
+// ReadChangesSince reads the change log of an existing overlay database with
+// meta.OpenForReading and without the migrations that New runs, so it never
+// takes the write lock. ok is false when the database, its change log or a
+// trigger that feeds the log is missing.
 func ReadChangesSince(ctx context.Context, cfg model.RepoPaths, since int64) (changes Changes, ok bool, err error) {
 	if _, err := os.Stat(cfg.OverlayDBPath); errors.Is(err, os.ErrNotExist) {
 		return Changes{}, false, nil
 	} else if err != nil {
 		return Changes{}, false, err
 	}
-	db, err := meta.OpenDB(cfg.OverlayDBPath)
+	db, err := meta.OpenForReading(cfg.OverlayDBPath)
 	if err != nil {
 		return Changes{}, false, err
 	}

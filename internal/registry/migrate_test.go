@@ -448,3 +448,69 @@ func TestNewRefusesANewerSchema(t *testing.T) {
 	}
 	metatest.RequireNewerSchemaError(t, err, path)
 }
+
+// The fsmonitor hook reads its repo with ReadRepo, which must return what New
+// and GetRepo return, from a current registry and from every earlier schema,
+// which it migrates as New does.
+func TestReadRepoReadsWhatNewReads(t *testing.T) {
+	ctx := context.Background()
+	want := metatest.Schema(t, createRegistry(t))
+	schemas := map[string][]string{}
+	for name, legacy := range legacyRegistries {
+		schemas[name] = legacy.stmts
+	}
+	schemas["current"] = nil
+	for name, stmts := range schemas {
+		t.Run(name, func(t *testing.T) {
+			var paths [2]string
+			for i := range paths {
+				paths[i] = filepath.Join(t.TempDir(), "repos.sqlite")
+				if stmts == nil {
+					store, err := New(ctx, paths[i])
+					if err != nil {
+						t.Fatal(err)
+					}
+					err = store.AddRepo(ctx, fullRepoWithRequests)
+					if closeErr := store.Close(); err != nil || closeErr != nil {
+						t.Fatalf("add repo: %v, close: %v", err, closeErr)
+					}
+					continue
+				}
+				metatest.Exec(t, paths[i], stmts...)
+			}
+			store, err := New(ctx, paths[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			wantRepo, err := store.GetRepo(ctx, "repo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := ReadRepo(ctx, paths[0], "repo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, wantRepo) {
+				t.Fatalf("ReadRepo = %+v, want %+v", got, wantRepo)
+			}
+			_, wantErr := store.GetRepo(ctx, "missing")
+			if _, err := ReadRepo(ctx, paths[0], "missing"); wantErr == nil || err == nil || err.Error() != wantErr.Error() {
+				t.Fatalf("ReadRepo of a missing repo: %v, want %v", err, wantErr)
+			}
+			if got := metatest.Schema(t, paths[0]); !slices.Equal(got, want) {
+				t.Fatalf("schema after ReadRepo = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestReadRepoRefusesANewerSchema(t *testing.T) {
+	path := createRegistry(t)
+	metatest.Exec(t, path, `PRAGMA user_version = 99`)
+	if _, err := ReadRepo(context.Background(), path, "repo"); err == nil {
+		t.Fatal("ReadRepo on a newer schema succeeded")
+	} else {
+		metatest.RequireNewerSchemaError(t, err, path)
+	}
+}

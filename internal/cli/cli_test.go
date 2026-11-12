@@ -659,4 +659,8 @@ func TestFSMonitorHookCLIAnswersGitToken(t *testing.T) {
 	if fields := hook(fields[0]); len(fields) != 2 || !strings.HasPrefix(fields[0], "artifact-fs:repo:") || fields[1] != "" {
 		t.Fatalf("fsmonitor-hook output for its own token = %q", fields)
 	}
+	var stdout, stderr bytes.Buffer
+	if code := Run(ctx, []string{"fsmonitor-hook", "2", fields[0]}, &stdout, &stderr); code != 1 || stdout.Len() != 0 || stderr.String() != "--name required\n" {
+		t.Fatalf("fsmonitor-hook without --name: exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+	}
 }

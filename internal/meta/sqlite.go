@@ -21,23 +21,28 @@ const busyTimeout = 5 * time.Second
 // longer runs or no longer precedes a retry.
 var testHookAfterWALSwitchBusy func()
 
-func OpenDB(path string) (*sql.DB, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, fmt.Errorf("mkdir db dir: %w", err)
-	}
+// dsn names path with busy_timeout and pragmas set on every connection.
+func dsn(path string, pragmas ...string) string {
 	params := url.Values{}
 	params.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeout.Milliseconds()))
-	params.Add("_pragma", "foreign_keys(ON)")
-	// In WAL mode NORMAL syncs the WAL only at checkpoints. A process crash
-	// loses no commit; an OS crash can lose the commits since the last sync.
-	params.Add("_pragma", "synchronous(NORMAL)")
+	for _, pragma := range pragmas {
+		params.Add("_pragma", pragma)
+	}
 	// A transaction takes the write lock at BEGIN, so another connection's
 	// write waits out busy_timeout. SQLite fails a read transaction's upgrade
 	// to a write at once with SQLITE_BUSY, without the busy handler. A
 	// transaction begun with sql.TxOptions{ReadOnly: true} stays deferred.
 	params.Add("_txlock", "immediate")
-	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: params.Encode()}).String()
-	db, err := sql.Open("sqlite", dsn)
+	return (&url.URL{Scheme: "file", Path: path, RawQuery: params.Encode()}).String()
+}
+
+func OpenDB(path string) (*sql.DB, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("mkdir db dir: %w", err)
+	}
+	// In WAL mode NORMAL syncs the WAL only at checkpoints. A process crash
+	// loses no commit; an OS crash can lose the commits since the last sync.
+	db, err := sql.Open("sqlite", dsn(path, "foreign_keys(ON)", "synchronous(NORMAL)"))
 	if err != nil {
 		return nil, err
 	}
@@ -58,6 +63,16 @@ func OpenDB(path string) (*sql.DB, error) {
 			testHookAfterWALSwitchBusy()
 		}
 	}
+}
+
+// OpenForReading opens a database for a caller that only reads, such as the
+// fsmonitor hook, which Git runs on every command that reads the index. Of
+// OpenDB's pragmas it sets only busy_timeout. It creates no directory,
+// switches no database to WAL and sets none of the pragmas that only writes
+// need. A database that
+// OpenDB created stays in WAL mode, which SQLite records in the file.
+func OpenForReading(path string) (*sql.DB, error) {
+	return sql.Open("sqlite", dsn(path))
 }
 
 // A Migration changes the schema inside the transaction Migrate holds on
@@ -101,6 +116,18 @@ func Migrate(ctx context.Context, db *sql.DB, migrations []Migration) error {
 		version, err = migrateNext(ctx, conn, migrations)
 	}
 	return err
+}
+
+// Migrated reports whether db has every migration, so Migrate would change
+// nothing. It fails as Migrate does on a database a newer build wrote.
+func Migrated(ctx context.Context, db *sql.DB, migrations []Migration) (bool, error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+	version, err := userVersion(ctx, conn, len(migrations))
+	return version == len(migrations), err
 }
 
 // testHookBeforeBegin, when set, runs in a migration step before it takes the
