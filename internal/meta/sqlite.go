@@ -54,8 +54,7 @@ func OpenDB(path string) (*sql.DB, error) {
 		if err == nil {
 			return db, nil
 		}
-		var sqliteErr *sqlite.Error
-		if !errors.As(err, &sqliteErr) || sqliteErr.Code()&0xff != sqlite3.SQLITE_BUSY || time.Now().After(deadline) {
+		if !IsBusy(err) || time.Now().After(deadline) {
 			db.Close()
 			return nil, err
 		}
@@ -63,6 +62,13 @@ func OpenDB(path string) (*sql.DB, error) {
 			testHookAfterWALSwitchBusy()
 		}
 	}
+}
+
+// IsBusy reports whether err is SQLITE_BUSY: another connection held a lock
+// past busy_timeout, or a lock upgrade failed at once.
+func IsBusy(err error) bool {
+	var sqliteErr *sqlite.Error
+	return errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == sqlite3.SQLITE_BUSY
 }
 
 // OpenForReading opens a database for a caller that only reads, such as the

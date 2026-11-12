@@ -3,7 +3,9 @@ package registry
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -11,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/metatest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -553,5 +556,52 @@ func TestReadRepoFailsAsNewFails(t *testing.T) {
 				t.Fatalf("ReadRepo: %v, want New's %v", err, wantErr)
 			}
 		})
+	}
+}
+
+// Git runs the fsmonitor hook on every command. A registry another process
+// locks past busy_timeout must fail ReadRepo after that one wait: New would
+// wait out busy_timeout again for the same lock.
+func TestReadRepoFailsABusyRegistryWithoutNew(t *testing.T) {
+	ctx := context.Background()
+	fellBack := false
+	testHookBeforeReadRepoNew = func() { fellBack = true }
+	defer func() { testHookBeforeReadRepoNew = nil }()
+	// The hook runs on the way to New.
+	legacy := filepath.Join(t.TempDir(), "repos.sqlite")
+	metatest.Exec(t, legacy, legacyRegistries["user_version 5"].stmts...)
+	if _, err := ReadRepo(ctx, legacy, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	if !fellBack {
+		t.Fatal("ReadRepo migrated an earlier schema without the hook")
+	}
+
+	fellBack = false
+	path := createRegistry(t)
+	holder, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: path}).String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	conn, err := holder.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	for _, stmt := range []string{`PRAGMA locking_mode=EXCLUSIVE`, `BEGIN EXCLUSIVE`} {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var repos int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM repos`).Scan(&repos); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadRepo(ctx, path, "repo"); !meta.IsBusy(err) {
+		t.Fatalf("ReadRepo of a locked registry: %v, want SQLITE_BUSY", err)
+	}
+	if fellBack {
+		t.Fatal("ReadRepo opened a locked registry with New")
 	}
 }
