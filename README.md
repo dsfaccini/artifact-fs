@@ -620,7 +620,7 @@ decides which invalidations it gets.
 
 | Package | Role |
 |---------|------|
-| `daemon` | Repo lifecycle. `Controller` runs every CLI command except `daemon` and the `gc`, `doctor` and `prefetch` stubs. `Service` holds the daemon lock, syncs the registry, prepares, mounts and unmounts each repo, reconciles HEAD, runs the refresh loop, and writes `repo_runtime` |
+| `daemon` | Repo lifecycle. `Controller` runs every CLI command except `daemon`, `fsmonitor-hook` and the `gc`, `doctor` and `prefetch` stubs. `FSMonitorHook` answers Git's fsmonitor hook without a `Controller`. `Service` holds the daemon lock, syncs the registry, prepares, mounts and unmounts each repo, reconciles HEAD, runs the refresh loop, and writes `repo_runtime` |
 | `fusefs` | FUSE adapter (inode management, op dispatch), Resolver (merged view), Engine (the adapter's only API: one method per operation) |
 | `gitstore` | Git CLI wrapper: clone, fetch, ls-tree, batch pool for `cat-file --batch` |
 | `snapshot` | SQLite store for `base_nodes` keyed by `(generation, path)` |

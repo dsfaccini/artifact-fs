@@ -619,6 +619,41 @@ func TestStatusCLIPrintsDaemonMountError(t *testing.T) {
 	}
 }
 
+// The hook reads a state root only while ensureStateRoot accepts it, as every
+// other command does.
+func TestFSMonitorHookCLIRefusesAWritableStateRoot(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ARTIFACT_FS_ROOT", root)
+	ctx := context.Background()
+	svc, err := daemon.NewController(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", MountPath: "/"}, RepoSpec: model.RepoSpec{RemoteURL: "https://github.com/example/repo.git"}, Enabled: true}
+	err = svc.AddRepoWithOptions(ctx, cfg, daemon.AddRepoOptions{Async: true})
+	if closeErr := svc.Close(); err != nil || closeErr != nil {
+		t.Fatalf("add repo: %v, close: %v", err, closeErr)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := Run(ctx, []string{"fsmonitor-hook", "--name", "repo", "2", ""}, &stdout, &stderr); code != 0 || stdout.Len() == 0 {
+		t.Fatalf("fsmonitor-hook on a private root: exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+	}
+	if err := os.Chmod(root, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	// The error names the root with its symlinks resolved.
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code := Run(ctx, []string{"fsmonitor-hook", "--name", "repo", "2", ""}, &stdout, &stderr)
+	if code != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "refusing state directory "+resolved+": writable by group or others") {
+		t.Fatalf("fsmonitor-hook on a group-writable root: exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestFSMonitorHookCLIAnswersGitToken(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("ARTIFACT_FS_ROOT", root)
