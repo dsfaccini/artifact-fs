@@ -69,9 +69,9 @@ func OpenDB(path string) (*sql.DB, error) {
 // fsmonitor hook, which Git runs on every command that reads the index. Of
 // OpenDB's pragmas it sets only busy_timeout. It creates no directory,
 // switches no database to WAL and sets none of the pragmas that only writes
-// need. Like any SQLite open, its first connection creates an empty database
-// file when none exists. A database that
-// OpenDB created stays in WAL mode, which SQLite records in the file.
+// need. A database that OpenDB created stays in WAL mode, which SQLite
+// records in the file. Like any SQLite open, its first connection creates an
+// empty database file when none exists.
 func OpenForReading(path string) (*sql.DB, error) {
 	return sql.Open("sqlite", dsn(path))
 }

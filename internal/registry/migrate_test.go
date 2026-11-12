@@ -1,8 +1,10 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -512,5 +514,44 @@ func TestReadRepoRefusesANewerSchema(t *testing.T) {
 		t.Fatal("ReadRepo on a newer schema succeeded")
 	} else {
 		metatest.RequireNewerSchemaError(t, err, path)
+	}
+}
+
+// Git prints the fsmonitor hook's error on every command, so ReadRepo fails
+// with the error New gives for the same registry.
+func TestReadRepoFailsAsNewFails(t *testing.T) {
+	for name, setup := range map[string]func(t *testing.T, path string){
+		"corrupt file": func(t *testing.T, path string) {
+			if err := os.WriteFile(path, bytes.Repeat([]byte("not a database "), 512), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"directory": func(t *testing.T, path string) {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"unreadable file": func(t *testing.T, path string) {
+			if os.Geteuid() == 0 {
+				t.Skip("root reads a file whatever its mode")
+			}
+			metatest.Exec(t, path)
+			if err := os.Chmod(path, 0); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "repos.sqlite")
+			setup(t, path)
+			store, wantErr := New(context.Background(), path)
+			if wantErr == nil {
+				store.Close()
+				t.Fatal("New succeeded")
+			}
+			if _, err := ReadRepo(context.Background(), path, "repo"); err == nil || err.Error() != wantErr.Error() {
+				t.Fatalf("ReadRepo: %v, want New's %v", err, wantErr)
+			}
+		})
 	}
 }
