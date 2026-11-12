@@ -274,6 +274,9 @@ func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfi
 	if _, err := runGit(ctx, repo.GitDir, append(configArgs, "fsmonitor.allowRemote", "true")...); err != nil {
 		return err
 	}
+	if _, err := runGit(ctx, repo.GitDir, append(configArgs, "core.untrackedCache", "true")...); err != nil {
+		return err
+	}
 	// Git adds the fsmonitor extension on the next porcelain index read. The
 	// daemon must not write the shared index behind a concurrent Git process.
 	return nil
@@ -337,6 +340,7 @@ func (s *Store) ReleaseAdoptedWorktree(ctx context.Context, repo model.RepoConfi
 	for _, pin := range [][2]string{
 		{"core.fsmonitor", "^" + regexp.QuoteMeta(fsmonitorHookPath(repo.GitDir)) + "$"},
 		{"fsmonitor.allowRemote", "^true$"},
+		{"core.untrackedCache", "^true$"},
 		{"core.filemode", "^true$"},
 		{"core.ignorecase", "^false$"},
 		{"core.symlinks", "^true$"},
