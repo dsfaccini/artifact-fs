@@ -527,11 +527,80 @@ func newHookService(t *testing.T, mountPath string) (*Service, model.RepoConfig)
 func hookAnswer(t *testing.T, svc *Service, since string) ([]byte, string, []string) {
 	t.Helper()
 	var out bytes.Buffer
-	if err := svc.ctl().FSMonitorHook(t.Context(), "repo", since, &out); err != nil {
+	if err := FSMonitorHook(t.Context(), svc.root, "repo", since, &out); err != nil {
 		t.Fatal(err)
 	}
 	fields := strings.Split(strings.TrimSuffix(out.String(), "\x00"), "\x00")
 	return out.Bytes(), fields[0], fields[1:]
+}
+
+// FSMonitorHook reads the state root without a Controller. It must answer
+// what the hook answers from a Controller's registry, which New opened and
+// migrated, for every token Git can hold.
+func TestFSMonitorHookAnswersWhatAControllerReads(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name             string
+		mounted, overlay bool
+	}{
+		{name: "mounted", mounted: true, overlay: true},
+		{name: "mounted without an overlay", mounted: true},
+		{name: "unmounted", overlay: true},
+		{name: "unmounted without an overlay"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			mountPath := filepath.Join(t.TempDir(), "mnt")
+			if tc.mounted {
+				mountPath = "/"
+			}
+			svc, cfg := newHookService(t, mountPath)
+			instance := "none"
+			if tc.overlay {
+				ov, err := overlay.New(ctx, cfg.RepoPaths)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer ov.Close()
+				if _, err := ov.CreateFile(ctx, "written.txt", 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := ov.Remove(ctx, "deleted.txt"); err != nil {
+					t.Fatal(err)
+				}
+				changes, ok, err := overlay.ReadChangesSince(ctx, cfg.RepoPaths, 0)
+				if err != nil || !ok {
+					t.Fatalf("read the change log: ok=%v, %v", ok, err)
+				}
+				instance = changes.Instance
+			}
+			ctl, err := NewController(ctx, svc.root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ctl.Close()
+			ctlCfg, err := ctl.registry.GetRepo(ctx, "repo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			prefix := "artifact-fs:repo:v1:"
+			for _, since := range []string{"", "other-hook:1", prefix + "rescan", prefix + instance + ":0", prefix + instance + ":1", prefix + instance + ":2", prefix + instance + ":-1", prefix + "other:0", "artifact-fs:repo:v0:" + instance + ":0"} {
+				got, _, _ := hookAnswer(t, svc, since)
+				var want bytes.Buffer
+				if err := answerFSMonitorHook(ctx, ctlCfg, since, &want); err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(got, want.Bytes()) {
+					t.Errorf("answer for token %q = %q, want %q", since, got, want.Bytes())
+				}
+			}
+			_, wantErr := ctl.registry.GetRepo(ctx, "missing")
+			if err := FSMonitorHook(ctx, svc.root, "missing", "", io.Discard); wantErr == nil || err == nil || err.Error() != wantErr.Error() {
+				t.Fatalf("hook for a missing repo: %v, want %v", err, wantErr)
+			}
+		})
+	}
 }
 
 // gitStatusWithAnswer runs git status in repo through a hook that replays

@@ -27,7 +27,8 @@ Repository-specific guidance for `artifact-fs`.
 ## Architecture
 
 - `cmd/artifact-fs` is the only binary entrypoint.
-- `internal/cli` runs the `daemon` command on `daemon.Service`, and every other command on `daemon.Controller`, except the `gc`, `doctor` and `prefetch` stubs. Only `daemon.Service` mounts.
+- `internal/cli` runs the `daemon` command on `daemon.Service`, the `fsmonitor-hook` command on `daemon.FSMonitorHook`, and every other command on `daemon.Controller`, except the `gc`, `doctor` and `prefetch` stubs. Only `daemon.Service` mounts.
+- `cli.Run` dispatches `fsmonitor-hook` before it builds the CLI. Git runs the hook on every command that reads the index, so the hook opens no `daemon.Controller`.
 - `internal/daemon` owns repo lifecycle: registry sync, snapshot publish, overlay reconcile, FUSE mount, watcher, refresh loop.
 - `internal/fusefs` is the merged view and writable filesystem layer.
 - `internal/gitstore` is the performance-sensitive git wrapper; most easy-to-break invariants live there.

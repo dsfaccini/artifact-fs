@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -23,6 +24,15 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	root := defaultRoot()
 	if v := os.Getenv("ARTIFACT_FS_ROOT"); v != "" {
 		root = v
+	}
+	// Git runs the hook on every command that reads the index, so the hook
+	// skips building the CLI.
+	if len(args) > 0 && args[0] == "fsmonitor-hook" {
+		if err := runFSMonitorHook(ctx, root, args[1:], stdout); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		return 0
 	}
 
 	app := &ucli.Command{
@@ -234,20 +244,6 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			return nil
 		}),
 		{
-			Name:   "fsmonitor-hook",
-			Usage:  "internal fsmonitor hook",
-			Hidden: true,
-			Flags:  []ucli.Flag{&ucli.StringFlag{Name: "name", Usage: "repo name (required)"}},
-			Action: withController(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Controller) error {
-				name := strings.TrimSpace(c.String("name"))
-				if name == "" {
-					return fmt.Errorf("--name required")
-				}
-				// Git passes the hook protocol version, then its last token.
-				return svc.FSMonitorHook(ctx, name, c.Args().Get(1), stdout)
-			}),
-		},
-		{
 			Name:  "set-refresh",
 			Usage: "update refresh interval",
 			Flags: []ucli.Flag{
@@ -352,6 +348,22 @@ func defaultRoot() string {
 		}
 	}
 	return "/var/lib/artifact-fs"
+}
+
+// runFSMonitorHook runs the internal fsmonitor-hook command that the hook
+// script execs: --name, then the arguments Git passes, the hook protocol
+// version and Git's last token.
+func runFSMonitorHook(ctx context.Context, root string, args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("fsmonitor-hook", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	name := flags.String("name", "", "repo name (required)")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*name) == "" {
+		return fmt.Errorf("--name required")
+	}
+	return daemon.FSMonitorHook(ctx, root, strings.TrimSpace(*name), flags.Arg(1), stdout)
 }
 
 // withController creates a daemon.Controller for the duration of the action.

@@ -179,6 +179,42 @@ func New(ctx context.Context, dbPath string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// testHookBeforeReadRepoNew, when set, runs in ReadRepo before it opens the
+// registry with New.
+var testHookBeforeReadRepoNew func()
+
+// ReadRepo returns what GetRepo on a store New opened at dbPath returns. A
+// registry that has every migration it reads with meta.OpenForReading, so
+// the fsmonitor hook pays for neither OpenDB's pragmas nor its WAL switch.
+// Any other registry it opens with New, which migrates it or fails as it
+// fails for every other command. A registry another connection locks past
+// busy_timeout fails with SQLITE_BUSY after that one wait.
+func ReadRepo(ctx context.Context, dbPath, name string) (model.RepoConfig, error) {
+	db, err := meta.OpenForReading(dbPath)
+	if err != nil {
+		return model.RepoConfig{}, err
+	}
+	defer db.Close()
+	migrated, err := meta.Migrated(ctx, db, migrations)
+	if err == nil && migrated {
+		return (&Store{db: db}).GetRepo(ctx, name)
+	}
+	// New would wait out busy_timeout again for the same lock, and Git runs
+	// the hook on every command.
+	if meta.IsBusy(err) {
+		return model.RepoConfig{}, err
+	}
+	if testHookBeforeReadRepoNew != nil {
+		testHookBeforeReadRepoNew()
+	}
+	s, err := New(ctx, dbPath)
+	if err != nil {
+		return model.RepoConfig{}, err
+	}
+	defer s.Close()
+	return s.GetRepo(ctx, name)
+}
+
 func (s *Store) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
 	now := time.Now().UnixNano()
 	var acquiredAtNS int64
