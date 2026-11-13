@@ -69,6 +69,7 @@ type cacheFixture struct {
 	t        *testing.T
 	ctx      context.Context
 	snap     *snapshot.Store
+	ov       *overlaystore.Store
 	resolver *Resolver
 	fs       *ArtifactFuse
 	mount    MountedFS
@@ -112,7 +113,7 @@ func newLoggedCacheFixture(t *testing.T, backend string, logger *slog.Logger, re
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ov.Close() })
-	f := &cacheFixture{t: t, ctx: ctx, snap: snap, resolver: &Resolver{Snapshot: snap, Overlay: ov}, blobs: &fakeHydrator{pathsByOID: map[string]string{}}}
+	f := &cacheFixture{t: t, ctx: ctx, snap: snap, ov: ov, resolver: &Resolver{Snapshot: snap, Overlay: ov}, blobs: &fakeHydrator{pathsByOID: map[string]string{}}}
 	f.resolver.SetGeneration(f.publish(nodes...))
 	engine := &Engine{Resolver: f.resolver, Repo: repo, Overlay: ov, Hydrator: f.blobs}
 
@@ -156,8 +157,198 @@ func (f *cacheFixture) publish(nodes ...model.BaseNode) int64 {
 // switchTo publishes nodes and switches the mount's resolver to them.
 func (f *cacheFixture) switchTo(nodes ...model.BaseNode) {
 	f.t.Helper()
-	if err := f.resolver.SwitchGeneration(f.ctx, f.publish(nodes...), 0); err != nil {
+	if _, err := f.resolver.SwitchGeneration(f.ctx, f.publish(nodes...), 0); err != nil {
 		f.t.Fatal(err)
+	}
+}
+
+// changesSince reads the overlay's change log after since, as the fsmonitor
+// hook does.
+func (f *cacheFixture) changesSince(since int64) overlaystore.Changes {
+	f.t.Helper()
+	changes, ok, err := overlaystore.ReadChangesSince(f.ctx, f.fs.engine.Repo, since)
+	if err != nil || !ok {
+		f.t.Fatalf("ReadChangesSince = %v, %v", ok, err)
+	}
+	return changes
+}
+
+// A switch logs every path whose base it changes, for the fsmonitor hook: Git
+// trusts each index entry the hook does not name. It lists each directory
+// whose tree changed, and every path below a directory only one generation
+// holds. An overlay entry shows the same content before and after the switch,
+// so the paths that entries cover stay out of the log.
+func TestSwitchGenerationLogsThePathsItChanges(t *testing.T) {
+	keep := []model.BaseNode{baseDir("keep", "keep"), baseFile("keep/a.txt", "a", 0o100644)}
+	f := newCacheFixture(t, append(keep,
+		baseFile("gone.txt", "gone", 0o100644),
+		baseFile("covered.txt", "covered1", 0o100644),
+		baseFile("hidden.txt", "hidden1", 0o100644),
+		baseFile("kind", "kind", 0o100644),
+		baseFile("run.sh", "run", 0o100644),
+		baseDir("old", "old"), baseFile("old/x.txt", "x", 0o100644),
+		baseDir("old/sub", "oldsub"), baseFile("old/sub/y.txt", "y", 0o100644),
+		baseDir("src", "src1"), baseFile("src/b.txt", "b1", 0o100644), baseFile("src/c.txt", "c", 0o100644),
+		baseDir("src/deep", "deep1"), baseFile("src/deep/d.txt", "d1", 0o100644),
+	)...)
+	writeOverlayFile(t, f.resolver.Overlay, "covered.txt", "edited")
+	if err := f.resolver.Overlay.FlushFile(f.ctx, "covered.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.resolver.Overlay.Remove(f.ctx, "hidden.txt"); err != nil {
+		t.Fatal(err)
+	}
+	before := f.changesSince(0)
+	f.switchTo(append(keep,
+		baseFile("covered.txt", "covered2", 0o100644),
+		baseFile("hidden.txt", "hidden2", 0o100644),
+		baseDir("kind", "kind"), baseFile("kind/k.txt", "k", 0o100644),
+		baseFile("run.sh", "run", 0o100755),
+		baseDir("add", "add"), baseFile("add/z.txt", "z", 0o100644),
+		baseDir("add/deep", "adddeep"), baseFile("add/deep/w.txt", "w", 0o100644),
+		baseDir("src", "src2"), baseFile("src/b.txt", "b2", 0o100644), baseFile("src/c.txt", "c", 0o100644), baseFile("src/new.txt", "new", 0o100644),
+		baseDir("src/deep", "deep2"), baseFile("src/deep/d.txt", "d2", 0o100644),
+	)...)
+	after := f.changesSince(before.Seq)
+	want := []string{"add", "add/deep", "add/deep/w.txt", "add/z.txt", "gone.txt", "kind", "kind/k.txt", "old", "old/sub", "old/sub/y.txt", "old/x.txt", "run.sh", "src/b.txt", "src/deep/d.txt", "src/new.txt"}
+	if !reflect.DeepEqual(after.Paths, want) {
+		t.Errorf("paths logged by the switch = %q, want %q", after.Paths, want)
+	}
+	if after.Instance != before.Instance {
+		t.Errorf("instance after the switch = %s, want %s", after.Instance, before.Instance)
+	}
+}
+
+// A generation with no root entries looks the same as one a prune removed, so
+// a switch from an empty tree cannot tell which paths it changes. It gives the
+// overlay a new instance, so the fsmonitor hook answers every earlier token
+// with a rescan.
+func TestSwitchGenerationFromAnEmptyTreeRenewsTheInstance(t *testing.T) {
+	f := newCacheFixture(t)
+	before := f.changesSince(0)
+	gen := f.publish(baseFile("a.txt", "a", 0o100644))
+	if _, err := f.resolver.SwitchGeneration(f.ctx, gen, 0); err != nil {
+		t.Fatal(err)
+	}
+	after := f.changesSince(before.Seq)
+	if after.Instance == before.Instance {
+		t.Errorf("instance after the switch = %s, want a new one", after.Instance)
+	}
+	if got := f.resolver.Generation(); got != gen {
+		t.Errorf("generation after the switch = %d, want %d", got, gen)
+	}
+}
+
+// countingListings counts the listings of the snapshot it wraps.
+type countingListings struct {
+	model.SnapshotStore
+	n int
+}
+
+func (s *countingListings) ListChildren(gen int64, dir string) ([]model.BaseNode, error) {
+	s.n++
+	return s.SnapshotStore.ListChildren(gen, dir)
+}
+
+// A switch's diff holds the overlay's cap of paths, here 3, plus one for each
+// overlay entry, which can cover a path the log then skips. Here two entries
+// cover changed paths, so a switch that changes 5 paths logs 3. Past 5 the
+// diff stops its walk, and the switch gives the overlay a new instance.
+func TestSwitchGenerationDiffsAsFarAsTheOverlayCanLog(t *testing.T) {
+	const maxPaths, covered, dirs = 3, 2, 10
+	for _, tt := range []struct {
+		name    string
+		changed int
+		renews  bool
+	}{
+		{"one below the cap plus the entries", maxPaths + covered - 1, false},
+		{"at the cap plus the entries", maxPaths + covered, false},
+		{"one past the cap plus the entries", maxPaths + covered + 1, true},
+		{"far past the cap plus the entries", dirs, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var before, after []model.BaseNode
+			var want []string
+			for i := range dirs {
+				dir, blob := fmt.Sprintf("d%d", i), "a"
+				before = append(before, baseDir(dir, dir+"-a"), baseFile(dir+"/f", "a", 0o100644))
+				if i < tt.changed {
+					blob = "b"
+					if i >= covered {
+						want = append(want, dir+"/f")
+					}
+				}
+				after = append(after, baseDir(dir, dir+"-"+blob), baseFile(dir+"/f", blob, 0o100644))
+			}
+			f := newCacheFixture(t, before...)
+			f.ov.MaxSwitchedPaths = maxPaths
+			for i := range covered {
+				path := fmt.Sprintf("d%d/f", i)
+				writeOverlayFile(t, f.ov, path, "covered")
+				if err := f.ov.FlushFile(f.ctx, path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gen := f.publish(after...)
+			listings := &countingListings{SnapshotStore: f.snap}
+			f.resolver.Snapshot = listings
+			logged := f.changesSince(0)
+			if _, err := f.resolver.SwitchGeneration(f.ctx, gen, 0); err != nil {
+				t.Fatal(err)
+			}
+			got := f.changesSince(logged.Seq)
+			if renewed := got.Instance != logged.Instance; renewed != tt.renews {
+				t.Errorf("instance renewed = %v, want %v", renewed, tt.renews)
+			}
+			if tt.renews {
+				want = nil
+			}
+			if !slices.Equal(got.Paths, want) {
+				t.Errorf("logged %q, want %q", got.Paths, want)
+			}
+			// A whole walk lists the root and each changed directory in both
+			// generations, then the old root once more.
+			if whole := 2 + 2*tt.changed + 1; tt.changed == dirs && listings.n >= whole {
+				t.Errorf("diff listed %d times, want fewer than the %d of the whole walk", listings.n, whole)
+			}
+		})
+	}
+}
+
+// failingListingOf fails every listing of generation gen.
+type failingListingOf struct {
+	model.SnapshotStore
+	gen int64
+}
+
+func (s failingListingOf) ListChildren(gen int64, dir string) ([]model.BaseNode, error) {
+	if gen == s.gen {
+		return nil, errors.New("injected listing failure")
+	}
+	return s.SnapshotStore.ListChildren(gen, dir)
+}
+
+// A switch whose diff fails still switches, returns the error, and gives the
+// overlay a new instance so that Git rescans.
+func TestSwitchGenerationWhoseDiffFailsRenewsTheInstance(t *testing.T) {
+	f := newCacheFixture(t, baseFile("a.txt", "a1", 0o100644))
+	before := f.changesSince(0)
+	from := f.resolver.Generation()
+	gen := f.publish(baseFile("a.txt", "a2", 0o100644))
+	f.resolver.Snapshot = failingListingOf{SnapshotStore: f.snap, gen: from}
+	sw, err := f.resolver.SwitchGeneration(f.ctx, gen, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sw.DiffErr == nil {
+		t.Error("switch returned no diff error")
+	}
+	after := f.changesSince(before.Seq)
+	if after.Instance == before.Instance || len(after.Paths) != 0 {
+		t.Errorf("change log after the switch = instance %s, paths %q; want a new instance and no paths", after.Instance, after.Paths)
+	}
+	if got := f.resolver.Generation(); got != gen {
+		t.Errorf("generation after the switch = %d, want %d", got, gen)
 	}
 }
 

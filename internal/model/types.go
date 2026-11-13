@@ -351,6 +351,32 @@ type SnapshotStore interface {
 	ListChildren(generation int64, parentPath string) ([]BaseNode, error)
 }
 
+// MaxSwitchedPaths is the most paths one log of a switch writes, the overlay
+// store's default cap. Past it, the overlay gives its database a new instance
+// instead, so Git rescans the work tree. The reconcile logs while every FUSE
+// op on the mount waits on the transition lock, unrelated reads included: on
+// Linux about 2.2 µs a path at 10,000 paths and 2.8 µs at 100,000, so up to
+// 0.28 s at this cap. The log after the kernel invalidations, and on FSKit the
+// one after the kernel's cache expires, each hold the overlay database's write
+// lock about as long, so writes through the mount wait on busy_timeout. A
+// rescan after a remount is cold: Git opens and hashes every tracked file
+// whose stat data it cannot trust. In a pydantic-ai mount of 5,975 files that
+// took git status 2.05 s with every blob cached, 0.34 ms a file, and
+// 11 minutes while it fetched every blob. Logging a path costs about a 120th
+// of what a cold rescan costs a file, so the cap only bounds how long ops
+// wait.
+const MaxSwitchedPaths = 100_000
+
+// SwitchedPaths names the paths whose base a generation switch changes.
+type SwitchedPaths struct {
+	// Paths holds each path whose base type, mode or blob differs between the
+	// two generations, and each path only one of them holds.
+	Paths []string
+	// Unknown is true when the switch does not name the paths it changed,
+	// so Git must rescan the work tree.
+	Unknown bool
+}
+
 type OverlayStore interface {
 	Lookup(ctx context.Context, path string) (OverlayEntry, bool, error)
 	EnsureCopyOnWrite(ctx context.Context, repo RepoPaths, path string, base BaseNode) (OverlayEntry, error)
@@ -371,13 +397,17 @@ type OverlayStore interface {
 	Mkdir(ctx context.Context, path string, mode uint32) error
 	SetMode(ctx context.Context, path string, mode uint32) error
 	SetMtime(ctx context.Context, path string, t time.Time) error
-	ReconcileChecked(ctx context.Context, baseLookup func(path string) (BaseNode, bool, error), lock sync.Locker, switchBase func()) error
+	ReconcileChecked(ctx context.Context, gen int64, baseLookup func(path string) (BaseNode, bool, error), switched SwitchedPaths, lock sync.Locker, switchBase func()) error
 	ListByPrefix(ctx context.Context, prefix string) ([]OverlayEntry, error)
 	// HasEntryBelow reports whether an entry of any kind lies below path.
 	HasEntryBelow(ctx context.Context, path string) (bool, error)
 	// CountEntries returns the number of entries of any kind, counting at
 	// most limit.
 	CountEntries(ctx context.Context, limit int) (int, error)
+	// SwitchedPathsLimit returns the most changed paths a switch's diff can
+	// hold while its log may still write each path one by one: the store's
+	// cap, plus one for each entry, which can cover a path.
+	SwitchedPathsLimit(ctx context.Context) (int, error)
 }
 
 type Hydrator interface {

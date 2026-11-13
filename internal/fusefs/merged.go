@@ -39,8 +39,11 @@ type Resolver struct {
 	generation atomic.Int64
 	commitTime atomic.Int64 // unix seconds of HEAD commit
 	transition sync.RWMutex
-	Snapshot   model.SnapshotStore
-	Overlay    model.OverlayStore
+	// switchMu runs one SwitchGeneration at a time, so the generation it
+	// diffs from is the one it switches from. It is taken before transition.
+	switchMu sync.Mutex
+	Snapshot model.SnapshotStore
+	Overlay  model.OverlayStore
 }
 
 func (r *Resolver) SetGeneration(gen int64) { r.generation.Store(gen) }
@@ -56,14 +59,37 @@ func (r *Resolver) CommitTime() int64       { return r.commitTime.Load() }
 // old generation, or the reconciled overlay with gen. The overlay looks up and
 // hashes its entries before SwitchGeneration takes the transition write lock,
 // which covers only applying the result and the switch.
-func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime int64) error {
+//
+// The overlay logs the paths the switch changed for the fsmonitor hook. A
+// HEAD move need not write the work tree, so the hook is how Git learns of
+// them.
+func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime int64) (Switch, error) {
 	baseLookup := func(path string) (model.BaseNode, bool, error) {
 		return r.Snapshot.LookupNode(ctx, gen, path)
 	}
-	return r.Overlay.ReconcileChecked(ctx, baseLookup, &r.transition, func() {
+	r.switchMu.Lock()
+	defer r.switchMu.Unlock()
+	sw := Switch{Replaced: r.Generation()}
+	// Readers resolved against no generation before the first switch, so
+	// nothing Git saw changes. An async repo's first switch follows the
+	// clean-index bootstrap, whose token a new instance would discard.
+	if sw.Replaced != 0 && sw.Replaced != gen {
+		sw.Changed, sw.DiffErr = SwitchedPaths(ctx, r.Snapshot, r.Overlay, sw.Replaced, gen)
+	}
+	return sw, r.Overlay.ReconcileChecked(ctx, gen, baseLookup, sw.Changed, &r.transition, func() {
 		r.SetCommitTime(commitTime)
 		r.SetGeneration(gen)
 	})
+}
+
+// Switch is what one SwitchGeneration did.
+type Switch struct {
+	// Replaced is the generation readers resolved against before the switch.
+	Replaced int64
+	// Changed is what the switch gave the overlay to log.
+	Changed model.SwitchedPaths
+	// DiffErr is the snapshot read error that made Changed Unknown, if any.
+	DiffErr error
 }
 
 type ResolvedNode struct {
@@ -369,16 +395,70 @@ func (r *Resolver) ChangedPaths(from, to int64, paths []string) (changed map[str
 		}
 		return dirs
 	}
+	mark := func(p string) bool {
+		changed[p] = true
+		return true
+	}
+	if ok, err := diff(r.Snapshot, from, to, mark, walk); !ok {
+		return nil, false, err
+	}
+	return changed, true, nil
+}
+
+// SwitchedPaths returns every path whose base type, mode or blob differs
+// between generations from and to of snap, and every path only one of them
+// holds. It lists both generations' children of each directory whose tree ID
+// differs and of each directory only one of them holds. The result is
+// Unknown, with no paths, when from holds no root entries, as for an empty
+// tree or a generation that was pruned or never published, and when a listing
+// fails, whose error it returns. It is Unknown also past the most paths ov's
+// log can write one by one, ov.SwitchedPathsLimit. The walk stops there, so a
+// switch the overlay renews the instance for costs no full diff. The limit is
+// read before the reconcile reads the entries, so it misses an entry written
+// in between. A switch that only such an entry keeps within the cap then
+// renews the instance, which costs Git one extra rescan.
+func SwitchedPaths(ctx context.Context, snap model.SnapshotStore, ov model.OverlayStore, from, to int64) (model.SwitchedPaths, error) {
+	limit, err := ov.SwitchedPathsLimit(ctx)
+	if err != nil {
+		return model.SwitchedPaths{Unknown: true}, err
+	}
+	return switchedPaths(snap, from, to, limit)
+}
+
+// switchedPaths returns what SwitchedPaths does, Unknown once more than limit
+// paths changed.
+func switchedPaths(snap model.SnapshotStore, from, to int64, limit int) (model.SwitchedPaths, error) {
+	var paths []string
+	mark := func(p string) bool {
+		paths = append(paths, p)
+		return len(paths) <= limit
+	}
+	descend := func(dirs []string, dir string) []string { return append(dirs, dir) }
+	if ok, err := diff(snap, from, to, mark, descend); !ok {
+		return model.SwitchedPaths{Unknown: true}, err
+	}
+	slices.Sort(paths)
+	return model.SwitchedPaths{Paths: paths}, nil
+}
+
+// diff walks down from the root of generations from and to of snap. For each
+// directory it lists, it calls mark with each child that the generations give
+// different types, modes or blobs or that only one of them holds, and walk with
+// each child directory that can hold such children. mark returns false to stop
+// the walk. walk returns the stack of directories to list, with the directory
+// pushed when diff should list it. ok is false when from holds no root entries
+// or mark stopped the walk.
+func diff(snap model.SnapshotStore, from, to int64, mark func(path string) bool, walk func(dirs []string, dir string) []string) (ok bool, err error) {
 	for dirs := []string{"."}; len(dirs) > 0; {
 		dir := dirs[len(dirs)-1]
 		dirs = dirs[:len(dirs)-1]
-		before, err := r.Snapshot.ListChildren(from, dir)
+		before, err := snap.ListChildren(from, dir)
 		if err != nil || dir == "." && len(before) == 0 {
-			return nil, false, err
+			return false, err
 		}
-		after, err := r.Snapshot.ListChildren(to, dir)
+		after, err := snap.ListChildren(to, dir)
 		if err != nil {
-			return nil, false, err
+			return false, err
 		}
 		added := make(map[string]model.BaseNode, len(after))
 		for _, n := range after {
@@ -388,14 +468,18 @@ func (r *Resolver) ChangedPaths(from, to int64, paths []string) (changed map[str
 			b, kept := added[a.Path]
 			delete(added, a.Path)
 			if !kept || a.Type != b.Type || a.Mode != b.Mode || baseBlob(a) != baseBlob(b) {
-				changed[a.Path] = true
+				if !mark(a.Path) {
+					return false, nil
+				}
 			}
 			if (a.Type == "dir" || kept && b.Type == "dir") && !(kept && sameTree(a, b)) {
 				dirs = walk(dirs, a.Path)
 			}
 		}
 		for _, b := range added {
-			changed[b.Path] = true
+			if !mark(b.Path) {
+				return false, nil
+			}
 			if b.Type == "dir" {
 				dirs = walk(dirs, b.Path)
 			}
@@ -403,10 +487,10 @@ func (r *Resolver) ChangedPaths(from, to int64, paths []string) (changed map[str
 	}
 	// A prune deletes a generation in one statement, so from still holding
 	// its root entries shows every listing above read it whole.
-	if before, err := r.Snapshot.ListChildren(from, "."); err != nil || len(before) == 0 {
-		return nil, false, err
+	if before, err := snap.ListChildren(from, "."); err != nil || len(before) == 0 {
+		return false, err
 	}
-	return changed, true, nil
+	return true, nil
 }
 
 // sameTree reports whether a and b are directories with the same tree ID,

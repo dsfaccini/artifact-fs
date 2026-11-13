@@ -974,8 +974,8 @@ func handleRead(ctx context.Context, e *Engine, fh *FileHandle, gen, off int64, 
 // reconcileOverlay reconciles ov with the base lookup reads, with no readers
 // to exclude.
 func reconcileOverlay(ctx context.Context, ov model.OverlayStore, lookup func(string) (model.BaseNode, bool)) error {
-	return ov.ReconcileChecked(ctx, func(path string) (model.BaseNode, bool, error) {
+	return ov.ReconcileChecked(ctx, 0, func(path string) (model.BaseNode, bool, error) {
 		n, ok := lookup(path)
 		return n, ok, nil
-	}, nil, nil)
+	}, model.SwitchedPaths{}, nil, nil)
 }

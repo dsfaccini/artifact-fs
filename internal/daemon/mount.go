@@ -92,13 +92,18 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 // startPreparedRuntime starts the runtime that serves res, which mounts it.
 // ctx is the runtime's parent, and prepareCtx bounds the steps before it
 // starts.
-func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *prepared) error {
+func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *prepared) (err error) {
 	cfg, snap, gen := res.cfg, res.snap, res.gen
-	if err := s.withCurrentPrepare(prepareCtx, cfg, func() error {
-		return s.pruneGenerations(prepareCtx, nil, snap, gen)
-	}); err != nil {
-		return withPreparationPhase(preparePhaseCleanupSnapshot, err)
+	ov, err := overlay.New(prepareCtx, cfg.RepoPaths)
+	if err != nil {
+		return err
 	}
+	defer func() {
+		if err != nil {
+			ov.Close()
+		}
+	}()
+	switched := s.switchedSinceServed(prepareCtx, cfg.Name, ov, snap, gen)
 	// attachMount checks this before each mount. Checking it here too
 	// keeps the index of a native worktree untouched.
 	if cfg.AdoptGitDir {
@@ -115,19 +120,21 @@ func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *pre
 			return err
 		}
 	}
-	ov, err := overlay.New(prepareCtx, cfg.RepoPaths)
-	if err != nil {
-		return err
-	}
 	baseLookup := func(path string) (model.BaseNode, bool, error) {
 		return snap.LookupNode(prepareCtx, gen, path)
 	}
-	if err := ov.ReconcileChecked(prepareCtx, baseLookup, nil, nil); err != nil {
-		ov.Close()
+	if err := ov.ReconcileChecked(prepareCtx, gen, baseLookup, switched, nil, nil); err != nil {
 		return err
 	}
+	// Prune only once the reconcile recorded gen as served. A start that
+	// fails or stops before then leaves the served generation for the next
+	// start to diff from.
+	if err := s.withCurrentPrepare(prepareCtx, cfg, func() error {
+		return s.pruneGenerations(prepareCtx, nil, snap, gen)
+	}); err != nil {
+		return withPreparationPhase(preparePhaseCleanupSnapshot, err)
+	}
 	if err := s.bootstrapCleanStatusIndex(prepareCtx, cfg, res.source.Commit, gen, snap, ov); err != nil {
-		ov.Close()
 		return err
 	}
 	var gate *fusefs.ReadyGate
@@ -138,6 +145,26 @@ func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *pre
 	rt := s.startRuntime(ctx, cfg, snap, ov, servedHead{oid: res.source.Commit, ref: res.source.Ref, gen: gen}, gate)
 	s.startRepoBackground(rt)
 	return nil
+}
+
+// switchedSinceServed returns what changed between the generation ov's change
+// log is current with and gen, such as a HEAD move while no runtime served
+// the repo. It is Unknown when ov recorded no generation or snap no longer
+// holds it.
+func (s *Service) switchedSinceServed(ctx context.Context, name string, ov *overlay.Store, snap *snapshot.Store, gen int64) model.SwitchedPaths {
+	served, err := ov.ServedGeneration(ctx)
+	if err != nil {
+		s.logger.Warn("served generation read failed; Git rescans the work tree", "repo", name, "error", err)
+		return model.SwitchedPaths{Unknown: true}
+	}
+	if served == gen {
+		return model.SwitchedPaths{}
+	}
+	switched, err := fusefs.SwitchedPaths(ctx, snap, ov, served, gen)
+	if err != nil {
+		s.logger.Warn("generation diff failed; Git rescans the work tree", "repo", name, "error", err)
+	}
+	return switched
 }
 
 // hasPublishedGeneration reports whether cfg's snapshot store holds a
@@ -179,6 +206,11 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 	headOID, headRef, gen, _ := snap.ReadState(ctx)
 	ov, err := overlay.New(ctx, cfg.RepoPaths)
 	if err != nil {
+		snap.Close()
+		return err
+	}
+	if err := ov.MarkServed(ctx, gen, s.switchedSinceServed(ctx, cfg.Name, ov, snap, gen)); err != nil {
+		ov.Close()
 		snap.Close()
 		return err
 	}
