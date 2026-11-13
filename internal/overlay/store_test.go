@@ -2240,8 +2240,8 @@ func lookupEntry(t *testing.T, s *Store, path string) (model.OverlayEntry, bool)
 	return e, ok
 }
 
-// One log of a switch writes at most maxSwitchedPaths paths. Past that, it
-// gives the overlay a new instance, so Git rescans and the transition lock
+// One log of a switch writes at most model.MaxSwitchedPaths paths. Past that,
+// it gives the overlay a new instance, so Git rescans and the transition lock
 // stays short. The cap counts only the paths no overlay entry covers, the
 // paths the log writes.
 func TestReconcileLogsAtMostMaxSwitchedPaths(t *testing.T) {
@@ -2250,9 +2250,9 @@ func TestReconcileLogsAtMostMaxSwitchedPaths(t *testing.T) {
 		changed, covered int
 		renews           bool
 	}{
-		{"at the cap", maxSwitchedPaths, 0, false},
-		{"past the cap", maxSwitchedPaths + 1, 0, true},
-		{"past the cap until the overlay covers one", maxSwitchedPaths + 1, 1, false},
+		{"at the cap", model.MaxSwitchedPaths, 0, false},
+		{"past the cap", model.MaxSwitchedPaths + 1, 0, true},
+		{"past the cap until the overlay covers one", model.MaxSwitchedPaths + 1, 1, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()

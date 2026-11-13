@@ -238,6 +238,78 @@ func TestSwitchGenerationFromAnEmptyTreeRenewsTheInstance(t *testing.T) {
 	}
 }
 
+// countingListings counts the listings of the snapshot it wraps.
+type countingListings struct {
+	model.SnapshotStore
+	n int
+}
+
+func (s *countingListings) ListChildren(gen int64, dir string) ([]model.BaseNode, error) {
+	s.n++
+	return s.SnapshotStore.ListChildren(gen, dir)
+}
+
+// The diff names every changed path up to its limit. Past it the result is
+// Unknown, and the walk stops instead of listing the rest of both trees.
+func TestSwitchedPathsStopsPastItsLimit(t *testing.T) {
+	const dirs = 10
+	f := newCacheFixture(t)
+	var before, after []model.BaseNode
+	for i := range dirs {
+		dir := fmt.Sprintf("d%d", i)
+		before = append(before, baseDir(dir, dir+"-1"), baseFile(dir+"/f", dir+"-a", 0o100644))
+		after = append(after, baseDir(dir, dir+"-2"), baseFile(dir+"/f", dir+"-b", 0o100644))
+	}
+	from, to := f.publish(before...), f.publish(after...)
+	snap := &countingListings{SnapshotStore: f.snap}
+	if got, err := switchedPaths(snap, from, to, dirs); err != nil || got.Unknown || len(got.Paths) != dirs {
+		t.Fatalf("diff with the limit at %d paths = %+v, %v; want them all", dirs, got, err)
+	}
+	full := snap.n
+	if got, err := switchedPaths(snap, from, to, dirs-1); err != nil || !got.Unknown {
+		t.Errorf("diff with the limit one below = %+v, %v; want Unknown", got, err)
+	}
+	snap.n = 0
+	if got, err := switchedPaths(snap, from, to, 2); err != nil || !got.Unknown {
+		t.Errorf("diff with the limit at 2 = %+v, %v; want Unknown", got, err)
+	}
+	if snap.n >= full {
+		t.Errorf("diff with the limit at 2 listed %d times, want fewer than the %d of the whole walk", snap.n, full)
+	}
+}
+
+// A switch's diff holds model.MaxSwitchedPaths paths, plus one for each
+// overlay entry, which can cover a path the log then skips. Here one of
+// model.MaxSwitchedPaths+1 changed paths is covered, so the switch logs the
+// rest one by one.
+func TestSwitchGenerationDiffsAsFarAsTheOverlayCanLog(t *testing.T) {
+	keep := baseFile("keep.txt", "keep", 0o100644)
+	f := newCacheFixture(t, keep)
+	writeOverlayFile(t, f.resolver.Overlay, "f000000", "covered")
+	if err := f.resolver.Overlay.FlushFile(f.ctx, "f000000"); err != nil {
+		t.Fatal(err)
+	}
+	nodes := []model.BaseNode{baseDir(".", "root"), keep}
+	for i := range model.MaxSwitchedPaths + 1 {
+		nodes = append(nodes, baseFile(fmt.Sprintf("f%06d", i), "new", 0o100644))
+	}
+	gen, err := f.snap.PublishGeneration(f.ctx, "head", "main", nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := f.changesSince(0)
+	if _, err := f.resolver.SwitchGeneration(f.ctx, gen, 0); err != nil {
+		t.Fatal(err)
+	}
+	after := f.changesSince(before.Seq)
+	if after.Instance != before.Instance {
+		t.Error("switch gave the overlay a new instance, want the paths logged")
+	}
+	if want := model.MaxSwitchedPaths; len(after.Paths) != want || after.Paths[0] != "f000001" || after.Paths[want-1] != fmt.Sprintf("f%06d", want) {
+		t.Errorf("logged %d paths, want f000001 through f%06d", len(after.Paths), want)
+	}
+}
+
 // failingListingOf fails every listing of generation gen.
 type failingListingOf struct {
 	model.SnapshotStore
