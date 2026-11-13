@@ -138,8 +138,12 @@ func TestReconfiguringTheFSMonitorHookLinkLeavesALink(t *testing.T) {
 	}
 
 	renaming := false
+	var stagedInfo os.FileInfo
 	store.testHookBeforeHookRename = func(path, staged string) {
 		renaming = true
+		if stagedInfo, err = os.Lstat(staged); err != nil {
+			t.Errorf("new link before the rename: %v", err)
+		}
 		current, err := os.Lstat(path)
 		if err != nil {
 			t.Errorf("hook link before the rename: %v", err)
@@ -155,6 +159,11 @@ func TestReconfiguringTheFSMonitorHookLinkLeavesALink(t *testing.T) {
 	}
 	if !renaming {
 		t.Fatal("reconfiguring made the link without a rename over it")
+	}
+	// A rename keeps the staged link's inode; a link made again at the path
+	// gets a new one.
+	if after, err := os.Lstat(link); err != nil || stagedInfo == nil || !os.SameFile(stagedInfo, after) {
+		t.Fatalf("the hook link after reconfiguring is not the staged link renamed over it (lstat: %v)", err)
 	}
 	if target, err := os.Readlink(link); err != nil || target != exe {
 		t.Fatalf("hook link = %q, %v; want a link to %q", target, err, exe)

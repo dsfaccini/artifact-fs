@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -339,14 +340,22 @@ func TestAdoptGitDirWarnsAboutCredentialedPromisorRemote(t *testing.T) {
 }
 
 // remove-repo hands the worktree back to native Git, so the filesystem
-// settings adoption pinned for the mount go too.
-// remove-repo unsets the hook link and, under a state root whose link path
-// Git would hand to a shell, the hook script in the git dir. An older
-// artifact-fs left the script under every state root.
+// settings adoption pinned for the mount go too. It unsets the hook link, also
+// for a repo whose ID holds a regular expression metacharacter, and the hook
+// script in the git dir. The script is the hook under a state root whose link
+// path Git would hand to a shell, and an older artifact-fs left it under every
+// state root.
 func TestRemoveRepoRestoresAdoptedWorktreeFilesystemConfig(t *testing.T) {
 	t.Parallel()
-	for _, stateDir := range []string{"state", "state root"} {
-		t.Run(stateDir, func(t *testing.T) {
+	for _, tc := range []struct {
+		name, stateDir, repo string
+		script               bool
+	}{
+		{"link", "state", "adopted", false},
+		{"script", "state root", "adopted", true},
+		{"metacharacter in the ID", "state", "a+b", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			ctx := t.Context()
 			dir, err := filepath.EvalSymlinks(t.TempDir())
@@ -363,13 +372,13 @@ func TestRemoveRepoRestoresAdoptedWorktreeFilesystemConfig(t *testing.T) {
 			runCmd(t, "git", "-C", source, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
 			runCmd(t, "git", "-C", source, "worktree", "add", "-b", "topic", worktree)
 			gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
-			root := filepath.Join(dir, stateDir)
+			root := filepath.Join(dir, tc.stateDir)
 			svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer svc.Close()
-			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: tc.repo, GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
 			if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
 				t.Fatal(err)
 			}
@@ -381,7 +390,7 @@ func TestRemoveRepoRestoresAdoptedWorktreeFilesystemConfig(t *testing.T) {
 				t.Fatal(err)
 			}
 			hook := gitstore.FSMonitorHookLink(root, stored.ID)
-			if strings.Contains(stateDir, " ") {
+			if tc.script {
 				hook = filepath.Join(gitDir, "hooks", "artifact-fs-fsmonitor")
 			}
 			worktreeConfig := filepath.Join(gitDir, "config.worktree")
@@ -459,6 +468,53 @@ func TestRemoveRepoUnsetsTheHookLinkAfterTheStateRootMoved(t *testing.T) {
 	}
 	defer ctl.Close()
 	if err := ctl.RemoveRepo(ctx, cfg.Name); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "config", "--file", worktreeConfig, "--get", "core.fsmonitor").Output(); err == nil {
+		t.Fatalf("core.fsmonitor = %q after remove-repo, want it unset", out)
+	}
+}
+
+// Under a UTF-8 locale Git's "." matches no byte that is not valid UTF-8, and
+// a Linux path can hold such a byte. remove-repo still unsets a hook link
+// under such a state root.
+func TestRemoveRepoUnsetsTheHookLinkUnderAStateRootThatIsNotUTF8(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("macOS refuses a file name that is not valid UTF-8")
+	}
+	t.Setenv("LC_ALL", "C.UTF-8")
+	ctx := t.Context()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
+	runCmd(t, "git", "init", "--initial-branch=main", source)
+	commitFile(t, source, "README.md", "base\n")
+	runCmd(t, "git", "-C", source, "worktree", "add", "-b", "topic", worktree)
+	gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
+	root := filepath.Join(dir, "state\xff")
+	svc, err := New(ctx, root, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.git.ConfigureFSMonitorHook(ctx, stored, svc.root); err != nil {
+		t.Fatal(err)
+	}
+	worktreeConfig := filepath.Join(gitDir, "config.worktree")
+	if got, want := strings.TrimSpace(runCmdOutput(t, "git", "config", "--file", worktreeConfig, "--get", "core.fsmonitor")), gitstore.FSMonitorHookLink(root, stored.ID); got != want {
+		t.Fatalf("core.fsmonitor = %q, want %q", got, want)
+	}
+	if err := svc.ctl().RemoveRepo(ctx, cfg.Name); err != nil {
 		t.Fatal(err)
 	}
 	if out, err := exec.Command("git", "config", "--file", worktreeConfig, "--get", "core.fsmonitor").Output(); err == nil {

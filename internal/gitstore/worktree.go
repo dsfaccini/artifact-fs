@@ -365,7 +365,7 @@ func FSMonitorHookLink(stateRoot string, id model.RepoID) string {
 }
 
 // fsmonitorHookLinkPattern returns an extended regular expression that
-// matches every path ParseFSMonitorHookLink accepts with id.
+// matches every path FSMonitorHookLink returns for id, under any state root.
 func fsmonitorHookLinkPattern(id model.RepoID) string {
 	return "/(.*/)?overlays/" + regexp.QuoteMeta(string(id)) + "/" + fsmonitorHookLinkName
 }
@@ -407,7 +407,10 @@ func (s *Store) ReleaseAdoptedWorktree(ctx context.Context, repo model.RepoConfi
 		{"core.ignorecase", "^false$"},
 		{"core.symlinks", "^true$"},
 	} {
-		if _, err := runGit(ctx, repo.GitDir, "config", "--file", worktreeConfig, "--unset-all", pin[0], pin[1]); err != nil {
+		// Git matches a value pattern in its locale. Under a UTF-8 locale "."
+		// matches no byte that is not valid UTF-8, which a path can hold, and
+		// the C locale matches each byte.
+		if _, err := runGitWithEnv(ctx, repo.GitDir, []string{"LC_ALL=C"}, "config", "--file", worktreeConfig, "--unset-all", pin[0], pin[1]); err != nil {
 			var exitErr *gitCommandError
 			if !errors.As(err, &exitErr) || exitErr.exitCode != 5 {
 				return err
