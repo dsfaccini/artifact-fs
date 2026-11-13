@@ -142,11 +142,13 @@ holds a space or another shell metacharacter through `sh -c`, which splits it.
 For such a link path the hook is a script at
 `<git dir>/hooks/artifact-fs-fsmonitor` instead, which works only when the git
 dir's path holds no such character. The hook is the script also when another
-user could rename a directory above the state root and put a hook of their own
-in its place. Each such directory must belong to you or root, and neither its
-group nor others may write it. A sticky directory, such as `/tmp`, passes, and
-so does group write when you are the group's only member, as with a private
-group per user under umask `002`. A state
+user could write or rename the state root or a directory above it, and put a
+hook of their own in its place. Each must belong to you or root, and others
+may not write it, so a state root under `/tmp` gets the script. Its group may
+write it only when it is yours and you are the group's only member, as with a
+private group per user under umask `002`. On Linux a directory with an access
+ACL gets the script too. On macOS an ACL that lets another user write such a
+directory goes unnoticed. A state
 root may be a symlink the current user owns, or a path relative to the current
 directory. ArtifactFS makes it absolute and resolves it at startup, and builds
 the paths of repos it registers from the resolved path. Repos registered before

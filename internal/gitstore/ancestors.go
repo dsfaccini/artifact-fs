@@ -12,12 +12,12 @@ import (
 var groupFile, passwdFile = "/etc/group", "/etc/passwd"
 
 // privateGroup reports whether uid is the only member of group gid, as
-// Debian's OpenSSH decides: every user whose primary group is gid is uid, the
-// group lists no member but uid's name, and uid is a member. It reads only
-// groupFile and passwdFile, and returns false when either names an entry from
-// another source, such as NIS, or lacks gid or uid.
+// Debian's OpenSSH decides: every user whose primary group is gid is uid,
+// every group entry for gid lists no member but uid's name, and uid is a
+// member. It reads only groupFile and passwdFile, compares IDs as numbers,
+// and returns false when either file holds an ID that is not a number or an
+// entry from another source, such as NIS, or lacks gid or uid.
 func privateGroup(gid, uid uint32) bool {
-	gidText, uidText := strconv.FormatUint(uint64(gid), 10), strconv.FormatUint(uint64(uid), 10)
 	users, ok := readDatabase(passwdFile)
 	if !ok {
 		return false
@@ -27,11 +27,16 @@ func privateGroup(gid, uid uint32) bool {
 		if len(user) < 4 {
 			continue
 		}
-		if user[2] == uidText {
+		userID, uidOK := parseID(user[2])
+		groupID, gidOK := parseID(user[3])
+		if !uidOK || !gidOK {
+			return false
+		}
+		if userID == uid {
 			name = user[0]
 		}
-		if user[3] == gidText {
-			if user[2] != uidText {
+		if groupID == gid {
+			if userID != uid {
 				return false
 			}
 			members++
@@ -41,19 +46,33 @@ func privateGroup(gid, uid uint32) bool {
 	if !ok || name == "" {
 		return false
 	}
+	found := false
 	for _, group := range groups {
-		if len(group) < 4 || group[2] != gidText {
+		if len(group) < 4 {
 			continue
 		}
+		groupID, ok := parseID(group[2])
+		if !ok {
+			return false
+		}
+		if groupID != gid {
+			continue
+		}
+		found = true
 		if group[3] != "" {
 			if group[3] != name {
 				return false
 			}
 			members++
 		}
-		return members > 0
 	}
-	return false
+	return found && members > 0
+}
+
+// parseID parses a decimal user or group ID.
+func parseID(field string) (uint32, bool) {
+	id, err := strconv.ParseUint(field, 10, 32)
+	return uint32(id), err == nil
 }
 
 // readDatabase returns the colon-separated fields of each entry in an

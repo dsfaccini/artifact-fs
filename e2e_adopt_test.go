@@ -13,6 +13,7 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -30,7 +31,8 @@ func TestE2EAdoptedWorktree(t *testing.T) {
 	base := filepath.Join(t.TempDir(), "base")
 	run(t, "", "git", "clone", createLocalTestRepo(t), base)
 	run(t, base, "git", "checkout", "main")
-	root := t.TempDir()
+	// The hook is the link only under a state root no other user can replace.
+	root := gittest.PrivateTempDir(t)
 	mountDir := newE2EMountDir(t)
 	mountPath := filepath.Join(mountDir, repoName)
 	run(t, base, "git", "worktree", "add", "--no-checkout", "-b", "topic", mountPath, "main")
@@ -71,11 +73,7 @@ func TestE2EAdoptedWorktree(t *testing.T) {
 		t.Fatalf("mounted .git = %q, want %q", got, want)
 	}
 	// git status answers through the hook link that the daemon installs, which runs this binary (see TestMain).
-	resolvedRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := strings.TrimSpace(gitCmd(t, mountPath, "config", "--get", "core.fsmonitor")), gitstore.FSMonitorHookLink(resolvedRoot, repoName); got != want {
+	if got, want := strings.TrimSpace(gitCmd(t, mountPath, "config", "--get", "core.fsmonitor")), gitstore.FSMonitorHookLink(root, repoName); got != want {
 		t.Fatalf("core.fsmonitor = %q, want %q", got, want)
 	}
 	assertGitStatus(t, mountPath, map[string]string{})

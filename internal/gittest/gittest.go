@@ -16,6 +16,37 @@ import (
 	"time"
 )
 
+// PrivateTempDir returns a new directory in the user's cache directory, with
+// its symlinks resolved, and removes it when t ends. A state root there gets
+// the FSMonitor hook link wherever no other user can write or rename the
+// cache directory and its ancestors, as the build cache already requires. A
+// state root under t.TempDir() gets the hook script on Linux, because every
+// user can write /tmp.
+func PrivateTempDir(t testing.TB) string {
+	t.Helper()
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cache, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(cache, "artifact-fs-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("PrivateTempDir cleanup: %v", err)
+		}
+	})
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
+}
+
 // PartialCloneRemote commits files on branch main of a bare repository that
 // serves partial clones, and returns its URL. A blobless clone of it holds no
 // blobs, so every read of one fetches from it.

@@ -3,10 +3,12 @@
 package gitstore
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -14,70 +16,129 @@ import (
 )
 
 // Git runs the hook link by its path, so the hook is the link only while no
-// other user can rename a directory above the state root. Group write passes
-// when the group is private to the user, as every directory is group-writable
-// under umask 002 with a private group per user. A sticky directory passes, as
-// /tmp does. Every other case falls back to the script in the git dir.
+// other user can write or rename the state root or a directory above it.
+// Group write passes when the directory is the user's and the group is
+// private to the user, as every directory is group-writable under umask 002
+// with a private group per user. Every other case falls back to the script in
+// the git dir.
 func TestFSMonitorHookIsTheLinkOnlyUnderPrivateAncestors(t *testing.T) {
+	euid := os.Geteuid()
 	for _, tc := range []struct {
 		name string
-		mode os.FileMode
-		// The parent's group is the user's primary group, the group file
-		// lists members for it, another user's primary group is it, or the
-		// user database holds a NIS entry.
-		primary bool
-		members string
-		peer    bool
-		nis     bool
-		link    bool
+		// mode is the parent's mode, and stateMode the state root's, 0700
+		// when zero. owner, when not -1, is the uid lstat reports for the
+		// parent. The parent's group is the user's primary group, the
+		// group file lists members for it, a second entry for it lists
+		// other, another user has it as primary group, written as peerGID
+		// when set, or the user database holds a NIS entry.
+		mode, stateMode os.FileMode
+		owner           int
+		primary         bool
+		members         string
+		secondEntry     bool
+		peer            bool
+		peerGID         string
+		nis             bool
+		acl             bool
+		symlink         bool
+		link            bool
 	}{
-		{name: "private", mode: 0o755, link: true},
-		{name: "private group", mode: 0o775, primary: true, link: true},
-		{name: "group that lists only the user", mode: 0o775, members: "me", link: true},
-		{name: "group without the user", mode: 0o775},
-		{name: "group that lists another user", mode: 0o775, primary: true, members: "me,other"},
-		{name: "group another user has as primary", mode: 0o775, primary: true, peer: true},
-		{name: "group from NIS", mode: 0o775, primary: true, nis: true},
-		{name: "others can write", mode: 0o777},
-		{name: "sticky", mode: 0o777 | os.ModeSticky, link: true},
+		{name: "private", mode: 0o755, owner: -1, link: true},
+		{name: "private group", mode: 0o775, owner: -1, primary: true, link: true},
+		{name: "group that lists only the user", mode: 0o775, owner: -1, members: "me", link: true},
+		{name: "group without the user", mode: 0o775, owner: -1},
+		{name: "group that lists another user", mode: 0o775, owner: -1, primary: true, members: "me,other"},
+		{name: "second entry for the group lists another user", mode: 0o775, owner: -1, primary: true, secondEntry: true},
+		{name: "group another user has as primary", mode: 0o775, owner: -1, primary: true, peer: true},
+		{name: "group another user has as primary with a leading zero", mode: 0o775, owner: -1, primary: true, peer: true, peerGID: "0%d"},
+		{name: "group from NIS", mode: 0o775, owner: -1, primary: true, nis: true},
+		{name: "others can write", mode: 0o777, owner: -1, primary: true},
+		{name: "sticky", mode: 0o777 | os.ModeSticky, owner: -1, primary: true},
+		{name: "another user owns it", mode: 0o755, owner: euid + 1},
+		{name: "root owns it", mode: 0o755, owner: 0, link: true},
+		{name: "root owns it and the user's private group can write it", mode: 0o775, owner: 0, primary: true},
+		{name: "access ACL grants another user write", mode: 0o755, owner: -1, primary: true, acl: true},
+		{name: "state root others can write", mode: 0o755, stateMode: 0o777, owner: -1},
+		{name: "state root through a symlink", mode: 0o755, owner: -1, symlink: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.owner == euid {
+				t.Skip("the test runs as the owner it would fake")
+			}
 			// Under umask 002 the test's temp directory is group-writable,
 			// and the fixture databases below describe only the parent.
-			tmp := t.TempDir()
+			tmp, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
 			if err := os.Chmod(tmp, 0o700); err != nil {
 				t.Fatal(err)
 			}
 			repo := filepath.Join(tmp, "repo")
 			run(t, "git", "init", repo)
 			parent := filepath.Join(tmp, "parent")
-			if err := os.Mkdir(parent, 0o700); err != nil {
+			stateRoot := filepath.Join(parent, "state")
+			if err := os.MkdirAll(stateRoot, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.Chmod(parent, tc.mode); err != nil {
-				t.Fatal(err)
+			for dir, mode := range map[string]os.FileMode{parent: tc.mode, stateRoot: cmp.Or(tc.stateMode, 0o700)} {
+				if err := os.Chmod(dir, mode); err != nil {
+					t.Fatal(err)
+				}
 			}
+			if tc.acl {
+				grantWriteACL(t, parent, uint32(euid+1))
+			}
+			if tc.symlink {
+				link := filepath.Join(parent, "link")
+				if err := os.Symlink(stateRoot, link); err != nil {
+					t.Fatal(err)
+				}
+				stateRoot = link
+			}
+			// Directories above the test's own report root's 0755, so the
+			// machine's directories decide no row.
+			realLstat := lstat
+			lstat = func(path string, st *syscall.Stat_t) error {
+				err := realLstat(path, st)
+				switch {
+				case path == parent && tc.owner >= 0:
+					st.Uid = uint32(tc.owner)
+				case !strings.HasPrefix(path+"/", tmp+"/"):
+					st.Uid, st.Mode = 0, syscall.S_IFDIR|0o755
+				}
+				return err
+			}
+			t.Cleanup(func() { lstat = realLstat })
+
 			var st syscall.Stat_t
 			if err := syscall.Lstat(parent, &st); err != nil {
 				t.Fatal(err)
 			}
-			euid := os.Geteuid()
 			primary := st.Gid + 1
 			if tc.primary {
 				primary = st.Gid
 			}
 			passwd := fmt.Sprintf("me:x:%d:%d::/:/bin/sh\n", euid, primary)
 			if tc.peer {
-				passwd += fmt.Sprintf("other:x:%d:%d::/:/bin/sh\n", euid+1, st.Gid)
+				peerGID := fmt.Sprint(st.Gid)
+				if tc.peerGID != "" {
+					peerGID = fmt.Sprintf(tc.peerGID, st.Gid)
+				}
+				passwd += fmt.Sprintf("other:x:%d:%s::/:/bin/sh\n", euid+1, peerGID)
 			}
 			if tc.nis {
 				passwd += "+::::::\n"
+			}
+			group := fmt.Sprintf("grp:x:%d:%s\n", st.Gid, tc.members)
+			if tc.secondEntry {
+				group += fmt.Sprintf("shared:x:%d:other\n", st.Gid)
 			}
 			databases := t.TempDir()
 			oldGroup, oldPasswd := groupFile, passwdFile
 			groupFile, passwdFile = filepath.Join(databases, "group"), filepath.Join(databases, "passwd")
 			t.Cleanup(func() { groupFile, passwdFile = oldGroup, oldPasswd })
-			if err := os.WriteFile(groupFile, fmt.Appendf(nil, "grp:x:%d:%s\n", st.Gid, tc.members), 0o644); err != nil {
+			if err := os.WriteFile(groupFile, []byte(group), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(passwdFile, []byte(passwd), 0o644); err != nil {
@@ -86,7 +147,6 @@ func TestFSMonitorHookIsTheLinkOnlyUnderPrivateAncestors(t *testing.T) {
 
 			gitDir := filepath.Join(repo, ".git")
 			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", GitDir: gitDir, MountPath: repo}}
-			stateRoot := filepath.Join(parent, "state")
 			if err := New(nil).ConfigureFSMonitorHook(t.Context(), cfg, stateRoot); err != nil {
 				t.Fatal(err)
 			}

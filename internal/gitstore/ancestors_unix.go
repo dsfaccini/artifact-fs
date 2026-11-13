@@ -8,34 +8,49 @@ import (
 	"syscall"
 )
 
+// lstat is syscall.Lstat. Tests replace it, because only root can give a
+// directory another owner.
+var lstat = syscall.Lstat
+
 // privateAncestors reports whether only the effective user and root can
-// rename each directory above stateRoot. Git runs the hook link by its path,
-// so whoever can rename a directory on that path chooses what Git runs.
-// ensureStateRoot checks the state root itself.
+// write or rename stateRoot and each directory above it. Git runs the hook
+// link by its path, so whoever can rename a directory on that path chooses
+// what Git runs. A stateRoot that is not its own resolved path fails.
 //
 // It checks each directory as OpenSSH's StrictModes does: root or the
-// effective user owns it, and neither its group nor others can write it. It
-// accepts two exceptions. In a sticky directory, such as /tmp, only an
-// entry's owner can rename the entry. Group write is safe when the group is
-// private to the effective user, as Debian's OpenSSH accepts: under umask 002
-// on a system with a private group per user, every directory a user makes is
-// group-writable, and the check would otherwise always fail there.
+// effective user owns it, and others cannot write it. Its group can write it
+// only when the effective user owns it and is the group's only member, as
+// Debian's OpenSSH accepts. Under umask 002 on a system with a private group
+// per user, every directory a user makes is group-writable, and the check
+// would otherwise always fail there. A sticky directory such as /tmp fails:
+// once an entry in it is gone, after a reboot or a cleanup, any user can make
+// one at its path. On Linux a directory with an access ACL fails, because the
+// ACL can let another user write it without showing in the mode. macOS ACLs
+// go unread.
 func privateAncestors(stateRoot string) bool {
+	if resolved, err := filepath.EvalSymlinks(stateRoot); err != nil || resolved != stateRoot {
+		return false
+	}
 	euid := uint32(os.Geteuid())
-	for dir := filepath.Dir(stateRoot); ; dir = filepath.Dir(dir) {
+	privateGroups := map[uint32]bool{}
+	for dir := stateRoot; ; dir = filepath.Dir(dir) {
 		var st syscall.Stat_t
-		if err := syscall.Lstat(dir, &st); err != nil {
+		if err := lstat(dir, &st); err != nil || hasACL(dir) {
 			return false
 		}
 		mode := uint32(st.Mode)
-		switch {
-		case st.Uid != 0 && st.Uid != euid:
+		if (st.Uid != 0 && st.Uid != euid) || mode&0o002 != 0 {
 			return false
-		case mode&syscall.S_ISVTX != 0:
-		case mode&0o002 != 0:
-			return false
-		case mode&0o020 != 0 && (st.Uid != euid || !privateGroup(st.Gid, euid)):
-			return false
+		}
+		if mode&0o020 != 0 {
+			private, ok := privateGroups[st.Gid]
+			if !ok {
+				private = privateGroup(st.Gid, euid)
+				privateGroups[st.Gid] = private
+			}
+			if st.Uid != euid || !private {
+				return false
+			}
 		}
 		if filepath.Dir(dir) == dir {
 			return true

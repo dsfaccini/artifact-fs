@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -113,7 +114,7 @@ func TestReconfiguringTheFSMonitorHookLeavesTheOpenHookWhole(t *testing.T) {
 // the hook meanwhile finds the old link or the new one.
 func TestReconfiguringTheFSMonitorHookLinkLeavesALink(t *testing.T) {
 	t.Parallel()
-	tmp := t.TempDir()
+	tmp := gittest.PrivateTempDir(t)
 	repo := filepath.Join(tmp, "repo")
 	run(t, "git", "init", repo)
 	gitDir := filepath.Join(repo, ".git")

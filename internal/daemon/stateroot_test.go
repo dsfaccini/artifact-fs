@@ -284,10 +284,7 @@ func TestNewKeepsResolvedStateRootAfterLinkRetarget(t *testing.T) {
 // segment as an authority, and the hook link Git runs from the worktree.
 func TestRelativeStateRootGivesGitAHookItCanRun(t *testing.T) {
 	ctx := t.Context()
-	dir, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	dir := gittest.PrivateTempDir(t)
 	t.Chdir(dir)
 	worktree := filepath.Join(dir, "worktree")
 	runCmd(t, "git", "init", "--initial-branch", "main", worktree)

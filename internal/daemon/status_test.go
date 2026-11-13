@@ -19,6 +19,7 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
@@ -551,10 +552,7 @@ func TestGitRunsTheFSMonitorHookUnderEveryStateRoot(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			ctx := t.Context()
-			dir, err := filepath.EvalSymlinks(t.TempDir())
-			if err != nil {
-				t.Fatal(err)
-			}
+			dir := gittest.PrivateTempDir(t)
 			worktree := filepath.Join(dir, "worktree")
 			runCmd(t, "git", "init", "--initial-branch", "main", worktree)
 			commitFile(t, worktree, "README.md", "base\n")

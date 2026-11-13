@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -121,10 +122,7 @@ func TestAdoptGitDirPreservesGitStateAndScopesConfig(t *testing.T) {
 func TestRemoveRepoStopsAdoptedFSMonitor(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	dir, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	dir := gittest.PrivateTempDir(t)
 	source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
 	runCmd(t, "git", "init", "--initial-branch=main", source)
 	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o644); err != nil {
@@ -358,10 +356,7 @@ func TestRemoveRepoRestoresAdoptedWorktreeFilesystemConfig(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			ctx := t.Context()
-			dir, err := filepath.EvalSymlinks(t.TempDir())
-			if err != nil {
-				t.Fatal(err)
-			}
+			dir := gittest.PrivateTempDir(t)
 			source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
 			runCmd(t, "git", "init", "--initial-branch=main", source)
 			runCmd(t, "git", "-C", source, "config", "core.filemode", "false")
@@ -425,10 +420,7 @@ func TestRemoveRepoRestoresAdoptedWorktreeFilesystemConfig(t *testing.T) {
 func TestRemoveRepoUnsetsTheHookLinkAfterTheStateRootMoved(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	dir, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	dir := gittest.PrivateTempDir(t)
 	source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
 	runCmd(t, "git", "init", "--initial-branch=main", source)
 	commitFile(t, source, "README.md", "base\n")
@@ -484,10 +476,7 @@ func TestRemoveRepoUnsetsTheHookLinkUnderAStateRootThatIsNotUTF8(t *testing.T) {
 	}
 	t.Setenv("LC_ALL", "C.UTF-8")
 	ctx := t.Context()
-	dir, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	dir := gittest.PrivateTempDir(t)
 	source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
 	runCmd(t, "git", "init", "--initial-branch=main", source)
 	commitFile(t, source, "README.md", "base\n")
@@ -564,10 +553,7 @@ func TestRemoveRepoAfterFailedAdoptionKeepsWorktreeConfig(t *testing.T) {
 func TestAdoptedMountSwitchesAnOlderHookScriptToTheLink(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	dir, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	dir := gittest.PrivateTempDir(t)
 	source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
 	runCmd(t, "git", "init", "--initial-branch=main", source)
 	commitFile(t, source, "README.md", "base\n")
