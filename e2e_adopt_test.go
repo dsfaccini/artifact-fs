@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/daemon"
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -69,8 +70,12 @@ func TestE2EAdoptedWorktree(t *testing.T) {
 	if got, want := readFileStr(t, filepath.Join(mountPath, ".git")), "gitdir: "+gitDir+"\n"; got != want {
 		t.Fatalf("mounted .git = %q, want %q", got, want)
 	}
-	// git status answers through the hook that the daemon installs, which runs this binary (see TestMain).
-	if got, want := strings.TrimSpace(gitCmd(t, mountPath, "config", "--get", "core.fsmonitor")), filepath.Join(gitDir, "hooks", "artifact-fs-fsmonitor"); got != want {
+	// git status answers through the hook link that the daemon installs, which runs this binary (see TestMain).
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.TrimSpace(gitCmd(t, mountPath, "config", "--get", "core.fsmonitor")), gitstore.FSMonitorHookLink(resolvedRoot, repoName); got != want {
 		t.Fatalf("core.fsmonitor = %q, want %q", got, want)
 	}
 	assertGitStatus(t, mountPath, map[string]string{})

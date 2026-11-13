@@ -328,7 +328,7 @@ type GitStore interface {
 	ValidatePreparedGitDir(ctx context.Context, repo RepoConfig) error
 	ConfigureAdoptedWorktree(ctx context.Context, repo RepoConfig) error
 	WarnAdoptedRemoteCredentials(ctx context.Context, repo RepoConfig)
-	ReleaseAdoptedWorktree(ctx context.Context, repo RepoConfig) error
+	ReleaseAdoptedWorktree(ctx context.Context, repo RepoConfig, stateRoot string) error
 	EnsureIndexInitialized(ctx context.Context, repo RepoConfig) error
 	ConfigureStatusOptimization(ctx context.Context, repo RepoConfig, stateRoot string) error
 	ConfigureFSMonitorHook(ctx context.Context, repo RepoConfig, stateRoot string) error

@@ -164,7 +164,7 @@ func (s *Controller) RemoveRepo(ctx context.Context, name string) error {
 			return registry.ErrRepoChanged
 		}
 		if latest.AdoptGitDir {
-			if err := s.git.ReleaseAdoptedWorktree(ctx, latest); err != nil {
+			if err := s.git.ReleaseAdoptedWorktree(ctx, latest, s.root); err != nil {
 				return err
 			}
 		}

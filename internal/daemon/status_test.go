@@ -537,6 +537,60 @@ func hookAnswer(t *testing.T, svc *Service, since string) ([]byte, string, []str
 // FSMonitorHook reads the state root without a Controller. It must answer
 // what the hook answers from a Controller's registry, which New opened and
 // migrated, for every token Git can hold.
+// Git runs a core.fsmonitor path that holds a shell metacharacter through
+// sh -c unquoted, and sh splits it. Under such a state root the hook stays the
+// script in the git dir, which quotes the root, so Git runs the hook under
+// every state root.
+func TestGitRunsTheFSMonitorHookUnderEveryStateRoot(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, root string
+		link       bool
+	}{
+		{"plain", "state", true},
+		{"space", "state root", false},
+		{"metacharacter", "state$root", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			worktree := filepath.Join(dir, "worktree")
+			runCmd(t, "git", "init", "--initial-branch", "main", worktree)
+			commitFile(t, worktree, "README.md", "base\n")
+			svc, err := New(ctx, filepath.Join(dir, tc.root), discardLogger())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer svc.Close()
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", GitDir: filepath.Join(worktree, ".git"), MountPath: worktree}}
+			if err := svc.git.ConfigureFSMonitorHook(ctx, cfg, svc.root); err != nil {
+				t.Fatal(err)
+			}
+			want := filepath.Join(cfg.GitDir, "hooks", "artifact-fs-fsmonitor")
+			if tc.link {
+				want = gitstore.FSMonitorHookLink(svc.root, cfg.ID)
+			}
+			hook := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "config", "--get", "core.fsmonitor"))
+			if hook != want {
+				t.Fatalf("core.fsmonitor = %q, want %q", hook, want)
+			}
+			status := exec.Command("git", "-C", worktree, "status", "--short")
+			status.Env = append(os.Environ(), "GIT_TRACE_FSMONITOR=1")
+			out, err := status.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git status: %v\n%s", err, out)
+			}
+			if ran := "fsmonitor process '" + hook + "' returned success"; !strings.Contains(string(out), ran) {
+				t.Fatalf("git status trace lacks %q:\n%s", ran, out)
+			}
+		})
+	}
+}
+
 func TestFSMonitorHookAnswersWhatAControllerReads(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

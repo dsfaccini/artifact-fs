@@ -132,11 +132,16 @@ kill $DAEMON_PID
 ArtifactFS creates the state root and its subdirectories with mode `0700`, and
 narrows existing subdirectories to `0700`. It refuses a state root, or one of
 its subdirectories, that another user owns or that group or others can write:
-the state root holds the hydrated blobs that reads serve, the fsmonitor hook of
-each clone in its default git dir, which Git runs on every `git status`, and,
-in `config/tmp`, the SSH wrapper that Git runs when ArtifactFS contacts a
-remote. The state root must allow execution, because Git runs the SSH wrapper
-from `config/tmp` and the fsmonitor hook from each default git dir. A state
+the state root holds the hydrated blobs that reads serve, each repo's
+fsmonitor hook, a link to the `artifact-fs` executable at
+`overlays/<repo>/fsmonitor-hook` that Git runs on every `git status`, and, in
+`config/tmp`, the SSH wrapper that Git runs when ArtifactFS contacts a remote.
+The state root must allow execution, because Git runs the SSH wrapper from
+`config/tmp` and each fsmonitor hook from `overlays`. Git runs a hook path that
+holds a space or another shell metacharacter through `sh -c`, which splits it.
+For such a link path the hook is a script at
+`<git dir>/hooks/artifact-fs-fsmonitor` instead, which works only when the git
+dir's path holds no such character. A state
 root may be a symlink the current user owns. ArtifactFS resolves it at startup
 and builds the paths of repos it registers from the resolved path. Repos
 registered before that keep the paths they stored.
@@ -620,7 +625,7 @@ decides which invalidations it gets.
 
 | Package | Role |
 |---------|------|
-| `daemon` | Repo lifecycle. `Controller` runs every CLI command except `daemon`, `fsmonitor-hook` and the `gc`, `doctor` and `prefetch` stubs. `FSMonitorHook` answers Git's fsmonitor hook without a `Controller`. `Service` holds the daemon lock, syncs the registry, prepares, mounts and unmounts each repo, reconciles HEAD, runs the refresh loop, and writes `repo_runtime` |
+| `daemon` | Repo lifecycle. `Controller` runs every CLI command except `daemon`, `fsmonitor-hook` and the `gc`, `doctor` and `prefetch` stubs. `FSMonitorHook` and `FSMonitorHookByID` answer Git's fsmonitor hook without a `Controller`. `Service` holds the daemon lock, syncs the registry, prepares, mounts and unmounts each repo, reconciles HEAD, runs the refresh loop, and writes `repo_runtime` |
 | `fusefs` | FUSE adapter (inode management, op dispatch), Resolver (merged view), Engine (the adapter's only API: one method per operation) |
 | `gitstore` | Git CLI wrapper: clone, fetch, ls-tree, batch pool for `cat-file --batch` |
 | `snapshot` | SQLite store for `base_nodes` keyed by `(generation, path)` |

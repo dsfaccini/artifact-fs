@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -150,10 +151,14 @@ func TestRemoveRepoStopsAdoptedFSMonitor(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The installed hook would run this test binary. Answer as an empty
-	// overlay does instead: nothing changed since the last token.
-	hookPath := filepath.Join(gitDir, "hooks", "artifact-fs-fsmonitor")
+	// overlay does instead: nothing changed since the last token. Replace the
+	// link, not the executable it names.
+	hookPath := gitstore.FSMonitorHookLink(root, stored.ID)
 	if got := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "config", "--get", "core.fsmonitor")); got != hookPath {
 		t.Fatalf("core.fsmonitor = %q, want %q", got, hookPath)
+	}
+	if err := os.Remove(hookPath); err != nil {
+		t.Fatal(err)
 	}
 	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\nprintf 'artifact-fs:adopted:1\\000'\n"), 0o755); err != nil {
 		t.Fatal(err)
@@ -335,57 +340,73 @@ func TestAdoptGitDirWarnsAboutCredentialedPromisorRemote(t *testing.T) {
 
 // remove-repo hands the worktree back to native Git, so the filesystem
 // settings adoption pinned for the mount go too.
+// remove-repo unsets the hook link and, under a state root whose link path
+// Git would hand to a shell, the hook script in the git dir. An older
+// artifact-fs left the script under every state root.
 func TestRemoveRepoRestoresAdoptedWorktreeFilesystemConfig(t *testing.T) {
 	t.Parallel()
-	ctx := t.Context()
-	dir, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
-	runCmd(t, "git", "init", "--initial-branch=main", source)
-	runCmd(t, "git", "-C", source, "config", "core.filemode", "false")
-	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	runCmd(t, "git", "-C", source, "add", "README.md")
-	runCmd(t, "git", "-C", source, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
-	runCmd(t, "git", "-C", source, "worktree", "add", "-b", "topic", worktree)
-	gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
-	svc, err := New(ctx, filepath.Join(dir, "state"), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer svc.Close()
-	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
-	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
-		t.Fatal(err)
-	}
-	stored, err := svc.registry.GetRepo(ctx, cfg.Name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := svc.git.ConfigureFSMonitorHook(ctx, stored, filepath.Join(dir, "state")); err != nil {
-		t.Fatal(err)
-	}
-	pinned := []string{"core.fsmonitor", "fsmonitor.allowRemote", "core.filemode", "core.ignorecase", "core.symlinks"}
-	worktreeConfig := filepath.Join(gitDir, "config.worktree")
-	for _, key := range pinned {
-		runCmd(t, "git", "config", "--file", worktreeConfig, "--get", key)
-	}
-	if err := svc.ctl().RemoveRepo(ctx, cfg.Name); err != nil {
-		t.Fatal(err)
-	}
-	for _, key := range pinned {
-		if out, err := exec.Command("git", "config", "--file", worktreeConfig, "--get", key).Output(); err == nil {
-			t.Fatalf("%s = %q after remove-repo, want it unset", key, out)
-		}
-	}
-	if err := os.Chmod(filepath.Join(worktree, "README.md"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if got := runCmdOutput(t, "git", "-C", worktree, "status", "--porcelain"); got != "" {
-		t.Fatalf("status after remove-repo and a mode change = %q, want clean as core.filemode=false makes it", got)
+	for _, stateDir := range []string{"state", "state root"} {
+		t.Run(stateDir, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
+			runCmd(t, "git", "init", "--initial-branch=main", source)
+			runCmd(t, "git", "-C", source, "config", "core.filemode", "false")
+			if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runCmd(t, "git", "-C", source, "add", "README.md")
+			runCmd(t, "git", "-C", source, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
+			runCmd(t, "git", "-C", source, "worktree", "add", "-b", "topic", worktree)
+			gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
+			root := filepath.Join(dir, stateDir)
+			svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer svc.Close()
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
+			if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
+				t.Fatal(err)
+			}
+			stored, err := svc.registry.GetRepo(ctx, cfg.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := svc.git.ConfigureFSMonitorHook(ctx, stored, root); err != nil {
+				t.Fatal(err)
+			}
+			hook := gitstore.FSMonitorHookLink(root, stored.ID)
+			if strings.Contains(stateDir, " ") {
+				hook = filepath.Join(gitDir, "hooks", "artifact-fs-fsmonitor")
+			}
+			worktreeConfig := filepath.Join(gitDir, "config.worktree")
+			if got := strings.TrimSpace(runCmdOutput(t, "git", "config", "--file", worktreeConfig, "--get", "core.fsmonitor")); got != hook {
+				t.Fatalf("core.fsmonitor = %q, want %q", got, hook)
+			}
+			pinned := []string{"core.fsmonitor", "fsmonitor.allowRemote", "core.filemode", "core.ignorecase", "core.symlinks"}
+			for _, key := range pinned {
+				runCmd(t, "git", "config", "--file", worktreeConfig, "--get", key)
+			}
+			if err := svc.ctl().RemoveRepo(ctx, cfg.Name); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range pinned {
+				if out, err := exec.Command("git", "config", "--file", worktreeConfig, "--get", key).Output(); err == nil {
+					t.Fatalf("%s = %q after remove-repo, want it unset", key, out)
+				}
+			}
+			if err := os.Chmod(filepath.Join(worktree, "README.md"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if got := runCmdOutput(t, "git", "-C", worktree, "status", "--porcelain"); got != "" {
+				t.Fatalf("status after remove-repo and a mode change = %q, want clean as core.filemode=false makes it", got)
+			}
+		})
 	}
 }
 
@@ -422,6 +443,70 @@ func TestRemoveRepoAfterFailedAdoptionKeepsWorktreeConfig(t *testing.T) {
 	}
 	if got := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "config", "--worktree", "--get", "core.symlinks")); got != "false" {
 		t.Fatalf("core.symlinks = %q after remove-repo, want the worktree's own false", got)
+	}
+}
+
+// A worktree that an older artifact-fs adopted names the hook script in its
+// git dir. A mount points core.fsmonitor at the hook link instead, and
+// remove-repo unsets the link.
+func TestAdoptedMountSwitchesAnOlderHookScriptToTheLink(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
+	runCmd(t, "git", "init", "--initial-branch=main", source)
+	commitFile(t, source, "README.md", "base\n")
+	runCmd(t, "git", "-C", source, "worktree", "add", "--no-checkout", "-b", "topic", worktree)
+	gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
+	runCmd(t, "git", "--git-dir", gitDir, "read-tree", "HEAD")
+	if err := os.Rename(filepath.Join(worktree, ".git"), filepath.Join(dir, "topic.gitfile")); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := New(ctx, filepath.Join(dir, "state"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(gitDir, "hooks", "artifact-fs-fsmonitor")
+	if err := os.MkdirAll(filepath.Dir(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", source, "config", "extensions.worktreeConfig", "true")
+	worktreeConfig := filepath.Join(gitDir, "config.worktree")
+	runCmd(t, "git", "config", "--file", worktreeConfig, "core.fsmonitor", script)
+
+	svc.mount = fakeMount
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.Lock()
+	rt := svc.running[stored.ID]
+	svc.mu.Unlock()
+	if rt == nil || rt.mfs == nil {
+		t.Fatal("adopted repo is not mounted after syncRepos")
+	}
+	if got, want := strings.TrimSpace(runCmdOutput(t, "git", "config", "--file", worktreeConfig, "--get", "core.fsmonitor")), gitstore.FSMonitorHookLink(svc.root, stored.ID); got != want {
+		t.Fatalf("core.fsmonitor after the mount = %q, want %q", got, want)
+	}
+	if err := svc.ctl().RemoveRepo(ctx, cfg.Name); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "config", "--file", worktreeConfig, "--get", "core.fsmonitor").Output(); err == nil {
+		t.Fatalf("core.fsmonitor = %q after remove-repo, want it unset", out)
 	}
 }
 

@@ -33,8 +33,8 @@ type Store struct {
 	// testHookSSHWrapperDirMade, when set, runs in batchModeSSH between
 	// making a wrapper's directory and writing the wrapper.
 	testHookSSHWrapperDirMade func(dir string)
-	// testHookBeforeHookRename, when set, runs in replaceExecutable between
-	// writing the new file and renaming it over path.
+	// testHookBeforeHookRename, when set, runs in replaceExecutable and
+	// replaceLink between writing the new hook and renaming it over path.
 	testHookBeforeHookRename func(path string)
 	// testHookBetweenHEADReads, when set, runs in ResolveHEAD between its
 	// read of HEAD's ref and its read of HEAD's commit.

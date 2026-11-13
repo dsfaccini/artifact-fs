@@ -49,6 +49,7 @@ func TestConfigureStatusOptimizationDoesNotWriteIndex(t *testing.T) {
 // A daemon configures the hook again while Git may run it. The new hook goes
 // to a file beside it and replaces it by rename, so until the rename the hook
 // path is the whole old hook, which a Git can exec, and after it the new one.
+// The space in the state root makes the hook the script in the git dir.
 func TestReconfiguringTheFSMonitorHookLeavesTheOpenHookWhole(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -56,8 +57,9 @@ func TestReconfiguringTheFSMonitorHookLeavesTheOpenHookWhole(t *testing.T) {
 	run(t, "git", "init", repo)
 	gitDir := filepath.Join(repo, ".git")
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", GitDir: gitDir, MountPath: repo}}
+	stateRoot := filepath.Join(tmp, "state root")
 	store := New(nil)
-	if err := store.ConfigureFSMonitorHook(t.Context(), cfg, tmp); err != nil {
+	if err := store.ConfigureFSMonitorHook(t.Context(), cfg, stateRoot); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -86,7 +88,7 @@ func TestReconfiguringTheFSMonitorHookLeavesTheOpenHookWhole(t *testing.T) {
 			t.Error("the hook path left the old hook before the new one was renamed over it")
 		}
 	}
-	if err := store.ConfigureFSMonitorHook(t.Context(), cfg, tmp); err != nil {
+	if err := store.ConfigureFSMonitorHook(t.Context(), cfg, stateRoot); err != nil {
 		t.Fatal(err)
 	}
 	if !renaming {
@@ -104,6 +106,58 @@ func TestReconfiguringTheFSMonitorHookLeavesTheOpenHookWhole(t *testing.T) {
 	}
 	if entries, err := filepath.Glob(filepath.Join(filepath.Dir(hookPath), ".*")); err != nil || len(entries) != 0 {
 		t.Fatalf("temporary hook files left = %v, %v", entries, err)
+	}
+}
+
+// Reconfiguring the hook link renames a new link over it, so a Git that runs
+// the hook meanwhile finds the old link or the new one.
+func TestReconfiguringTheFSMonitorHookLinkLeavesALink(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, "git", "init", repo)
+	gitDir := filepath.Join(repo, ".git")
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", GitDir: gitDir, MountPath: repo}}
+	store := New(nil)
+	if err := store.ConfigureFSMonitorHook(t.Context(), cfg, tmp); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := runGit(context.Background(), gitDir, "config", "--unset", "core.fsmonitor"); err != nil {
+			t.Errorf("disable test fsmonitor hook: %v", err)
+		}
+	})
+	link := FSMonitorHookLink(tmp, cfg.ID)
+	before, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	renaming := false
+	store.testHookBeforeHookRename = func(path string) {
+		renaming = true
+		current, err := os.Lstat(path)
+		if err != nil {
+			t.Errorf("hook link before the rename: %v", err)
+		} else if !os.SameFile(before, current) {
+			t.Error("the hook path left the old link before the new one was renamed over it")
+		}
+	}
+	if err := store.ConfigureFSMonitorHook(t.Context(), cfg, tmp); err != nil {
+		t.Fatal(err)
+	}
+	if !renaming {
+		t.Fatal("reconfiguring made the link without a rename over it")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target, err := os.Readlink(link); err != nil || target != exe {
+		t.Fatalf("hook link = %q, %v; want a link to %q", target, err, exe)
+	}
+	if entries, err := filepath.Glob(filepath.Join(filepath.Dir(link), ".*")); err != nil || len(entries) != 0 {
+		t.Fatalf("temporary hook links left = %v, %v", entries, err)
 	}
 }
 
