@@ -18,18 +18,35 @@ import (
 
 // PrivateTempDir returns a new directory in the user's cache directory, with
 // its symlinks resolved, and removes it when t ends. A state root there gets
-// the FSMonitor hook link wherever no other user can write or rename the
-// cache directory and its ancestors, as the build cache already requires. A
-// state root under t.TempDir() gets the hook script on Linux, because every
-// user can write /tmp.
+// the FSMonitor hook link where no other user can write the cache directory
+// or a directory above it. PrivateTempDir skips t when there is no cache
+// directory or others can write one of those directories. A state root under
+// t.TempDir() gets the hook script on Linux, because every user can write
+// /tmp. A test killed before its cleanup leaves an artifact-fs-test-*
+// directory in the cache directory.
 func PrivateTempDir(t testing.TB) string {
 	t.Helper()
 	cache, err := os.UserCacheDir()
 	if err != nil {
-		t.Fatal(err)
+		t.Skipf("no cache directory for a private temp dir: %v", err)
 	}
 	if err := os.MkdirAll(cache, 0o700); err != nil {
 		t.Fatal(err)
+	}
+	if cache, err = filepath.EvalSymlinks(cache); err != nil {
+		t.Fatal(err)
+	}
+	for dir := cache; ; dir = filepath.Dir(dir) {
+		info, err := os.Lstat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm()&0o002 != 0 {
+			t.Skipf("others can write %s, so a state root in the cache directory %s gets the hook script", dir, cache)
+		}
+		if filepath.Dir(dir) == dir {
+			break
+		}
 	}
 	dir, err := os.MkdirTemp(cache, "artifact-fs-test-")
 	if err != nil {
@@ -40,11 +57,7 @@ func PrivateTempDir(t testing.TB) string {
 			t.Errorf("PrivateTempDir cleanup: %v", err)
 		}
 	})
-	resolved, err := filepath.EvalSymlinks(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return resolved
+	return dir
 }
 
 // PartialCloneRemote commits files on branch main of a bare repository that

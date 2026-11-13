@@ -28,18 +28,21 @@ func TestFSMonitorHookIsTheLinkOnlyUnderPrivateAncestors(t *testing.T) {
 		// mode is the parent's mode, and stateMode the state root's, 0700
 		// when zero. owner, when not -1, is the uid lstat reports for the
 		// parent. The parent's group is the user's primary group, the
-		// group file lists members for it, a second entry for it lists
-		// other, another user has it as primary group, written as peerGID
-		// when set, or the user database holds a NIS entry.
+		// group file lists members for it, holds extraGroup with %d for the
+		// gid, or lacks the gid, another user has it as primary group,
+		// written as peerGID when set, or the user database holds a NIS
+		// entry. The parent lies on NFS.
 		mode, stateMode os.FileMode
 		owner           int
 		primary         bool
 		members         string
-		secondEntry     bool
+		extraGroup      string
+		noGroup         bool
 		peer            bool
 		peerGID         string
 		nis             bool
 		acl             bool
+		nfs             bool
 		symlink         bool
 		link            bool
 	}{
@@ -48,9 +51,14 @@ func TestFSMonitorHookIsTheLinkOnlyUnderPrivateAncestors(t *testing.T) {
 		{name: "group that lists only the user", mode: 0o775, owner: -1, members: "me", link: true},
 		{name: "group without the user", mode: 0o775, owner: -1},
 		{name: "group that lists another user", mode: 0o775, owner: -1, primary: true, members: "me,other"},
-		{name: "second entry for the group lists another user", mode: 0o775, owner: -1, primary: true, secondEntry: true},
+		{name: "second entry for the group lists another user", mode: 0o775, owner: -1, primary: true, extraGroup: "shared:x:%d:other"},
+		{name: "second entry for the group with a leading zero lists another user", mode: 0o775, owner: -1, primary: true, extraGroup: "shared:x:0%d:other"},
+		{name: "group entry whose gid is not a number", mode: 0o775, owner: -1, primary: true, extraGroup: "shared:x:+%d:other"},
+		{name: "group missing from the group file", mode: 0o775, owner: -1, primary: true, noGroup: true},
 		{name: "group another user has as primary", mode: 0o775, owner: -1, primary: true, peer: true},
 		{name: "group another user has as primary with a leading zero", mode: 0o775, owner: -1, primary: true, peer: true, peerGID: "0%d"},
+		{name: "group another user has as primary after white space", mode: 0o775, owner: -1, primary: true, peer: true, peerGID: " %d"},
+		{name: "group another user has as primary with a plus sign", mode: 0o775, owner: -1, primary: true, peer: true, peerGID: "+%d"},
 		{name: "group from NIS", mode: 0o775, owner: -1, primary: true, nis: true},
 		{name: "others can write", mode: 0o777, owner: -1, primary: true},
 		{name: "sticky", mode: 0o777 | os.ModeSticky, owner: -1, primary: true},
@@ -58,6 +66,7 @@ func TestFSMonitorHookIsTheLinkOnlyUnderPrivateAncestors(t *testing.T) {
 		{name: "root owns it", mode: 0o755, owner: 0, link: true},
 		{name: "root owns it and the user's private group can write it", mode: 0o775, owner: 0, primary: true},
 		{name: "access ACL grants another user write", mode: 0o755, owner: -1, primary: true, acl: true},
+		{name: "on NFS", mode: 0o755, owner: -1, nfs: true},
 		{name: "state root others can write", mode: 0o755, stateMode: 0o777, owner: -1},
 		{name: "state root through a symlink", mode: 0o755, owner: -1, symlink: true},
 	} {
@@ -96,9 +105,9 @@ func TestFSMonitorHookIsTheLinkOnlyUnderPrivateAncestors(t *testing.T) {
 				}
 				stateRoot = link
 			}
-			// Directories above the test's own report root's 0755, so the
-			// machine's directories decide no row.
-			realLstat := lstat
+			// Directories above the test's own report root's 0755 on a local
+			// file system, so the machine's directories decide no row.
+			realLstat, realOnNFS := lstat, onNFS
 			lstat = func(path string, st *syscall.Stat_t) error {
 				err := realLstat(path, st)
 				switch {
@@ -109,7 +118,13 @@ func TestFSMonitorHookIsTheLinkOnlyUnderPrivateAncestors(t *testing.T) {
 				}
 				return err
 			}
-			t.Cleanup(func() { lstat = realLstat })
+			onNFS = func(path string) bool {
+				if path == parent && tc.nfs {
+					return true
+				}
+				return strings.HasPrefix(path+"/", tmp+"/") && realOnNFS(path)
+			}
+			t.Cleanup(func() { lstat, onNFS = realLstat, realOnNFS })
 
 			var st syscall.Stat_t
 			if err := syscall.Lstat(parent, &st); err != nil {
@@ -131,8 +146,11 @@ func TestFSMonitorHookIsTheLinkOnlyUnderPrivateAncestors(t *testing.T) {
 				passwd += "+::::::\n"
 			}
 			group := fmt.Sprintf("grp:x:%d:%s\n", st.Gid, tc.members)
-			if tc.secondEntry {
-				group += fmt.Sprintf("shared:x:%d:other\n", st.Gid)
+			if tc.noGroup {
+				group = fmt.Sprintf("grp:x:%d:%s\n", st.Gid+1, tc.members)
+			}
+			if tc.extraGroup != "" {
+				group += fmt.Sprintf(tc.extraGroup, st.Gid) + "\n"
 			}
 			databases := t.TempDir()
 			oldGroup, oldPasswd := groupFile, passwdFile

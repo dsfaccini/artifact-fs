@@ -25,8 +25,9 @@ var lstat = syscall.Lstat
 // would otherwise always fail there. A sticky directory such as /tmp fails:
 // once an entry in it is gone, after a reboot or a cleanup, any user can make
 // one at its path. On Linux a directory with an access ACL fails, because the
-// ACL can let another user write it without showing in the mode. macOS ACLs
-// go unread.
+// ACL can let another user write it without showing in the mode. A directory
+// on NFS fails for the same reason, because no NFSv4 ACL shows as one. macOS
+// ACLs go unread.
 func privateAncestors(stateRoot string) bool {
 	if resolved, err := filepath.EvalSymlinks(stateRoot); err != nil || resolved != stateRoot {
 		return false
@@ -35,7 +36,7 @@ func privateAncestors(stateRoot string) bool {
 	privateGroups := map[uint32]bool{}
 	for dir := stateRoot; ; dir = filepath.Dir(dir) {
 		var st syscall.Stat_t
-		if err := lstat(dir, &st); err != nil || hasACL(dir) {
+		if err := lstat(dir, &st); err != nil || hasACL(dir) || onNFS(dir) {
 			return false
 		}
 		mode := uint32(st.Mode)

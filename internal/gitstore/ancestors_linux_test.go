@@ -3,10 +3,19 @@ package gitstore
 import (
 	"encoding/binary"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"golang.org/x/sys/unix"
 )
+
+// hasACL reports an ACL when it cannot read one, so the check fails closed.
+func TestHasACLFailsClosedWhenItCannotRead(t *testing.T) {
+	t.Parallel()
+	if !hasACL(filepath.Join(t.TempDir(), "missing")) {
+		t.Fatal("hasACL of a path it cannot read = false, want true")
+	}
+}
 
 // grantWriteACL gives uid write to dir through an access ACL, as
 // setfacl -m u:<uid>:rwx does. It skips t on a file system without ACLs.

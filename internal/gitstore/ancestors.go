@@ -69,7 +69,9 @@ func privateGroup(gid, uid uint32) bool {
 	return found && members > 0
 }
 
-// parseID parses a decimal user or group ID.
+// parseID parses a decimal user or group ID. glibc also reads an ID with
+// leading white space or a sign, which parseID refuses, so the caller fails
+// closed on one.
 func parseID(field string) (uint32, bool) {
 	id, err := strconv.ParseUint(field, 10, 32)
 	return uint32(id), err == nil

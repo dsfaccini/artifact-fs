@@ -147,8 +147,9 @@ hook of their own in its place. Each must belong to you or root, and others
 may not write it, so a state root under `/tmp` gets the script. Its group may
 write it only when it is yours and you are the group's only member, as with a
 private group per user under umask `002`. On Linux a directory with an access
-ACL gets the script too. On macOS an ACL that lets another user write such a
-directory goes unnoticed. A state
+ACL gets the script too, and on either system so does a directory on NFS,
+whose NFSv4 ACLs the mode does not show. On macOS an ACL on a local directory
+that lets another user write it goes unnoticed. A state
 root may be a symlink the current user owns, or a path relative to the current
 directory. ArtifactFS makes it absolute and resolves it at startup, and builds
 the paths of repos it registers from the resolved path. Repos registered before
