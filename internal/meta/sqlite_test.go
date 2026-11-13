@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -49,9 +50,9 @@ func TestOpenDBConfiguresEveryConnection(t *testing.T) {
 	}
 }
 
-// A mount runs up to maxIdleConns queries at once. The next burst of queries
-// runs on the same connections, so no query pays for a new connection's
-// pragmas and schema read. A temporary table lives only on the connection that
+// A walk by 16 threads keeps up to maxIdleConns queries in flight per
+// database. The next burst of queries runs on the same connections, so no
+// query pays for a new connection's pragmas and schema read. A temporary table lives only on the connection that
 // created it, so it marks a connection that the pool kept.
 func TestOpenDBKeepsTheConnectionsOfConcurrentQueries(t *testing.T) {
 	db, err := OpenDB(filepath.Join(t.TempDir(), "meta.sqlite"))
@@ -95,39 +96,40 @@ func TestOpenDBKeepsTheConnectionsOfConcurrentQueries(t *testing.T) {
 }
 
 // A connection that runs no query for connMaxIdleTime closes, so an idle
-// daemon gives back each connection's page cache.
+// daemon gives back each connection's page cache. database/sql's cleaner runs
+// on a timer, so the test drives it with synctest's clock.
 func TestOpenDBClosesIdleConnections(t *testing.T) {
-	saved := connMaxIdleTime
-	connMaxIdleTime = time.Millisecond
-	defer func() { connMaxIdleTime = saved }()
-	db, err := OpenDB(filepath.Join(t.TempDir(), "meta.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	synctest.Test(t, func(t *testing.T) {
+		db, err := OpenDB(filepath.Join(t.TempDir(), "meta.sqlite"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
 
-	ctx := t.Context()
-	conns := make([]*sql.Conn, 3)
-	for i := range conns {
-		if conns[i], err = db.Conn(ctx); err != nil {
-			t.Fatal(err)
+		ctx := t.Context()
+		conns := make([]*sql.Conn, 3)
+		for i := range conns {
+			if conns[i], err = db.Conn(ctx); err != nil {
+				t.Fatal(err)
+			}
 		}
-	}
-	for _, conn := range conns {
-		if err := conn.Close(); err != nil {
-			t.Fatal(err)
+		for _, conn := range conns {
+			if err := conn.Close(); err != nil {
+				t.Fatal(err)
+			}
 		}
-	}
-	if open := db.Stats().OpenConnections; open != len(conns) {
-		t.Fatalf("%d connections open after the burst, want %d", open, len(conns))
-	}
-	// database/sql's cleaner runs at least a second apart.
-	for db.Stats().OpenConnections != 0 {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if closed := db.Stats().MaxIdleTimeClosed; closed != int64(len(conns)) {
-		t.Fatalf("%d connections closed for idle time, want %d", closed, len(conns))
-	}
+		time.Sleep(connMaxIdleTime - time.Second)
+		synctest.Wait()
+		if open := db.Stats().OpenConnections; open != len(conns) {
+			t.Fatalf("%d connections open before connMaxIdleTime passed, want %d", open, len(conns))
+		}
+		time.Sleep(connMaxIdleTime + time.Second)
+		synctest.Wait()
+		stats := db.Stats()
+		if stats.OpenConnections != 0 || stats.MaxIdleTimeClosed != int64(len(conns)) {
+			t.Fatalf("%d connections open and %d closed for idle time, want 0 and %d", stats.OpenConnections, stats.MaxIdleTimeClosed, len(conns))
+		}
+	})
 }
 
 // A first open switches the database to WAL. While a connection in rollback

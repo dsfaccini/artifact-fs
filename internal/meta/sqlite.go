@@ -27,7 +27,7 @@ const maxIdleConns = 16
 // connMaxIdleTime is how long a connection stays open with no query. Each
 // connection keeps its own page cache, so a daemon whose mounts sit idle gives
 // that memory back, and the next burst opens its connections once.
-var connMaxIdleTime = 30 * time.Second
+const connMaxIdleTime = 30 * time.Second
 
 // testHookAfterWALSwitchBusy, when set, runs in OpenDB after a switch to WAL
 // failed with SQLITE_BUSY, before the retry. The test catches a call that no
