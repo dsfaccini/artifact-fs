@@ -19,6 +19,7 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
@@ -532,6 +533,64 @@ func hookAnswer(t *testing.T, svc *Service, since string) ([]byte, string, []str
 	}
 	fields := strings.Split(strings.TrimSuffix(out.String(), "\x00"), "\x00")
 	return out.Bytes(), fields[0], fields[1:]
+}
+
+// Git runs a core.fsmonitor path that holds a shell metacharacter through
+// sh -c unquoted, and sh splits it. Under such a state root the hook stays the
+// script in the git dir, which quotes the root, so Git runs the hook under
+// every state root.
+func TestGitRunsTheFSMonitorHookUnderEveryStateRoot(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, root string
+		link       bool
+	}{
+		{"plain", "state", true},
+		{"space", "state root", false},
+		{"metacharacter", "state$root", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			dir := gittest.PrivateTempDir(t)
+			worktree := filepath.Join(dir, "worktree")
+			runCmd(t, "git", "init", "--initial-branch", "main", worktree)
+			commitFile(t, worktree, "README.md", "base\n")
+			svc, err := New(ctx, filepath.Join(dir, tc.root), discardLogger())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer svc.Close()
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", GitDir: filepath.Join(worktree, ".git"), MountPath: worktree}}
+			if err := svc.git.ConfigureFSMonitorHook(ctx, cfg, svc.root); err != nil {
+				t.Fatal(err)
+			}
+			want := filepath.Join(cfg.GitDir, "hooks", "artifact-fs-fsmonitor")
+			if tc.link {
+				want = gitstore.FSMonitorHookLink(svc.root, cfg.ID)
+			}
+			if hook := requireGitRunsFSMonitorHook(t, worktree); hook != want {
+				t.Fatalf("core.fsmonitor = %q, want %q", hook, want)
+			}
+		})
+	}
+}
+
+// requireGitRunsFSMonitorHook fails t unless git status in worktree runs its
+// core.fsmonitor hook with success, and returns the hook's path.
+func requireGitRunsFSMonitorHook(t *testing.T, worktree string) string {
+	t.Helper()
+	hook := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "config", "--get", "core.fsmonitor"))
+	status := exec.Command("git", "-C", worktree, "status", "--short")
+	status.Env = append(os.Environ(), "GIT_TRACE_FSMONITOR=1")
+	out, err := status.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git status: %v\n%s", err, out)
+	}
+	if ran := "fsmonitor process '" + hook + "' returned success"; !strings.Contains(string(out), ran) {
+		t.Fatalf("git status trace lacks %q:\n%s", ran, out)
+	}
+	return hook
 }
 
 // FSMonitorHook reads the state root without a Controller. It must answer

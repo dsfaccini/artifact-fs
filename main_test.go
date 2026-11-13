@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/cli"
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 )
 
@@ -21,8 +22,10 @@ import (
 var e2eMountsStarted atomic.Int64
 
 func TestMain(m *testing.M) {
-	if len(os.Args) > 1 && os.Args[1] == "fsmonitor-hook" {
-		os.Exit(cli.Run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
+	// Git runs this binary as the FSMonitor hook, through the hook link or
+	// the hook script, in every test that installs the hook.
+	if _, _, ok := gitstore.ParseFSMonitorHookLink(os.Args[0]); ok || len(os.Args) > 1 && os.Args[1] == "fsmonitor-hook" {
+		os.Exit(cli.Main(context.Background(), os.Args, os.Stdout, os.Stderr))
 	}
 	// AFS_E2E_REPO opts into a real remote, and the README authenticates it
 	// through the machine's ambient Git credential helper, so keep that config.
