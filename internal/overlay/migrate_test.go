@@ -83,6 +83,8 @@ var legacyOverlays = map[string][]string{
 	"user_version 1": append(slices.Clone(overlayWithChangeLog), `PRAGMA user_version = 1`),
 	// This schema, after migration 2.
 	"user_version 2": append(slices.Clone(overlayWithChangeLog), `CREATE TABLE IF NOT EXISTS overlay_pending (path TEXT PRIMARY KEY)`, `PRAGMA user_version = 2`),
+	// This schema, after migration 3.
+	"user_version 3": append(slices.Clone(overlayWithChangeLog), `CREATE TABLE IF NOT EXISTS overlay_pending (path TEXT PRIMARY KEY)`, `ALTER TABLE overlay_instance ADD COLUMN served_generation INTEGER NOT NULL DEFAULT 0`, `PRAGMA user_version = 3`),
 }
 
 func testConfig(t *testing.T) model.RepoPaths {

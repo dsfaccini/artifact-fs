@@ -132,14 +132,28 @@ kill $DAEMON_PID
 ArtifactFS creates the state root and its subdirectories with mode `0700`, and
 narrows existing subdirectories to `0700`. It refuses a state root, or one of
 its subdirectories, that another user owns or that group or others can write:
-the state root holds the hydrated blobs that reads serve, the fsmonitor hook of
-each clone in its default git dir, which Git runs on every `git status`, and,
-in `config/tmp`, the SSH wrapper that Git runs when ArtifactFS contacts a
-remote. The state root must allow execution, because Git runs the SSH wrapper
-from `config/tmp` and the fsmonitor hook from each default git dir. A state
-root may be a symlink the current user owns. ArtifactFS resolves it at startup
-and builds the paths of repos it registers from the resolved path. Repos
-registered before that keep the paths they stored.
+the state root holds the hydrated blobs that reads serve, each repo's
+fsmonitor hook, a link to the `artifact-fs` executable at
+`overlays/<repo>/fsmonitor-hook` that Git runs on every `git status`, and, in
+`config/tmp`, the SSH wrapper that Git runs when ArtifactFS contacts a remote.
+The state root must allow execution, because Git runs the SSH wrapper from
+`config/tmp` and each fsmonitor hook from `overlays`. Git runs a hook path that
+holds a space or another shell metacharacter through `sh -c`, which splits it.
+For such a link path the hook is a script at
+`<git dir>/hooks/artifact-fs-fsmonitor` instead, which works only when the git
+dir's path holds no such character. The hook is the script also when another
+user could write or rename the state root or a directory above it, and put a
+hook of their own in its place. Each must belong to you or root, and others
+may not write it, so a state root under `/tmp` gets the script. Its group may
+write it only when it is yours and you are the group's only member, as with a
+private group per user under umask `002`. On Linux a directory with an access
+ACL gets the script too, and on either system so does a directory on NFS,
+whose NFSv4 ACLs the mode does not show. On macOS an ACL on a local directory
+that lets another user write it goes unnoticed. A state
+root may be a symlink the current user owns, or a path relative to the current
+directory. ArtifactFS makes it absolute and resolves it at startup, and builds
+the paths of repos it registers from the resolved path. Repos registered before
+that keep the paths they stored.
 
 The daemon keeps its SSH wrapper in `config/tmp/daemon` and empties that
 directory when it starts. Other CLI commands keep theirs in `config/tmp`, and
@@ -238,7 +252,7 @@ Every other Git command ArtifactFS runs that can contact a remote runs the same 
 
 Git Credential Manager can still show its GUI prompt unless `GCM_INTERACTIVE=never` is set. Other waits are not terminal prompts either, so these settings do not end them: an ssh-agent key added with `ssh-add -c`, a FIDO security key waiting for a touch, `ControlMaster ask` or `autoask`, and a `ProxyCommand` that waits for a browser login. Such a wait holds the command until its context ends: a remote refresh after 30 seconds, a preparation after 30 minutes, a hydration batch fetch after 2 minutes, and the `fetch` command until Ctrl-C.
 
-When the Git index matches the published snapshot and the overlay is empty, startup marks snapshot entries valid for Git's filesystem monitor before the mount serves the repo: before a prepared repo mounts, and before an async repo's gate opens. This lets the first `git status` use the daemon's change list instead of reading every tracked blob, and each later `git status` receives only the paths the overlay changed since Git's previous query, plus each file whose writes are not yet flushed. A HEAD change that writes no file, such as `git update-ref` or `git reset --soft`, also changes what the mount shows. The next query receives every path whose committed content, mode or type the change altered, except paths the overlay covers. Once the mount has told the kernel to drop what it cached, the daemon logs those paths again, so a query that ran in between, and may have read attributes the kernel cached from before the change, does not leave Git trusting them. The next query gets a rescan instead when the change alters more than 10,000 paths, when the snapshot holds no entries for the tree the mount showed before the change, as for an empty tree, or when the snapshot cannot be read. Nothing records what changes while no daemon serves the repo, such as a HEAD change, so the first query after the repo is mounted again gets a rescan, unless startup marks the baseline again. Paths with no `text` attribute, or under `text=auto`, `-text` or `binary`, are marked, unless `eol=lf` applies without `text=auto`. Paths under `text`, `text=input` or `eol=lf` without `text=auto` stay unmarked, because Git's check-in turns CRLF into LF and a blob that holds CRLF then differs from its file; Git compares those paths itself. `-text eol=lf` stays unmarked too, because `git check-attr` prints it like the literal `text=unset`, which Git converts under `eol=lf`. A `git status` that runs while the worktree is unmounted sees the empty mountpoint, so Git's next query gets a rescan. When startup marks the baseline again, its own query takes that rescan, and the first `git status` after the mount receives only the overlay's changes. ArtifactFS skips this baseline when the index or a `.gitattributes` blob is uncertain, when `core.attributesFile` is configured or `core.autocrlf` is set to anything but false, when an `eol=crlf`, `crlf`, `filter`, `ident` or `working-tree-encoding` attribute applies, or when staged work or overlay changes exist; Git then performs its normal status scan.
+When the Git index matches the published snapshot and the overlay is empty, startup marks snapshot entries valid for Git's filesystem monitor before the mount serves the repo: before a prepared repo mounts, and before an async repo's gate opens. This lets the first `git status` use the daemon's change list instead of reading every tracked blob, and each later `git status` receives only the paths the overlay changed since Git's previous query, plus each file whose writes are not yet flushed. A HEAD change that writes no file, such as `git update-ref` or `git reset --soft`, also changes what the mount shows. The next query receives every path whose committed content, mode or type the change altered, except paths the overlay covers. The daemon logs those paths again once the kernel can no longer answer with attributes it cached from before the change, so a query that ran in between does not leave Git trusting them: right after the mount tells the kernel to drop what it cached, and on FSKit, where the mount cannot tell it, after the kernel's 1 second cache expires. The next query gets a rescan instead when more than 100,000 of those paths remain, when the snapshot holds no entries for the tree the mount showed before the change, as for an empty tree, or when the snapshot cannot be read. When the repo is mounted again, the daemon logs the same way what changed since the tree the overlay last served, such as a HEAD change while no daemon ran. The first query after the mount gets a rescan only when the snapshot no longer holds that tree, unless startup marks the baseline again. Paths with no `text` attribute, or under `text=auto`, `-text` or `binary`, are marked, unless `eol=lf` applies without `text=auto`. Paths under `text`, `text=input` or `eol=lf` without `text=auto` stay unmarked, because Git's check-in turns CRLF into LF and a blob that holds CRLF then differs from its file; Git compares those paths itself. `-text eol=lf` stays unmarked too, because `git check-attr` prints it like the literal `text=unset`, which Git converts under `eol=lf`. A `git status` that runs while the worktree is unmounted sees the empty mountpoint, so Git's next query gets a rescan. When startup marks the baseline again, its own query takes that rescan, and the first `git status` after the mount receives only the overlay's changes. ArtifactFS skips this baseline when the index or a `.gitattributes` blob is uncertain, when `core.attributesFile` is configured or `core.autocrlf` is set to anything but false, when an `eol=crlf`, `crlf`, `filter`, `ident` or `working-tree-encoding` attribute applies, or when staged work or overlay changes exist; Git then performs its normal status scan.
 
 Use `--hydration-concurrency` to set each repo's number of hydration workers (default 4). A repo's workers share a pool of up to that many persistent `git cat-file --batch` processes that copy fetched blobs into the cache, so higher values trade memory for faster bulk hydration:
 
@@ -627,7 +641,7 @@ decides which invalidations it gets.
 
 | Package | Role |
 |---------|------|
-| `daemon` | Repo lifecycle. `Controller` runs every CLI command except `daemon`, `fsmonitor-hook` and the `gc`, `doctor` and `prefetch` stubs. `FSMonitorHook` answers Git's fsmonitor hook without a `Controller`. `Service` holds the daemon lock, syncs the registry, prepares, mounts and unmounts each repo, reconciles HEAD, runs the refresh loop, and writes `repo_runtime` |
+| `daemon` | Repo lifecycle. `Controller` runs every CLI command except `daemon`, `fsmonitor-hook` and the `gc`, `doctor` and `prefetch` stubs. `FSMonitorHook` and `FSMonitorHookByID` answer Git's fsmonitor hook without a `Controller`. `Service` holds the daemon lock, syncs the registry, prepares, mounts and unmounts each repo, reconciles HEAD, runs the refresh loop, and writes `repo_runtime` |
 | `fusefs` | FUSE adapter (inode management, op dispatch), Resolver (merged view), Engine (the adapter's only API: one method per operation) |
 | `gitstore` | Git CLI wrapper: clone, fetch, ls-tree, batch pool for `cat-file --batch` |
 | `snapshot` | SQLite store for `base_nodes` keyed by `(generation, path)` |

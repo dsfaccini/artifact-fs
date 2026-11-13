@@ -2240,10 +2240,87 @@ func lookupEntry(t *testing.T, s *Store, path string) (model.OverlayEntry, bool)
 	return e, ok
 }
 
+// One log of a switch writes at most maxSwitchedPaths paths. Past that, it
+// gives the overlay a new instance, so Git rescans and the transition lock
+// stays short. The cap counts only the paths no overlay entry covers, the
+// paths the log writes.
+func TestReconcileLogsAtMostMaxSwitchedPaths(t *testing.T) {
+	for _, tt := range []struct {
+		name             string
+		changed, covered int
+		renews           bool
+	}{
+		{"at the cap", maxSwitchedPaths, 0, false},
+		{"past the cap", maxSwitchedPaths + 1, 0, true},
+		{"past the cap until the overlay covers one", maxSwitchedPaths + 1, 1, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			s, cfg := testStore(t)
+			paths := make([]string, tt.changed)
+			for i := range paths {
+				paths[i] = fmt.Sprintf("f%06d", i)
+			}
+			for _, path := range paths[:tt.covered] {
+				if _, err := s.CreateFile(ctx, path, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := changesSince(t, cfg, 0)
+			noBase := func(string) (model.BaseNode, bool, error) { return model.BaseNode{}, false, nil }
+			if err := s.ReconcileChecked(ctx, 1, noBase, model.SwitchedPaths{Paths: paths}, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			after := changesSince(t, cfg, before.Seq)
+			if renewed := after.Instance != before.Instance; renewed != tt.renews {
+				t.Errorf("instance renewed = %v, want %v", renewed, tt.renews)
+			}
+			want := paths[tt.covered:]
+			if tt.renews {
+				want = nil
+			}
+			if !slices.Equal(after.Paths, want) {
+				t.Errorf("logged %d paths, want %d, %s through %s", len(after.Paths), len(want), paths[tt.covered], paths[tt.changed-1])
+			}
+		})
+	}
+}
+
+// A reconcile records the generation it reconciled with, also when it changes
+// and logs nothing, and MarkServed records the generation it is given.
+func TestReconcileAndMarkServedRecordTheServedGeneration(t *testing.T) {
+	ctx := t.Context()
+	s, _ := testStore(t)
+	served := func() int64 {
+		t.Helper()
+		gen, err := s.ServedGeneration(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return gen
+	}
+	if got := served(); got != 0 {
+		t.Fatalf("served generation of a new overlay = %d, want 0", got)
+	}
+	noBase := func(string) (model.BaseNode, bool, error) { return model.BaseNode{}, false, nil }
+	if err := s.ReconcileChecked(ctx, 3, noBase, model.SwitchedPaths{}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := served(); got != 3 {
+		t.Errorf("served generation after a reconcile with 3 = %d, want 3", got)
+	}
+	if err := s.MarkServed(ctx, 5, model.SwitchedPaths{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := served(); got != 5 {
+		t.Errorf("served generation after MarkServed(5) = %d, want 5", got)
+	}
+}
+
 // reconcile reconciles s with the base lookup reads, with no readers to
 // exclude.
 func reconcile(ctx context.Context, s *Store, lookup func(string) (model.BaseNode, bool)) error {
-	return s.ReconcileChecked(ctx, func(path string) (model.BaseNode, bool, error) {
+	return s.ReconcileChecked(ctx, 0, func(path string) (model.BaseNode, bool, error) {
 		n, ok := lookup(path)
 		return n, ok, nil
 	}, model.SwitchedPaths{}, nil, nil)

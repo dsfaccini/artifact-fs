@@ -26,10 +26,10 @@ type lockTimer struct {
 	wall, cpu time.Duration
 }
 
-func (o *lockTimer) ReconcileChecked(ctx context.Context, baseLookup func(string) (model.BaseNode, bool, error), switched model.SwitchedPaths, lock sync.Locker, switchBase func()) error {
+func (o *lockTimer) ReconcileChecked(ctx context.Context, gen int64, baseLookup func(string) (model.BaseNode, bool, error), switched model.SwitchedPaths, lock sync.Locker, switchBase func()) error {
 	var wallStart time.Time
 	var cpuStart time.Duration
-	return o.OverlayStore.ReconcileChecked(ctx, baseLookup, switched, observedLock{
+	return o.OverlayStore.ReconcileChecked(ctx, gen, baseLookup, switched, observedLock{
 		Locker: lock,
 		locked: func() {
 			wallStart, cpuStart = time.Now(), cpuTime(o.b)

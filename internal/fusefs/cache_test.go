@@ -340,16 +340,20 @@ func (s failingListingOf) ListChildren(gen int64, dir string) ([]model.BaseNode,
 	return s.SnapshotStore.ListChildren(gen, dir)
 }
 
-// A switch whose diff fails still switches, and gives the overlay a new
-// instance so that Git rescans.
+// A switch whose diff fails still switches, returns the error, and gives the
+// overlay a new instance so that Git rescans.
 func TestSwitchGenerationWhoseDiffFailsRenewsTheInstance(t *testing.T) {
 	f := newCacheFixture(t, baseFile("a.txt", "a1", 0o100644))
 	before := f.changesSince(0)
 	from := f.resolver.Generation()
 	gen := f.publish(baseFile("a.txt", "a2", 0o100644))
 	f.resolver.Snapshot = failingListingOf{SnapshotStore: f.snap, gen: from}
-	if _, err := f.resolver.SwitchGeneration(f.ctx, gen, 0); err != nil {
+	sw, err := f.resolver.SwitchGeneration(f.ctx, gen, 0)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if sw.DiffErr == nil {
+		t.Error("switch returned no diff error")
 	}
 	after := f.changesSince(before.Seq)
 	if after.Instance == before.Instance || len(after.Paths) != 0 {
@@ -357,47 +361,6 @@ func TestSwitchGenerationWhoseDiffFailsRenewsTheInstance(t *testing.T) {
 	}
 	if got := f.resolver.Generation(); got != gen {
 		t.Errorf("generation after the switch = %d, want %d", got, gen)
-	}
-}
-
-// A switch logs at most maxSwitchedPaths paths one by one. Past that, it gives
-// the overlay a new instance, so Git rescans and the transition lock stays short.
-func TestSwitchGenerationLogsAtMostMaxSwitchedPaths(t *testing.T) {
-	for _, tt := range []struct {
-		name    string
-		changed int
-		renews  bool
-	}{
-		{"at the cap", maxSwitchedPaths, false},
-		{"past the cap", maxSwitchedPaths + 1, true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			keep := baseFile("keep.txt", "keep", 0o100644)
-			f := newCacheFixture(t, keep)
-			nodes := []model.BaseNode{baseDir(".", "root"), keep}
-			for i := range tt.changed {
-				nodes = append(nodes, baseFile(fmt.Sprintf("f%06d", i), "new", 0o100644))
-			}
-			gen, err := f.snap.PublishGeneration(f.ctx, "head", "main", nodes)
-			if err != nil {
-				t.Fatal(err)
-			}
-			before := f.changesSince(0)
-			if _, err := f.resolver.SwitchGeneration(f.ctx, gen, 0); err != nil {
-				t.Fatal(err)
-			}
-			after := f.changesSince(before.Seq)
-			if renewed := after.Instance != before.Instance; renewed != tt.renews {
-				t.Errorf("instance renewed = %v, want %v", renewed, tt.renews)
-			}
-			if want := tt.changed; tt.renews {
-				if len(after.Paths) != 0 {
-					t.Errorf("logged %d paths, want none", len(after.Paths))
-				}
-			} else if len(after.Paths) != want || after.Paths[0] != "f000000" || after.Paths[want-1] != fmt.Sprintf("f%06d", want-1) {
-				t.Errorf("logged %d paths, want f000000 through f%06d", len(after.Paths), want-1)
-			}
-		})
 	}
 }
 

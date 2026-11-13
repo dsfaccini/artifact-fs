@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -18,7 +19,7 @@ func TestMain(m *testing.M) {
 	// The FSMonitor hook that the daemon installs runs this binary, which
 	// would otherwise run the tests inside Git. FSMonitorHook answers "/" for
 	// a worktree that is not mounted, and package tests never mount.
-	if len(os.Args) > 1 && os.Args[1] == "fsmonitor-hook" {
+	if _, _, ok := gitstore.ParseFSMonitorHookLink(os.Args[0]); ok || len(os.Args) > 1 && os.Args[1] == "fsmonitor-hook" {
 		fmt.Print("artifact-fs:package-test\x00/\x00")
 		os.Exit(0)
 	}

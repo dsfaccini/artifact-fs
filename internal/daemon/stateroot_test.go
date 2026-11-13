@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"golang.org/x/sys/unix"
@@ -275,6 +276,30 @@ func TestNewKeepsResolvedStateRootAfterLinkRetarget(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(attacker); err != nil || len(entries) != 0 {
 		t.Fatalf("the service wrote through the retargeted link: %v, %v", entries, err)
+	}
+}
+
+// A relative state root resolves against the working directory once. A
+// relative path would fail each store's SQLite URI, which reads its first
+// segment as an authority, and the hook link Git runs from the worktree.
+func TestRelativeStateRootGivesGitAHookItCanRun(t *testing.T) {
+	ctx := t.Context()
+	dir := gittest.PrivateTempDir(t)
+	t.Chdir(dir)
+	worktree := filepath.Join(dir, "worktree")
+	runCmd(t, "git", "init", "--initial-branch", "main", worktree)
+	commitFile(t, worktree, "README.md", "base\n")
+	svc, err := New(ctx, "state", discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", GitDir: filepath.Join(worktree, ".git"), MountPath: worktree}}
+	if err := svc.git.ConfigureFSMonitorHook(ctx, cfg, svc.root); err != nil {
+		t.Fatal(err)
+	}
+	if hook, want := requireGitRunsFSMonitorHook(t, worktree), gitstore.FSMonitorHookLink(filepath.Join(dir, "state"), cfg.ID); hook != want {
+		t.Fatalf("core.fsmonitor = %q, want %q", hook, want)
 	}
 }
 

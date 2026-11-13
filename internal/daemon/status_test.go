@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
@@ -556,6 +558,64 @@ func hookAnswerFor(t *testing.T, svc *Service, name, since string) ([]byte, stri
 	return out.Bytes(), fields[0], fields[1:]
 }
 
+// Git runs a core.fsmonitor path that holds a shell metacharacter through
+// sh -c unquoted, and sh splits it. Under such a state root the hook stays the
+// script in the git dir, which quotes the root, so Git runs the hook under
+// every state root.
+func TestGitRunsTheFSMonitorHookUnderEveryStateRoot(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, root string
+		link       bool
+	}{
+		{"plain", "state", true},
+		{"space", "state root", false},
+		{"metacharacter", "state$root", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			dir := gittest.PrivateTempDir(t)
+			worktree := filepath.Join(dir, "worktree")
+			runCmd(t, "git", "init", "--initial-branch", "main", worktree)
+			commitFile(t, worktree, "README.md", "base\n")
+			svc, err := New(ctx, filepath.Join(dir, tc.root), discardLogger())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer svc.Close()
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", GitDir: filepath.Join(worktree, ".git"), MountPath: worktree}}
+			if err := svc.git.ConfigureFSMonitorHook(ctx, cfg, svc.root); err != nil {
+				t.Fatal(err)
+			}
+			want := filepath.Join(cfg.GitDir, "hooks", "artifact-fs-fsmonitor")
+			if tc.link {
+				want = gitstore.FSMonitorHookLink(svc.root, cfg.ID)
+			}
+			if hook := requireGitRunsFSMonitorHook(t, worktree); hook != want {
+				t.Fatalf("core.fsmonitor = %q, want %q", hook, want)
+			}
+		})
+	}
+}
+
+// requireGitRunsFSMonitorHook fails t unless git status in worktree runs its
+// core.fsmonitor hook with success, and returns the hook's path.
+func requireGitRunsFSMonitorHook(t *testing.T, worktree string) string {
+	t.Helper()
+	hook := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "config", "--get", "core.fsmonitor"))
+	status := exec.Command("git", "-C", worktree, "status", "--short")
+	status.Env = append(os.Environ(), "GIT_TRACE_FSMONITOR=1")
+	out, err := status.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git status: %v\n%s", err, out)
+	}
+	if ran := "fsmonitor process '" + hook + "' returned success"; !strings.Contains(string(out), ran) {
+		t.Fatalf("git status trace lacks %q:\n%s", ran, out)
+	}
+	return hook
+}
+
 // FSMonitorHook reads the state root without a Controller. It must answer
 // what the hook answers from a Controller's registry, which New opened and
 // migrated, for every token Git can hold.
@@ -1042,33 +1102,27 @@ func TestFSMonitorHookNamesThePathsAGenerationSwitchChanged(t *testing.T) {
 	}
 }
 
-// A HEAD move while the daemon is down changes what the next mount serves,
-// and no runtime logged it. Git's index keeps a token the hook trusts, even
-// when the overlay is empty: the clean-index bootstrap skips an index that
-// differs from HEAD. The next runtime gives the overlay a new instance, so
-// git status through the hook equals its answer with fsmonitor off.
-func TestFSMonitorHookAfterAHEADMoveWhileTheDaemonWasDown(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	tmp := shortTempDir(t)
-	svc, _ := newSyncedDaemonIn(t, tmp)
+// acrossARestart serves the repo of a daemon in tmp, made with opts, and
+// takes a token the hook trusts for a work tree that stands in for the mount.
+// It stops the daemon, calls whileDown, and serves the repo from a new daemon
+// on the same state root once its preparations end. It returns the repo's
+// config, git's location arguments for the work tree, and the token.
+func acrossARestart(t *testing.T, tmp string, opts AddRepoOptions, whileDown func(cfg model.RepoConfig, work string)) (model.RepoConfig, []string, string) {
+	t.Helper()
+	ctx := t.Context()
+	svc, _ := newDaemonWithRepo(t, tmp, opts)
 	if err := svc.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.prepareWorkers.Wait()
 	root := filepath.Join(tmp, "artifact-fs")
 	cfg, err := registry.ReadRepo(ctx, registryPath(root), "repo")
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg.MountPath = "/" // always in the mount table, so it stands in for a live mount
-	// work holds what the mount serves.
 	work := t.TempDir()
-	write := func(content string) {
-		if err := os.WriteFile(filepath.Join(work, "README.md"), []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write("main\n")
+	writeFile(t, filepath.Join(work, "README.md"), "main\n")
 	location := []string{"--git-dir", cfg.GitDir, "--work-tree", work}
 	answer, token, _ := hookAnswerOf(t, cfg, "other-hook:1")
 	if _, status := gitStatusWithAnswerIn(t, location, answer); status != "" {
@@ -1081,92 +1135,212 @@ func TestFSMonitorHookAfterAHEADMoveWhileTheDaemonWasDown(t *testing.T) {
 	if err := svc.Close(); err != nil {
 		t.Fatal(err)
 	}
-
-	remote := filepath.Join(tmp, "remote")
-	commitFile(t, remote, "README.md", "next\n")
-	runCmd(t, "git", "--git-dir", cfg.GitDir, "fetch", "--no-tags", "origin", "main")
-	runCmd(t, "git", "--git-dir", cfg.GitDir, "update-ref", "refs/heads/main", "FETCH_HEAD")
-	write("next\n")
+	whileDown(cfg, work)
 	restarted, err := New(ctx, root, discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer restarted.Close()
+	t.Cleanup(func() { _ = restarted.Close() })
 	restarted.mount = fakeMount
 	if err := restarted.syncRepos(ctx); err != nil {
 		t.Fatal(err)
 	}
+	restarted.prepareWorkers.Wait()
 	if st, err := restarted.ctl().Status(ctx, "repo"); err != nil || st.State != repoStateMounted || st.ServedHEADOID != strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", cfg.GitDir, "rev-parse", "HEAD")) {
-		t.Fatalf("status after the restart = %+v, %v; want the moved HEAD mounted", st, err)
+		t.Fatalf("status after the restart = %+v, %v; want HEAD mounted", st, err)
 	}
-	answer, _, _ = hookAnswerOf(t, cfg, since)
+	return cfg, location, since
+}
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// moveHEADWhileDown commits a new README.md to the repo's remote, points the
+// repo's main at it, and writes it to work, as a HEAD move with no daemon
+// leaves the mount to serve. It returns the new commit.
+func moveHEADWhileDown(t *testing.T, tmp string, cfg model.RepoConfig, work string) string {
+	t.Helper()
+	next := commitFile(t, filepath.Join(tmp, "remote"), "README.md", "next\n")
+	runCmd(t, "git", "--git-dir", cfg.GitDir, "fetch", "--no-tags", "origin", "main")
+	runCmd(t, "git", "--git-dir", cfg.GitDir, "update-ref", "refs/heads/main", next)
+	writeFile(t, filepath.Join(work, "README.md"), "next\n")
+	return next
+}
+
+// publishWhileDown publishes the tree of commit as the current generation of
+// cfg's snapshot store, as a preparation with no daemon does, and prunes
+// every generation below it when prune is set.
+func publishWhileDown(t *testing.T, cfg model.RepoConfig, commit string, prune bool) {
+	t.Helper()
+	ctx := t.Context()
+	git := gitstore.New(discardLogger())
+	defer git.Close()
+	nodes, err := git.BuildTreeIndex(ctx, cfg, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Close()
+	gen, err := snap.PublishGeneration(ctx, commit, "refs/heads/main", nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prune {
+		if err := snap.PruneGenerations(ctx, gen); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// requireStatusWithFSMonitorOff checks that git status through the hook's
+// answer for since matches the status with fsmonitor off, want, and returns
+// the paths the hook answered.
+func requireStatusWithFSMonitorOff(t *testing.T, cfg model.RepoConfig, location []string, since, want string) []string {
+	t.Helper()
+	answer, _, paths := hookAnswerOf(t, cfg, since)
 	_, status := gitStatusWithAnswerIn(t, location, answer)
 	truth := runCmdOutput(t, "git", append(location, "-c", "core.fsmonitor=false", "status", "--porcelain")...)
-	if want := "MM README.md\n"; truth != want {
+	if truth != want {
 		t.Fatalf("status with fsmonitor off = %q, want %q", truth, want)
 	}
 	if status != truth {
 		t.Errorf("status = %q, want %q, as with fsmonitor off", status, truth)
 	}
+	return paths
 }
 
-// An async repo's runtime starts with no record of what changed while no
-// runtime served the repo either, so it gives the overlay a new instance and
-// the hook answers every earlier token with a rescan.
-func TestAsyncRuntimeStartRenewsTheInstance(t *testing.T) {
+// A HEAD move while the daemon is down changes what the next mount serves,
+// and no runtime logged it. Git's index keeps a token the hook trusts, even
+// when the overlay is empty: the clean-index bootstrap skips an index that
+// differs from HEAD. The next runtime logs what changed since the generation
+// the overlay last served, so the hook names README.md and Git's index stays
+// trusted for every other path.
+func TestFSMonitorHookAfterAHEADMoveWhileTheDaemonWasDown(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
 	tmp := shortTempDir(t)
-	svc, _ := newDaemonWithRepo(t, tmp, AddRepoOptions{Async: true})
-	if err := svc.syncRepos(ctx); err != nil {
-		t.Fatal(err)
+	cfg, location, since := acrossARestart(t, tmp, AddRepoOptions{}, func(cfg model.RepoConfig, work string) {
+		moveHEADWhileDown(t, tmp, cfg, work)
+	})
+	if paths := requireStatusWithFSMonitorOff(t, cfg, location, since, "MM README.md\n"); !slices.Equal(paths, []string{"README.md"}) {
+		t.Errorf("hook answered %q, want README.md", paths)
 	}
-	cfg, err := svc.registry.GetRepo(ctx, "repo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	instance := func() string {
-		t.Helper()
-		changes, ok, err := overlay.ReadChangesSince(ctx, cfg.RepoPaths, 0)
-		if err != nil || !ok {
-			t.Fatalf("ReadChangesSince = %v, %v", ok, err)
+}
+
+// A restart with no HEAD move keeps Git's token trusted. A rescan would make
+// Git open every file whose stat data it cannot trust, and a mount numbers
+// its inodes anew. The overlay holds an entry, so the clean-index bootstrap
+// does not rewrite the index.
+func TestFSMonitorHookKeepsItsTokenAcrossARestart(t *testing.T) {
+	t.Parallel()
+	tmp := shortTempDir(t)
+	cfg, location, since := acrossARestart(t, tmp, AddRepoOptions{}, func(cfg model.RepoConfig, work string) {
+		ov, err := overlay.New(t.Context(), cfg.RepoPaths)
+		if err != nil {
+			t.Fatal(err)
 		}
-		return changes.Instance
+		defer ov.Close()
+		if _, err := ov.CreateFile(t.Context(), "untracked.txt", 0o644); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(work, "untracked.txt"), "")
+	})
+	if paths := requireStatusWithFSMonitorOff(t, cfg, location, since, "?? untracked.txt\n"); !slices.Equal(paths, []string{"untracked.txt"}) {
+		t.Errorf("hook answered %q, want untracked.txt", paths)
 	}
-	before := instance()
-	if err := svc.Close(); err != nil {
-		t.Fatal(err)
+}
+
+// A restart whose overlay last served a generation the snapshot store no
+// longer holds cannot tell what changed, so Git rescans. Here a preparation
+// while the daemon was down published HEAD's new tree and pruned the rest.
+func TestFSMonitorHookRescansAfterARestartFromAPrunedGeneration(t *testing.T) {
+	t.Parallel()
+	tmp := shortTempDir(t)
+	cfg, location, since := acrossARestart(t, tmp, AddRepoOptions{}, func(cfg model.RepoConfig, work string) {
+		publishWhileDown(t, cfg, moveHEADWhileDown(t, tmp, cfg, work), true)
+	})
+	if paths := requireStatusWithFSMonitorOff(t, cfg, location, since, "MM README.md\n"); !slices.Equal(paths, []string{"/"}) {
+		t.Errorf("hook answered %q, want a rescan", paths)
 	}
-	restarted, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+}
+
+// The runtime of an async repo with a preparation pending starts behind its
+// gate on the snapshot store's current generation, with no reconcile. Here a
+// preparation while the daemon was down published HEAD's new tree and a new
+// one was requested, so the async preparation after the restart switches
+// between equal trees. The runtime start logs what changed since the
+// generation the overlay last served.
+func TestAsyncRuntimeStartLogsWhatChangedSinceTheServedGeneration(t *testing.T) {
+	t.Parallel()
+	tmp := shortTempDir(t)
+	cfg, location, since := acrossARestart(t, tmp, AddRepoOptions{Async: true}, func(cfg model.RepoConfig, work string) {
+		publishWhileDown(t, cfg, moveHEADWhileDown(t, tmp, cfg, work), false)
+		reg, err := registry.New(t.Context(), registryPath(filepath.Join(tmp, "artifact-fs")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reg.Close()
+		stored, err := reg.GetRepo(t.Context(), cfg.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := reg.BeginPrepare(t.Context(), stored, model.PrepareStatePreparing, "while-down"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if paths := requireStatusWithFSMonitorOff(t, cfg, location, since, "MM README.md\n"); !slices.Equal(paths, []string{"README.md"}) {
+		t.Errorf("hook answered %q, want README.md", paths)
+	}
+}
+
+// seqMount records the change log's latest sequence each time the daemon
+// asks the mount to invalidate the kernel's caches.
+type seqMount struct {
+	*fakeMountedFS
+	backend string
+	repo    model.RepoPaths
+	mu      sync.Mutex
+	seqs    []int64
+}
+
+func (m *seqMount) Backend() string { return m.backend }
+
+func (m *seqMount) InvalidateChanged() error {
+	changes, _, err := overlay.ReadChangesSince(context.Background(), m.repo, 0)
+	m.mu.Lock()
+	m.seqs = append(m.seqs, changes.Seq)
+	m.mu.Unlock()
+	return err
+}
+
+// serveThrough makes mount serve f's runtime.
+func (f *headReconcileFixture) serveThrough(mount fusefs.MountedFS) {
+	f.svc.mu.Lock()
+	f.rt.mfs, f.rt.mount = mount, mountServing
+	f.svc.mu.Unlock()
+}
+
+// switchToNext publishes the tree of f.nextOID, which changes README.md, and
+// switches f's runtime to it.
+func (f *headReconcileFixture) switchToNext() {
+	f.t.Helper()
+	nodes, err := f.svc.git.BuildTreeIndex(f.ctx, f.rt.cfg, f.nextOID)
 	if err != nil {
-		t.Fatal(err)
+		f.t.Fatal(err)
 	}
-	defer restarted.Close()
-	restarted.mount = fakeMount
-	if err := restarted.syncRepos(ctx); err != nil {
-		t.Fatal(err)
+	gen, err := f.rt.snapshot.PublishGeneration(f.ctx, f.nextOID, "main", nodes)
+	if err != nil {
+		f.t.Fatal(err)
 	}
-	if after := instance(); after == before {
-		t.Errorf("instance after the restart = %s, want a new one", after)
+	if err := f.svc.switchGeneration(f.ctx, f.rt, gen, 0); err != nil {
+		f.t.Fatal(err)
 	}
-}
-
-// reconcileSeqs records the change log's sequence when each reconcile has
-// committed, before anything after it logs.
-type reconcileSeqs struct {
-	model.OverlayStore
-	repo model.RepoPaths
-	mu   sync.Mutex
-	seqs []int64
-}
-
-func (o *reconcileSeqs) ReconcileChecked(ctx context.Context, baseLookup func(string) (model.BaseNode, bool, error), switched model.SwitchedPaths, lock sync.Locker, switchBase func()) error {
-	err := o.OverlayStore.ReconcileChecked(ctx, baseLookup, switched, lock, switchBase)
-	changes, _, readErr := overlay.ReadChangesSince(ctx, o.repo, 0)
-	o.mu.Lock()
-	o.seqs = append(o.seqs, changes.Seq)
-	o.mu.Unlock()
-	return errors.Join(err, readErr)
 }
 
 // A git status between a switch's commit and the kernel invalidations can
@@ -1176,28 +1350,49 @@ func (o *reconcileSeqs) ReconcileChecked(ctx context.Context, baseLookup func(st
 func TestSwitchLogsItsPathsAgainAfterTheKernelInvalidations(t *testing.T) {
 	t.Parallel()
 	f := newIdleHeadReconcileFixture(t, time.Millisecond)
-	seqs := &reconcileSeqs{OverlayStore: f.rt.resolver.Overlay, repo: f.rt.cfg.RepoPaths}
-	f.rt.resolver.Overlay = seqs
-	nodes, err := f.svc.git.BuildTreeIndex(f.ctx, f.rt.cfg, f.nextOID)
-	if err != nil {
-		t.Fatal(err)
+	mount := &seqMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, backend: fusefs.BackendKernel, repo: f.rt.cfg.RepoPaths}
+	f.serveThrough(mount)
+	f.switchToNext()
+	if len(mount.seqs) != 1 {
+		t.Fatalf("invalidations = %d, want 1", len(mount.seqs))
 	}
-	gen, err := f.rt.snapshot.PublishGeneration(f.ctx, f.nextOID, "main", nodes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.svc.switchGeneration(f.ctx, f.rt, gen, 0); err != nil {
-		t.Fatal(err)
-	}
-	if len(seqs.seqs) != 1 {
-		t.Fatalf("reconciles = %d, want 1", len(seqs.seqs))
-	}
-	changes, _, err := overlay.ReadChangesSince(f.ctx, f.rt.cfg.RepoPaths, seqs.seqs[0])
+	changes, _, err := overlay.ReadChangesSince(f.ctx, f.rt.cfg.RepoPaths, mount.seqs[0])
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := []string{"README.md"}; !reflect.DeepEqual(changes.Paths, want) {
-		t.Errorf("paths logged after the reconcile = %q, want %q", changes.Paths, want)
+		t.Errorf("paths logged after the invalidations = %q, want %q", changes.Paths, want)
+	}
+}
+
+// FSKit sends the kernel no invalidations, so the kernel can answer with
+// attributes it cached from the old generation for fusefs.CacheTTL after the
+// switch. The daemon logs the paths once more when they have expired.
+func TestSwitchOnFSKitLogsItsPathsAgainAfterTheKernelCacheExpires(t *testing.T) {
+	t.Parallel()
+	f := newIdleHeadReconcileFixture(t, time.Millisecond)
+	f.serveThrough(&seqMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, backend: fusefs.BackendFSKit, repo: f.rt.cfg.RepoPaths})
+	start := time.Now()
+	f.switchToNext()
+	switched, _, err := overlay.ReadChangesSince(f.ctx, f.rt.cfg.RepoPaths, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		changes, _, err := overlay.ReadChangesSince(f.ctx, f.rt.cfg.RepoPaths, switched.Seq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(changes.Paths) > 0 {
+			if want := []string{"README.md"}; !reflect.DeepEqual(changes.Paths, want) {
+				t.Errorf("paths logged after the switch = %q, want %q", changes.Paths, want)
+			}
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if elapsed := time.Since(start); elapsed < fusefs.CacheTTL {
+		t.Errorf("logged again %v after the switch began, want no sooner than %v", elapsed, fusefs.CacheTTL)
 	}
 }
 

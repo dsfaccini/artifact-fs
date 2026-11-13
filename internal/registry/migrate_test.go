@@ -467,7 +467,7 @@ func TestReadRepoReadsWhatNewReads(t *testing.T) {
 	schemas["current"] = nil
 	for name, stmts := range schemas {
 		t.Run(name, func(t *testing.T) {
-			var paths [2]string
+			var paths [3]string
 			for i := range paths {
 				paths[i] = filepath.Join(t.TempDir(), "repos.sqlite")
 				if stmts == nil {
@@ -506,7 +506,46 @@ func TestReadRepoReadsWhatNewReads(t *testing.T) {
 			if got := metatest.Schema(t, paths[0]); !slices.Equal(got, want) {
 				t.Fatalf("schema after ReadRepo = %q, want %q", got, want)
 			}
+			got, err = ReadRepoByID(ctx, paths[2], wantRepo.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, wantRepo) {
+				t.Fatalf("ReadRepoByID = %+v, want %+v", got, wantRepo)
+			}
+			if _, err := ReadRepoByID(ctx, paths[2], "missing"); err == nil || err.Error() != wantErr.Error() {
+				t.Fatalf("ReadRepoByID of a missing repo: %v, want %v", err, wantErr)
+			}
+			if got := metatest.Schema(t, paths[2]); !slices.Equal(got, want) {
+				t.Fatalf("schema after ReadRepoByID = %q, want %q", got, want)
+			}
 		})
+	}
+}
+
+// The hook link names a repo by its ID, which need not be its name.
+func TestReadRepoByIDReadsTheRepoWithThatID(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "repos.sqlite")
+	store, err := New(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := fullRepoWithRequests
+	cfg.ID = "repo-id"
+	if err := store.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	want, err := store.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadRepoByID(ctx, path, cfg.ID); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadRepoByID(%q) = %+v, %v; want %+v", cfg.ID, got, err, want)
+	}
+	if got, err := ReadRepoByID(ctx, path, model.RepoID(cfg.Name)); err == nil || err.Error() != "repo not found" {
+		t.Fatalf("ReadRepoByID of the name %q = %+v, %v; want repo not found", cfg.Name, got, err)
 	}
 }
 
