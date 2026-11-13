@@ -473,9 +473,10 @@ func TestSwitchMovesTheTimesOfTheDirectoriesWhoseListingItChanges(t *testing.T) 
 	}
 }
 
-// A switch from an empty tree cannot tell which listings it changes, so it
-// moves the ctime of every directory.
-func TestSwitchFromAnEmptyTreeMovesEveryDirectorysCtime(t *testing.T) {
+// A switch that cannot tell which listings it changes, here from an empty
+// tree, moves the mtime and ctime of every directory. Git can trust a
+// directory's mtime alone, under core.trustctime=false.
+func TestSwitchFromAnEmptyTreeMovesEveryDirectorysTimes(t *testing.T) {
 	const commitTime = 1_700_000_000
 	f := newCacheFixture(t)
 	f.resolver.SetCommitTime(commitTime)
@@ -483,8 +484,99 @@ func TestSwitchFromAnEmptyTreeMovesEveryDirectorysCtime(t *testing.T) {
 	if _, err := f.resolver.SwitchGeneration(f.ctx, f.publish(dirTimesNodes...), commitTime); err != nil {
 		t.Fatal(err)
 	}
-	if got := f.dirTimes(fuseops.RootInodeID, "d"); got[1] < start.UnixNano() {
-		t.Errorf("d's ctime after the switch = %d, want no earlier than %d", got[1], start.UnixNano())
+	if got := f.dirTimes(fuseops.RootInodeID, "d"); got[0] < start.UnixNano() || got[1] < start.UnixNano() {
+		t.Errorf("d's mtime and ctime after the switch = %d, want both no earlier than %d", got, start.UnixNano())
+	}
+}
+
+// Overlay entries below a directory the base lacks imply it. A rename of the
+// last of them, an untracked file that leaves no delete marker, removes the
+// directory from its parent's listing too.
+func TestRenameOutOfAnImpliedDirectoryMovesItsParentsTimes(t *testing.T) {
+	const commitTime = 1_700_000_000
+	f := newCacheFixture(t, append(slices.Clone(dirTimesNodes), baseDir("imp", "imp"), baseFile("imp/b.txt", "b", 0o100644))...)
+	f.resolver.SetCommitTime(commitTime)
+	imp := f.lookup(fuseops.RootInodeID, "imp")
+	if err := f.fs.CreateFile(f.ctx, &fuseops.CreateFileOp{Parent: imp, Name: "u.txt", Mode: 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.resolver.SwitchGeneration(f.ctx, f.publish(dirTimesNodes...), commitTime); err != nil {
+		t.Fatal(err)
+	}
+	if got := readdirNames(t, f.resolver, "."); !slices.Contains(got, "imp") {
+		t.Fatalf("root after the switch lists %q, want imp implied by imp/u.txt", got)
+	}
+	before := f.rootTimes()
+	if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: imp, OldName: "u.txt", NewParent: f.lookup(fuseops.RootInodeID, "d"), NewName: "u.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readdirNames(t, f.resolver, "."); slices.Contains(got, "imp") {
+		t.Fatalf("root after the rename lists %q, want no imp", got)
+	}
+	if after := f.rootTimes(); after[0] <= before[0] || after[1] <= before[1] {
+		t.Errorf("root: mtime and ctime %d before, %d after; want both later", before, after)
+	}
+}
+
+// rootTimes returns the mtime and ctime, in Unix nanoseconds, that getattr
+// reports for the root.
+func (f *cacheFixture) rootTimes() [2]int64 {
+	f.t.Helper()
+	op := &fuseops.GetInodeAttributesOp{Inode: fuseops.RootInodeID}
+	if err := f.fs.GetInodeAttributes(f.ctx, op); err != nil {
+		f.t.Fatal(err)
+	}
+	return [2]int64{op.Attributes.Mtime.UnixNano(), op.Attributes.Ctime.UnixNano()}
+}
+
+// A write through a handle whose path a switch removed recreates the path,
+// which changes its directory's listing.
+func TestAWriteThatRecreatesItsPathMovesItsDirectorysTimes(t *testing.T) {
+	const commitTime = 1_700_000_000
+	f := newCacheFixture(t, dirTimesNodes...)
+	f.resolver.SetCommitTime(commitTime)
+	d := f.lookup(fuseops.RootInodeID, "d")
+	a := f.lookup(d, "a.txt")
+	handle := f.openRW(a).Handle
+	nodes := slices.DeleteFunc(slices.Clone(dirTimesNodes), func(n model.BaseNode) bool { return n.Path == "d/a.txt" })
+	nodes[slices.IndexFunc(nodes, func(n model.BaseNode) bool { return n.Path == "d" })] = baseDir("d", "d2")
+	if _, err := f.resolver.SwitchGeneration(f.ctx, f.publish(nodes...), commitTime); err != nil {
+		t.Fatal(err)
+	}
+	before := f.dirTimes(fuseops.RootInodeID, "d")
+	if err := f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: a, Handle: handle, Data: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readdirNames(t, f.resolver, "d"); !slices.Contains(got, "a.txt") {
+		t.Fatalf("d after the write lists %q, want a.txt", got)
+	}
+	if after := f.dirTimes(fuseops.RootInodeID, "d"); after[0] <= before[0] || after[1] <= before[1] {
+		t.Errorf("d: mtime and ctime %d before, %d after; want both later", before, after)
+	}
+}
+
+// A base directory reports the commit time, which can lie in the future. A
+// listing change still moves its times past it, through a switch between two
+// commits with that time and through an op.
+func TestListingChangesMoveTimesPastAFutureCommitTime(t *testing.T) {
+	commitTime := time.Now().Add(time.Hour).Unix()
+	f := newCacheFixture(t, dirTimesNodes...)
+	f.resolver.SetCommitTime(commitTime)
+	before := f.dirTimes(fuseops.RootInodeID, "d")
+	nodes := append(slices.Clone(dirTimesNodes), baseFile("d/new.txt", "new", 0o100644))
+	nodes[slices.IndexFunc(nodes, func(n model.BaseNode) bool { return n.Path == "d" })] = baseDir("d", "d2")
+	if _, err := f.resolver.SwitchGeneration(f.ctx, f.publish(nodes...), commitTime); err != nil {
+		t.Fatal(err)
+	}
+	switched := f.dirTimes(fuseops.RootInodeID, "d")
+	if switched[0] <= before[0] || switched[1] <= before[1] {
+		t.Errorf("d after the switch: mtime and ctime %d before, %d after; want both later", before, switched)
+	}
+	if err := f.fs.CreateFile(f.ctx, &fuseops.CreateFileOp{Parent: f.lookup(fuseops.RootInodeID, "d"), Name: "made.txt", Mode: 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	if created := f.dirTimes(fuseops.RootInodeID, "d"); created[0] <= switched[0] || created[1] <= switched[1] {
+		t.Errorf("d after a create: mtime and ctime %d before, %d after; want both later", switched, created)
 	}
 }
 

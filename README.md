@@ -526,10 +526,12 @@ a 1 s TTL. The synthesized `.git` file never changes, and the mount reports it
 with a 1 minute TTL. Every base file and directory reports the time of the HEAD
 commit the mount serves as its mtime. When an op through the mount or a HEAD
 change adds, removes, renames or retypes an entry, its directory's mtime and
-ctime move to that moment, as on a local file system, until an mtime set on the
-directory replaces them. Only memory holds those changes, so every directory
-reports a ctime no earlier than the mount's start, and Git's untracked cache
-still sees a change made before a restart.
+ctime move to that moment, as on a local file system, or past the commit time
+when that lies in the future. An mtime set on the directory shows until its
+listing changes again. A HEAD change whose paths the mount cannot name moves
+the times of every directory. Only memory holds those changes, so every
+directory reports a ctime no earlier than the mount's start, and Git's
+untracked cache still sees a change made before a restart.
 
 On every backend, an inode reads the generation of the attributes the kernel
 last received for it, or a later one in which its path has the same type, mode

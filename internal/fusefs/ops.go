@@ -655,10 +655,13 @@ func (e *Engine) Write(ctx context.Context, b *Blobs, path string, off int64, da
 		if !errors.Is(err, fs.ErrNotExist) {
 			return 0, err
 		}
-		// Path doesn't exist in snapshot -- create it
+		// The path vanished while a handle on it was open, such as at a
+		// switch, and the write recreates it.
+		absent := e.absentDirsAbove(path)
 		if _, cErr := e.Overlay.CreateFile(ctx, path, 0o644); cErr != nil {
 			return 0, cErr
 		}
+		e.entryChanged(path, absent)
 	}
 	return e.Overlay.WriteFile(ctx, path, off, data)
 }
@@ -808,13 +811,21 @@ func (e *Engine) pinOpenFiles(ctx context.Context, path string, files openFiles)
 // overlay. A destination it replaces is copied only when open handles still
 // read it, so that they keep its content. files may be nil when no handle can
 // be open.
+//
+// A rename of the last overlay entry below a directory the base lacks, which
+// only overlay entries imply, takes that directory out of its parent's
+// listing too. An untracked source leaves no delete marker behind to imply it.
 func (e *Engine) Rename(ctx context.Context, b *Blobs, oldPath, newPath string, files openFiles) error {
 	if err := e.rename(ctx, b, oldPath, newPath, files); err != nil {
 		return err
 	}
-	if oldPath, newPath = model.CleanPath(oldPath), model.CleanPath(newPath); oldPath != newPath {
-		e.Resolver.listingChanged(parentDir(oldPath), parentDir(newPath))
+	if model.CleanPath(oldPath) == model.CleanPath(newPath) {
+		return nil
 	}
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
+	e.Resolver.listingChanged(parentDir(newPath))
+	e.entryChanged(oldPath, e.absentDirsAbove(oldPath))
 	return nil
 }
 
@@ -1086,6 +1097,32 @@ func (e *Engine) Rmdir(ctx context.Context, path string) error {
 	return nil
 }
 
+// absentDirsAbove returns the directories above path, nearest first, that the
+// merged view lacks. Only overlay entries below a directory the base lacks
+// imply it, so it appears with the first of them and vanishes with the last.
+// The caller holds the transition read lock.
+func (e *Engine) absentDirsAbove(path string) []string {
+	var absent []string
+	for dir := parentDir(path); dir != "."; dir = parentDir(dir) {
+		if _, err := e.Resolver.resolvePath(dir); !errors.Is(err, fs.ErrNotExist) {
+			break
+		}
+		absent = append(absent, dir)
+	}
+	return absent
+}
+
+// entryChanged records that path's entry appeared in or vanished from its
+// directory's listing, and so did each of absent, directories above path
+// that appeared or vanished with it.
+func (e *Engine) entryChanged(path string, absent []string) {
+	dirs := []string{parentDir(path)}
+	for _, dir := range absent {
+		dirs = append(dirs, parentDir(dir))
+	}
+	e.Resolver.listingChanged(dirs...)
+}
+
 // errAttrUnsupported rejects a mode or mtime change on the root or on a base
 // entry that is neither a file nor a directory.
 var errAttrUnsupported = fmt.Errorf("%w: %w", syscall.ENOTSUP, fs.ErrInvalid)
@@ -1141,7 +1178,7 @@ func (e *Engine) SetAttributes(ctx context.Context, b *Blobs, path, typ string, 
 				return err
 			}
 			if typ == "dir" {
-				e.Resolver.forgetListing(model.CleanPath(path))
+				e.Resolver.mtimeSetOn(model.CleanPath(path))
 			}
 		}
 		return nil

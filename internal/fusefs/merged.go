@@ -61,6 +61,14 @@ type dirTimes struct {
 	// op through the mount or a generation switch added, removed or retyped.
 	// It raises the directory's mtime and ctime, as on a local file system.
 	listed map[string]time.Time
+	// allListed is the last change to every directory's listing, from a
+	// switch that could not tell which listings it changed.
+	allListed time.Time
+	// latest is the latest time listed or allListed holds.
+	latest time.Time
+	// mtimeSet holds, for each directory whose mtime was set, the latest
+	// listing change before the set. Only a later change raises its mtime.
+	mtimeSet map[string]time.Time
 }
 
 // SetDirFloor makes t the earliest ctime any directory reports.
@@ -70,30 +78,52 @@ func (r *Resolver) SetDirFloor(t time.Time) {
 	r.times.floor = t
 }
 
-// listingChanged records that the listings of dirs changed now. Each record
-// is later than the one before it, so two changes never share a time.
+// nextListingLocked returns the time of a listing change happening now. It is
+// later than every listing change before it, and than the commit time a base
+// directory reports, which can lie in the future, so the change always moves
+// the directory's times. The caller holds r.times.mu.
+func (r *Resolver) nextListingLocked() time.Time {
+	t := time.Now()
+	if commit := time.Unix(r.CommitTime(), 0); !t.After(commit) {
+		t = commit.Add(time.Nanosecond)
+	}
+	if !t.After(r.times.latest) {
+		t = r.times.latest.Add(time.Nanosecond)
+	}
+	r.times.latest = t
+	return t
+}
+
+// listingChanged records that the listings of dirs changed now.
 func (r *Resolver) listingChanged(dirs ...string) {
-	now := time.Now()
 	r.times.mu.Lock()
 	defer r.times.mu.Unlock()
 	if r.times.listed == nil {
 		r.times.listed = map[string]time.Time{}
 	}
+	t := r.nextListingLocked()
 	for _, dir := range dirs {
-		t := now
-		if last, ok := r.times.listed[dir]; ok && !t.After(last) {
-			t = last.Add(time.Nanosecond)
-		}
 		r.times.listed[dir] = t
 	}
 }
 
-// forgetListing drops dir's last listing change, so that an mtime set on dir
-// shows.
-func (r *Resolver) forgetListing(dir string) {
+// allListingsChanged records that the listing of every directory may have
+// changed now.
+func (r *Resolver) allListingsChanged() {
 	r.times.mu.Lock()
 	defer r.times.mu.Unlock()
-	delete(r.times.listed, dir)
+	r.times.allListed = r.nextListingLocked()
+}
+
+// mtimeSetOn records that an mtime was set on dir, so that it shows until
+// dir's listing changes again.
+func (r *Resolver) mtimeSetOn(dir string) {
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	if r.times.mtimeSet == nil {
+		r.times.mtimeSet = map[string]time.Time{}
+	}
+	r.times.mtimeSet[dir] = r.times.latest
 }
 
 // dirTimes returns the mtime and ctime that directory dir reports, given the
@@ -107,8 +137,12 @@ func (r *Resolver) dirTimes(dir string, mtime, ctime time.Time) (time.Time, time
 	}
 	r.times.mu.Lock()
 	defer r.times.mu.Unlock()
-	if t, ok := r.times.listed[dir]; ok {
-		mtime, ctime = later(mtime, t), later(ctime, t)
+	changed := later(r.times.listed[dir], r.times.allListed)
+	if !changed.IsZero() {
+		if changed.After(r.times.mtimeSet[dir]) {
+			mtime = later(mtime, changed)
+		}
+		ctime = later(ctime, changed)
 	}
 	return mtime, later(ctime, r.times.floor)
 }
@@ -150,7 +184,7 @@ func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime i
 		r.SetCommitTime(commitTime)
 		r.SetGeneration(gen)
 		if sw.Changed.Unknown {
-			r.SetDirFloor(time.Now())
+			r.allListingsChanged()
 		} else {
 			r.listingChanged(listings...)
 		}
