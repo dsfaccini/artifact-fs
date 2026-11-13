@@ -18,8 +18,10 @@ var lstat = unix.Lstat
 var stateRootDirs = []string{"config", filepath.Join("config", "locks"), filepath.Join("config", "tmp"), "repos", "overlays", "cache", "meta"}
 
 // ensureStateRoot creates the state root and its fixed subdirectories 0700, and
-// returns the root with its symlinks resolved. Use only the resolved root: a
-// link that is retargeted after this check then redirects nothing.
+// returns the root, absolute and with its symlinks resolved. Use only the
+// resolved root: a link that is retargeted after this check then redirects
+// nothing, and a path built from it, such as the hook link Git runs from the
+// worktree, names the same file from any working directory.
 //
 // It refuses the root as given when another user owns it, even as a symlink to
 // a directory of the current user, because that user chose the target. It
@@ -34,9 +36,12 @@ var stateRootDirs = []string{"config", filepath.Join("config", "locks"), filepat
 func ensureStateRoot(root string) (string, error) {
 	// Check the owner before creating anything. With a trailing slash, macOS's
 	// mkdir follows a dangling symlink and creates its target.
-	root = filepath.Clean(root)
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
 	var link unix.Stat_t
-	err := lstat(root, &link)
+	err = lstat(root, &link)
 	if errors.Is(err, unix.ENOENT) {
 		if err := os.MkdirAll(root, 0o700); err != nil {
 			return "", err

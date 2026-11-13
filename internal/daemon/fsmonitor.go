@@ -97,6 +97,20 @@ func FSMonitorHook(ctx context.Context, root, name, since string, w io.Writer) e
 	return answerFSMonitorHook(ctx, cfg, since, w)
 }
 
+// FSMonitorHookByID answers as FSMonitorHook does for the repo registered as
+// id, which Git runs through the hook link gitstore.FSMonitorHookLink returns.
+func FSMonitorHookByID(ctx context.Context, root string, id model.RepoID, since string, w io.Writer) error {
+	root, err := ensureStateRoot(root)
+	if err != nil {
+		return err
+	}
+	cfg, err := registry.ReadRepoByID(ctx, registryPath(root), id)
+	if err != nil {
+		return err
+	}
+	return answerFSMonitorHook(ctx, cfg, since, w)
+}
+
 // answerFSMonitorHook writes FSMonitorHook's answer for cfg.
 func answerFSMonitorHook(ctx context.Context, cfg model.RepoConfig, since string, w io.Writer) error {
 	prefix := fmt.Sprintf("artifact-fs:%s:%s:", cfg.ID, cfg.ConfigVersion)

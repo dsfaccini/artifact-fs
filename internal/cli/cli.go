@@ -15,10 +15,30 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/daemon"
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/logging"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	ucli "github.com/urfave/cli/v3"
 )
+
+// Main runs artifact-fs with the arguments the process received, its program
+// name first. Git runs the FSMonitor hook link with the hook protocol version
+// and its last token, and the link's path names the state root and the repo.
+func Main(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) int {
+	root, id, ok := gitstore.ParseFSMonitorHookLink(args[0])
+	if !ok {
+		return Run(ctx, args[1:], stdout, stderr)
+	}
+	var since string
+	if len(args) > 2 {
+		since = args[2]
+	}
+	if err := daemon.FSMonitorHookByID(ctx, root, id, since, stdout); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
 
 func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) int {
 	root := defaultRoot()

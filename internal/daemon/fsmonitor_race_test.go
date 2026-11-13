@@ -8,7 +8,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 )
 
-// The bootstrap installs the FSMonitor hook script, which runs this test
+// The bootstrap installs the FSMonitor hook link, which runs this test
 // binary.
 func TestFSMonitorHookSkipsRaceExitSleep(t *testing.T) {
 	f := newBootstrapFixture(t)

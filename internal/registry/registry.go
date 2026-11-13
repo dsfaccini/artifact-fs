@@ -190,6 +190,17 @@ var testHookBeforeReadRepoNew func()
 // fails for every other command. A registry another connection locks past
 // busy_timeout fails with SQLITE_BUSY after that one wait.
 func ReadRepo(ctx context.Context, dbPath, name string) (model.RepoConfig, error) {
+	return readRepo(ctx, dbPath, func(s *Store) (model.RepoConfig, error) { return s.GetRepo(ctx, name) })
+}
+
+// ReadRepoByID is ReadRepo for the repo registered as id.
+func ReadRepoByID(ctx context.Context, dbPath string, id model.RepoID) (model.RepoConfig, error) {
+	return readRepo(ctx, dbPath, func(s *Store) (model.RepoConfig, error) {
+		return scanRepo(s.db.QueryRowContext(ctx, `SELECT `+repoColumns+` FROM repos WHERE repo_id=?`, string(id)))
+	})
+}
+
+func readRepo(ctx context.Context, dbPath string, get func(*Store) (model.RepoConfig, error)) (model.RepoConfig, error) {
 	db, err := meta.OpenForReading(dbPath)
 	if err != nil {
 		return model.RepoConfig{}, err
@@ -197,7 +208,7 @@ func ReadRepo(ctx context.Context, dbPath, name string) (model.RepoConfig, error
 	defer db.Close()
 	migrated, err := meta.Migrated(ctx, db, migrations)
 	if err == nil && migrated {
-		return (&Store{db: db}).GetRepo(ctx, name)
+		return get(&Store{db: db})
 	}
 	// New would wait out busy_timeout again for the same lock, and Git runs
 	// the hook on every command.
@@ -212,7 +223,7 @@ func ReadRepo(ctx context.Context, dbPath, name string) (model.RepoConfig, error
 		return model.RepoConfig{}, err
 	}
 	defer s.Close()
-	return s.GetRepo(ctx, name)
+	return get(s)
 }
 
 func (s *Store) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
