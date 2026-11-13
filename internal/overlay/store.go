@@ -9,6 +9,7 @@ import (
 	"io"
 	iofs "io/fs"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -116,6 +117,11 @@ var changeLogTriggerNames = []string{"overlay_entries_insert_change", "overlay_e
 var _ model.OverlayStore = (*Store)(nil)
 
 type Store struct {
+	// MaxSwitchedPaths is the most paths one log of a switch writes. Past
+	// it, the log gives the database a new instance instead. New sets it to
+	// model.MaxSwitchedPaths. Change it only before the store is in use.
+	MaxSwitchedPaths int
+
 	db       *sql.DB
 	repo     model.RepoPaths
 	upperDir string
@@ -148,7 +154,7 @@ func New(ctx context.Context, cfg model.RepoPaths) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("open %s: %w", cfg.OverlayDBPath, err)
 	}
-	return &Store{db: db, repo: cfg, upperDir: upperDir, pending: map[string]*pendingWrite{}}, nil
+	return &Store{MaxSwitchedPaths: model.MaxSwitchedPaths, db: db, repo: cfg, upperDir: upperDir, pending: map[string]*pendingWrite{}}, nil
 }
 
 // commitPendingFromBackingFiles commits the size and mtime of each path a
@@ -1168,8 +1174,8 @@ func (s *Store) SetMode(ctx context.Context, path string, mode uint32) error {
 //
 // The apply phase logs each of switched's paths that no overlay entry covers,
 // because the merged view shows the new base there. When switched is Unknown,
-// or names more than model.MaxSwitchedPaths such paths, it gives the database
-// a new instance instead, so the fsmonitor hook answers every earlier token
+// or names more than s.MaxSwitchedPaths such paths, it gives the database a
+// new instance instead, so the fsmonitor hook answers every earlier token
 // with a rescan. In the same transaction it records gen, the generation
 // baseLookup reads, as the generation the change log is current with.
 func (s *Store) ReconcileChecked(ctx context.Context, gen int64, baseLookup func(path string) (model.BaseNode, bool, error), switched model.SwitchedPaths, lock sync.Locker, switchBase func()) error {
@@ -1305,7 +1311,7 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 	if err := resumeChangeLog(ctx, tx, revealed...); err != nil {
 		return nil, err
 	}
-	if err := logSwitched(ctx, tx, switched, covered); err != nil {
+	if err := logSwitched(ctx, tx, switched, covered, s.MaxSwitchedPaths); err != nil {
 		return nil, err
 	}
 	if err := setServedGeneration(ctx, tx, gen); err != nil {
@@ -1581,10 +1587,10 @@ func resumeChangeLog(ctx context.Context, tx *sql.Tx, paths ...string) error {
 }
 
 // logSwitched logs each of switched's paths that covered rejects, in tx. When
-// switched is Unknown, or more than model.MaxSwitchedPaths paths remain to
-// log, it gives the database a new instance instead, so the fsmonitor hook
-// answers every earlier token with a rescan.
-func logSwitched(ctx context.Context, tx *sql.Tx, switched model.SwitchedPaths, covered func(path string) bool) error {
+// switched is Unknown, or more than maxPaths paths remain to log, it gives the
+// database a new instance instead, so the fsmonitor hook answers every earlier
+// token with a rescan.
+func logSwitched(ctx context.Context, tx *sql.Tx, switched model.SwitchedPaths, covered func(path string) bool, maxPaths int) error {
 	var paths []string
 	if !switched.Unknown {
 		for _, path := range switched.Paths {
@@ -1593,7 +1599,7 @@ func logSwitched(ctx context.Context, tx *sql.Tx, switched model.SwitchedPaths, 
 			}
 		}
 	}
-	if switched.Unknown || len(paths) > model.MaxSwitchedPaths {
+	if switched.Unknown || len(paths) > maxPaths {
 		_, err := tx.ExecContext(ctx, `UPDATE overlay_instance SET id = lower(hex(randomblob(16)))`)
 		return err
 	}
@@ -1667,7 +1673,7 @@ func (s *Store) logSwitchedIn(ctx context.Context, switched model.SwitchedPaths,
 		_, found := slices.BinarySearch(entries, path)
 		return found
 	}
-	if err := logSwitched(ctx, tx, switched, covered); err != nil {
+	if err := logSwitched(ctx, tx, switched, covered, s.MaxSwitchedPaths); err != nil {
 		return err
 	}
 	if then != nil {
@@ -1809,6 +1815,12 @@ func (s *Store) HasEntryBelow(ctx context.Context, path string) (bool, error) {
 
 // CountEntries returns the number of entries of any kind, counting at most
 // limit. It reads at most limit rows of an index.
+// SwitchedPathsLimit returns s.MaxSwitchedPaths plus the number of entries.
+func (s *Store) SwitchedPathsLimit(ctx context.Context) (int, error) {
+	entries, err := s.CountEntries(ctx, math.MaxInt)
+	return s.MaxSwitchedPaths + entries, err
+}
+
 func (s *Store) CountEntries(ctx context.Context, limit int) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM (SELECT 1 FROM overlay_entries LIMIT ?)`, limit).Scan(&n)

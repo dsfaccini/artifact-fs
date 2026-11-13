@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"math"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -524,10 +523,12 @@ func (r *Resolver) ChangedPaths(from, to int64, paths []string) (changed map[str
 // differs and of each directory only one of them holds. The result is
 // Unknown, with no paths, when from holds no root entries, as for an empty
 // tree or a generation that was pruned or never published, and when a listing
-// fails, whose error it returns. It is Unknown also when more paths changed
-// than ov can log: model.MaxSwitchedPaths, plus one for each of ov's entries,
-// which can cover a path. The walk stops there, so a switch the overlay
-// renews the instance for costs no full diff.
+// fails, whose error it returns. It is Unknown also past the most paths ov's
+// log can write one by one, ov.SwitchedPathsLimit. The walk stops there, so a
+// switch the overlay renews the instance for costs no full diff. The limit is
+// read before the reconcile reads the entries, so it misses an entry written
+// in between. A switch that only such an entry keeps within the cap then
+// renews the instance, which costs Git one extra rescan.
 func SwitchedPaths(ctx context.Context, snap model.SnapshotStore, ov model.OverlayStore, from, to int64) (model.SwitchedPaths, error) {
 	switched, _, err := switchedPathsFor(ctx, snap, ov, from, to)
 	return switched, err
@@ -537,11 +538,11 @@ func SwitchedPaths(ctx context.Context, snap model.SnapshotStore, ov model.Overl
 // directory that gained, lost or retyped an entry, which is nil when the
 // result is Unknown.
 func switchedPathsFor(ctx context.Context, snap model.SnapshotStore, ov model.OverlayStore, from, to int64) (model.SwitchedPaths, []string, error) {
-	entries, err := ov.CountEntries(ctx, math.MaxInt)
+	limit, err := ov.SwitchedPathsLimit(ctx)
 	if err != nil {
 		return model.SwitchedPaths{Unknown: true}, nil, err
 	}
-	return switchedPaths(snap, from, to, model.MaxSwitchedPaths+entries)
+	return switchedPaths(snap, from, to, limit)
 }
 
 // switchedPaths returns what switchedPathsFor does, Unknown once more than

@@ -2240,26 +2240,28 @@ func lookupEntry(t *testing.T, s *Store, path string) (model.OverlayEntry, bool)
 	return e, ok
 }
 
-// One log of a switch writes at most model.MaxSwitchedPaths paths. Past that,
-// it gives the overlay a new instance, so Git rescans and the transition lock
-// stays short. The cap counts only the paths no overlay entry covers, the
-// paths the log writes.
+// One log of a switch writes at most the store's MaxSwitchedPaths paths, here
+// 3. Past that, it gives the overlay a new instance, so Git rescans and the
+// transition lock stays short. The cap counts only the paths no overlay entry
+// covers, the paths the log writes.
 func TestReconcileLogsAtMostMaxSwitchedPaths(t *testing.T) {
+	const maxPaths = 3
 	for _, tt := range []struct {
 		name             string
 		changed, covered int
 		renews           bool
 	}{
-		{"at the cap", model.MaxSwitchedPaths, 0, false},
-		{"past the cap", model.MaxSwitchedPaths + 1, 0, true},
-		{"past the cap until the overlay covers one", model.MaxSwitchedPaths + 1, 1, false},
+		{"at the cap", maxPaths, 0, false},
+		{"past the cap", maxPaths + 1, 0, true},
+		{"past the cap until the overlay covers one", maxPaths + 1, 1, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()
 			s, cfg := testStore(t)
+			s.MaxSwitchedPaths = maxPaths
 			paths := make([]string, tt.changed)
 			for i := range paths {
-				paths[i] = fmt.Sprintf("f%06d", i)
+				paths[i] = fmt.Sprintf("f%d", i)
 			}
 			for _, path := range paths[:tt.covered] {
 				if _, err := s.CreateFile(ctx, path, 0o644); err != nil {
@@ -2280,9 +2282,16 @@ func TestReconcileLogsAtMostMaxSwitchedPaths(t *testing.T) {
 				want = nil
 			}
 			if !slices.Equal(after.Paths, want) {
-				t.Errorf("logged %d paths, want %d, %s through %s", len(after.Paths), len(want), paths[tt.covered], paths[tt.changed-1])
+				t.Errorf("logged %q, want %q", after.Paths, want)
 			}
 		})
+	}
+}
+
+// New caps a switch's log at model.MaxSwitchedPaths.
+func TestNewCapsASwitchsLogAtMaxSwitchedPaths(t *testing.T) {
+	if s, _ := testStore(t); s.MaxSwitchedPaths != model.MaxSwitchedPaths {
+		t.Errorf("MaxSwitchedPaths = %d, want %d", s.MaxSwitchedPaths, model.MaxSwitchedPaths)
 	}
 }
 

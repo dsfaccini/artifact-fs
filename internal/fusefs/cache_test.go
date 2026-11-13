@@ -69,6 +69,7 @@ type cacheFixture struct {
 	t        *testing.T
 	ctx      context.Context
 	snap     *snapshot.Store
+	ov       *overlaystore.Store
 	resolver *Resolver
 	fs       *ArtifactFuse
 	mount    MountedFS
@@ -112,7 +113,7 @@ func newLoggedCacheFixture(t *testing.T, backend string, logger *slog.Logger, re
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ov.Close() })
-	f := &cacheFixture{t: t, ctx: ctx, snap: snap, resolver: &Resolver{Snapshot: snap, Overlay: ov}, blobs: &fakeHydrator{pathsByOID: map[string]string{}}}
+	f := &cacheFixture{t: t, ctx: ctx, snap: snap, ov: ov, resolver: &Resolver{Snapshot: snap, Overlay: ov}, blobs: &fakeHydrator{pathsByOID: map[string]string{}}}
 	f.resolver.SetGeneration(f.publish(nodes...))
 	engine := &Engine{Resolver: f.resolver, Repo: repo, Overlay: ov, Hydrator: f.blobs}
 
@@ -338,64 +339,68 @@ func (s *countingListings) ListChildren(gen int64, dir string) ([]model.BaseNode
 	return s.SnapshotStore.ListChildren(gen, dir)
 }
 
-// The diff names every changed path up to its limit. Past it the result is
-// Unknown, and the walk stops instead of listing the rest of both trees.
-func TestSwitchedPathsStopsPastItsLimit(t *testing.T) {
-	const dirs = 10
-	f := newCacheFixture(t)
-	var before, after []model.BaseNode
-	for i := range dirs {
-		dir := fmt.Sprintf("d%d", i)
-		before = append(before, baseDir(dir, dir+"-1"), baseFile(dir+"/f", dir+"-a", 0o100644))
-		after = append(after, baseDir(dir, dir+"-2"), baseFile(dir+"/f", dir+"-b", 0o100644))
-	}
-	from, to := f.publish(before...), f.publish(after...)
-	snap := &countingListings{SnapshotStore: f.snap}
-	if got, _, err := switchedPaths(snap, from, to, dirs); err != nil || got.Unknown || len(got.Paths) != dirs {
-		t.Fatalf("diff with the limit at %d paths = %+v, %v; want them all", dirs, got, err)
-	}
-	full := snap.n
-	if got, _, err := switchedPaths(snap, from, to, dirs-1); err != nil || !got.Unknown {
-		t.Errorf("diff with the limit one below = %+v, %v; want Unknown", got, err)
-	}
-	snap.n = 0
-	if got, _, err := switchedPaths(snap, from, to, 2); err != nil || !got.Unknown {
-		t.Errorf("diff with the limit at 2 = %+v, %v; want Unknown", got, err)
-	}
-	if snap.n >= full {
-		t.Errorf("diff with the limit at 2 listed %d times, want fewer than the %d of the whole walk", snap.n, full)
-	}
-}
-
-// A switch's diff holds model.MaxSwitchedPaths paths, plus one for each
-// overlay entry, which can cover a path the log then skips. Here one of
-// model.MaxSwitchedPaths+1 changed paths is covered, so the switch logs the
-// rest one by one.
+// A switch's diff holds the overlay's cap of paths, here 3, plus one for each
+// overlay entry, which can cover a path the log then skips. Here two entries
+// cover changed paths, so a switch that changes 5 paths logs 3. Past 5 the
+// diff stops its walk, and the switch gives the overlay a new instance.
 func TestSwitchGenerationDiffsAsFarAsTheOverlayCanLog(t *testing.T) {
-	keep := baseFile("keep.txt", "keep", 0o100644)
-	f := newCacheFixture(t, keep)
-	writeOverlayFile(t, f.resolver.Overlay, "f000000", "covered")
-	if err := f.resolver.Overlay.FlushFile(f.ctx, "f000000"); err != nil {
-		t.Fatal(err)
-	}
-	nodes := []model.BaseNode{baseDir(".", "root"), keep}
-	for i := range model.MaxSwitchedPaths + 1 {
-		nodes = append(nodes, baseFile(fmt.Sprintf("f%06d", i), "new", 0o100644))
-	}
-	gen, err := f.snap.PublishGeneration(f.ctx, "head", "main", nodes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	before := f.changesSince(0)
-	if _, err := f.resolver.SwitchGeneration(f.ctx, gen, 0); err != nil {
-		t.Fatal(err)
-	}
-	after := f.changesSince(before.Seq)
-	if after.Instance != before.Instance {
-		t.Error("switch gave the overlay a new instance, want the paths logged")
-	}
-	if want := model.MaxSwitchedPaths; len(after.Paths) != want || after.Paths[0] != "f000001" || after.Paths[want-1] != fmt.Sprintf("f%06d", want) {
-		t.Errorf("logged %d paths, want f000001 through f%06d", len(after.Paths), want)
+	const maxPaths, covered, dirs = 3, 2, 10
+	for _, tt := range []struct {
+		name    string
+		changed int
+		renews  bool
+	}{
+		{"one below the cap plus the entries", maxPaths + covered - 1, false},
+		{"at the cap plus the entries", maxPaths + covered, false},
+		{"one past the cap plus the entries", maxPaths + covered + 1, true},
+		{"far past the cap plus the entries", dirs, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var before, after []model.BaseNode
+			var want []string
+			for i := range dirs {
+				dir, blob := fmt.Sprintf("d%d", i), "a"
+				before = append(before, baseDir(dir, dir+"-a"), baseFile(dir+"/f", "a", 0o100644))
+				if i < tt.changed {
+					blob = "b"
+					if i >= covered {
+						want = append(want, dir+"/f")
+					}
+				}
+				after = append(after, baseDir(dir, dir+"-"+blob), baseFile(dir+"/f", blob, 0o100644))
+			}
+			f := newCacheFixture(t, before...)
+			f.ov.MaxSwitchedPaths = maxPaths
+			for i := range covered {
+				path := fmt.Sprintf("d%d/f", i)
+				writeOverlayFile(t, f.ov, path, "covered")
+				if err := f.ov.FlushFile(f.ctx, path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gen := f.publish(after...)
+			listings := &countingListings{SnapshotStore: f.snap}
+			f.resolver.Snapshot = listings
+			logged := f.changesSince(0)
+			if _, err := f.resolver.SwitchGeneration(f.ctx, gen, 0); err != nil {
+				t.Fatal(err)
+			}
+			got := f.changesSince(logged.Seq)
+			if renewed := got.Instance != logged.Instance; renewed != tt.renews {
+				t.Errorf("instance renewed = %v, want %v", renewed, tt.renews)
+			}
+			if tt.renews {
+				want = nil
+			}
+			if !slices.Equal(got.Paths, want) {
+				t.Errorf("logged %q, want %q", got.Paths, want)
+			}
+			// A whole walk lists the root and each changed directory in both
+			// generations, then the old root once more.
+			if whole := 2 + 2*tt.changed + 1; tt.changed == dirs && listings.n >= whole {
+				t.Errorf("diff listed %d times, want fewer than the %d of the whole walk", listings.n, whole)
+			}
+		})
 	}
 }
 

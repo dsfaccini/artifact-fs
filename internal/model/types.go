@@ -351,9 +351,9 @@ type SnapshotStore interface {
 	ListChildren(generation int64, parentPath string) ([]BaseNode, error)
 }
 
-// MaxSwitchedPaths is the most paths one log of a switch writes. Past it, the
-// overlay gives its database a new instance instead, so Git rescans the work
-// tree. The reconcile logs while every FUSE op on the mount waits on the
+// MaxSwitchedPaths is the most paths one log of a switch writes, the overlay
+// store's default cap. Past it, the overlay gives its database a new instance
+// instead, so Git rescans the work tree. The reconcile logs while every FUSE op on the mount waits on the
 // transition lock, unrelated reads included: on Linux about 2.2 µs a path at
 // 10,000 paths and 2.8 µs at 100,000, so up to 0.28 s at this cap. The log
 // after the kernel invalidations, and on FSKit the one after the kernel's
@@ -403,6 +403,10 @@ type OverlayStore interface {
 	// CountEntries returns the number of entries of any kind, counting at
 	// most limit.
 	CountEntries(ctx context.Context, limit int) (int, error)
+	// SwitchedPathsLimit returns the most changed paths a switch's diff can
+	// hold while its log may still write each path one by one: the store's
+	// cap, plus one for each entry, which can cover a path.
+	SwitchedPathsLimit(ctx context.Context) (int, error)
 }
 
 type Hydrator interface {
