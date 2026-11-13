@@ -256,7 +256,12 @@ func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.Repo
 // The hook is the link FSMonitorHookLink returns, which Git runs without a
 // shell. Git runs a path with a shell metacharacter through sh -c unquoted,
 // and sh splits it, so for such a link path the hook is the script at
-// <git dir>/hooks/artifact-fs-fsmonitor, which quotes the state root.
+// <git dir>/hooks/artifact-fs-fsmonitor, which quotes the state root. The
+// hook is the script also when privateAncestors finds a directory above the
+// state root that another user can rename. Git then runs a file in the git
+// dir, and the hook refuses a state root that another user put in its place.
+// A git dir under the state root, the default for a clone, lies under the
+// same directories, so there the script protects nothing more.
 func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfig, stateRoot string) error {
 	configArgs := []string{"config"}
 	if repo.AdoptGitDir {
@@ -267,7 +272,7 @@ func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfi
 		return err
 	}
 	hookPath := FSMonitorHookLink(stateRoot, repo.ID)
-	if strings.ContainsAny(hookPath, gitShellMeta) {
+	if strings.ContainsAny(hookPath, gitShellMeta) || !privateAncestors(stateRoot) {
 		hookPath = fsmonitorHookPath(repo.GitDir)
 		if err := os.MkdirAll(filepath.Dir(hookPath), 0o755); err != nil {
 			return err
