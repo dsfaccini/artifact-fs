@@ -79,7 +79,7 @@ func TestReconfiguringTheFSMonitorHookLeavesTheOpenHookWhole(t *testing.T) {
 	}
 
 	renaming := false
-	store.testHookBeforeHookRename = func(path string) {
+	store.testHookBeforeHookRename = func(path, _ string) {
 		renaming = true
 		current, err := os.Stat(path)
 		if err != nil {
@@ -132,9 +132,13 @@ func TestReconfiguringTheFSMonitorHookLinkLeavesALink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	renaming := false
-	store.testHookBeforeHookRename = func(path string) {
+	store.testHookBeforeHookRename = func(path, staged string) {
 		renaming = true
 		current, err := os.Lstat(path)
 		if err != nil {
@@ -142,16 +146,15 @@ func TestReconfiguringTheFSMonitorHookLinkLeavesALink(t *testing.T) {
 		} else if !os.SameFile(before, current) {
 			t.Error("the hook path left the old link before the new one was renamed over it")
 		}
+		if target, err := os.Readlink(staged); err != nil || target != exe {
+			t.Errorf("new link before the rename = %q, %v; want a link to %q", target, err, exe)
+		}
 	}
 	if err := store.ConfigureFSMonitorHook(t.Context(), cfg, tmp); err != nil {
 		t.Fatal(err)
 	}
 	if !renaming {
 		t.Fatal("reconfiguring made the link without a rename over it")
-	}
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
 	}
 	if target, err := os.Readlink(link); err != nil || target != exe {
 		t.Fatalf("hook link = %q, %v; want a link to %q", target, err, exe)

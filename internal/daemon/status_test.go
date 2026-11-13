@@ -534,9 +534,6 @@ func hookAnswer(t *testing.T, svc *Service, since string) ([]byte, string, []str
 	return out.Bytes(), fields[0], fields[1:]
 }
 
-// FSMonitorHook reads the state root without a Controller. It must answer
-// what the hook answers from a Controller's registry, which New opened and
-// migrated, for every token Git can hold.
 // Git runs a core.fsmonitor path that holds a shell metacharacter through
 // sh -c unquoted, and sh splits it. Under such a state root the hook stays the
 // script in the git dir, which quotes the root, so Git runs the hook under
@@ -574,23 +571,33 @@ func TestGitRunsTheFSMonitorHookUnderEveryStateRoot(t *testing.T) {
 			if tc.link {
 				want = gitstore.FSMonitorHookLink(svc.root, cfg.ID)
 			}
-			hook := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "config", "--get", "core.fsmonitor"))
-			if hook != want {
+			if hook := requireGitRunsFSMonitorHook(t, worktree); hook != want {
 				t.Fatalf("core.fsmonitor = %q, want %q", hook, want)
-			}
-			status := exec.Command("git", "-C", worktree, "status", "--short")
-			status.Env = append(os.Environ(), "GIT_TRACE_FSMONITOR=1")
-			out, err := status.CombinedOutput()
-			if err != nil {
-				t.Fatalf("git status: %v\n%s", err, out)
-			}
-			if ran := "fsmonitor process '" + hook + "' returned success"; !strings.Contains(string(out), ran) {
-				t.Fatalf("git status trace lacks %q:\n%s", ran, out)
 			}
 		})
 	}
 }
 
+// requireGitRunsFSMonitorHook fails t unless git status in worktree runs its
+// core.fsmonitor hook with success, and returns the hook's path.
+func requireGitRunsFSMonitorHook(t *testing.T, worktree string) string {
+	t.Helper()
+	hook := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "config", "--get", "core.fsmonitor"))
+	status := exec.Command("git", "-C", worktree, "status", "--short")
+	status.Env = append(os.Environ(), "GIT_TRACE_FSMONITOR=1")
+	out, err := status.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git status: %v\n%s", err, out)
+	}
+	if ran := "fsmonitor process '" + hook + "' returned success"; !strings.Contains(string(out), ran) {
+		t.Fatalf("git status trace lacks %q:\n%s", ran, out)
+	}
+	return hook
+}
+
+// FSMonitorHook reads the state root without a Controller. It must answer
+// what the hook answers from a Controller's registry, which New opened and
+// migrated, for every token Git can hold.
 func TestFSMonitorHookAnswersWhatAControllerReads(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

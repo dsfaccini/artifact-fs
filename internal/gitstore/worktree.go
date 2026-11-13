@@ -313,7 +313,7 @@ func (s *Store) replaceExecutable(path, script string) error {
 		err = os.Chmod(tmp, 0o755)
 	}
 	if err == nil && s.testHookBeforeHookRename != nil {
-		s.testHookBeforeHookRename(path)
+		s.testHookBeforeHookRename(path, tmp)
 	}
 	if err == nil {
 		err = os.Rename(tmp, path)
@@ -341,7 +341,7 @@ func (s *Store) replaceLink(path, target string) error {
 		return err
 	}
 	if s.testHookBeforeHookRename != nil {
-		s.testHookBeforeHookRename(path)
+		s.testHookBeforeHookRename(path, link)
 	}
 	return os.Rename(link, path)
 }
@@ -362,6 +362,12 @@ const fsmonitorHookLinkName = "fsmonitor-hook"
 // state root and the repo from it with ParseFSMonitorHookLink.
 func FSMonitorHookLink(stateRoot string, id model.RepoID) string {
 	return filepath.Join(stateRoot, "overlays", string(id), fsmonitorHookLinkName)
+}
+
+// fsmonitorHookLinkPattern returns an extended regular expression that
+// matches every path ParseFSMonitorHookLink accepts with id.
+func fsmonitorHookLinkPattern(id model.RepoID) string {
+	return "/(.*/)?overlays/" + regexp.QuoteMeta(string(id)) + "/" + fsmonitorHookLinkName
 }
 
 // ParseFSMonitorHookLink returns the state root and the repo ID of the hook
@@ -385,17 +391,17 @@ func ParseFSMonitorHookLink(path string) (stateRoot string, id model.RepoID, ok 
 // successful adoption does not come back, because adoption overwrote it. The
 // core.worktree and core.bare pins stay, because they match the registered
 // worktree. extensions.worktreeConfig stays on because sibling worktrees may
-// now keep their own settings in config.worktree. It unsets the hook link
-// under stateRoot and the hook script in the git dir, which an older
-// artifact-fs or a link path with a shell metacharacter leaves.
-func (s *Store) ReleaseAdoptedWorktree(ctx context.Context, repo model.RepoConfig, stateRoot string) error {
+// now keep their own settings in config.worktree. It unsets the hook script
+// in the git dir and a hook link for the repo's ID under any state root, so
+// it also unsets a link the mount made before the state root moved.
+func (s *Store) ReleaseAdoptedWorktree(ctx context.Context, repo model.RepoConfig) error {
 	// --worktree resolves to this file, but fails once the extension is off.
 	worktreeConfig := filepath.Join(repo.GitDir, "config.worktree")
 	if _, err := os.Stat(worktreeConfig); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	for _, pin := range [][2]string{
-		{"core.fsmonitor", "^(" + regexp.QuoteMeta(FSMonitorHookLink(stateRoot, repo.ID)) + "|" + regexp.QuoteMeta(fsmonitorHookPath(repo.GitDir)) + ")$"},
+		{"core.fsmonitor", "^(" + fsmonitorHookLinkPattern(repo.ID) + "|" + regexp.QuoteMeta(fsmonitorHookPath(repo.GitDir)) + ")$"},
 		{"fsmonitor.allowRemote", "^true$"},
 		{"core.filemode", "^true$"},
 		{"core.ignorecase", "^false$"},

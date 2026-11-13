@@ -142,9 +142,10 @@ holds a space or another shell metacharacter through `sh -c`, which splits it.
 For such a link path the hook is a script at
 `<git dir>/hooks/artifact-fs-fsmonitor` instead, which works only when the git
 dir's path holds no such character. A state
-root may be a symlink the current user owns. ArtifactFS resolves it at startup
-and builds the paths of repos it registers from the resolved path. Repos
-registered before that keep the paths they stored.
+root may be a symlink the current user owns, or a path relative to the current
+directory. ArtifactFS makes it absolute and resolves it at startup, and builds
+the paths of repos it registers from the resolved path. Repos registered before
+that keep the paths they stored.
 
 The daemon keeps its SSH wrapper in `config/tmp/daemon` and empties that
 directory when it starts. Other CLI commands keep theirs in `config/tmp`, and

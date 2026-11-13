@@ -410,6 +410,62 @@ func TestRemoveRepoRestoresAdoptedWorktreeFilesystemConfig(t *testing.T) {
 	}
 }
 
+// The mount wrote the hook link under the state root it resolved then. After
+// the root moved and a symlink took its old path, remove-repo resolves the
+// root to the new path, and still unsets the link the mount wrote.
+func TestRemoveRepoUnsetsTheHookLinkAfterTheStateRootMoved(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
+	runCmd(t, "git", "init", "--initial-branch=main", source)
+	commitFile(t, source, "README.md", "base\n")
+	runCmd(t, "git", "-C", source, "worktree", "add", "-b", "topic", worktree)
+	gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
+	root := filepath.Join(dir, "state")
+	svc, err := New(ctx, root, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
+	err = svc.ctl().AddRepo(ctx, cfg)
+	var stored model.RepoConfig
+	if err == nil {
+		stored, err = svc.registry.GetRepo(ctx, cfg.Name)
+	}
+	if err == nil {
+		err = svc.git.ConfigureFSMonitorHook(ctx, stored, svc.root)
+	}
+	if closeErr := svc.Close(); err != nil || closeErr != nil {
+		t.Fatalf("configure the hook: %v, close: %v", err, closeErr)
+	}
+	worktreeConfig := filepath.Join(gitDir, "config.worktree")
+	if got, want := strings.TrimSpace(runCmdOutput(t, "git", "config", "--file", worktreeConfig, "--get", "core.fsmonitor")), gitstore.FSMonitorHookLink(root, stored.ID); got != want {
+		t.Fatalf("core.fsmonitor = %q, want %q", got, want)
+	}
+	moved := filepath.Join(dir, "moved")
+	if err := os.Rename(root, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(moved, root); err != nil {
+		t.Fatal(err)
+	}
+	ctl, err := NewController(ctx, root, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctl.Close()
+	if err := ctl.RemoveRepo(ctx, cfg.Name); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "config", "--file", worktreeConfig, "--get", "core.fsmonitor").Output(); err == nil {
+		t.Fatalf("core.fsmonitor = %q after remove-repo, want it unset", out)
+	}
+}
+
 // remove-repo unsets only the values adoption pins, so an adoption that
 // failed before it wrote any leaves the worktree's own config.worktree alone.
 func TestRemoveRepoAfterFailedAdoptionKeepsWorktreeConfig(t *testing.T) {

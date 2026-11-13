@@ -34,8 +34,9 @@ type Store struct {
 	// making a wrapper's directory and writing the wrapper.
 	testHookSSHWrapperDirMade func(dir string)
 	// testHookBeforeHookRename, when set, runs in replaceExecutable and
-	// replaceLink between writing the new hook and renaming it over path.
-	testHookBeforeHookRename func(path string)
+	// replaceLink between writing the new hook at staged and renaming it over
+	// path.
+	testHookBeforeHookRename func(path, staged string)
 	// testHookBetweenHEADReads, when set, runs in ResolveHEAD between its
 	// read of HEAD's ref and its read of HEAD's commit.
 	testHookBetweenHEADReads func()
