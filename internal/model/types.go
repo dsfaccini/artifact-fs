@@ -353,17 +353,18 @@ type SnapshotStore interface {
 
 // MaxSwitchedPaths is the most paths one log of a switch writes, the overlay
 // store's default cap. Past it, the overlay gives its database a new instance
-// instead, so Git rescans the work tree. The reconcile logs while every FUSE op on the mount waits on the
-// transition lock, unrelated reads included: on Linux about 2.2 µs a path at
-// 10,000 paths and 2.8 µs at 100,000, so up to 0.28 s at this cap. The log
-// after the kernel invalidations, and on FSKit the one after the kernel's
-// cache expires, each hold the overlay database's write lock about as long,
-// so writes through the mount wait on busy_timeout. A rescan after a remount
-// is cold: Git opens and hashes every tracked file whose stat data it cannot
-// trust. In a pydantic-ai mount of 5,975 files that took git status 2.05 s
-// with every blob cached, 0.34 ms a file, and 11 minutes while it fetched
-// every blob. Logging a path costs about a 120th of what a cold rescan costs
-// a file, so the cap only bounds how long ops wait.
+// instead, so Git rescans the work tree. The reconcile logs while every FUSE
+// op on the mount waits on the transition lock, unrelated reads included: on
+// Linux about 2.2 µs a path at 10,000 paths and 2.8 µs at 100,000, so up to
+// 0.28 s at this cap. The log after the kernel invalidations, and on FSKit the
+// one after the kernel's cache expires, each hold the overlay database's write
+// lock about as long, so writes through the mount wait on busy_timeout. A
+// rescan after a remount is cold: Git opens and hashes every tracked file
+// whose stat data it cannot trust. In a pydantic-ai mount of 5,975 files that
+// took git status 2.05 s with every blob cached, 0.34 ms a file, and
+// 11 minutes while it fetched every blob. Logging a path costs about a 120th
+// of what a cold rescan costs a file, so the cap only bounds how long ops
+// wait.
 const MaxSwitchedPaths = 100_000
 
 // SwitchedPaths names the paths whose base a generation switch changes.
