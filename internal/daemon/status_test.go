@@ -1345,6 +1345,23 @@ func TestAsyncRepoFirstSwitchKeepsTheInstance(t *testing.T) {
 	if after := instance(); after != atReady {
 		t.Errorf("instance after the first switch = %s, want %s from before it", after, atReady)
 	}
+	// The switch ran: its reconcile recorded the generation the preparation
+	// published, and the activation after it recorded the repo ready.
+	stored, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := runningRuntime(svc, stored.ID)
+	if stored.PrepareState != model.PrepareStateReady || rt == nil {
+		t.Fatalf("after the preparation: prepare state %q, running %v; want ready and running", stored.PrepareState, rt != nil)
+	}
+	_, _, published, err := rt.snapshot.ReadState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if served, err := rt.overlay.ServedGeneration(ctx); err != nil || served != published || published == 0 {
+		t.Errorf("served generation = %d, %v; want the published generation %d", served, err, published)
+	}
 }
 
 // The runtime of an async repo with a preparation pending starts behind its
