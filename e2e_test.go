@@ -1336,6 +1336,9 @@ func TestE2EVerifiedSource(t *testing.T) {
 	if got := readFileStr(t, filepath.Join(mountPath, "local-only.txt")); got != "overlay\n" {
 		t.Fatalf("local overlay after restart = %q", got)
 	}
+	// Nothing logged what changed while no daemon served the repo, so the
+	// first query after the restart gets a rescan.
+	gitCmd(t, mountPath, "status", "--short")
 	assertGitStatus(t, mountPath, map[string]string{
 		"README.md":      "M ",
 		"local-only.txt": "A ",
