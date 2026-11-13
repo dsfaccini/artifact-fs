@@ -52,8 +52,9 @@ func TestOpenDBConfiguresEveryConnection(t *testing.T) {
 
 // A walk by 16 threads keeps up to maxIdleConns queries in flight per
 // database. The next burst of queries runs on the same connections, so no
-// query pays for a new connection's pragmas and schema read. A temporary table lives only on the connection that
-// created it, so it marks a connection that the pool kept.
+// query pays for a new connection's pragmas and schema read. A temporary
+// table lives only on the connection that created it, so it marks a
+// connection that the pool kept.
 func TestOpenDBKeepsTheConnectionsOfConcurrentQueries(t *testing.T) {
 	db, err := OpenDB(filepath.Join(t.TempDir(), "meta.sqlite"))
 	if err != nil {
