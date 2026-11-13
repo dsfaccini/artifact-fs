@@ -156,7 +156,7 @@ func (f *cacheFixture) publish(nodes ...model.BaseNode) int64 {
 // switchTo publishes nodes and switches the mount's resolver to them.
 func (f *cacheFixture) switchTo(nodes ...model.BaseNode) {
 	f.t.Helper()
-	if err := f.resolver.SwitchGeneration(f.ctx, f.publish(nodes...), 0); err != nil {
+	if _, err := f.resolver.SwitchGeneration(f.ctx, f.publish(nodes...), 0); err != nil {
 		f.t.Fatal(err)
 	}
 }
@@ -226,7 +226,7 @@ func TestSwitchGenerationFromAnEmptyTreeRenewsTheInstance(t *testing.T) {
 	f := newCacheFixture(t)
 	before := f.changesSince(0)
 	gen := f.publish(baseFile("a.txt", "a", 0o100644))
-	if err := f.resolver.SwitchGeneration(f.ctx, gen, 0); err != nil {
+	if _, err := f.resolver.SwitchGeneration(f.ctx, gen, 0); err != nil {
 		t.Fatal(err)
 	}
 	after := f.changesSince(before.Seq)
@@ -327,6 +327,80 @@ func TestEntryOpsMoveTheTimesOfTheDirectoriesTheyChange(t *testing.T) {
 	}
 }
 
+// failingListingOf fails every listing of generation gen.
+type failingListingOf struct {
+	model.SnapshotStore
+	gen int64
+}
+
+func (s failingListingOf) ListChildren(gen int64, dir string) ([]model.BaseNode, error) {
+	if gen == s.gen {
+		return nil, errors.New("injected listing failure")
+	}
+	return s.SnapshotStore.ListChildren(gen, dir)
+}
+
+// A switch whose diff fails still switches, and gives the overlay a new
+// instance so that Git rescans.
+func TestSwitchGenerationWhoseDiffFailsRenewsTheInstance(t *testing.T) {
+	f := newCacheFixture(t, baseFile("a.txt", "a1", 0o100644))
+	before := f.changesSince(0)
+	from := f.resolver.Generation()
+	gen := f.publish(baseFile("a.txt", "a2", 0o100644))
+	f.resolver.Snapshot = failingListingOf{SnapshotStore: f.snap, gen: from}
+	if _, err := f.resolver.SwitchGeneration(f.ctx, gen, 0); err != nil {
+		t.Fatal(err)
+	}
+	after := f.changesSince(before.Seq)
+	if after.Instance == before.Instance || len(after.Paths) != 0 {
+		t.Errorf("change log after the switch = instance %s, paths %q; want a new instance and no paths", after.Instance, after.Paths)
+	}
+	if got := f.resolver.Generation(); got != gen {
+		t.Errorf("generation after the switch = %d, want %d", got, gen)
+	}
+}
+
+// A switch logs at most maxSwitchedPaths paths one by one. Past that, it gives
+// the overlay a new instance, so Git rescans and the transition lock stays short.
+func TestSwitchGenerationLogsAtMostMaxSwitchedPaths(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		changed int
+		renews  bool
+	}{
+		{"at the cap", maxSwitchedPaths, false},
+		{"past the cap", maxSwitchedPaths + 1, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			keep := baseFile("keep.txt", "keep", 0o100644)
+			f := newCacheFixture(t, keep)
+			nodes := []model.BaseNode{baseDir(".", "root"), keep}
+			for i := range tt.changed {
+				nodes = append(nodes, baseFile(fmt.Sprintf("f%06d", i), "new", 0o100644))
+			}
+			gen, err := f.snap.PublishGeneration(f.ctx, "head", "main", nodes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := f.changesSince(0)
+			if _, err := f.resolver.SwitchGeneration(f.ctx, gen, 0); err != nil {
+				t.Fatal(err)
+			}
+			after := f.changesSince(before.Seq)
+			if renewed := after.Instance != before.Instance; renewed != tt.renews {
+				t.Errorf("instance renewed = %v, want %v", renewed, tt.renews)
+			}
+			if want := tt.changed; tt.renews {
+				if len(after.Paths) != 0 {
+					t.Errorf("logged %d paths, want none", len(after.Paths))
+				}
+			} else if len(after.Paths) != want || after.Paths[0] != "f000000" || after.Paths[want-1] != fmt.Sprintf("f%06d", want-1) {
+				t.Errorf("logged %d paths, want f000000 through f%06d", len(after.Paths), want-1)
+			}
+		})
+	}
+}
+
 // Memory holds the listing changes a mount records, so every directory reports
 // a ctime no earlier than the mount's start. A listing change from before a
 // restart then still changes the directory's stat data. Its mtime stays.
@@ -387,7 +461,7 @@ func TestSwitchMovesTheTimesOfTheDirectoriesWhoseListingItChanges(t *testing.T) 
 		baseDir("e", "e2"), baseFile("e/b.txt", "b2", 0o100644),
 		baseDir("g", "g2"), baseDir("g/k", "k"), baseFile("g/k/z.txt", "z", 0o100644),
 	)
-	if err := f.resolver.SwitchGeneration(f.ctx, gen, commitTime); err != nil {
+	if _, err := f.resolver.SwitchGeneration(f.ctx, gen, commitTime); err != nil {
 		t.Fatal(err)
 	}
 	for name, want := range map[string]bool{"d": true, "e": false, "g": true} {
@@ -406,7 +480,7 @@ func TestSwitchFromAnEmptyTreeMovesEveryDirectorysCtime(t *testing.T) {
 	f := newCacheFixture(t)
 	f.resolver.SetCommitTime(commitTime)
 	start := time.Now()
-	if err := f.resolver.SwitchGeneration(f.ctx, f.publish(dirTimesNodes...), commitTime); err != nil {
+	if _, err := f.resolver.SwitchGeneration(f.ctx, f.publish(dirTimesNodes...), commitTime); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.dirTimes(fuseops.RootInodeID, "d"); got[1] < start.UnixNano() {

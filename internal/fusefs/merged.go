@@ -135,31 +135,34 @@ func (r *Resolver) CommitTime() int64       { return r.commitTime.Load() }
 // The overlay logs the paths the switch changed for the fsmonitor hook. A
 // HEAD move need not write the work tree, so the hook is how Git learns of
 // them.
-func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime int64) error {
+func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime int64) (Switch, error) {
 	baseLookup := func(path string) (model.BaseNode, bool, error) {
 		return r.Snapshot.LookupNode(ctx, gen, path)
 	}
 	r.switchMu.Lock()
 	defer r.switchMu.Unlock()
-	var switched model.SwitchedPaths
+	sw := Switch{Replaced: r.Generation()}
 	var listings []string
-	if from := r.Generation(); from != 0 && from != gen {
-		paths, dirs, ok, err := r.SwitchedPaths(from, gen)
-		if err != nil {
-			return err
-		}
-		switched = model.SwitchedPaths{Paths: paths, Unknown: !ok}
-		listings = dirs
+	if sw.Replaced != 0 && sw.Replaced != gen {
+		sw.Changed, listings = r.SwitchedPaths(sw.Replaced, gen)
 	}
-	return r.Overlay.ReconcileChecked(ctx, baseLookup, switched, &r.transition, func() {
+	return sw, r.Overlay.ReconcileChecked(ctx, baseLookup, sw.Changed, &r.transition, func() {
 		r.SetCommitTime(commitTime)
 		r.SetGeneration(gen)
-		if switched.Unknown {
+		if sw.Changed.Unknown {
 			r.SetDirFloor(time.Now())
 		} else {
 			r.listingChanged(listings...)
 		}
 	})
+}
+
+// Switch is what one SwitchGeneration did.
+type Switch struct {
+	// Replaced is the generation readers resolved against before the switch.
+	Replaced int64
+	// Changed is what the switch gave the overlay to log.
+	Changed model.SwitchedPaths
 }
 
 type ResolvedNode struct {
@@ -471,26 +474,43 @@ func (r *Resolver) ChangedPaths(from, to int64, paths []string) (changed map[str
 	return changed, true, nil
 }
 
+// maxSwitchedPaths is the most changed paths a switch logs one by one. Past
+// it, a new instance makes Git rescan the work tree instead. The overlay logs
+// the paths while every FUSE op waits on the transition lock, at about 2.2 µs
+// a path on Linux, so the cap holds that wait near 22 ms. A rescan costs Git
+// little more than the paths' lstats: in a pydantic-ai mount, git status took
+// 96 ms with a rescan and 102 ms with an empty change list, because listing
+// the directories for untracked files dominates both.
+const maxSwitchedPaths = 10_000
+
 // SwitchedPaths returns every path whose base type, mode or blob differs
 // between generations from and to, and every path only one of them holds. It
-// also returns listings, each directory that gained, lost or retyped an
-// entry. It lists both generations' children of each directory whose tree ID
-// differs and of each directory only one of them holds. ok is false when from
-// holds no root entries, as for an empty tree or after a prune.
-func (r *Resolver) SwitchedPaths(from, to int64) (paths, listings []string, ok bool, err error) {
-	descend := func(dirs []string, dir string) []string { return append(dirs, dir) }
+// lists both generations' children of each directory whose tree ID differs and
+// of each directory only one of them holds. The result is Unknown, with no
+// paths, when from holds no root entries, as for an empty tree or after a
+// prune, when a listing fails, or when more than maxSwitchedPaths paths
+// changed. listings holds each directory that gained, lost or retyped an
+// entry, and nothing when the result is Unknown.
+func (r *Resolver) SwitchedPaths(from, to int64) (switched model.SwitchedPaths, listings []string) {
+	var paths []string
+	descend := func(dirs []string, dir string) []string {
+		if len(paths) > maxSwitchedPaths {
+			return nil
+		}
+		return append(dirs, dir)
+	}
 	mark := func(p string, listing bool) {
 		paths = append(paths, p)
 		if listing {
 			listings = append(listings, parentDir(p))
 		}
 	}
-	if ok, err := r.diff(from, to, mark, descend); !ok {
-		return nil, nil, false, err
+	if ok, _ := r.diff(from, to, mark, descend); !ok || len(paths) > maxSwitchedPaths {
+		return model.SwitchedPaths{Unknown: true}, nil
 	}
 	slices.Sort(paths)
 	slices.Sort(listings)
-	return paths, slices.Compact(listings), true, nil
+	return model.SwitchedPaths{Paths: paths}, slices.Compact(listings)
 }
 
 // diff walks down from the root of generations from and to. For each

@@ -1165,8 +1165,8 @@ func (s *Store) SetMode(ctx context.Context, path string, mode uint32) error {
 //
 // The apply phase logs each of switched's paths that no overlay entry covers,
 // because the merged view shows the new base there. When switched is Unknown,
-// it gives the database a new instance instead, so the fsmonitor hook makes
-// Git rescan the work tree.
+// it gives the database a new instance instead, so the fsmonitor hook answers
+// every earlier token with a rescan.
 func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path string) (model.BaseNode, bool, error), switched model.SwitchedPaths, lock sync.Locker, switchBase func()) error {
 	// A reconcile's own changes reach the change log only in part, so one
 	// reconcile must not plan while another applies.
@@ -1291,19 +1291,15 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 	}
 	// An entry shows the same content before and after the switch, unless the
 	// plan removed a delete marker over a base path, which revealed holds.
-	logged := revealed
-	for _, path := range switched.Paths {
-		if _, covered := slices.BinarySearchFunc(entries, path, func(e model.OverlayEntry, p string) int { return strings.Compare(e.Path, p) }); !covered {
-			logged = append(logged, path)
-		}
+	covered := func(path string) bool {
+		_, found := slices.BinarySearchFunc(entries, path, func(e model.OverlayEntry, p string) int { return strings.Compare(e.Path, p) })
+		return found
 	}
-	if err := resumeChangeLog(ctx, tx, logged...); err != nil {
+	if err := resumeChangeLog(ctx, tx, revealed...); err != nil {
 		return nil, err
 	}
-	if switched.Unknown {
-		if _, err := tx.ExecContext(ctx, `UPDATE overlay_instance SET id = lower(hex(randomblob(16)))`); err != nil {
-			return nil, err
-		}
+	if err := logSwitched(ctx, tx, switched, covered); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -1571,6 +1567,64 @@ func resumeChangeLog(ctx context.Context, tx *sql.Tx, paths ...string) error {
 			return err
 		}
 	}
+	return logChanges(ctx, tx, paths...)
+}
+
+// logSwitched logs each of switched's paths that covered rejects, in tx. When
+// switched is Unknown, it gives the database a new instance instead, so the
+// fsmonitor hook answers every earlier token with a rescan.
+func logSwitched(ctx context.Context, tx *sql.Tx, switched model.SwitchedPaths, covered func(path string) bool) error {
+	if switched.Unknown {
+		_, err := tx.ExecContext(ctx, `UPDATE overlay_instance SET id = lower(hex(randomblob(16)))`)
+		return err
+	}
+	var paths []string
+	for _, path := range switched.Paths {
+		if !covered(path) {
+			paths = append(paths, path)
+		}
+	}
+	return logChanges(ctx, tx, paths...)
+}
+
+// LogSwitched logs switched again, as ReconcileChecked does: each of its paths
+// that no overlay entry covers, or a new instance when switched is Unknown.
+// The daemon calls it after the kernel invalidations that follow a switch, so
+// a token issued before them, whose query may have read attributes the kernel
+// cached from the old generation, gets the paths again. It calls it with
+// Unknown when an async repo's runtime starts, because nothing logged what
+// changed while no runtime served the repo.
+func (s *Store) LogSwitched(ctx context.Context, switched model.SwitchedPaths) error {
+	if len(switched.Paths) == 0 && !switched.Unknown {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var entries []string
+	if !switched.Unknown {
+		rows, err := tx.QueryContext(ctx, `SELECT path FROM overlay_entries ORDER BY path`)
+		if err != nil {
+			return err
+		}
+		if entries, err = scanPaths(rows); err != nil {
+			return err
+		}
+	}
+	covered := func(path string) bool {
+		_, found := slices.BinarySearch(entries, path)
+		return found
+	}
+	if err := logSwitched(ctx, tx, switched, covered); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// logChanges logs paths in tx.
+func logChanges(ctx context.Context, tx *sql.Tx, paths ...string) error {
 	if len(paths) == 0 {
 		return nil
 	}

@@ -55,7 +55,7 @@ func cpuTime(b *testing.B) time.Duration {
 func switchGeneration(b *testing.B, r *Resolver, gen int64, cpu *time.Duration) {
 	b.Helper()
 	start := cpuTime(b)
-	if err := r.SwitchGeneration(context.Background(), gen, 0); err != nil {
+	if _, err := r.SwitchGeneration(context.Background(), gen, 0); err != nil {
 		b.Fatal(err)
 	}
 	*cpu += cpuTime(b) - start

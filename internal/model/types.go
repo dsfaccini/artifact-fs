@@ -356,7 +356,8 @@ type SwitchedPaths struct {
 	// Paths holds each path whose base type, mode or blob differs between the
 	// two generations, and each path only one of them holds.
 	Paths []string
-	// Unknown is true when the switch cannot tell which paths changed.
+	// Unknown is true when the switch does not name the paths it changed,
+	// so Git must rescan the work tree.
 	Unknown bool
 }
 
