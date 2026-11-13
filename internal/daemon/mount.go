@@ -122,7 +122,7 @@ func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *pre
 	baseLookup := func(path string) (model.BaseNode, bool, error) {
 		return snap.LookupNode(prepareCtx, gen, path)
 	}
-	if err := ov.ReconcileChecked(prepareCtx, baseLookup, nil, nil); err != nil {
+	if err := ov.ReconcileChecked(prepareCtx, baseLookup, model.SwitchedPaths{}, nil, nil); err != nil {
 		ov.Close()
 		return err
 	}

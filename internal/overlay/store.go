@@ -1162,7 +1162,12 @@ func (s *Store) SetMode(ctx context.Context, path string, mode uint32) error {
 // write changed since the plan read it, and applies the result. Then it calls
 // switchBase to switch the readers to the base baseLookup reads, and releases
 // lock. Either may be nil.
-func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path string) (model.BaseNode, bool, error), lock sync.Locker, switchBase func()) error {
+//
+// The apply phase logs each of switched's paths that no overlay entry covers,
+// because the merged view shows the new base there. When switched is Unknown,
+// it gives the database a new instance instead, so the fsmonitor hook makes
+// Git rescan the work tree.
+func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path string) (model.BaseNode, bool, error), switched model.SwitchedPaths, lock sync.Locker, switchBase func()) error {
 	// A reconcile's own changes reach the change log only in part, so one
 	// reconcile must not plan while another applies.
 	s.reconcileMu.Lock()
@@ -1193,7 +1198,7 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 	if lock != nil {
 		lock.Lock()
 	}
-	removed, err := s.applyReconcile(ctx, r, seq, entries, plan)
+	removed, err := s.applyReconcile(ctx, r, seq, entries, plan, switched)
 	if err == nil && switchBase != nil {
 		switchBase()
 	}
@@ -1213,8 +1218,9 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 	return err
 }
 
-// applyReconcile applies plan and returns the entries it removed.
-func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, entries []model.OverlayEntry, plan reconcilePlan) ([]model.OverlayEntry, error) {
+// applyReconcile applies plan, logs switched, and returns the entries it
+// removed.
+func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, entries []model.OverlayEntry, plan reconcilePlan, switched model.SwitchedPaths) ([]model.OverlayEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.flushAllLocked(ctx); err != nil {
@@ -1249,7 +1255,7 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 			return nil, err
 		}
 	}
-	if len(plan.remove) == 0 && len(plan.update) == 0 {
+	if len(plan.remove) == 0 && len(plan.update) == 0 && len(switched.Paths) == 0 && !switched.Unknown {
 		return nil, nil
 	}
 	var revealed []string
@@ -1283,8 +1289,21 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 			return nil, err
 		}
 	}
-	if err := resumeChangeLog(ctx, tx, revealed...); err != nil {
+	// An entry shows the same content before and after the switch, unless the
+	// plan removed a delete marker over a base path, which revealed holds.
+	logged := revealed
+	for _, path := range switched.Paths {
+		if _, covered := slices.BinarySearchFunc(entries, path, func(e model.OverlayEntry, p string) int { return strings.Compare(e.Path, p) }); !covered {
+			logged = append(logged, path)
+		}
+	}
+	if err := resumeChangeLog(ctx, tx, logged...); err != nil {
 		return nil, err
+	}
+	if switched.Unknown {
+		if _, err := tx.ExecContext(ctx, `UPDATE overlay_instance SET id = lower(hex(randomblob(16)))`); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err

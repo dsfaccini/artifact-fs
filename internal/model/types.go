@@ -351,6 +351,15 @@ type SnapshotStore interface {
 	ListChildren(generation int64, parentPath string) ([]BaseNode, error)
 }
 
+// SwitchedPaths names the paths whose base a generation switch changes.
+type SwitchedPaths struct {
+	// Paths holds each path whose base type, mode or blob differs between the
+	// two generations, and each path only one of them holds.
+	Paths []string
+	// Unknown is true when the switch cannot tell which paths changed.
+	Unknown bool
+}
+
 type OverlayStore interface {
 	Lookup(ctx context.Context, path string) (OverlayEntry, bool, error)
 	EnsureCopyOnWrite(ctx context.Context, repo RepoPaths, path string, base BaseNode) (OverlayEntry, error)
@@ -371,7 +380,7 @@ type OverlayStore interface {
 	Mkdir(ctx context.Context, path string, mode uint32) error
 	SetMode(ctx context.Context, path string, mode uint32) error
 	SetMtime(ctx context.Context, path string, t time.Time) error
-	ReconcileChecked(ctx context.Context, baseLookup func(path string) (BaseNode, bool, error), lock sync.Locker, switchBase func()) error
+	ReconcileChecked(ctx context.Context, baseLookup func(path string) (BaseNode, bool, error), switched SwitchedPaths, lock sync.Locker, switchBase func()) error
 	ListByPrefix(ctx context.Context, prefix string) ([]OverlayEntry, error)
 	// HasEntryBelow reports whether an entry of any kind lies below path.
 	HasEntryBelow(ctx context.Context, path string) (bool, error)

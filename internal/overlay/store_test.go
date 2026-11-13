@@ -2246,5 +2246,5 @@ func reconcile(ctx context.Context, s *Store, lookup func(string) (model.BaseNod
 	return s.ReconcileChecked(ctx, func(path string) (model.BaseNode, bool, error) {
 		n, ok := lookup(path)
 		return n, ok, nil
-	}, nil, nil)
+	}, model.SwitchedPaths{}, nil, nil)
 }
