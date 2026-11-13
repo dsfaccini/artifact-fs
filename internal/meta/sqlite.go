@@ -16,6 +16,19 @@ import (
 
 const busyTimeout = 5 * time.Second
 
+// maxIdleConns is how many connections an OpenDB database keeps open between
+// queries. A mount serves its ops concurrently, each op runs its queries one
+// at a time, and a walk by 16 threads keeps up to 16 queries in flight per
+// database. Past the idle limit database/sql closes each connection a query
+// returns, so the next query opens a new one: it runs the DSN's pragmas and
+// reads the schema again.
+const maxIdleConns = 16
+
+// connMaxIdleTime is how long a connection stays open with no query. Each
+// connection keeps its own page cache, so a daemon whose mounts sit idle gives
+// that memory back, and the next burst opens its connections once.
+var connMaxIdleTime = 30 * time.Second
+
 // testHookAfterWALSwitchBusy, when set, runs in OpenDB after a switch to WAL
 // failed with SQLITE_BUSY, before the retry. The test catches a call that no
 // longer runs or no longer precedes a retry.
@@ -46,6 +59,8 @@ func OpenDB(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxIdleConns(maxIdleConns)
+	db.SetConnMaxIdleTime(connMaxIdleTime)
 	// Switching a new database to WAL upgrades a read lock to a write lock.
 	// SQLite fails an upgrade with SQLITE_BUSY at once, without the busy
 	// handler, so concurrent first opens retry it until busy_timeout.

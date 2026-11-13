@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestOpenDBConfiguresEveryConnection(t *testing.T) {
@@ -45,6 +46,87 @@ func TestOpenDBConfiguresEveryConnection(t *testing.T) {
 		if foreignKeys != 1 {
 			t.Fatalf("foreign_keys = %d, want 1", foreignKeys)
 		}
+	}
+}
+
+// A mount runs up to maxIdleConns queries at once. The next burst of queries
+// runs on the same connections, so no query pays for a new connection's
+// pragmas and schema read. A temporary table lives only on the connection that
+// created it, so it marks a connection that the pool kept.
+func TestOpenDBKeepsTheConnectionsOfConcurrentQueries(t *testing.T) {
+	db, err := OpenDB(filepath.Join(t.TempDir(), "meta.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	ctx := t.Context()
+	burst := func(query func(*sql.Conn) error) {
+		t.Helper()
+		conns := make([]*sql.Conn, maxIdleConns)
+		for i := range conns {
+			if conns[i], err = db.Conn(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, conn := range conns {
+			if err := query(conn); err != nil {
+				t.Fatal(err)
+			}
+			if err := conn.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	burst(func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, `CREATE TEMP TABLE kept (x)`)
+		return err
+	})
+	kept := 0
+	burst(func(conn *sql.Conn) error {
+		var n int
+		err := conn.QueryRowContext(ctx, `SELECT count(*) FROM temp.sqlite_master WHERE name = 'kept'`).Scan(&n)
+		kept += n
+		return err
+	})
+	if kept != maxIdleConns {
+		t.Fatalf("the second burst ran on %d kept connections of %d", kept, maxIdleConns)
+	}
+}
+
+// A connection that runs no query for connMaxIdleTime closes, so an idle
+// daemon gives back each connection's page cache.
+func TestOpenDBClosesIdleConnections(t *testing.T) {
+	saved := connMaxIdleTime
+	connMaxIdleTime = time.Millisecond
+	defer func() { connMaxIdleTime = saved }()
+	db, err := OpenDB(filepath.Join(t.TempDir(), "meta.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	ctx := t.Context()
+	conns := make([]*sql.Conn, 3)
+	for i := range conns {
+		if conns[i], err = db.Conn(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, conn := range conns {
+		if err := conn.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if open := db.Stats().OpenConnections; open != len(conns) {
+		t.Fatalf("%d connections open after the burst, want %d", open, len(conns))
+	}
+	// database/sql's cleaner runs at least a second apart.
+	for db.Stats().OpenConnections != 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if closed := db.Stats().MaxIdleTimeClosed; closed != int64(len(conns)) {
+		t.Fatalf("%d connections closed for idle time, want %d", closed, len(conns))
 	}
 }
 
