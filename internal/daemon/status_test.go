@@ -1161,13 +1161,16 @@ func writeFile(t *testing.T, path, content string) {
 
 // moveHEADWhileDown commits a new README.md to the repo's remote, points the
 // repo's main at it, and writes it to work, as a HEAD move with no daemon
-// leaves the mount to serve. It returns the new commit.
+// leaves the mount to serve. It returns the new commit. The new content has
+// another size: a rewrite of the same size within the second of the index's
+// stat data can leave that stat data matching, so Git takes the file as
+// unchanged with fsmonitor off too.
 func moveHEADWhileDown(t *testing.T, tmp string, cfg model.RepoConfig, work string) string {
 	t.Helper()
-	next := commitFile(t, filepath.Join(tmp, "remote"), "README.md", "next\n")
+	next := commitFile(t, filepath.Join(tmp, "remote"), "README.md", "next commit\n")
 	runCmd(t, "git", "--git-dir", cfg.GitDir, "fetch", "--no-tags", "origin", "main")
 	runCmd(t, "git", "--git-dir", cfg.GitDir, "update-ref", "refs/heads/main", next)
-	writeFile(t, filepath.Join(work, "README.md"), "next\n")
+	writeFile(t, filepath.Join(work, "README.md"), "next commit\n")
 	return next
 }
 

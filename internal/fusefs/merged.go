@@ -70,7 +70,10 @@ func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime i
 	r.switchMu.Lock()
 	defer r.switchMu.Unlock()
 	sw := Switch{Replaced: r.Generation()}
-	if sw.Replaced != gen {
+	// Readers resolved against no generation before the first switch, so
+	// nothing Git saw changes. An async repo's first switch follows the
+	// clean-index bootstrap, whose token a new instance would discard.
+	if sw.Replaced != 0 && sw.Replaced != gen {
 		sw.Changed, sw.DiffErr = SwitchedPaths(r.Snapshot, sw.Replaced, gen)
 	}
 	return sw, r.Overlay.ReconcileChecked(ctx, gen, baseLookup, sw.Changed, &r.transition, func() {
