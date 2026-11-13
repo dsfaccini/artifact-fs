@@ -1273,6 +1273,80 @@ func TestFSMonitorHookRescansAfterARestartFromAPrunedGeneration(t *testing.T) {
 	}
 }
 
+// A start that fails before its reconcile records the new generation as
+// served leaves the generation the overlay served for the next start to diff
+// from. Here the start after a HEAD move fails on a corrupt index, and the
+// one after it, with the index restored, logs README.md.
+func TestFSMonitorHookAfterAStartThatFailedBeforeItsReconcile(t *testing.T) {
+	t.Parallel()
+	tmp := shortTempDir(t)
+	cfg, location, since := acrossARestart(t, tmp, AddRepoOptions{}, func(cfg model.RepoConfig, work string) {
+		moveHEADWhileDown(t, tmp, cfg, work)
+		index := filepath.Join(cfg.GitDir, "index")
+		saved, err := os.ReadFile(index)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, index, "not an index")
+		failing, err := New(t.Context(), filepath.Join(tmp, "artifact-fs"), discardLogger())
+		if err != nil {
+			t.Fatal(err)
+		}
+		failing.mount = fakeMount
+		if err := failing.syncRepos(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		failing.prepareWorkers.Wait()
+		if st, err := failing.ctl().Status(t.Context(), "repo"); err != nil || st.State == repoStateMounted {
+			t.Fatalf("status of the start with a corrupt index = %+v, %v; want it unmounted", st, err)
+		}
+		if err := failing.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(index, saved, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if paths := requireStatusWithFSMonitorOff(t, cfg, location, since, "MM README.md\n"); !slices.Equal(paths, []string{"README.md"}) {
+		t.Errorf("hook answered %q, want README.md", paths)
+	}
+}
+
+// An async repo's first switch, from no generation, follows the clean-index
+// bootstrap and keeps the instance the bootstrap's token names. The gate held
+// every op until then, so nothing Git saw changed.
+func TestAsyncRepoFirstSwitchKeepsTheInstance(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	svc, _ := newDaemonWithRepo(t, shortTempDir(t), AddRepoOptions{Async: true})
+	// instance runs on the preparation's goroutine too, so it never stops
+	// the test.
+	instance := func() string {
+		cfg, err := svc.registry.GetRepo(ctx, "repo")
+		if err != nil {
+			t.Error(err)
+			return ""
+		}
+		changes, ok, err := overlay.ReadChangesSince(ctx, cfg.RepoPaths, 0)
+		if err != nil || !ok {
+			t.Errorf("ReadChangesSince = %v, %v", ok, err)
+		}
+		return changes.Instance
+	}
+	var atReady string
+	svc.readyRecorded = func() { atReady = instance() }
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	svc.prepareWorkers.Wait()
+	if atReady == "" {
+		t.Fatal("the preparation never recorded the repo ready")
+	}
+	if after := instance(); after != atReady {
+		t.Errorf("instance after the first switch = %s, want %s from before it", after, atReady)
+	}
+}
+
 // The runtime of an async repo with a preparation pending starts behind its
 // gate on the snapshot store's current generation, with no reconcile. Here a
 // preparation while the daemon was down published HEAD's new tree and a new

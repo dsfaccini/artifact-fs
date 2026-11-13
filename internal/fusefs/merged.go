@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -181,7 +182,7 @@ func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime i
 	// nothing Git saw changes. An async repo's first switch follows the
 	// clean-index bootstrap, whose token a new instance would discard.
 	if sw.Replaced != 0 && sw.Replaced != gen {
-		sw.Changed, listings, sw.DiffErr = switchedPaths(r.Snapshot, sw.Replaced, gen)
+		sw.Changed, listings, sw.DiffErr = switchedPathsFor(ctx, r.Snapshot, r.Overlay, sw.Replaced, gen)
 	}
 	return sw, r.Overlay.ReconcileChecked(ctx, gen, baseLookup, sw.Changed, &r.transition, func() {
 		r.SetCommitTime(commitTime)
@@ -507,7 +508,11 @@ func (r *Resolver) ChangedPaths(from, to int64, paths []string) (changed map[str
 		}
 		return dirs
 	}
-	if ok, err := diff(r.Snapshot, from, to, func(p string, _ bool) { changed[p] = true }, walk); !ok {
+	mark := func(p string, _ bool) bool {
+		changed[p] = true
+		return true
+	}
+	if ok, err := diff(r.Snapshot, from, to, mark, walk); !ok {
 		return nil, false, err
 	}
 	return changed, true, nil
@@ -519,24 +524,38 @@ func (r *Resolver) ChangedPaths(from, to int64, paths []string) (changed map[str
 // differs and of each directory only one of them holds. The result is
 // Unknown, with no paths, when from holds no root entries, as for an empty
 // tree or a generation that was pruned or never published, and when a listing
-// fails, whose error it returns.
-func SwitchedPaths(snap model.SnapshotStore, from, to int64) (model.SwitchedPaths, error) {
-	switched, _, err := switchedPaths(snap, from, to)
+// fails, whose error it returns. It is Unknown also when more paths changed
+// than ov can log: model.MaxSwitchedPaths, plus one for each of ov's entries,
+// which can cover a path. The walk stops there, so a switch the overlay
+// renews the instance for costs no full diff.
+func SwitchedPaths(ctx context.Context, snap model.SnapshotStore, ov model.OverlayStore, from, to int64) (model.SwitchedPaths, error) {
+	switched, _, err := switchedPathsFor(ctx, snap, ov, from, to)
 	return switched, err
 }
 
-// switchedPaths returns what SwitchedPaths does, and listings, each directory
-// that gained, lost or retyped an entry, which is nil when the result is
-// Unknown.
-func switchedPaths(snap model.SnapshotStore, from, to int64) (switched model.SwitchedPaths, listings []string, err error) {
+// switchedPathsFor returns what SwitchedPaths does, and listings, each
+// directory that gained, lost or retyped an entry, which is nil when the
+// result is Unknown.
+func switchedPathsFor(ctx context.Context, snap model.SnapshotStore, ov model.OverlayStore, from, to int64) (model.SwitchedPaths, []string, error) {
+	entries, err := ov.CountEntries(ctx, math.MaxInt)
+	if err != nil {
+		return model.SwitchedPaths{Unknown: true}, nil, err
+	}
+	return switchedPaths(snap, from, to, model.MaxSwitchedPaths+entries)
+}
+
+// switchedPaths returns what switchedPathsFor does, Unknown once more than
+// limit paths changed.
+func switchedPaths(snap model.SnapshotStore, from, to int64, limit int) (switched model.SwitchedPaths, listings []string, err error) {
 	var paths []string
-	descend := func(dirs []string, dir string) []string { return append(dirs, dir) }
-	mark := func(p string, listing bool) {
+	mark := func(p string, listing bool) bool {
 		paths = append(paths, p)
 		if listing {
 			listings = append(listings, parentDir(p))
 		}
+		return len(paths) <= limit
 	}
+	descend := func(dirs []string, dir string) []string { return append(dirs, dir) }
 	if ok, err := diff(snap, from, to, mark, descend); !ok {
 		return model.SwitchedPaths{Unknown: true}, nil, err
 	}
@@ -548,11 +567,12 @@ func switchedPaths(snap model.SnapshotStore, from, to int64) (switched model.Swi
 // diff walks down from the root of generations from and to of snap. For each
 // directory it lists, it calls mark with each child that the generations give
 // different types, modes or blobs or that only one of them holds, with listing
-// true when only one holds it or its type differs, and walk with
-// each child directory that can hold such children. walk returns the stack of
-// directories to list, with the directory pushed when diff should list it. ok
-// is false when from holds no root entries.
-func diff(snap model.SnapshotStore, from, to int64, mark func(path string, listing bool), walk func(dirs []string, dir string) []string) (ok bool, err error) {
+// true when only one holds it or its type differs, and walk with each child
+// directory that can hold such children. mark returns false to stop the walk.
+// walk returns the stack of directories to list, with the directory pushed
+// when diff should list it. ok is false when from holds no root entries or
+// mark stopped the walk.
+func diff(snap model.SnapshotStore, from, to int64, mark func(path string, listing bool) bool, walk func(dirs []string, dir string) []string) (ok bool, err error) {
 	for dirs := []string{"."}; len(dirs) > 0; {
 		dir := dirs[len(dirs)-1]
 		dirs = dirs[:len(dirs)-1]
@@ -572,14 +592,18 @@ func diff(snap model.SnapshotStore, from, to int64, mark func(path string, listi
 			b, kept := added[a.Path]
 			delete(added, a.Path)
 			if !kept || a.Type != b.Type || a.Mode != b.Mode || baseBlob(a) != baseBlob(b) {
-				mark(a.Path, !kept || a.Type != b.Type)
+				if !mark(a.Path, !kept || a.Type != b.Type) {
+					return false, nil
+				}
 			}
 			if (a.Type == "dir" || kept && b.Type == "dir") && !(kept && sameTree(a, b)) {
 				dirs = walk(dirs, a.Path)
 			}
 		}
 		for _, b := range added {
-			mark(b.Path, true)
+			if !mark(b.Path, true) {
+				return false, nil
+			}
 			if b.Type == "dir" {
 				dirs = walk(dirs, b.Path)
 			}

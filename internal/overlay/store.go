@@ -1168,10 +1168,10 @@ func (s *Store) SetMode(ctx context.Context, path string, mode uint32) error {
 //
 // The apply phase logs each of switched's paths that no overlay entry covers,
 // because the merged view shows the new base there. When switched is Unknown,
-// or names more than maxSwitchedPaths such paths, it gives the database a new
-// instance instead, so the fsmonitor hook answers every earlier token with a
-// rescan. In the same transaction it records gen, the generation baseLookup
-// reads, as the generation the change log is current with.
+// or names more than model.MaxSwitchedPaths such paths, it gives the database
+// a new instance instead, so the fsmonitor hook answers every earlier token
+// with a rescan. In the same transaction it records gen, the generation
+// baseLookup reads, as the generation the change log is current with.
 func (s *Store) ReconcileChecked(ctx context.Context, gen int64, baseLookup func(path string) (model.BaseNode, bool, error), switched model.SwitchedPaths, lock sync.Locker, switchBase func()) error {
 	// A reconcile's own changes reach the change log only in part, so one
 	// reconcile must not plan while another applies.
@@ -1580,21 +1580,10 @@ func resumeChangeLog(ctx context.Context, tx *sql.Tx, paths ...string) error {
 	return logChanges(ctx, tx, paths...)
 }
 
-// maxSwitchedPaths is the most paths one log of a switch writes. Past it, a
-// new instance makes Git rescan the work tree instead. The reconcile logs
-// while every FUSE op waits on the transition lock, about 2.2 µs a path on
-// Linux and 0.28 s for this many. A rescan after a remount is cold: Git opens
-// and hashes every tracked file whose stat data it cannot trust. In a
-// pydantic-ai mount of 5,975 files that took git status 2.05 s with every
-// blob cached, 0.34 ms a file, and 11 minutes while it fetched every blob.
-// Logging a path costs about a 150th of what a cold rescan costs a file, so
-// the cap only bounds how long ops wait.
-const maxSwitchedPaths = 100_000
-
 // logSwitched logs each of switched's paths that covered rejects, in tx. When
-// switched is Unknown, or more than maxSwitchedPaths paths remain to log, it
-// gives the database a new instance instead, so the fsmonitor hook answers
-// every earlier token with a rescan.
+// switched is Unknown, or more than model.MaxSwitchedPaths paths remain to
+// log, it gives the database a new instance instead, so the fsmonitor hook
+// answers every earlier token with a rescan.
 func logSwitched(ctx context.Context, tx *sql.Tx, switched model.SwitchedPaths, covered func(path string) bool) error {
 	var paths []string
 	if !switched.Unknown {
@@ -1604,7 +1593,7 @@ func logSwitched(ctx context.Context, tx *sql.Tx, switched model.SwitchedPaths, 
 			}
 		}
 	}
-	if switched.Unknown || len(paths) > maxSwitchedPaths {
+	if switched.Unknown || len(paths) > model.MaxSwitchedPaths {
 		_, err := tx.ExecContext(ctx, `UPDATE overlay_instance SET id = lower(hex(randomblob(16)))`)
 		return err
 	}

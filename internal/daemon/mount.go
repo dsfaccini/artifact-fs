@@ -103,13 +103,7 @@ func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *pre
 			ov.Close()
 		}
 	}()
-	// Diff before the prune below drops the generation the overlay served.
 	switched := s.switchedSinceServed(prepareCtx, cfg.Name, ov, snap, gen)
-	if err := s.withCurrentPrepare(prepareCtx, cfg, func() error {
-		return s.pruneGenerations(prepareCtx, nil, snap, gen)
-	}); err != nil {
-		return withPreparationPhase(preparePhaseCleanupSnapshot, err)
-	}
 	// attachMount checks this before each mount. Checking it here too
 	// keeps the index of a native worktree untouched.
 	if cfg.AdoptGitDir {
@@ -131,6 +125,14 @@ func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *pre
 	}
 	if err := ov.ReconcileChecked(prepareCtx, gen, baseLookup, switched, nil, nil); err != nil {
 		return err
+	}
+	// Prune only once the reconcile recorded gen as served. A start that
+	// fails or stops before then leaves the served generation for the next
+	// start to diff from.
+	if err := s.withCurrentPrepare(prepareCtx, cfg, func() error {
+		return s.pruneGenerations(prepareCtx, nil, snap, gen)
+	}); err != nil {
+		return withPreparationPhase(preparePhaseCleanupSnapshot, err)
 	}
 	if err := s.bootstrapCleanStatusIndex(prepareCtx, cfg, res.source.Commit, gen, snap, ov); err != nil {
 		return err
@@ -158,7 +160,7 @@ func (s *Service) switchedSinceServed(ctx context.Context, name string, ov *over
 	if served == gen {
 		return model.SwitchedPaths{}
 	}
-	switched, err := fusefs.SwitchedPaths(snap, served, gen)
+	switched, err := fusefs.SwitchedPaths(ctx, snap, ov, served, gen)
 	if err != nil {
 		s.logger.Warn("generation diff failed; Git rescans the work tree", "repo", name, "error", err)
 	}
