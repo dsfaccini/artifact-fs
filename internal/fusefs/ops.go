@@ -377,13 +377,17 @@ func (e *Engine) Attrs(b *Blobs, path string) (Attrs, error) {
 		return Attrs{}, err
 	}
 	if n.FromOverlay {
-		return Attrs{
+		a := Attrs{
 			Mode:  n.Overlay.Mode,
 			Size:  n.Overlay.SizeBytes,
 			Type:  n.Overlay.NodeType(),
 			Mtime: time.Unix(0, n.Overlay.MtimeUnixNs),
 			Ctime: time.Unix(0, n.Overlay.CtimeUnixNs),
-		}, nil
+		}
+		if a.Type == "dir" {
+			a.Mtime, a.Ctime = e.Resolver.dirTimes(model.CleanPath(path), a.Mtime, a.Ctime)
+		}
+		return a, nil
 	}
 	size := n.Base.SizeBytes
 	if (n.Base.Type == "file" || n.Base.Type == "symlink") && n.Base.SizeState != "known" && n.Base.ObjectOID != "" {
@@ -391,18 +395,38 @@ func (e *Engine) Attrs(b *Blobs, path string) (Attrs, error) {
 			return Attrs{}, err
 		}
 	}
-	// Base files use the HEAD commit timestamp for mtime so tools like
-	// make see a stable, meaningful value.
+	mt, ct := baseTime(gen, commitTime), baseTime(gen, commitTime)
+	if n.Base.Type == "dir" {
+		mt, ct = e.Resolver.dirTimes(model.CleanPath(path), mt, ct)
+	}
+	return Attrs{Mode: normalizeMode(n.Base.Mode, n.Base.Type), Size: size, Type: n.Base.Type, Mtime: mt, Ctime: ct, Gen: gen, Blob: baseBlob(n.Base)}, nil
+}
+
+// baseTime is the mtime and ctime of a base entry. Base entries use the HEAD
+// commit timestamp so tools like make see a stable, meaningful value.
+func baseTime(gen, commitTime int64) time.Time {
 	if commitTime == 0 {
 		commitTime = gen // fallback: commit time unavailable
 	}
-	mt := time.Unix(commitTime, 0)
-	return Attrs{Mode: normalizeMode(n.Base.Mode, n.Base.Type), Size: size, Type: n.Base.Type, Mtime: mt, Ctime: mt, Gen: gen, Blob: baseBlob(n.Base)}, nil
+	return time.Unix(commitTime, 0)
 }
 
-// ReadDir lists path with the generation and commit time it listed.
+// ReadDir lists path with the generation and commit time it listed. Each
+// directory entry carries the times Attrs gives it.
 func (e *Engine) ReadDir(ctx context.Context, path string) ([]ReaddirEntry, int64, int64, error) {
-	return e.Resolver.ReaddirSnapshot(ctx, path)
+	entries, gen, commitTime, err := e.Resolver.ReaddirSnapshot(ctx, path)
+	for i, entry := range entries {
+		if entry.Type != "dir" {
+			continue
+		}
+		mt, ct := baseTime(gen, commitTime), baseTime(gen, commitTime)
+		if entry.FromOverlay {
+			mt, ct = time.Unix(0, entry.MtimeUnixNs), time.Unix(0, entry.CtimeUnixNs)
+		}
+		mt, ct = e.Resolver.dirTimes(model.CleanPath(filepath.Join(path, entry.Name)), mt, ct)
+		entries[i].MtimeUnixNs, entries[i].CtimeUnixNs = mt.UnixNano(), ct.UnixNano()
+	}
+	return entries, gen, commitTime, err
 }
 
 // MissingPaths returns those of paths that the merged view lacks. It hydrates
@@ -678,8 +702,11 @@ func (e *Engine) Create(ctx context.Context, path string, mode uint32) error {
 	if err := e.requireAbsent(path); err != nil {
 		return err
 	}
-	_, err := e.Overlay.CreateFile(ctx, path, mode)
-	return err
+	if _, err := e.Overlay.CreateFile(ctx, path, mode); err != nil {
+		return err
+	}
+	e.Resolver.listingChanged(parentDir(path))
+	return nil
 }
 
 // Symlink makes a symlink at path, unless path exists.
@@ -689,8 +716,11 @@ func (e *Engine) Symlink(ctx context.Context, path string, target string) error 
 	if err := e.requireAbsent(path); err != nil {
 		return err
 	}
-	_, err := e.Overlay.CreateSymlink(ctx, path, target)
-	return err
+	if _, err := e.Overlay.CreateSymlink(ctx, path, target); err != nil {
+		return err
+	}
+	e.Resolver.listingChanged(parentDir(path))
+	return nil
 }
 
 // ReadSymlink returns the target of the symlink at path. It reads a base
@@ -750,7 +780,11 @@ func (e *Engine) Unlink(ctx context.Context, b *Blobs, path string, files openFi
 			return err
 		}
 	}
-	return e.Overlay.Remove(ctx, path)
+	if err := e.Overlay.Remove(ctx, path); err != nil {
+		return err
+	}
+	e.Resolver.listingChanged(parentDir(path))
+	return nil
 }
 
 // pinOpenFiles points the open handles on path at its overlay file, if it
@@ -775,6 +809,16 @@ func (e *Engine) pinOpenFiles(ctx context.Context, path string, files openFiles)
 // read it, so that they keep its content. files may be nil when no handle can
 // be open.
 func (e *Engine) Rename(ctx context.Context, b *Blobs, oldPath, newPath string, files openFiles) error {
+	if err := e.rename(ctx, b, oldPath, newPath, files); err != nil {
+		return err
+	}
+	if oldPath, newPath = model.CleanPath(oldPath), model.CleanPath(newPath); oldPath != newPath {
+		e.Resolver.listingChanged(parentDir(oldPath), parentDir(newPath))
+	}
+	return nil
+}
+
+func (e *Engine) rename(ctx context.Context, b *Blobs, oldPath, newPath string, files openFiles) error {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
 	oldPath = model.CleanPath(oldPath)
@@ -1017,7 +1061,11 @@ func (e *Engine) Mkdir(ctx context.Context, path string, mode uint32) error {
 	if err := e.requireAbsent(path); err != nil {
 		return err
 	}
-	return e.Overlay.Mkdir(ctx, path, mode)
+	if err := e.Overlay.Mkdir(ctx, path, mode); err != nil {
+		return err
+	}
+	e.Resolver.listingChanged(parentDir(path))
+	return nil
 }
 
 func (e *Engine) Rmdir(ctx context.Context, path string) error {
@@ -1031,7 +1079,11 @@ func (e *Engine) Rmdir(ctx context.Context, path string) error {
 	if len(children) > 0 {
 		return syscall.ENOTEMPTY
 	}
-	return e.Overlay.Remove(ctx, path)
+	if err := e.Overlay.Remove(ctx, path); err != nil {
+		return err
+	}
+	e.Resolver.listingChanged(parentDir(path))
+	return nil
 }
 
 // errAttrUnsupported rejects a mode or mtime change on the root or on a base
@@ -1087,6 +1139,9 @@ func (e *Engine) SetAttributes(ctx context.Context, b *Blobs, path, typ string, 
 			}
 			if err := e.Overlay.SetMtime(ctx, path, *mtime); err != nil {
 				return err
+			}
+			if typ == "dir" {
+				e.Resolver.forgetListing(model.CleanPath(path))
 			}
 		}
 		return nil

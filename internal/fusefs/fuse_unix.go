@@ -2120,14 +2120,11 @@ func readdirAttrs(e ReaddirEntry, gen, commitTime int64) (mode uint32, size int6
 	typ = e.Type
 	mode = normalizeMode(e.Mode, typ)
 	size = e.SizeBytes
-	if e.FromOverlay {
+	// Engine.ReadDir gives every directory entry its times.
+	if e.FromOverlay || typ == "dir" {
 		return mode, size, typ, time.Unix(0, e.MtimeUnixNs), time.Unix(0, e.CtimeUnixNs)
 	}
-	ct := commitTime
-	if ct == 0 {
-		ct = gen
-	}
-	mt := time.Unix(ct, 0)
+	mt := baseTime(gen, commitTime)
 	return mode, size, typ, mt, mt
 }
 
@@ -2903,6 +2900,11 @@ func MountRepoWithGate(ctx, opCtx context.Context, repo model.RepoPaths, engine 
 	}
 	fsint := NewArtifactFuse(repo, engine)
 	fsint.log = fuseLog{logger: logger, repo: repo.Name, redact: redact}
+	if engine != nil {
+		// Memory holds the listing changes the mount records, so every
+		// directory reports a ctime no earlier than the mount's start.
+		engine.Resolver.SetDirFloor(time.Now())
+	}
 
 	mountCfg := fuse.MountConfig{
 		FSName:                  FSName(repo.Name),

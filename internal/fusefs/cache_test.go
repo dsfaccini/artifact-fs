@@ -238,6 +238,182 @@ func TestSwitchGenerationFromAnEmptyTreeRenewsTheInstance(t *testing.T) {
 	}
 }
 
+// dirTimes returns the mtime and ctime, in Unix nanoseconds, that getattr
+// reports for the directory name in parent. It fails the test unless parent's
+// listing reports the same times.
+func (f *cacheFixture) dirTimes(parent fuseops.InodeID, name string) [2]int64 {
+	f.t.Helper()
+	op := &fuseops.GetInodeAttributesOp{Inode: f.lookup(parent, name)}
+	if err := f.fs.GetInodeAttributes(f.ctx, op); err != nil {
+		f.t.Fatalf("GetInodeAttributes(%s): %v", name, err)
+	}
+	got := [2]int64{op.Attributes.Mtime.UnixNano(), op.Attributes.Ctime.UnixNano()}
+	if listed := readDirPlus(f.t, f.fs, parent)[name]; [2]int64{listed.mtime, listed.ctime} != got {
+		f.t.Fatalf("%s: listing reports mtime %d and ctime %d, getattr %d and %d", name, listed.mtime, listed.ctime, got[0], got[1])
+	}
+	return got
+}
+
+// dirTimesNodes are a base tree for the directory time tests.
+var dirTimesNodes = []model.BaseNode{
+	baseDir("d", "d"), baseFile("d/a.txt", "a", 0o100644),
+	baseDir("d/sub", "sub"), baseDir("d/sub/deep", "deep"), baseFile("d/sub/deep/x.txt", "x", 0o100644),
+	baseDir("e", "e"), baseFile("e/b.txt", "b", 0o100644),
+}
+
+// An op through the mount that adds, removes or renames an entry moves the
+// mtime and ctime of each directory whose listing it changes, and no other
+// directory's. Git's untracked cache trusts a directory whose stat data has
+// not changed since it listed the directory.
+func TestEntryOpsMoveTheTimesOfTheDirectoriesTheyChange(t *testing.T) {
+	type dirs struct{ d, e fuseops.InodeID }
+	tests := []struct {
+		name    string
+		setup   func(f *cacheFixture, in dirs) error
+		op      func(f *cacheFixture, in dirs) error
+		changed []string
+	}{
+		{name: "create", changed: []string{"d"}, op: func(f *cacheFixture, in dirs) error {
+			return f.fs.CreateFile(f.ctx, &fuseops.CreateFileOp{Parent: in.d, Name: "new.txt", Mode: 0o644})
+		}},
+		{name: "mkdir", changed: []string{"d"}, op: func(f *cacheFixture, in dirs) error {
+			return f.fs.MkDir(f.ctx, &fuseops.MkDirOp{Parent: in.d, Name: "new", Mode: os.ModeDir | 0o755})
+		}},
+		{name: "symlink", changed: []string{"d"}, op: func(f *cacheFixture, in dirs) error {
+			return f.fs.CreateSymlink(f.ctx, &fuseops.CreateSymlinkOp{Parent: in.d, Name: "link", Target: "a.txt"})
+		}},
+		{name: "unlink", changed: []string{"d"}, op: func(f *cacheFixture, in dirs) error {
+			return f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: in.d, Name: "a.txt"})
+		}},
+		{name: "rmdir", changed: []string{"d"}, setup: func(f *cacheFixture, in dirs) error {
+			return f.fs.MkDir(f.ctx, &fuseops.MkDirOp{Parent: in.d, Name: "empty", Mode: os.ModeDir | 0o755})
+		}, op: func(f *cacheFixture, in dirs) error {
+			return f.fs.RmDir(f.ctx, &fuseops.RmDirOp{Parent: in.d, Name: "empty"})
+		}},
+		{name: "rename in a directory", changed: []string{"d"}, op: func(f *cacheFixture, in dirs) error {
+			return f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: in.d, OldName: "a.txt", NewParent: in.d, NewName: "c.txt"})
+		}},
+		{name: "rename across directories", changed: []string{"d", "e"}, op: func(f *cacheFixture, in dirs) error {
+			return f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: in.d, OldName: "a.txt", NewParent: in.e, NewName: "a.txt"})
+		}},
+		{name: "rename a directory", changed: []string{"d", "e"}, op: func(f *cacheFixture, in dirs) error {
+			return f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: in.d, OldName: "sub", NewParent: in.e, NewName: "sub"})
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newCacheFixture(t, dirTimesNodes...)
+			in := dirs{d: f.lookup(fuseops.RootInodeID, "d"), e: f.lookup(fuseops.RootInodeID, "e")}
+			if tt.setup != nil {
+				if err := tt.setup(f, in); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := map[string][2]int64{}
+			for _, name := range []string{"d", "e"} {
+				before[name] = f.dirTimes(fuseops.RootInodeID, name)
+			}
+			if err := tt.op(f, in); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"d", "e"} {
+				after := f.dirTimes(fuseops.RootInodeID, name)
+				moved := after[0] > before[name][0] && after[1] > before[name][1]
+				if want := slices.Contains(tt.changed, name); moved != want || !want && after != before[name] {
+					t.Errorf("%s: mtime and ctime %d before, %d after; want them moved: %v", name, before[name], after, want)
+				}
+			}
+		})
+	}
+}
+
+// Memory holds the listing changes a mount records, so every directory reports
+// a ctime no earlier than the mount's start. A listing change from before a
+// restart then still changes the directory's stat data. Its mtime stays.
+func TestDirectoriesReportACtimeNoEarlierThanTheMountsStart(t *testing.T) {
+	start := time.Now()
+	f := newCacheFixture(t, dirTimesNodes...)
+	commitTime := time.Unix(f.resolver.Generation(), 0).UnixNano()
+	if got := f.dirTimes(fuseops.RootInodeID, "d"); got[0] != commitTime || got[1] < start.UnixNano() {
+		t.Errorf("d: mtime and ctime %d, want mtime %d and ctime no earlier than %d", got, commitTime, start.UnixNano())
+	}
+	root := &fuseops.GetInodeAttributesOp{Inode: fuseops.RootInodeID}
+	if err := f.fs.GetInodeAttributes(f.ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	if root.Attributes.Ctime.Before(start) {
+		t.Errorf("root ctime %v, want no earlier than %v", root.Attributes.Ctime, start)
+	}
+}
+
+// An mtime set on a directory shows until its listing changes again, as on a
+// local file system: tar and rsync -t set a directory's times after they fill
+// it.
+func TestAnMtimeSetOnADirectoryShowsUntilItsListingChanges(t *testing.T) {
+	f := newCacheFixture(t, dirTimesNodes...)
+	d := f.lookup(fuseops.RootInodeID, "d")
+	if err := f.fs.CreateFile(f.ctx, &fuseops.CreateFileOp{Parent: d, Name: "new.txt", Mode: 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	set := time.Unix(1_000_000_000, 0)
+	if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: d, Mtime: &set}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.dirTimes(fuseops.RootInodeID, "d"); got[0] != set.UnixNano() {
+		t.Fatalf("d's mtime after it was set = %d, want %d", got[0], set.UnixNano())
+	}
+	if err := f.fs.CreateFile(f.ctx, &fuseops.CreateFileOp{Parent: d, Name: "next.txt", Mode: 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.dirTimes(fuseops.RootInodeID, "d"); got[0] <= set.UnixNano() {
+		t.Errorf("d's mtime after a create = %d, want later than %d", got[0], set.UnixNano())
+	}
+}
+
+// A switch moves the times of each directory that gains, loses or retypes an
+// entry. A base directory otherwise reports the commit time, which two
+// commits can share.
+func TestSwitchMovesTheTimesOfTheDirectoriesWhoseListingItChanges(t *testing.T) {
+	const commitTime = 1_700_000_000
+	f := newCacheFixture(t, append(dirTimesNodes, baseDir("g", "g1"), baseFile("g/k", "k", 0o100644))...)
+	f.resolver.SetCommitTime(commitTime)
+	before := map[string][2]int64{}
+	for _, name := range []string{"d", "e", "g"} {
+		before[name] = f.dirTimes(fuseops.RootInodeID, name)
+	}
+	gen := f.publish(
+		baseDir("d", "d2"), baseFile("d/a.txt", "a", 0o100644), baseFile("d/new.txt", "new", 0o100644),
+		baseDir("d/sub", "sub"), baseDir("d/sub/deep", "deep"), baseFile("d/sub/deep/x.txt", "x", 0o100644),
+		baseDir("e", "e2"), baseFile("e/b.txt", "b2", 0o100644),
+		baseDir("g", "g2"), baseDir("g/k", "k"), baseFile("g/k/z.txt", "z", 0o100644),
+	)
+	if err := f.resolver.SwitchGeneration(f.ctx, gen, commitTime); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]bool{"d": true, "e": false, "g": true} {
+		after := f.dirTimes(fuseops.RootInodeID, name)
+		moved := after[0] > before[name][0] && after[1] > before[name][1]
+		if moved != want || !want && after != before[name] {
+			t.Errorf("%s: mtime and ctime %d before, %d after; want them moved: %v", name, before[name], after, want)
+		}
+	}
+}
+
+// A switch from an empty tree cannot tell which listings it changes, so it
+// moves the ctime of every directory.
+func TestSwitchFromAnEmptyTreeMovesEveryDirectorysCtime(t *testing.T) {
+	const commitTime = 1_700_000_000
+	f := newCacheFixture(t)
+	f.resolver.SetCommitTime(commitTime)
+	start := time.Now()
+	if err := f.resolver.SwitchGeneration(f.ctx, f.publish(dirTimesNodes...), commitTime); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.dirTimes(fuseops.RootInodeID, "d"); got[1] < start.UnixNano() {
+		t.Errorf("d's ctime after the switch = %d, want no earlier than %d", got[1], start.UnixNano())
+	}
+}
+
 // lookupMissed reports whether a lookup answered that the name is missing:
 // with a negative entry where the platform caches them, and ENOENT elsewhere.
 func lookupMissed(err error, op *fuseops.LookUpInodeOp) bool {

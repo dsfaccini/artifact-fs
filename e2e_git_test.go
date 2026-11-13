@@ -258,6 +258,26 @@ func testE2EGitCleanState(t *testing.T, repo *mountedE2ERepo) {
 	}
 }
 
+// Git's untracked cache trusts a directory whose stat data has not changed
+// since Git listed it. git update-index --test-untracked-cache checks that a
+// directory's stat data changes when an entry is added to it or removed from
+// it, and stays when a file in it or an entry in a subdirectory changes.
+func testE2EGitTestUntrackedCache(t *testing.T, repo *mountedE2ERepo) {
+	// A failed check leaves its directory behind.
+	t.Cleanup(func() {
+		leftovers, err := filepath.Glob(filepath.Join(repo.mountPath, "mtime-test-*"))
+		if err != nil {
+			t.Error(err)
+		}
+		for _, dir := range leftovers {
+			if err := os.RemoveAll(dir); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	gitCmdQuiet(t, repo.mountPath, "update-index", "--test-untracked-cache")
+}
+
 // Editors poll Git while other processes stat the mount. On FSKit a deadlock in this workload wedges the mount
 // until reboot, so the test fails on a deadline instead of waiting on stuck processes.
 func testE2EGitConcurrentReads(t *testing.T, repo *mountedE2ERepo) {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -42,8 +43,79 @@ type Resolver struct {
 	// switchMu runs one SwitchGeneration at a time, so the generation it
 	// diffs from is the one it switches from. It is taken before transition.
 	switchMu sync.Mutex
+	times    dirTimes
 	Snapshot model.SnapshotStore
 	Overlay  model.OverlayStore
+}
+
+// dirTimes holds the directory times that only memory records. Git's
+// untracked cache trusts a directory whose stat data it has seen, so each
+// change to a directory's listing must change its stat data.
+type dirTimes struct {
+	mu sync.Mutex
+	// floor is the earliest ctime any directory reports. The daemon sets it
+	// to the mount's start, so a listing change from before a restart, which
+	// memory no longer holds, still changes the directory's stat data.
+	floor time.Time
+	// listed holds the last change to each directory's listing: an entry an
+	// op through the mount or a generation switch added, removed or retyped.
+	// It raises the directory's mtime and ctime, as on a local file system.
+	listed map[string]time.Time
+}
+
+// SetDirFloor makes t the earliest ctime any directory reports.
+func (r *Resolver) SetDirFloor(t time.Time) {
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	r.times.floor = t
+}
+
+// listingChanged records that the listings of dirs changed now. Each record
+// is later than the one before it, so two changes never share a time.
+func (r *Resolver) listingChanged(dirs ...string) {
+	now := time.Now()
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	if r.times.listed == nil {
+		r.times.listed = map[string]time.Time{}
+	}
+	for _, dir := range dirs {
+		t := now
+		if last, ok := r.times.listed[dir]; ok && !t.After(last) {
+			t = last.Add(time.Nanosecond)
+		}
+		r.times.listed[dir] = t
+	}
+}
+
+// forgetListing drops dir's last listing change, so that an mtime set on dir
+// shows.
+func (r *Resolver) forgetListing(dir string) {
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	delete(r.times.listed, dir)
+}
+
+// dirTimes returns the mtime and ctime that directory dir reports, given the
+// ones the overlay or the snapshot gives it.
+func (r *Resolver) dirTimes(dir string, mtime, ctime time.Time) (time.Time, time.Time) {
+	later := func(a, b time.Time) time.Time {
+		if b.After(a) {
+			return b
+		}
+		return a
+	}
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	if t, ok := r.times.listed[dir]; ok {
+		mtime, ctime = later(mtime, t), later(ctime, t)
+	}
+	return mtime, later(ctime, r.times.floor)
+}
+
+// parentDir returns the directory that holds path.
+func parentDir(path string) string {
+	return model.CleanPath(filepath.Dir(model.CleanPath(path)))
 }
 
 func (r *Resolver) SetGeneration(gen int64) { r.generation.Store(gen) }
@@ -70,16 +142,23 @@ func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime i
 	r.switchMu.Lock()
 	defer r.switchMu.Unlock()
 	var switched model.SwitchedPaths
+	var listings []string
 	if from := r.Generation(); from != 0 && from != gen {
-		paths, ok, err := r.SwitchedPaths(from, gen)
+		paths, dirs, ok, err := r.SwitchedPaths(from, gen)
 		if err != nil {
 			return err
 		}
 		switched = model.SwitchedPaths{Paths: paths, Unknown: !ok}
+		listings = dirs
 	}
 	return r.Overlay.ReconcileChecked(ctx, baseLookup, switched, &r.transition, func() {
 		r.SetCommitTime(commitTime)
 		r.SetGeneration(gen)
+		if switched.Unknown {
+			r.SetDirFloor(time.Now())
+		} else {
+			r.listingChanged(listings...)
+		}
 	})
 }
 
@@ -386,7 +465,7 @@ func (r *Resolver) ChangedPaths(from, to int64, paths []string) (changed map[str
 		}
 		return dirs
 	}
-	if ok, err := r.diff(from, to, func(p string) { changed[p] = true }, walk); !ok {
+	if ok, err := r.diff(from, to, func(p string, _ bool) { changed[p] = true }, walk); !ok {
 		return nil, false, err
 	}
 	return changed, true, nil
@@ -394,25 +473,34 @@ func (r *Resolver) ChangedPaths(from, to int64, paths []string) (changed map[str
 
 // SwitchedPaths returns every path whose base type, mode or blob differs
 // between generations from and to, and every path only one of them holds. It
-// lists both generations' children of each directory whose tree ID differs and
-// of each directory only one of them holds. ok is false when from holds no root
-// entries, as for an empty tree or after a prune.
-func (r *Resolver) SwitchedPaths(from, to int64) (paths []string, ok bool, err error) {
+// also returns listings, each directory that gained, lost or retyped an
+// entry. It lists both generations' children of each directory whose tree ID
+// differs and of each directory only one of them holds. ok is false when from
+// holds no root entries, as for an empty tree or after a prune.
+func (r *Resolver) SwitchedPaths(from, to int64) (paths, listings []string, ok bool, err error) {
 	descend := func(dirs []string, dir string) []string { return append(dirs, dir) }
-	if ok, err := r.diff(from, to, func(p string) { paths = append(paths, p) }, descend); !ok {
-		return nil, false, err
+	mark := func(p string, listing bool) {
+		paths = append(paths, p)
+		if listing {
+			listings = append(listings, parentDir(p))
+		}
+	}
+	if ok, err := r.diff(from, to, mark, descend); !ok {
+		return nil, nil, false, err
 	}
 	slices.Sort(paths)
-	return paths, true, nil
+	slices.Sort(listings)
+	return paths, slices.Compact(listings), true, nil
 }
 
 // diff walks down from the root of generations from and to. For each
 // directory it lists, it calls mark with each child that the generations give
-// different types, modes or blobs or that only one of them holds, and walk with
+// different types, modes or blobs or that only one of them holds, with listing
+// true when only one holds it or its type differs, and walk with
 // each child directory that can hold such children. walk returns the stack of
 // directories to list, with the directory pushed when diff should list it. ok
 // is false when from holds no root entries.
-func (r *Resolver) diff(from, to int64, mark func(path string), walk func(dirs []string, dir string) []string) (ok bool, err error) {
+func (r *Resolver) diff(from, to int64, mark func(path string, listing bool), walk func(dirs []string, dir string) []string) (ok bool, err error) {
 	for dirs := []string{"."}; len(dirs) > 0; {
 		dir := dirs[len(dirs)-1]
 		dirs = dirs[:len(dirs)-1]
@@ -432,14 +520,14 @@ func (r *Resolver) diff(from, to int64, mark func(path string), walk func(dirs [
 			b, kept := added[a.Path]
 			delete(added, a.Path)
 			if !kept || a.Type != b.Type || a.Mode != b.Mode || baseBlob(a) != baseBlob(b) {
-				mark(a.Path)
+				mark(a.Path, !kept || a.Type != b.Type)
 			}
 			if (a.Type == "dir" || kept && b.Type == "dir") && !(kept && sameTree(a, b)) {
 				dirs = walk(dirs, a.Path)
 			}
 		}
 		for _, b := range added {
-			mark(b.Path)
+			mark(b.Path, true)
 			if b.Type == "dir" {
 				dirs = walk(dirs, b.Path)
 			}
