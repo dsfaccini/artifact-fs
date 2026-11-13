@@ -109,13 +109,13 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 // drop what it caches that the switch changed. It records when the previous
 // generation retired.
 func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, commitTime int64) error {
-	prev := rt.resolver.Generation()
-	if err := rt.resolver.SwitchGeneration(ctx, gen, commitTime); err != nil {
+	sw, err := rt.resolver.SwitchGeneration(ctx, gen, commitTime)
+	if err != nil {
 		return err
 	}
-	if prev != 0 && prev != gen {
+	if sw.Replaced != 0 && sw.Replaced != gen {
 		rt.retiredMu.Lock()
-		rt.retired = append(rt.retired, retiredGeneration{gen: prev, at: time.Now()})
+		rt.retired = append(rt.retired, retiredGeneration{gen: sw.Replaced, at: time.Now()})
 		rt.retiredMu.Unlock()
 	}
 	s.mu.Lock()
@@ -127,6 +127,9 @@ func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, co
 		if err := mfs.InvalidateChanged(); err != nil {
 			s.logger.Warn("kernel cache invalidation failed", "repo", name, "error", err)
 		}
+	}
+	if err := rt.overlay.LogSwitched(ctx, sw.Changed); err != nil {
+		s.logger.Warn("change log after the kernel invalidations failed", "repo", name, "error", err)
 	}
 	return nil
 }

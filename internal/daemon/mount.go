@@ -122,7 +122,10 @@ func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *pre
 	baseLookup := func(path string) (model.BaseNode, bool, error) {
 		return snap.LookupNode(prepareCtx, gen, path)
 	}
-	if err := ov.ReconcileChecked(prepareCtx, baseLookup, model.SwitchedPaths{}, nil, nil); err != nil {
+	// Nothing logged what changed while no runtime served the repo, such as
+	// a HEAD move, so Git rescans once. The bootstrap below reads the new
+	// instance, so a bootstrapped index needs no rescan.
+	if err := ov.ReconcileChecked(prepareCtx, baseLookup, model.SwitchedPaths{Unknown: true}, nil, nil); err != nil {
 		ov.Close()
 		return err
 	}
@@ -179,6 +182,13 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 	headOID, headRef, gen, _ := snap.ReadState(ctx)
 	ov, err := overlay.New(ctx, cfg.RepoPaths)
 	if err != nil {
+		snap.Close()
+		return err
+	}
+	// Nothing logged what changed while no runtime served the repo, such as
+	// a HEAD move, so Git rescans once.
+	if err := ov.LogSwitched(ctx, model.SwitchedPaths{Unknown: true}); err != nil {
+		ov.Close()
 		snap.Close()
 		return err
 	}

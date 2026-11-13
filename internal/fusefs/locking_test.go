@@ -425,7 +425,7 @@ func TestHydrationHoldsNoLock(t *testing.T) {
 				t.Fatalf("op returned before hydration: %v", err)
 			}
 
-			if err := f.resolver.SwitchGeneration(context.Background(), f.resolver.Generation(), f.resolver.CommitTime()); err != nil {
+			if _, err := f.resolver.SwitchGeneration(context.Background(), f.resolver.Generation(), f.resolver.CommitTime()); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := f.resolver.ResolvePath("other.txt"); err != nil {
@@ -658,7 +658,7 @@ func TestHEADSwitchDuringHydrationUsesNewBlob(t *testing.T) {
 	case err := <-done:
 		t.Fatalf("WriteFile returned before hydration: %v", err)
 	}
-	if err := f.resolver.SwitchGeneration(context.Background(), 2, f.resolver.CommitTime()); err != nil {
+	if _, err := f.resolver.SwitchGeneration(context.Background(), 2, f.resolver.CommitTime()); err != nil {
 		t.Fatal(err)
 	}
 	close(release)
@@ -1061,9 +1061,10 @@ func blobOID(content string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// Switches run one at a time, so each diffs from the generation it replaces.
-// Generation 3 restores p.txt, which generation 2 changed: a switch to 3 that
-// diffed from 1 while the switch to 2 ran would leave p.txt out of the log.
+// Switches run one at a time, so each diffs from the generation it replaces
+// and returns that generation. Generation 3 restores p.txt, which generation 2
+// changed: a switch to 3 that diffed from 1 while the switch to 2 ran would
+// leave p.txt out of the log.
 func TestSwitchGenerationDiffsFromTheGenerationItReplaces(t *testing.T) {
 	q := baseFile("q.txt", "q", 0o100644)
 	f := newCacheFixture(t, baseFile("p.txt", "p1", 0o100644), q)
@@ -1084,28 +1085,43 @@ func TestSwitchGenerationDiffsFromTheGenerationItReplaces(t *testing.T) {
 		unlocking: func() { once.Do(func() { firstSeq = f.changesSince(0).Seq }) },
 	}
 
-	done2 := make(chan error, 1)
-	go func() { done2 <- f.resolver.SwitchGeneration(f.ctx, gen2, 0) }()
+	type result struct {
+		sw  Switch
+		err error
+	}
+	from := f.resolver.Generation()
+	done2 := make(chan result, 1)
+	go func() {
+		sw, err := f.resolver.SwitchGeneration(f.ctx, gen2, 0)
+		done2 <- result{sw, err}
+	}()
 	select {
 	case <-snapshot.paused:
-	case err := <-done2:
-		t.Fatalf("switch to %d returned before it looked up the new base: %v", gen2, err)
+	case res := <-done2:
+		t.Fatalf("switch to %d returned before it looked up the new base: %v", gen2, res.err)
 	}
-	done3 := make(chan error, 1)
+	done3 := make(chan result, 1)
 	finished3 := make(chan struct{})
 	go func() {
-		done3 <- f.resolver.SwitchGeneration(f.ctx, gen3, 0)
+		sw, err := f.resolver.SwitchGeneration(f.ctx, gen3, 0)
+		done3 <- result{sw, err}
 		close(finished3)
 	}()
 	if !waitParked(finished3, "(*Resolver).SwitchGeneration") {
-		t.Fatalf("switch to %d returned while the switch to %d ran: %v", gen3, gen2, <-done3)
+		t.Fatalf("switch to %d returned while the switch to %d ran: %v", gen3, gen2, (<-done3).err)
 	}
 	close(snapshot.resume)
-	if err := <-done2; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-done3; err != nil {
-		t.Fatal(err)
+	for _, want := range []struct {
+		done     chan result
+		replaced int64
+	}{{done2, from}, {done3, gen2}} {
+		res := <-want.done
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		if res.sw.Replaced != want.replaced {
+			t.Errorf("switch replaced generation %d, want %d", res.sw.Replaced, want.replaced)
+		}
 	}
 	if got := f.resolver.Generation(); got != gen3 {
 		t.Fatalf("generation after both switches = %d, want %d", got, gen3)
@@ -1172,7 +1188,10 @@ func TestSwitchGenerationServesReadsWhileItLooksUpTheBase(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- f.resolver.SwitchGeneration(ctx, 2, 0) }()
+	go func() {
+		_, err := f.resolver.SwitchGeneration(ctx, 2, 0)
+		done <- err
+	}()
 	select {
 	case <-snapshot.paused:
 	case err := <-done:
