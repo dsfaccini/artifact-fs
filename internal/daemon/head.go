@@ -123,6 +123,9 @@ func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, co
 	serving := rt.mount == mountServing
 	name := rt.cfg.Name
 	s.mu.Unlock()
+	if sw.DiffErr != nil {
+		s.logger.Warn("generation diff failed; Git rescans the work tree", "repo", name, "error", sw.DiffErr)
+	}
 	if serving {
 		if err := mfs.InvalidateChanged(); err != nil {
 			s.logger.Warn("kernel cache invalidation failed", "repo", name, "error", err)
@@ -131,7 +134,33 @@ func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, co
 	if err := rt.overlay.LogSwitched(ctx, sw.Changed); err != nil {
 		s.logger.Warn("change log after the kernel invalidations failed", "repo", name, "error", err)
 	}
+	// FSKit sends the kernel no invalidations, so the kernel can answer with
+	// attributes it cached from the old generation until they expire.
+	if serving && mfs.Backend() == fusefs.BackendFSKit {
+		s.logSwitchedAfterCacheTTL(rt, name, sw.Changed)
+	}
 	return nil
+}
+
+// logSwitchedAfterCacheTTL logs switched once more after fusefs.CacheTTL,
+// when every attribute the kernel cached before the switch has expired. A
+// stop of rt cancels it.
+func (s *Service) logSwitchedAfterCacheTTL(rt *repoRuntime, name string, switched model.SwitchedPaths) {
+	if len(switched.Paths) == 0 && !switched.Unknown {
+		return
+	}
+	rt.workers.Go(func() {
+		expired := time.NewTimer(fusefs.CacheTTL)
+		defer expired.Stop()
+		select {
+		case <-rt.ctx.Done():
+			return
+		case <-expired.C:
+		}
+		if err := rt.overlay.LogSwitched(rt.ctx, switched); err != nil {
+			s.logger.Warn("change log after the kernel cache expired failed", "repo", name, "error", err)
+		}
+	})
 }
 
 // pruneGenerations prunes snap's generations below keepFrom, except those

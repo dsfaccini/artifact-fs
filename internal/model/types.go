@@ -381,7 +381,7 @@ type OverlayStore interface {
 	Mkdir(ctx context.Context, path string, mode uint32) error
 	SetMode(ctx context.Context, path string, mode uint32) error
 	SetMtime(ctx context.Context, path string, t time.Time) error
-	ReconcileChecked(ctx context.Context, baseLookup func(path string) (BaseNode, bool, error), switched SwitchedPaths, lock sync.Locker, switchBase func()) error
+	ReconcileChecked(ctx context.Context, gen int64, baseLookup func(path string) (BaseNode, bool, error), switched SwitchedPaths, lock sync.Locker, switchBase func()) error
 	ListByPrefix(ctx context.Context, prefix string) ([]OverlayEntry, error)
 	// HasEntryBelow reports whether an entry of any kind lies below path.
 	HasEntryBelow(ctx context.Context, path string) (bool, error)
