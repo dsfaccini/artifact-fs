@@ -222,6 +222,10 @@ type InodeRef struct {
 	// separate open after the create, and a create grants its creator access
 	// whatever the mode.
 	CreateOpenPending bool
+	// EntryReplied says the mount recorded an entry reply for the inode
+	// since the switch pass last sent an invalidation of its name, so a reply
+	// with the name's dentry can still be on its way to the kernel.
+	EntryReplied bool
 }
 
 // report records attrs as what the kernel last received for ref. Reads then
@@ -373,7 +377,9 @@ func (fs *ArtifactFuse) allocInode(path string, attrs Attrs) *InodeRef {
 // holds for the name. Caller must hold fs.mu write lock.
 func (fs *ArtifactFuse) allocEntry(parent fuseops.InodeID, name, path string, attrs Attrs) *InodeRef {
 	delete(fs.negatives, kernelEntry{parent, name})
-	return fs.allocInode(path, attrs)
+	ref := fs.allocInode(path, attrs)
+	ref.EntryReplied = true
+	return ref
 }
 
 // createEntry returns a new inode for the name in parent at path, which an op
@@ -709,10 +715,11 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // kernel can still cache pages of the replaced identity, which report keeps
 // in InodeRef.Prior. An overlay entry itself changes only through the mount,
 // which keeps the kernel's view of it current. A dormant mapping gets no
-// invalidation: the kernel holds nothing for it. An invalidation the kernel
-// answers with ENOENT goes again while the mount holds its inode, for at most
-// CacheTTL. A failure skips only what it concerns, and the first one is
-// returned.
+// invalidation: the kernel holds nothing for it. An inode invalidation the
+// kernel answers with ENOENT goes again while the mount holds the inode, and
+// an entry invalidation while it holds the inode and recorded an entry reply
+// for it since it last sent the name's, for at most CacheTTL. A failure skips
+// only what it concerns, and the first one is returned.
 //
 // The pass reads the overlay once, and finds each held inode's identity with
 // Engine.Identities: it diffs the generation each inode's base identity was
@@ -833,9 +840,8 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			currents = append(currents, MergedIdentity{Identity: id, Exists: exists, Err: err})
 		}
 	}
-	// entries holds each name the pass invalidates, with the inode the mount
-	// holds while the kernel can hold the name: the named inode, or the
-	// parent of a negative entry.
+	// entries holds each name the pass invalidates, with the inode it names,
+	// or 0 for a negative entry.
 	type heldEntry struct {
 		kernelEntry
 		held fuseops.InodeID
@@ -945,6 +951,18 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		changed = append(changed, id)
 	}
 	clear(fs.retypedNames)
+	// An entry invalidation that gets ENOENT goes again only when an entry
+	// reply came since the pass last sent it. Otherwise the kernel can hold
+	// the inode with no dentry for the name: an open file keeps its inode
+	// after an earlier pass dropped the name, and the inode maps back when
+	// its path returns.
+	for i, e := range entries {
+		if ref := fs.inodes[e.held]; ref != nil && ref.EntryReplied {
+			ref.EntryReplied = false
+		} else {
+			entries[i].held = 0
+		}
+	}
 	// An op may have taken, moved or recreated a path since the check, which
 	// removes it from unmapped.
 	for _, m := range remap {
@@ -996,7 +1014,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			continue
 		}
 		if exists {
-			entries = append(entries, heldEntry{k.entry, k.entry.parent})
+			entries = append(entries, heldEntry{k.entry, 0})
 			fs.mu.Lock()
 			delete(fs.negatives, k.entry)
 			fs.mu.Unlock()
@@ -1009,7 +1027,10 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// whatever the pass sent before it arrived, so the pass sends such an
 	// invalidation again until it lands or held's FORGET arrives. It stops
 	// CacheTTL after it read the table: the kernel lets a reply expire
-	// CacheTTL after it takes it.
+	// CacheTTL after it takes it. A negative entry's invalidation, held 0,
+	// goes once. Up to 6.18 and from 7.2, Linux takes the parent's lock
+	// before it looks up the name, so it waits for a lookup in flight there.
+	// From 6.19 to 7.1 it drops no negative entry at all.
 	type invalidation struct {
 		held fuseops.InodeID
 		send func() error
