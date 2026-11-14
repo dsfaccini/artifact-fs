@@ -4,6 +4,8 @@ import (
 	"os"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // accessTime returns info's access time, or its modification time when the
@@ -14,3 +16,5 @@ func accessTime(info os.FileInfo) time.Time {
 	}
 	return info.ModTime()
 }
+
+const utimeOmit = unix.UTIME_OMIT

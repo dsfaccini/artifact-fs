@@ -18,6 +18,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -32,6 +34,11 @@ const (
 	// does not stall installs.
 	evictBatch = 128
 )
+
+// ReadRefresh is the age at which RecordRead moves a blob's access time, so a
+// blob's access time trails each serve by at most ReadRefresh. Linux relatime
+// moves an access time at the same age.
+const ReadRefresh = 24 * time.Hour
 
 // Stats counts the blobs in a cache directory.
 type Stats struct {
@@ -126,6 +133,28 @@ func Install(dir, oid, staged string) error {
 	return nil
 }
 
+// RecordRead records a read of the cached blob at path, whose file info is
+// info, in its access time, which eviction orders and cuts by. It sets the
+// access time to now once it is more than ReadRefresh old. It leaves the
+// modification time, which identifies the cached file. The file system alone
+// records too little:
+// APFS moves an access time only while it is not newer than the modification
+// time, and a noatime mount never moves it.
+//
+// It writes the current time explicitly, not UTIME_NOW. Linux relatime moves
+// an access time on a read while the change time is not older than it, and
+// UTIME_NOW gives both one value, so the next read would move the access time
+// again. The kernel takes the change time from its coarse clock, which
+// usually trails the explicit time.
+func RecordRead(path string, info os.FileInfo) error {
+	now := time.Now()
+	if now.Sub(accessTime(info)) <= ReadRefresh {
+		return nil
+	}
+	ts := []unix.Timespec{unix.NsecToTimespec(now.UnixNano()), {Nsec: utimeOmit}}
+	return unix.UtimesNanoAt(unix.AT_FDCWD, path, ts, unix.AT_SYMLINK_NOFOLLOW)
+}
+
 // Recount moves blobs from the flat layout of earlier versions, <dir>/<oid>,
 // into their shards, and recounts the counters from the blobs on disk. The
 // hydrator runs it when it starts, which corrects counters that an OS crash,
@@ -176,13 +205,15 @@ type candidate struct {
 // before each batch takes the lock.
 var testHookBeforeEvictBatch func()
 
-// Evict removes blobs in order of least recent access time until the cache
-// holds at most maxBytes, or until ctx ends. A maxBytes of 0 empties the
-// cache, the empty blob included. It first recounts the cache, so
-// it also corrects counters that drifted. It unlinks each blob, so a handle
-// open on it keeps reading the blob, and the next open of its path hydrates
-// it again. A blob read or replaced after Evict listed it stays.
-func Evict(ctx context.Context, dir string, maxBytes int64) (EvictResult, error) {
+// Evict removes blobs in order of least recent access time while the cache
+// holds more than maxBytes or the blob's access time is before readBefore, or
+// until ctx ends. A maxBytes of 0 empties the cache, the empty blob included,
+// and math.MaxInt64 sets no byte budget. A zero readBefore removes no blob for
+// its age. It first recounts the cache, so it also corrects counters that
+// drifted. It unlinks each blob, so a handle open on it keeps reading the
+// blob, and the next open of its path hydrates it again. A blob read or
+// replaced after Evict listed it stays.
+func Evict(ctx context.Context, dir string, maxBytes int64, readBefore time.Time) (EvictResult, error) {
 	if maxBytes < 0 {
 		return EvictResult{}, errors.New("max bytes must not be negative")
 	}
@@ -199,33 +230,38 @@ func Evict(ctx context.Context, dir string, maxBytes int64) (EvictResult, error)
 	st, candidates, err := recountLocked(ctx, dir, lock)
 	_ = lock.Close()
 	res := EvictResult{Remaining: st}
-	if err != nil || fits(st, maxBytes) {
+	if err != nil {
 		return res, err
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].atime.Before(candidates[j].atime) })
-	for len(candidates) > 0 {
+	for len(candidates) > 0 && evicts(candidates[0], res.Remaining, maxBytes, readBefore) {
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
 		if testHookBeforeEvictBatch != nil {
 			testHookBeforeEvictBatch()
 		}
-		var done bool
-		candidates, done, err = evictBatchLocked(ctx, dir, maxBytes, candidates, &res)
-		if err != nil || done {
+		candidates, err = evictBatchLocked(ctx, dir, maxBytes, readBefore, candidates, &res)
+		if err != nil {
 			return res, err
 		}
 	}
 	return res, nil
 }
 
+// evicts reports whether Evict removes c, the least recently accessed blob
+// left, from a cache with st.
+func evicts(c candidate, st Stats, maxBytes int64, readBefore time.Time) bool {
+	return !fits(st, maxBytes) || c.atime.Before(readBefore)
+}
+
 // evictBatchLocked removes up to evictBatch candidates under one lock hold and
-// returns the candidates left. done says the cache fits. It writes the
-// counters for every blob it removed, even when it fails.
-func evictBatchLocked(ctx context.Context, dir string, maxBytes int64, candidates []candidate, res *EvictResult) (left []candidate, done bool, err error) {
+// returns the candidates left. It writes the counters for every blob it
+// removed, even when it fails.
+func evictBatchLocked(ctx context.Context, dir string, maxBytes int64, readBefore time.Time, candidates []candidate, res *EvictResult) (left []candidate, err error) {
 	lock, err := lockStats(dir)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	defer lock.Close()
 	st, valid, err := readStats(lock)
@@ -233,7 +269,7 @@ func evictBatchLocked(ctx context.Context, dir string, maxBytes int64, candidate
 		st, _, err = recountLocked(ctx, dir, lock)
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	defer func() {
 		if writeErr := writeStats(lock, st); err == nil {
@@ -242,9 +278,9 @@ func evictBatchLocked(ctx context.Context, dir string, maxBytes int64, candidate
 		res.Remaining = st
 	}()
 	n := 0
-	for ; n < len(candidates) && n < evictBatch && !fits(st, maxBytes); n++ {
+	for ; n < len(candidates) && n < evictBatch && evicts(candidates[n], st, maxBytes, readBefore); n++ {
 		if err := ctx.Err(); err != nil {
-			return nil, false, err
+			return nil, err
 		}
 		c := candidates[n]
 		cur, statErr := os.Lstat(c.path)
@@ -255,14 +291,14 @@ func evictBatchLocked(ctx context.Context, dir string, maxBytes int64, candidate
 			if errors.Is(err, fs.ErrNotExist) {
 				continue
 			}
-			return nil, false, err
+			return nil, err
 		}
 		st.Blobs--
 		st.Bytes -= cur.Size()
 		res.Evicted++
 		res.EvictedBytes += cur.Size()
 	}
-	return candidates[n:], fits(st, maxBytes), nil
+	return candidates[n:], nil
 }
 
 // fits reports whether a cache with st fits maxBytes. Only an empty cache

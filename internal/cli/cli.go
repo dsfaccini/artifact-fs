@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -313,17 +314,34 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		},
 		{
 			Name:  "evict-cache",
-			Usage: "evict least recently accessed blobs until the blob cache fits a byte budget",
+			Usage: "evict blobs not served within a duration, and the least recently read blobs until the blob cache fits a byte budget",
 			Flags: []ucli.Flag{
 				&ucli.StringFlag{Name: "name", Usage: "repo name (required)"},
-				&ucli.Int64Flag{Name: "max-bytes", Required: true, Usage: "byte budget the blob cache must fit (required)"},
+				// Without --max-bytes there is no budget, and a shown default of
+				// 0 would read as one that empties the cache.
+				&ucli.Int64Flag{Name: "max-bytes", HideDefault: true, Usage: "byte budget the blob cache must fit"},
+				&ucli.DurationFlag{Name: "older-than", HideDefault: true, Usage: "evict every blob not served within this, such as 336h; a blob can stay up to a day longer"},
 			},
 			Action: withController(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Controller) error {
 				name := strings.TrimSpace(c.String("name"))
 				if name == "" {
 					return fmt.Errorf("--name required")
 				}
-				res, err := svc.EvictCache(ctx, name, c.Int64("max-bytes"))
+				if !c.IsSet("max-bytes") && !c.IsSet("older-than") {
+					return fmt.Errorf("--max-bytes or --older-than required")
+				}
+				maxBytes := int64(math.MaxInt64)
+				if c.IsSet("max-bytes") {
+					maxBytes = c.Int64("max-bytes")
+				}
+				var servedBefore time.Time
+				if c.IsSet("older-than") {
+					if c.Duration("older-than") <= 0 {
+						return fmt.Errorf("--older-than must be positive")
+					}
+					servedBefore = time.Now().Add(-c.Duration("older-than"))
+				}
+				res, err := svc.EvictCache(ctx, name, maxBytes, servedBefore)
 				if err != nil {
 					return err
 				}

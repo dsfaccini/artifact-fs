@@ -115,14 +115,69 @@ func TestEvictCacheCLIZeroBudgetEmptiesTheCache(t *testing.T) {
 	}
 }
 
-func TestEvictCacheCLIRequiresMaxBytes(t *testing.T) {
-	registerRepoWithCache(t, strings.Repeat("a", 40))
-	stdout, stderr, code := runCLI(t, "evict-cache", "--name", "repo")
-	if code == 0 {
-		t.Fatalf("evict-cache without --max-bytes exit = 0, stdout=%q", stdout)
+// --older-than evicts every blob the daemon has not served within the
+// duration, and a byte budget beside it evicts the least recently read blobs
+// left until the cache fits. The daemon moves an access time only once it is
+// more than a day old, so an access time 24h30m old can belong to a blob served
+// half an hour ago, and --older-than 24h keeps it. It evicts a blob whose
+// access time is more than the duration plus that day old.
+func TestEvictCacheCLIEvictsBlobsNotServedWithinTheDuration(t *testing.T) {
+	unserved, maybeServed, recent := strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 40)
+	for _, tt := range []struct {
+		name string
+		args []string
+		kept map[string]bool
+		want string
+	}{
+		{"cutoff", []string{"--older-than", "24h"}, map[string]bool{unserved: false, maybeServed: true, recent: true}, "evicted_blobs=1 evicted_bytes=10 hydrated_blobs=2 hydrated_bytes=20\n"},
+		{"cutoff_and_budget", []string{"--older-than", "24h", "--max-bytes", "10"}, map[string]bool{unserved: false, maybeServed: false, recent: true}, "evicted_blobs=2 evicted_bytes=20 hydrated_blobs=1 hydrated_bytes=10\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := registerRepoWithCache(t)
+			now := time.Now()
+			installBlob(t, dir, unserved, "0123456789", now.Add(-49*time.Hour))
+			installBlob(t, dir, maybeServed, "0123456789", now.Add(-24*time.Hour-30*time.Minute))
+			installBlob(t, dir, recent, "0123456789", now.Add(-time.Hour))
+
+			stdout, stderr, code := runCLI(t, append([]string{"evict-cache", "--name", "repo"}, tt.args...)...)
+			if code != 0 {
+				t.Fatalf("evict-cache exit = %d, stderr=%q", code, stderr)
+			}
+			if stdout != tt.want {
+				t.Fatalf("stdout = %q, want %q", stdout, tt.want)
+			}
+			for oid, kept := range tt.kept {
+				if _, err := os.Stat(blobcache.Path(dir, oid)); (err == nil) != kept {
+					t.Fatalf("blob %s present = %v, want %v", oid[:2], err == nil, kept)
+				}
+			}
+		})
 	}
-	if !strings.Contains(stderr, "max-bytes") {
-		t.Fatalf("stderr = %q, want it to name max-bytes", stderr)
+}
+
+func TestEvictCacheCLIRequiresMaxBytesOrOlderThan(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"neither", nil, "--max-bytes or --older-than required"},
+		{"zero_cutoff", []string{"--older-than", "0s"}, "--older-than must be positive"},
+		{"negative_cutoff", []string{"--older-than=-1h"}, "--older-than must be positive"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := registerRepoWithCache(t, strings.Repeat("a", 40))
+			stdout, stderr, code := runCLI(t, append([]string{"evict-cache", "--name", "repo"}, tt.args...)...)
+			if code == 0 {
+				t.Fatalf("evict-cache %v exit = 0, stdout=%q", tt.args, stdout)
+			}
+			if !strings.Contains(stderr, tt.want) {
+				t.Fatalf("stderr = %q, want %q", stderr, tt.want)
+			}
+			if _, err := os.Stat(blobcache.Path(dir, strings.Repeat("a", 40))); err != nil {
+				t.Fatalf("blob after a refused evict-cache: %v", err)
+			}
+		})
 	}
 }
 
@@ -140,5 +195,17 @@ func TestStatusCLIReadsCacheCountersWithoutWalking(t *testing.T) {
 	stdout, stderr, code := runCLI(t, "status", "--name", "repo")
 	if code != 0 || !strings.Contains(stdout, " hydrated_blobs=1 hydrated_bytes=10 ") {
 		t.Fatalf("status exit = %d, stdout=%q, stderr=%q; want 1 blob, 10 bytes", code, stdout, stderr)
+	}
+}
+
+// Without --max-bytes there is no byte budget, so the help shows no default
+// for it: a default of 0 reads as the budget that empties the cache.
+func TestEvictCacheCLIHelpShowsNoFlagDefaults(t *testing.T) {
+	stdout, stderr, code := runCLI(t, "evict-cache", "--help")
+	if code != 0 || !strings.Contains(stdout, "--older-than") {
+		t.Fatalf("evict-cache --help exit = %d, stdout=%q, stderr=%q; want the help", code, stdout, stderr)
+	}
+	if strings.Contains(stdout, "default:") {
+		t.Fatalf("evict-cache --help = %q, want no flag defaults", stdout)
 	}
 }

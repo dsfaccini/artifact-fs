@@ -3,6 +3,7 @@ package blobcache
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,7 +61,7 @@ func TestEvictCountsBlobsRemovedBeforeAFailedRemove(t *testing.T) {
 	}
 	defer os.Chmod(filepath.Dir(locked), 0o700)
 
-	if _, err := Evict(context.Background(), dir, 0); err == nil {
+	if _, err := Evict(context.Background(), dir, 0, time.Time{}); err == nil {
 		t.Fatal("Evict succeeded, want the read-only shard's remove error")
 	}
 	requireStats(t, dir, Stats{Blobs: 1, Bytes: 10})
@@ -81,7 +82,7 @@ func TestEvictRecountsBeforeEvicting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := Evict(context.Background(), dir, 100)
+	res, err := Evict(context.Background(), dir, 100, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +101,7 @@ func TestEvictStopsWhenContextEnds(t *testing.T) {
 	testHookBeforeEvictBatch = cancel
 	defer func() { testHookBeforeEvictBatch = nil }()
 
-	res, err := Evict(ctx, dir, 0)
+	res, err := Evict(ctx, dir, 0, time.Time{})
 	if !errors.Is(err, context.Canceled) || res.Evicted != 0 {
 		t.Fatalf("Evict = %+v, %v; want nothing evicted and context.Canceled", res, err)
 	}
@@ -132,7 +133,7 @@ func TestEvictKeepsBlobChangedAfterListing(t *testing.T) {
 			testHookBeforeEvictBatch = func() { change(t, dir, oldest, oldestPath) }
 			defer func() { testHookBeforeEvictBatch = nil }()
 
-			res, err := Evict(context.Background(), dir, 10)
+			res, err := Evict(context.Background(), dir, 10, time.Time{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -142,6 +143,37 @@ func TestEvictKeepsBlobChangedAfterListing(t *testing.T) {
 			requireStats(t, dir, Stats{Blobs: 1, Bytes: 10})
 		})
 	}
+}
+
+// A daemon that serves a blob after Evict listed the cache records the read,
+// which moves its access time past the cutoff, so Evict keeps the blob.
+func TestEvictKeepsABlobReadAfterListingUnderACutoff(t *testing.T) {
+	dir := t.TempDir()
+	old := time.Now().Add(-72 * time.Hour)
+	read := install(t, dir, strings.Repeat("a", 40), 10, old)
+	unread := install(t, dir, strings.Repeat("b", 40), 10, old.Add(time.Minute))
+	testHookBeforeEvictBatch = func() {
+		st, err := os.Lstat(read)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := RecordRead(read, st); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() { testHookBeforeEvictBatch = nil }()
+
+	res, err := Evict(context.Background(), dir, math.MaxInt64, time.Now().Add(-48*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(read); err != nil || res.Evicted != 1 {
+		t.Fatalf("Evict = %+v; read blob stat err %v; want the read blob kept and the other evicted", res, err)
+	}
+	if _, err := os.Stat(unread); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unread blob after Evict: %v, want it evicted", err)
+	}
+	requireStats(t, dir, Stats{Blobs: 1, Bytes: 10})
 }
 
 // cancelOnCall is a context whose Err reports nil until its nth call, then
@@ -173,7 +205,7 @@ func TestEvictLeavesCountersWhenContextEndsDuringRecount(t *testing.T) {
 	}
 	ctx := &cancelOnCall{Context: context.Background(), n: 2}
 
-	res, err := Evict(ctx, dir, 0)
+	res, err := Evict(ctx, dir, 0, time.Time{})
 	if !errors.Is(err, context.Canceled) || res.Evicted != 0 {
 		t.Fatalf("Evict = %+v, %v; want nothing evicted and context.Canceled", res, err)
 	}
@@ -190,7 +222,7 @@ func TestEvictStopsMovingFlatBlobsWhenContextEnds(t *testing.T) {
 	}
 	ctx := &cancelOnCall{Context: context.Background(), n: 2}
 
-	if _, err := Evict(ctx, dir, 0); !errors.Is(err, context.Canceled) {
+	if _, err := Evict(ctx, dir, 0, time.Time{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Evict err = %v, want context.Canceled", err)
 	}
 	if data, err := os.ReadFile(Path(dir, first)); err != nil || string(data) != first {

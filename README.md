@@ -264,21 +264,17 @@ Use `--hydration-concurrency` to set each repo's number of hydration workers (de
 
 ### Evicting the blob cache
 
-The blob cache keeps every hydrated blob until you evict it. Nothing evicts automatically. `evict-cache` removes the least recently accessed blobs, by file access time, until the cache holds at most `--max-bytes` bytes. The flag is required and has no default; `--max-bytes 0` empties the cache:
+The blob cache keeps every hydrated blob until you evict it. Nothing evicts automatically. `evict-cache` removes blobs in order of least recent read: every blob the daemon has not served within `--older-than`, a duration such as `336h`, and then the least recently read blobs until the cache holds at most `--max-bytes` bytes. A blob can stay up to a day past `--older-than`, because its access time trails each serve by up to a day. On macOS a blob can also go while a file held open serves it; see below. Give either flag or both; neither has a default. `--max-bytes 0` empties the cache:
 
 ```bash
 ./artifact-fs evict-cache --name workers-sdk --max-bytes 1073741824
 # evicted_blobs=812 evicted_bytes=402653184 hydrated_blobs=2210 hydrated_bytes=1073610752
+./artifact-fs evict-cache --name workers-sdk --older-than 336h
 ```
 
 It is safe while the daemon runs. A file already open keeps reading its blob, and the next open of an evicted file hydrates it again. A blob whose access time changes after `evict-cache` lists the cache stays. Repos that share a `--blob-cache-dir` share one budget, and evicting through any of them evicts the shared directory.
 
-Eviction follows the access times the filesystem records, so its order depends on the mount:
-
-- `noatime`: reads never update the access time, so eviction removes the oldest-hydrated blobs first.
-- `relatime`, the Linux default: after the first read, a read updates the access time only when it is more than a day old, so eviction order is accurate to about a day.
-- APFS on macOS: a read updates the access time only while it is not newer than the modification time, so only the first read after hydration counts, and eviction removes the blobs first read longest ago.
-- The kernel can serve repeated reads of a mounted file from its page cache without reading the blob file, and those reads leave its access time unchanged.
+A blob's last read is its file's access time. A newly hydrated blob's access time is when it was hydrated. The daemon records a read when it opens a cached blob to serve it: at each open of a file of the mount that the kernel sends it, and at each read of a symlink's target. Linux sends an open for every `open(2)`. macOS may not ([osxfuse#199](https://github.com/osxfuse/osxfuse/issues/199)), so while one process holds a file open, other processes' opens of it can record nothing, and `--older-than` can evict its blob. The held file keeps reading the evicted blob, and the next open after it closes hydrates the blob again, which needs the remote. When the blob's access time is more than a day old, the daemon sets it to the current time, so on every filesystem it trails each serve by at most a day. `--older-than` therefore evicts only blobs whose access time is a day older than the cutoff, so every blob the daemon opened to serve within the duration stays. The filesystem alone would record too little: APFS on macOS moves an access time only while it is not newer than the modification time, and a `noatime` mount never moves it. The daemon leaves the modification time, which it uses with the size and the file's identity to tell that a cached blob is unchanged. Reads through a file that stays open record nothing after its open, and the kernel can serve them from its page cache without reading the blob file.
 
 The cache shards blobs by the first two hex characters of their object ID, `<blob-cache-dir>/<2 hex>/<oid>`. When a repo mounts, the daemon moves blobs of the earlier flat layout into their shards and recounts the cache. `evict-cache` does the same before it evicts, and `status` does it once for a cache whose counters are missing or pending. While one of them recounts, hydration into the same cache waits, so mounting a repo stalls hydration for every repo that shares its `--blob-cache-dir` for one walk of the directory, about half a second per 100,000 blobs on an APFS laptop. Hydration and eviction update the counters `status` reports as they add and remove blobs, under a lock on the cache's `stats` file, so `status` walks the cache only when its counters are missing or pending. Before hydration moves a blob into the cache, it marks the counters pending in the `stats` file, and it clears the mark when it updates them, so after a process crash in between, the next `status`, hydration or eviction recounts. The recount at mount corrects counters that an OS crash, a crash during eviction, or a change made by hand left wrong.
 
@@ -655,7 +651,7 @@ decides which invalidations it gets.
 | `gitstore` | Git CLI wrapper: clone, fetch, ls-tree, batch pool for `cat-file --batch` |
 | `snapshot` | SQLite store for `base_nodes` keyed by `(generation, path)` |
 | `overlay` | SQLite metadata + `upper/` directory for local writes, delete entries, reconciliation |
-| `blobcache` | Blob cache layout (sharded by object ID), its counters, and LRU eviction for `evict-cache` |
+| `blobcache` | Blob cache layout (sharded by object ID), its counters, read times, and eviction for `evict-cache` |
 | `hydrator` | Priority queue with deduped waiters; workers fetch queued blobs in batches. With more than one worker, a reserved worker takes only reads and copies of local blobs and blocks on `reservedReady`; the others block on `workReady` |
 | `watcher` | Polls the contents of `HEAD` and of the ref it names, loose or packed, at 500ms intervals |
 | `registry` | SQLite store of repo configs, prepare and mount requests, acquisition receipts, and the `repo_runtime` records the daemon writes and `status` reads |
