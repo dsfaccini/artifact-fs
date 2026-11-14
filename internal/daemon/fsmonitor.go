@@ -12,6 +12,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
+	"github.com/cloudflare/artifact-fs/internal/registry"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 )
 
@@ -80,11 +81,38 @@ func (s *Service) configureStatusOptimization(ctx context.Context, cfg model.Rep
 // registration and this database while the worktree is mounted. Otherwise
 // native edits may have bypassed the overlay, and "/" makes Git rescan the
 // worktree.
-func (s *Controller) FSMonitorHook(ctx context.Context, name string, since string, w io.Writer) error {
-	cfg, err := s.registry.GetRepo(ctx, name)
+//
+// Git runs the hook on every command that reads the index, so it opens no
+// Controller: it reads the registry with registry.ReadRepo and builds no git
+// store. It checks the state root as every command does.
+func FSMonitorHook(ctx context.Context, root, name, since string, w io.Writer) error {
+	root, err := ensureStateRoot(root)
 	if err != nil {
 		return err
 	}
+	cfg, err := registry.ReadRepo(ctx, registryPath(root), name)
+	if err != nil {
+		return err
+	}
+	return answerFSMonitorHook(ctx, cfg, since, w)
+}
+
+// FSMonitorHookByID answers as FSMonitorHook does for the repo registered as
+// id, which Git runs through the hook link gitstore.FSMonitorHookLink returns.
+func FSMonitorHookByID(ctx context.Context, root string, id model.RepoID, since string, w io.Writer) error {
+	root, err := ensureStateRoot(root)
+	if err != nil {
+		return err
+	}
+	cfg, err := registry.ReadRepoByID(ctx, registryPath(root), id)
+	if err != nil {
+		return err
+	}
+	return answerFSMonitorHook(ctx, cfg, since, w)
+}
+
+// answerFSMonitorHook writes FSMonitorHook's answer for cfg.
+func answerFSMonitorHook(ctx context.Context, cfg model.RepoConfig, since string, w io.Writer) error {
 	prefix := fmt.Sprintf("artifact-fs:%s:%s:", cfg.ID, cfg.ConfigVersion)
 	rest, trusted := strings.CutPrefix(since, prefix)
 	sinceInstance, seqText, ok := strings.Cut(rest, ":")

@@ -252,6 +252,16 @@ func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.Repo
 // worktree, which may still be gated during startup. It writes only the hook
 // config. An adopted worktree writes it to config.worktree, which
 // ConfigureAdoptedWorktree must have enabled.
+//
+// The hook is the link FSMonitorHookLink returns, which Git runs without a
+// shell. Git runs a path with a shell metacharacter through sh -c unquoted,
+// and sh splits it, so for such a link path the hook is the script at
+// <git dir>/hooks/artifact-fs-fsmonitor, which quotes the state root. The
+// hook is the script also when privateAncestors finds a directory above the
+// state root that another user can rename. Git then runs a file in the git
+// dir, and the hook refuses a state root that another user put in its place.
+// A git dir under the state root, the default for a clone, lies under the
+// same directories, so there the script protects nothing more.
 func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfig, stateRoot string) error {
 	configArgs := []string{"config"}
 	if repo.AdoptGitDir {
@@ -261,11 +271,16 @@ func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfi
 	if err != nil {
 		return err
 	}
-	hookPath := fsmonitorHookPath(repo.GitDir)
-	if err := os.MkdirAll(filepath.Dir(hookPath), 0o755); err != nil {
-		return err
-	}
-	if err := s.replaceExecutable(hookPath, fsmonitorHookScript(stateRoot, exe, repo.Name)); err != nil {
+	hookPath := FSMonitorHookLink(stateRoot, repo.ID)
+	if strings.ContainsAny(hookPath, gitShellMeta) || !privateAncestors(stateRoot) {
+		hookPath = fsmonitorHookPath(repo.GitDir)
+		if err := os.MkdirAll(filepath.Dir(hookPath), 0o755); err != nil {
+			return err
+		}
+		if err := s.replaceExecutable(hookPath, fsmonitorHookScript(stateRoot, exe, repo.Name)); err != nil {
+			return err
+		}
+	} else if err := s.replaceLink(hookPath, exe); err != nil {
 		return err
 	}
 	if _, err := runGit(ctx, repo.GitDir, append(configArgs, "core.fsmonitor", hookPath)...); err != nil {
@@ -306,7 +321,7 @@ func (s *Store) replaceExecutable(path, script string) error {
 		err = os.Chmod(tmp, 0o755)
 	}
 	if err == nil && s.testHookBeforeHookRename != nil {
-		s.testHookBeforeHookRename(path)
+		s.testHookBeforeHookRename(path, tmp)
 	}
 	if err == nil {
 		err = os.Rename(tmp, path)
@@ -317,8 +332,62 @@ func (s *Store) replaceExecutable(path, script string) error {
 	return err
 }
 
+// replaceLink makes a symlink to target in a new directory beside path, then
+// renames it over path, so a Git that runs the hook meanwhile finds the old
+// link or the new one.
+func (s *Store) replaceLink(path, target string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.MkdirTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	link := filepath.Join(tmp, filepath.Base(path))
+	if err := os.Symlink(target, link); err != nil {
+		return err
+	}
+	if s.testHookBeforeHookRename != nil {
+		s.testHookBeforeHookRename(path, link)
+	}
+	return os.Rename(link, path)
+}
+
 func fsmonitorHookPath(gitDir string) string {
 	return filepath.Join(gitDir, "hooks", "artifact-fs-fsmonitor")
+}
+
+// gitShellMeta holds the characters that make Git run a command through
+// sh -c, from prepare_shell_cmd in Git's run-command.c.
+const gitShellMeta = "|&;<>()$`\\\"' \t\n*?[#~=%"
+
+// fsmonitorHookLinkName names the link FSMonitorHookLink returns.
+const fsmonitorHookLinkName = "fsmonitor-hook"
+
+// FSMonitorHookLink returns the path of the symlink to the artifact-fs
+// executable that Git runs as repo id's FSMonitor hook. The hook reads the
+// state root and the repo from it with ParseFSMonitorHookLink.
+func FSMonitorHookLink(stateRoot string, id model.RepoID) string {
+	return filepath.Join(stateRoot, "overlays", string(id), fsmonitorHookLinkName)
+}
+
+// fsmonitorHookLinkPattern returns an extended regular expression that
+// matches every path FSMonitorHookLink returns for id, under any state root.
+func fsmonitorHookLinkPattern(id model.RepoID) string {
+	return "/(.*/)?overlays/" + regexp.QuoteMeta(string(id)) + "/" + fsmonitorHookLinkName
+}
+
+// ParseFSMonitorHookLink returns the state root and the repo ID of the hook
+// link at path, the program name Git runs it with. It returns false for any
+// other path.
+func ParseFSMonitorHookLink(path string) (stateRoot string, id model.RepoID, ok bool) {
+	overlayDir := filepath.Dir(path)
+	overlays := filepath.Dir(overlayDir)
+	if !filepath.IsAbs(path) || filepath.Base(path) != fsmonitorHookLinkName || filepath.Base(overlays) != "overlays" {
+		return "", "", false
+	}
+	return filepath.Dir(overlays), model.RepoID(filepath.Base(overlayDir)), true
 }
 
 // ReleaseAdoptedWorktree hands a worktree back to native Git once remove-repo
@@ -330,7 +399,9 @@ func fsmonitorHookPath(gitDir string) string {
 // successful adoption does not come back, because adoption overwrote it. The
 // core.worktree and core.bare pins stay, because they match the registered
 // worktree. extensions.worktreeConfig stays on because sibling worktrees may
-// now keep their own settings in config.worktree.
+// now keep their own settings in config.worktree. It unsets the hook script
+// in the git dir and a hook link for the repo's ID under any state root, so
+// it also unsets a link the mount made before the state root moved.
 func (s *Store) ReleaseAdoptedWorktree(ctx context.Context, repo model.RepoConfig) error {
 	// --worktree resolves to this file, but fails once the extension is off.
 	worktreeConfig := filepath.Join(repo.GitDir, "config.worktree")
@@ -338,14 +409,17 @@ func (s *Store) ReleaseAdoptedWorktree(ctx context.Context, repo model.RepoConfi
 		return nil
 	}
 	for _, pin := range [][2]string{
-		{"core.fsmonitor", "^" + regexp.QuoteMeta(fsmonitorHookPath(repo.GitDir)) + "$"},
+		{"core.fsmonitor", "^(" + fsmonitorHookLinkPattern(repo.ID) + "|" + regexp.QuoteMeta(fsmonitorHookPath(repo.GitDir)) + ")$"},
 		{"fsmonitor.allowRemote", "^true$"},
 		{"core.untrackedCache", "^true$"},
 		{"core.filemode", "^true$"},
 		{"core.ignorecase", "^false$"},
 		{"core.symlinks", "^true$"},
 	} {
-		if _, err := runGit(ctx, repo.GitDir, "config", "--file", worktreeConfig, "--unset-all", pin[0], pin[1]); err != nil {
+		// Git matches a value pattern in its locale. Under a UTF-8 locale "."
+		// matches no byte that is not valid UTF-8, which a path can hold, and
+		// the C locale matches each byte.
+		if _, err := runGitWithEnv(ctx, repo.GitDir, []string{"LC_ALL=C"}, "config", "--file", worktreeConfig, "--unset-all", pin[0], pin[1]); err != nil {
 			var exitErr *gitCommandError
 			if !errors.As(err, &exitErr) || exitErr.exitCode != 5 {
 				return err

@@ -225,7 +225,7 @@ func NewController(ctx context.Context, root string, logger *slog.Logger) (*Cont
 // newCore opens the registry under root and a git store that makes the files
 // Git runs under tempDir.
 func newCore(ctx context.Context, root, tempDir string, logger *slog.Logger) (*core, error) {
-	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
+	reg, err := registry.New(ctx, registryPath(root))
 	if err != nil {
 		return nil, err
 	}
@@ -234,6 +234,8 @@ func newCore(ctx context.Context, root, tempDir string, logger *slog.Logger) (*c
 	git.SetBatchPoolSize(DefaultHydrationConcurrency)
 	return &core{root: root, logger: logger, registry: reg, git: git}, nil
 }
+
+func registryPath(root string) string { return filepath.Join(root, "config", "repos.sqlite") }
 
 // Close releases the controller's registry and git processes.
 func (c *Controller) Close() error {

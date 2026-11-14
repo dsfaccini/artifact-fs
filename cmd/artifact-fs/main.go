@@ -13,5 +13,5 @@ import (
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	os.Exit(cli.Run(ctx, os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(cli.Main(ctx, os.Args, os.Stdout, os.Stderr))
 }

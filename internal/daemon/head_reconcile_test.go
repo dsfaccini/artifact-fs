@@ -563,7 +563,7 @@ func TestStatusReportsCleanAfterAnUntrackedPathComesAndGoes(t *testing.T) {
 			return nil
 		}},
 		{"directory", func(f *headReconcileFixture, e *fusefs.Engine) error {
-			if err := e.Mkdir(f.ctx, "build", 0o755); err != nil {
+			if _, err := e.Mkdir(f.ctx, "build", 0o755); err != nil {
 				return err
 			}
 			return e.Rmdir(f.ctx, "build")
@@ -594,7 +594,7 @@ func TestRmdirOfARenameChainStopRemovesTheDirectory(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := e.Mkdir(f.ctx, "build", 0o755); err != nil {
+	if _, err := e.Mkdir(f.ctx, "build", 0o755); err != nil {
 		t.Fatal(err)
 	}
 	rename("README.md", "build/r.md")
@@ -605,7 +605,7 @@ func TestRmdirOfARenameChainStopRemovesTheDirectory(t *testing.T) {
 	if _, err := f.rt.resolver.ResolvePath("build"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("build after rmdir: %v, want it gone", err)
 	}
-	if err := e.Mkdir(f.ctx, "build", 0o755); err != nil {
+	if _, err := e.Mkdir(f.ctx, "build", 0o755); err != nil {
 		t.Fatalf("mkdir build after rmdir: %v", err)
 	}
 }

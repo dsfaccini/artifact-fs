@@ -1,14 +1,19 @@
 package registry
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"io"
+	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/metatest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -447,4 +452,195 @@ func TestNewRefusesANewerSchema(t *testing.T) {
 		t.Fatal("New on a newer schema succeeded")
 	}
 	metatest.RequireNewerSchemaError(t, err, path)
+}
+
+// The fsmonitor hook reads its repo with ReadRepo, which must return what New
+// and GetRepo return, from a current registry and from every earlier schema,
+// which it migrates as New does.
+func TestReadRepoReadsWhatNewReads(t *testing.T) {
+	ctx := context.Background()
+	want := metatest.Schema(t, createRegistry(t))
+	schemas := map[string][]string{}
+	for name, legacy := range legacyRegistries {
+		schemas[name] = legacy.stmts
+	}
+	schemas["current"] = nil
+	for name, stmts := range schemas {
+		t.Run(name, func(t *testing.T) {
+			var paths [3]string
+			for i := range paths {
+				paths[i] = filepath.Join(t.TempDir(), "repos.sqlite")
+				if stmts == nil {
+					store, err := New(ctx, paths[i])
+					if err != nil {
+						t.Fatal(err)
+					}
+					err = store.AddRepo(ctx, fullRepoWithRequests)
+					if closeErr := store.Close(); err != nil || closeErr != nil {
+						t.Fatalf("add repo: %v, close: %v", err, closeErr)
+					}
+					continue
+				}
+				metatest.Exec(t, paths[i], stmts...)
+			}
+			store, err := New(ctx, paths[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			wantRepo, err := store.GetRepo(ctx, "repo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := ReadRepo(ctx, paths[0], "repo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, wantRepo) {
+				t.Fatalf("ReadRepo = %+v, want %+v", got, wantRepo)
+			}
+			_, wantErr := store.GetRepo(ctx, "missing")
+			if _, err := ReadRepo(ctx, paths[0], "missing"); wantErr == nil || err == nil || err.Error() != wantErr.Error() {
+				t.Fatalf("ReadRepo of a missing repo: %v, want %v", err, wantErr)
+			}
+			if got := metatest.Schema(t, paths[0]); !slices.Equal(got, want) {
+				t.Fatalf("schema after ReadRepo = %q, want %q", got, want)
+			}
+			got, err = ReadRepoByID(ctx, paths[2], wantRepo.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, wantRepo) {
+				t.Fatalf("ReadRepoByID = %+v, want %+v", got, wantRepo)
+			}
+			if _, err := ReadRepoByID(ctx, paths[2], "missing"); err == nil || err.Error() != wantErr.Error() {
+				t.Fatalf("ReadRepoByID of a missing repo: %v, want %v", err, wantErr)
+			}
+			if got := metatest.Schema(t, paths[2]); !slices.Equal(got, want) {
+				t.Fatalf("schema after ReadRepoByID = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// The hook link names a repo by its ID, which need not be its name.
+func TestReadRepoByIDReadsTheRepoWithThatID(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "repos.sqlite")
+	store, err := New(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := fullRepoWithRequests
+	cfg.ID = "repo-id"
+	if err := store.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	want, err := store.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadRepoByID(ctx, path, cfg.ID); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadRepoByID(%q) = %+v, %v; want %+v", cfg.ID, got, err, want)
+	}
+	if got, err := ReadRepoByID(ctx, path, model.RepoID(cfg.Name)); err == nil || err.Error() != "repo not found" {
+		t.Fatalf("ReadRepoByID of the name %q = %+v, %v; want repo not found", cfg.Name, got, err)
+	}
+}
+
+func TestReadRepoRefusesANewerSchema(t *testing.T) {
+	path := createRegistry(t)
+	metatest.Exec(t, path, `PRAGMA user_version = 99`)
+	if _, err := ReadRepo(context.Background(), path, "repo"); err == nil {
+		t.Fatal("ReadRepo on a newer schema succeeded")
+	} else {
+		metatest.RequireNewerSchemaError(t, err, path)
+	}
+}
+
+// Git prints the fsmonitor hook's error on every command, so ReadRepo fails
+// with the error New gives for the same registry.
+func TestReadRepoFailsAsNewFails(t *testing.T) {
+	for name, setup := range map[string]func(t *testing.T, path string){
+		"corrupt file": func(t *testing.T, path string) {
+			if err := os.WriteFile(path, bytes.Repeat([]byte("not a database "), 512), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"directory": func(t *testing.T, path string) {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"unreadable file": func(t *testing.T, path string) {
+			if os.Geteuid() == 0 {
+				t.Skip("root reads a file whatever its mode")
+			}
+			metatest.Exec(t, path)
+			if err := os.Chmod(path, 0); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "repos.sqlite")
+			setup(t, path)
+			store, wantErr := New(context.Background(), path)
+			if wantErr == nil {
+				store.Close()
+				t.Fatal("New succeeded")
+			}
+			if _, err := ReadRepo(context.Background(), path, "repo"); err == nil || err.Error() != wantErr.Error() {
+				t.Fatalf("ReadRepo: %v, want New's %v", err, wantErr)
+			}
+		})
+	}
+}
+
+// Git runs the fsmonitor hook on every command. A registry another process
+// locks past busy_timeout must fail ReadRepo after that one wait: New would
+// wait out busy_timeout again for the same lock.
+func TestReadRepoFailsABusyRegistryWithoutNew(t *testing.T) {
+	ctx := context.Background()
+	fellBack := false
+	testHookBeforeReadRepoNew = func() { fellBack = true }
+	defer func() { testHookBeforeReadRepoNew = nil }()
+	// The hook runs on the way to New.
+	legacy := filepath.Join(t.TempDir(), "repos.sqlite")
+	metatest.Exec(t, legacy, legacyRegistries["user_version 5"].stmts...)
+	if _, err := ReadRepo(ctx, legacy, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	if !fellBack {
+		t.Fatal("ReadRepo migrated an earlier schema without the hook")
+	}
+
+	fellBack = false
+	path := createRegistry(t)
+	holder, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: path}).String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	conn, err := holder.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	for _, stmt := range []string{`PRAGMA locking_mode=EXCLUSIVE`, `BEGIN EXCLUSIVE`} {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var repos int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM repos`).Scan(&repos); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadRepo(ctx, path, "repo"); !meta.IsBusy(err) {
+		t.Fatalf("ReadRepo of a locked registry: %v, want SQLITE_BUSY", err)
+	}
+	if fellBack {
+		t.Fatal("ReadRepo opened a locked registry with New")
+	}
 }

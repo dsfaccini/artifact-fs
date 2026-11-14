@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -39,8 +40,222 @@ type Resolver struct {
 	generation atomic.Int64
 	commitTime atomic.Int64 // unix seconds of HEAD commit
 	transition sync.RWMutex
-	Snapshot   model.SnapshotStore
-	Overlay    model.OverlayStore
+	// switchMu runs one SwitchGeneration at a time, so the generation it
+	// diffs from is the one it switches from. It is taken before transition.
+	switchMu sync.Mutex
+	times    dirTimes
+	Snapshot model.SnapshotStore
+	Overlay  model.OverlayStore
+}
+
+// dirTimes holds the directory times that only memory records. Git's
+// untracked cache trusts a directory whose stat data it has seen, so each
+// change to a directory's listing must change its stat data.
+type dirTimes struct {
+	mu sync.Mutex
+	// floor is the earliest ctime any directory reports. The daemon sets it
+	// to the mount's start, so a listing change from before a restart, which
+	// memory no longer holds, still changes the directory's stat data.
+	floor time.Time
+	// listed holds the last change to each directory's listing: an entry an
+	// op through the mount or a generation switch added, removed or retyped.
+	// It raises the directory's mtime and ctime, as on a local file system.
+	// Each key is a copy, so it keeps no longer path it was cut from alive.
+	listed map[string]time.Time
+	// allListed is the last change to every directory's listing, from a
+	// switch that could not tell which listings it changed.
+	allListed time.Time
+	// latest is the latest time listed or allListed holds.
+	latest time.Time
+	// mtimeSet holds each directory whose mtime was set, until a listing
+	// change reaches the mtime it set. A listing change after the set
+	// replaces the mtime, as on a local file system.
+	mtimeSet map[string]mtimeSetting
+	// switched holds the directories whose listing a switch changed since
+	// the switch pass last took them, and allSwitched whether a switch
+	// changed every listing. No identity the pass compares holds a
+	// directory's times, so the pass invalidates what the kernel caches for
+	// these.
+	switched    map[string]bool
+	allSwitched bool
+}
+
+// mtimeSetting is an mtime set on a directory.
+type mtimeSetting struct {
+	// before is the latest listing change before the set.
+	before time.Time
+	value  time.Time
+}
+
+// SetDirFloor makes t the earliest ctime any directory reports.
+func (r *Resolver) SetDirFloor(t time.Time) {
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	r.times.floor = t
+}
+
+// nextListingLocked returns the time of a listing change happening now. It is
+// later than every listing change before it, and than the commit time a base
+// directory reports, which can lie in the future, so the change always moves
+// the directory's times. The caller holds r.times.mu.
+func (r *Resolver) nextListingLocked() time.Time {
+	t := time.Now()
+	if commit := time.Unix(r.CommitTime(), 0); !t.After(commit) {
+		t = commit.Add(time.Nanosecond)
+	}
+	if !t.After(r.times.latest) {
+		t = r.times.latest.Add(time.Nanosecond)
+	}
+	r.times.latest = t
+	return t
+}
+
+// listingChanged records that the listings of dirs changed now.
+func (r *Resolver) listingChanged(dirs ...string) {
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	r.listingChangedLocked(dirs, false)
+}
+
+// listingChangedLocked implements listingChanged, and records dirs in
+// r.times.switched too when switched is true. The caller holds r.times.mu.
+func (r *Resolver) listingChangedLocked(dirs []string, switched bool) {
+	if r.times.listed == nil {
+		r.times.listed = map[string]time.Time{}
+	}
+	switched = switched && !r.times.allSwitched
+	if switched && r.times.switched == nil {
+		r.times.switched = map[string]bool{}
+	}
+	t := r.nextListingLocked()
+	for _, dir := range dirs {
+		key := strings.Clone(dir)
+		r.times.listed[key] = t
+		if switched {
+			r.times.switched[key] = true
+		}
+		// The directory reports t from now on also without the record.
+		if set, ok := r.times.mtimeSet[dir]; ok && !set.value.After(t) {
+			delete(r.times.mtimeSet, dir)
+		}
+	}
+}
+
+// allListingsChangedLocked records that the listing of every directory may
+// have changed now. That change hides every listing change before it, so it
+// forgets them, and every set mtime it reaches. The caller holds r.times.mu.
+func (r *Resolver) allListingsChangedLocked() {
+	t := r.nextListingLocked()
+	r.times.allListed = t
+	clear(r.times.listed)
+	for dir, set := range r.times.mtimeSet {
+		if !set.value.After(t) {
+			delete(r.times.mtimeSet, dir)
+		}
+	}
+}
+
+// listingsSwitched records the listing changes of a switch: those of
+// listings, or of every directory when all is true. takeSwitchedListings
+// returns them.
+func (r *Resolver) listingsSwitched(listings []string, all bool) {
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	if all {
+		r.allListingsChangedLocked()
+		r.times.switched, r.times.allSwitched = nil, true
+		return
+	}
+	r.listingChangedLocked(listings, true)
+}
+
+// takeSwitchedListings returns the directories whose listing a switch changed
+// since its last call, or all true when a switch changed every listing, and
+// forgets them.
+func (r *Resolver) takeSwitchedListings() (dirs map[string]bool, all bool) {
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	dirs, all = r.times.switched, r.times.allSwitched
+	r.times.switched, r.times.allSwitched = nil, false
+	return dirs, all
+}
+
+// mtimeSetOn records that mtime value was set on dir, so that it shows until
+// dir's listing changes again.
+func (r *Resolver) mtimeSetOn(dir string, value time.Time) {
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	if r.times.mtimeSet == nil {
+		r.times.mtimeSet = map[string]mtimeSetting{}
+	}
+	r.times.mtimeSet[strings.Clone(dir)] = mtimeSetting{before: r.times.latest, value: value}
+}
+
+// dirsRemoved forgets the times recorded for dirs, directories that no
+// longer exist.
+func (r *Resolver) dirsRemoved(dirs ...string) {
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	for _, dir := range dirs {
+		delete(r.times.listed, dir)
+		delete(r.times.mtimeSet, dir)
+	}
+}
+
+// dirTimes returns the mtime and ctime that directory dir reports, given the
+// ones the overlay or the snapshot gives it.
+func (r *Resolver) dirTimes(dir string, mtime, ctime time.Time) (time.Time, time.Time) {
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	return r.dirTimesLocked(dir, mtime, ctime)
+}
+
+// dirTimesLocked implements dirTimes. The caller holds r.times.mu.
+func (r *Resolver) dirTimesLocked(dir string, mtime, ctime time.Time) (time.Time, time.Time) {
+	changed := later(r.times.listed[dir], r.times.allListed)
+	if !changed.IsZero() {
+		if set, ok := r.times.mtimeSet[dir]; !ok {
+			mtime = later(mtime, changed)
+		} else if changed.After(set.before) {
+			mtime = changed
+		}
+		ctime = later(ctime, changed)
+	}
+	return mtime, later(ctime, r.times.floor)
+}
+
+// childDirTimes sets the times of each directory among entries, the
+// children of dir, to those dirTimes gives it, from base, the times of a
+// base entry.
+func (r *Resolver) childDirTimes(dir string, entries []ReaddirEntry, base time.Time) {
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	// While no directory has a record, every lookup misses, so no child's
+	// path is built.
+	records := len(r.times.listed) > 0 || len(r.times.mtimeSet) > 0
+	for i, entry := range entries {
+		if entry.Type != "dir" {
+			continue
+		}
+		mt, ct := base, base
+		if entry.FromOverlay {
+			mt, ct = time.Unix(0, entry.MtimeUnixNs), time.Unix(0, entry.CtimeUnixNs)
+		}
+		var child string
+		if records {
+			child = model.CleanPath(filepath.Join(dir, entry.Name))
+		}
+		mt, ct = r.dirTimesLocked(child, mt, ct)
+		entries[i].MtimeUnixNs, entries[i].CtimeUnixNs = mt.UnixNano(), ct.UnixNano()
+	}
+}
+
+// later returns the later of a and b.
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
 }
 
 func (r *Resolver) SetGeneration(gen int64) { r.generation.Store(gen) }
@@ -56,14 +271,39 @@ func (r *Resolver) CommitTime() int64       { return r.commitTime.Load() }
 // old generation, or the reconciled overlay with gen. The overlay looks up and
 // hashes its entries before SwitchGeneration takes the transition write lock,
 // which covers only applying the result and the switch.
-func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime int64) error {
+//
+// The overlay logs the paths the switch changed for the fsmonitor hook. A
+// HEAD move need not write the work tree, so the hook is how Git learns of
+// them.
+func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime int64) (Switch, error) {
 	baseLookup := func(path string) (model.BaseNode, bool, error) {
 		return r.Snapshot.LookupNode(ctx, gen, path)
 	}
-	return r.Overlay.ReconcileChecked(ctx, baseLookup, &r.transition, func() {
+	r.switchMu.Lock()
+	defer r.switchMu.Unlock()
+	sw := Switch{Replaced: r.Generation()}
+	var listings []string
+	// Readers resolved against no generation before the first switch, so
+	// nothing Git saw changes. An async repo's first switch follows the
+	// clean-index bootstrap, whose token a new instance would discard.
+	if sw.Replaced != 0 && sw.Replaced != gen {
+		sw.Changed, listings, sw.DiffErr = switchedPathsFor(ctx, r.Snapshot, r.Overlay, sw.Replaced, gen)
+	}
+	return sw, r.Overlay.ReconcileChecked(ctx, gen, baseLookup, sw.Changed, &r.transition, func() {
 		r.SetCommitTime(commitTime)
 		r.SetGeneration(gen)
+		r.listingsSwitched(listings, sw.Changed.Unknown)
 	})
+}
+
+// Switch is what one SwitchGeneration did.
+type Switch struct {
+	// Replaced is the generation readers resolved against before the switch.
+	Replaced int64
+	// Changed is what the switch gave the overlay to log.
+	Changed model.SwitchedPaths
+	// DiffErr is the snapshot read error that made Changed Unknown, if any.
+	DiffErr error
 }
 
 type ResolvedNode struct {
@@ -369,16 +609,83 @@ func (r *Resolver) ChangedPaths(from, to int64, paths []string) (changed map[str
 		}
 		return dirs
 	}
+	mark := func(p string, _ bool) bool {
+		changed[p] = true
+		return true
+	}
+	if ok, err := diff(r.Snapshot, from, to, mark, walk); !ok {
+		return nil, false, err
+	}
+	return changed, true, nil
+}
+
+// SwitchedPaths returns every path whose base type, mode or blob differs
+// between generations from and to of snap, and every path only one of them
+// holds. It lists both generations' children of each directory whose tree ID
+// differs and of each directory only one of them holds. The result is
+// Unknown, with no paths, when from holds no root entries, as for an empty
+// tree or a generation that was pruned or never published, and when a listing
+// fails, whose error it returns. It is Unknown also past the most paths ov's
+// log can write one by one, ov.SwitchedPathsLimit. The walk stops there, so a
+// switch the overlay renews the instance for costs no full diff. The limit is
+// read before the reconcile reads the entries, so it misses an entry written
+// in between. A switch that only such an entry keeps within the cap then
+// renews the instance, which costs Git one extra rescan.
+func SwitchedPaths(ctx context.Context, snap model.SnapshotStore, ov model.OverlayStore, from, to int64) (model.SwitchedPaths, error) {
+	switched, _, err := switchedPathsFor(ctx, snap, ov, from, to)
+	return switched, err
+}
+
+// switchedPathsFor returns what SwitchedPaths does, and listings, each
+// directory that gained, lost or retyped an entry, which is nil when the
+// result is Unknown.
+func switchedPathsFor(ctx context.Context, snap model.SnapshotStore, ov model.OverlayStore, from, to int64) (model.SwitchedPaths, []string, error) {
+	limit, err := ov.SwitchedPathsLimit(ctx)
+	if err != nil {
+		return model.SwitchedPaths{Unknown: true}, nil, err
+	}
+	return switchedPaths(snap, from, to, limit)
+}
+
+// switchedPaths returns what switchedPathsFor does, Unknown once more than
+// limit paths changed.
+func switchedPaths(snap model.SnapshotStore, from, to int64, limit int) (switched model.SwitchedPaths, listings []string, err error) {
+	var paths []string
+	mark := func(p string, listing bool) bool {
+		paths = append(paths, p)
+		if listing {
+			listings = append(listings, model.CleanPath(filepath.Dir(p)))
+		}
+		return len(paths) <= limit
+	}
+	descend := func(dirs []string, dir string) []string { return append(dirs, dir) }
+	if ok, err := diff(snap, from, to, mark, descend); !ok {
+		return model.SwitchedPaths{Unknown: true}, nil, err
+	}
+	slices.Sort(paths)
+	slices.Sort(listings)
+	return model.SwitchedPaths{Paths: paths}, slices.Compact(listings), nil
+}
+
+// diff walks down from the root of generations from and to of snap. For each
+// directory it lists, it calls mark with each child that the generations give
+// different types, modes or blobs or that only one of them holds, with listing
+// true when only one holds it or its type differs, and walk with each child
+// directory that can hold such children. mark returns false to stop the walk.
+// walk returns the stack of directories to list, with the directory pushed
+// when diff should list it. ok is false when from holds no root entries or
+// mark stopped the walk.
+func diff(snap model.SnapshotStore, from, to int64, mark func(path string, listing bool) bool, walk func(dirs []string, dir string) []string) (ok bool, err error) {
 	for dirs := []string{"."}; len(dirs) > 0; {
 		dir := dirs[len(dirs)-1]
 		dirs = dirs[:len(dirs)-1]
-		before, err := r.Snapshot.ListChildren(from, dir)
+		before, err := snap.ListChildren(from, dir)
 		if err != nil || dir == "." && len(before) == 0 {
-			return nil, false, err
+			return false, err
 		}
-		after, err := r.Snapshot.ListChildren(to, dir)
+		after, err := snap.ListChildren(to, dir)
 		if err != nil {
-			return nil, false, err
+			return false, err
 		}
 		added := make(map[string]model.BaseNode, len(after))
 		for _, n := range after {
@@ -388,14 +695,18 @@ func (r *Resolver) ChangedPaths(from, to int64, paths []string) (changed map[str
 			b, kept := added[a.Path]
 			delete(added, a.Path)
 			if !kept || a.Type != b.Type || a.Mode != b.Mode || baseBlob(a) != baseBlob(b) {
-				changed[a.Path] = true
+				if !mark(a.Path, !kept || a.Type != b.Type) {
+					return false, nil
+				}
 			}
 			if (a.Type == "dir" || kept && b.Type == "dir") && !(kept && sameTree(a, b)) {
 				dirs = walk(dirs, a.Path)
 			}
 		}
 		for _, b := range added {
-			changed[b.Path] = true
+			if !mark(b.Path, true) {
+				return false, nil
+			}
 			if b.Type == "dir" {
 				dirs = walk(dirs, b.Path)
 			}
@@ -403,10 +714,10 @@ func (r *Resolver) ChangedPaths(from, to int64, paths []string) (changed map[str
 	}
 	// A prune deletes a generation in one statement, so from still holding
 	// its root entries shows every listing above read it whole.
-	if before, err := r.Snapshot.ListChildren(from, "."); err != nil || len(before) == 0 {
-		return nil, false, err
+	if before, err := snap.ListChildren(from, "."); err != nil || len(before) == 0 {
+		return false, err
 	}
-	return changed, true, nil
+	return true, nil
 }
 
 // sameTree reports whether a and b are directories with the same tree ID,

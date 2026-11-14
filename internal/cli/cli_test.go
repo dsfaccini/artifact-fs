@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/daemon"
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/registry"
@@ -619,6 +620,106 @@ func TestStatusCLIPrintsDaemonMountError(t *testing.T) {
 	}
 }
 
+// The hook reads a state root only while ensureStateRoot accepts it, as every
+// other command does.
+func TestFSMonitorHookCLIRefusesAWritableStateRoot(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ARTIFACT_FS_ROOT", root)
+	ctx := context.Background()
+	svc, err := daemon.NewController(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", MountPath: "/"}, RepoSpec: model.RepoSpec{RemoteURL: "https://github.com/example/repo.git"}, Enabled: true}
+	err = svc.AddRepoWithOptions(ctx, cfg, daemon.AddRepoOptions{Async: true})
+	if closeErr := svc.Close(); err != nil || closeErr != nil {
+		t.Fatalf("add repo: %v, close: %v", err, closeErr)
+	}
+	// The error names the root with its symlinks resolved.
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"artifact-fs", "fsmonitor-hook", "--name", "repo", "2", ""},
+		{gitstore.FSMonitorHookLink(resolved, "repo"), "2", ""},
+	} {
+		if err := os.Chmod(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		var stdout, stderr bytes.Buffer
+		if code := Main(ctx, args, &stdout, &stderr); code != 0 || stdout.Len() == 0 {
+			t.Fatalf("%q on a private root: exit %d, stdout %q, stderr %q", args, code, stdout.String(), stderr.String())
+		}
+		if err := os.Chmod(root, 0o770); err != nil {
+			t.Fatal(err)
+		}
+		stdout.Reset()
+		stderr.Reset()
+		code := Main(ctx, args, &stdout, &stderr)
+		if code != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "refusing state directory "+resolved+": writable by group or others") {
+			t.Fatalf("%q on a group-writable root: exit %d, stdout %q, stderr %q", args, code, stdout.String(), stderr.String())
+		}
+	}
+}
+
+// Git runs the hook link with the hook protocol version and its last token.
+// The link answers what the hook script's fsmonitor-hook --name answers.
+func TestFSMonitorHookLinkAnswersWhatTheScriptAnswers(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ARTIFACT_FS_ROOT", root)
+	ctx := context.Background()
+	svc, err := daemon.NewController(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// "/" is always in the mount table, so it stands in for a live mount.
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo", MountPath: "/"}, RepoSpec: model.RepoSpec{RemoteURL: "https://github.com/example/repo.git"}, Enabled: true}
+	if err := svc.AddRepoWithOptions(ctx, cfg, daemon.AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	repos, err := svc.ListRepos(ctx)
+	if closeErr := svc.Close(); err != nil || closeErr != nil || len(repos) != 1 {
+		t.Fatalf("list repos: %v, %v, %d", err, closeErr, len(repos))
+	}
+	ov, err := overlay.New(ctx, repos[0].RepoPaths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ov.Close(); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		code           int
+		stdout, stderr string
+	}
+	answer := func(args ...string) result {
+		var stdout, stderr bytes.Buffer
+		code := Main(ctx, args, &stdout, &stderr)
+		return result{code, stdout.String(), stderr.String()}
+	}
+	own := answer("artifact-fs", "fsmonitor-hook", "--name", "repo", "2", "")
+	token, _, _ := strings.Cut(own.stdout, "\x00")
+	if own.code != 0 || !strings.HasPrefix(token, "artifact-fs:repo:") {
+		t.Fatalf("fsmonitor-hook answer %+v has no token", own)
+	}
+	for _, tc := range []struct{ name, since string }{
+		{"repo", ""},
+		{"repo", "other-hook:1"},
+		{"repo", token},
+		{"missing", token},
+	} {
+		script := answer("artifact-fs", "fsmonitor-hook", "--name", tc.name, "2", tc.since)
+		if link := answer(gitstore.FSMonitorHookLink(resolved, model.RepoID(tc.name)), "2", tc.since); link != script {
+			t.Errorf("repo %s, token %q: the link answered %+v, the script %+v", tc.name, tc.since, link, script)
+		}
+	}
+}
+
 func TestFSMonitorHookCLIAnswersGitToken(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("ARTIFACT_FS_ROOT", root)
@@ -658,5 +759,9 @@ func TestFSMonitorHookCLIAnswersGitToken(t *testing.T) {
 	// A new token and no paths: the empty overlay answers the current token.
 	if fields := hook(fields[0]); len(fields) != 2 || !strings.HasPrefix(fields[0], "artifact-fs:repo:") || fields[1] != "" {
 		t.Fatalf("fsmonitor-hook output for its own token = %q", fields)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := Run(ctx, []string{"fsmonitor-hook", "2", fields[0]}, &stdout, &stderr); code != 1 || stdout.Len() != 0 || stderr.String() != "--name required\n" {
+		t.Fatalf("fsmonitor-hook without --name: exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
 	}
 }

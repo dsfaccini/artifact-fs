@@ -178,7 +178,8 @@ func TestDeletedPathsLeaveNoMapping(t *testing.T) {
 // A HEAD change retires the number of each path it removes, whether or not
 // the kernel still holds its inode, and keeps the number of each path that
 // still exists. The kernel holds nothing for a forgotten path, so the switch
-// sends no invalidation for it.
+// sends no invalidation for it. It invalidates the root, whose listing it
+// changed.
 func TestSwitchRetiresInodeNumbersOfVanishedPaths(t *testing.T) {
 	f := newCacheFixture(t,
 		baseFile("kept.txt", "kept-1", 0o100644),
@@ -195,8 +196,8 @@ func TestSwitchRetiresInodeNumbersOfVanishedPaths(t *testing.T) {
 	if err := f.mount.InvalidateChanged(); err != nil {
 		t.Fatal(err)
 	}
-	if inodes, entries := f.notifier.recorded(); len(inodes) != 0 || !slices.Equal(entries, []kernelEntry{{root, "held.txt"}}) {
-		t.Fatalf("invalidated inodes %v and entries %v, want only the entry of held.txt", inodes, entries)
+	if inodes, entries := f.notifier.recorded(); !slices.Equal(inodes, []fuseops.InodeID{root}) || !slices.Equal(entries, []kernelEntry{{root, "held.txt"}}) {
+		t.Fatalf("invalidated inodes %v and entries %v, want the root's inode and the entry of held.txt", inodes, entries)
 	}
 	forget(t, f.fs, held)
 	if len(f.fs.unmapped) != 0 {
@@ -265,7 +266,8 @@ func TestCreateBeforeTheSwitchPassGetsNewInodeNumber(t *testing.T) {
 // and invalidated when a later switch brings the path back with another blob,
 // so the kernel drops what it cached and gets ESTALE when it asks again. Its
 // name already left the kernel, so no switch sends an entry invalidation for
-// it once the path is unmapped.
+// it once the path is unmapped. A switch from the empty tree cannot tell
+// which listings it changed, so it invalidates the root.
 func TestSwitchInvalidatesHeldInodeWhosePathReturns(t *testing.T) {
 	f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
 	held := f.lookup(fuseops.RootInodeID, "file.txt")
@@ -283,11 +285,11 @@ func TestSwitchInvalidatesHeldInodeWhosePathReturns(t *testing.T) {
 	if _, entries := pass(); !slices.Equal(entries, []kernelEntry{{fuseops.RootInodeID, "file.txt"}}) {
 		t.Fatalf("entries invalidated when file.txt vanished = %v, want file.txt", entries)
 	}
-	if inodes, entries := pass(); len(inodes) != 0 || len(entries) != 0 {
-		t.Fatalf("a switch that keeps file.txt absent invalidated inodes %v and entries %v, want none", inodes, entries)
+	if inodes, entries := pass(); !slices.Equal(inodes, []fuseops.InodeID{fuseops.RootInodeID}) || len(entries) != 0 {
+		t.Fatalf("a switch that keeps file.txt absent invalidated inodes %v and entries %v, want only the root's inode", inodes, entries)
 	}
-	if inodes, entries := pass(baseFile("file.txt", "blob-B", 0o100644)); !slices.Equal(inodes, []fuseops.InodeID{held}) || len(entries) != 0 {
-		t.Fatalf("file.txt came back with blob-B and the switch invalidated inodes %v and entries %v, want only the held inode %d", inodes, entries, held)
+	if inodes, entries := pass(baseFile("file.txt", "blob-B", 0o100644)); !slices.Equal(inodes, []fuseops.InodeID{held, fuseops.RootInodeID}) || len(entries) != 0 {
+		t.Fatalf("file.txt came back with blob-B and the switch invalidated inodes %v and entries %v, want the held inode %d and the root's", inodes, entries, held)
 	}
 }
 

@@ -425,7 +425,7 @@ func TestHydrationHoldsNoLock(t *testing.T) {
 				t.Fatalf("op returned before hydration: %v", err)
 			}
 
-			if err := f.resolver.SwitchGeneration(context.Background(), f.resolver.Generation(), f.resolver.CommitTime()); err != nil {
+			if _, err := f.resolver.SwitchGeneration(context.Background(), f.resolver.Generation(), f.resolver.CommitTime()); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := f.resolver.ResolvePath("other.txt"); err != nil {
@@ -658,7 +658,7 @@ func TestHEADSwitchDuringHydrationUsesNewBlob(t *testing.T) {
 	case err := <-done:
 		t.Fatalf("WriteFile returned before hydration: %v", err)
 	}
-	if err := f.resolver.SwitchGeneration(context.Background(), 2, f.resolver.CommitTime()); err != nil {
+	if _, err := f.resolver.SwitchGeneration(context.Background(), 2, f.resolver.CommitTime()); err != nil {
 		t.Fatal(err)
 	}
 	close(release)
@@ -1051,14 +1051,84 @@ type lockObserver struct {
 	unlocking func()
 }
 
-func (o *lockObserver) ReconcileChecked(ctx context.Context, baseLookup func(string) (model.BaseNode, bool, error), lock sync.Locker, switchBase func()) error {
-	return o.OverlayStore.ReconcileChecked(ctx, baseLookup, observedLock{Locker: lock, locked: o.locked, unlocking: o.unlocking}, switchBase)
+func (o *lockObserver) ReconcileChecked(ctx context.Context, gen int64, baseLookup func(string) (model.BaseNode, bool, error), switched model.SwitchedPaths, lock sync.Locker, switchBase func()) error {
+	return o.OverlayStore.ReconcileChecked(ctx, gen, baseLookup, switched, observedLock{Locker: lock, locked: o.locked, unlocking: o.unlocking}, switchBase)
 }
 
 func blobOID(content string) string {
 	h := sha1.New()
 	_, _ = fmt.Fprintf(h, "blob %d\x00%s", len(content), content)
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Switches run one at a time, so each diffs from the generation it replaces
+// and returns that generation. Generation 3 restores p.txt, which generation 2
+// changed: a switch to 3 that diffed from 1 while the switch to 2 ran would
+// leave p.txt out of the log.
+func TestSwitchGenerationDiffsFromTheGenerationItReplaces(t *testing.T) {
+	q := baseFile("q.txt", "q", 0o100644)
+	f := newCacheFixture(t, baseFile("p.txt", "p1", 0o100644), q)
+	// The reconcile looks up the base of each entry, where the switch to 2 pauses.
+	if err := f.resolver.Overlay.Remove(f.ctx, q.Path); err != nil {
+		t.Fatal(err)
+	}
+	gen2 := f.publish(baseFile("p.txt", "p2", 0o100644), q)
+	gen3 := f.publish(baseFile("p.txt", "p1", 0o100644), q)
+	snapshot := &pausingSnapshot{SnapshotStore: f.snap, gen: gen2, paused: make(chan struct{}), resume: make(chan struct{})}
+	f.resolver.Snapshot = snapshot
+	var once sync.Once
+	var firstSeq int64
+	f.resolver.Overlay = &lockObserver{
+		OverlayStore: f.resolver.Overlay,
+		locked:       func() {},
+		// The first switch has committed its log when it releases the lock.
+		unlocking: func() { once.Do(func() { firstSeq = f.changesSince(0).Seq }) },
+	}
+
+	type result struct {
+		sw  Switch
+		err error
+	}
+	from := f.resolver.Generation()
+	done2 := make(chan result, 1)
+	go func() {
+		sw, err := f.resolver.SwitchGeneration(f.ctx, gen2, 0)
+		done2 <- result{sw, err}
+	}()
+	select {
+	case <-snapshot.paused:
+	case res := <-done2:
+		t.Fatalf("switch to %d returned before it looked up the new base: %v", gen2, res.err)
+	}
+	done3 := make(chan result, 1)
+	finished3 := make(chan struct{})
+	go func() {
+		sw, err := f.resolver.SwitchGeneration(f.ctx, gen3, 0)
+		done3 <- result{sw, err}
+		close(finished3)
+	}()
+	if !waitParked(finished3, "(*Resolver).SwitchGeneration") {
+		t.Fatalf("switch to %d returned while the switch to %d ran: %v", gen3, gen2, (<-done3).err)
+	}
+	close(snapshot.resume)
+	for _, want := range []struct {
+		done     chan result
+		replaced int64
+	}{{done2, from}, {done3, gen2}} {
+		res := <-want.done
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		if res.sw.Replaced != want.replaced {
+			t.Errorf("switch replaced generation %d, want %d", res.sw.Replaced, want.replaced)
+		}
+	}
+	if got := f.resolver.Generation(); got != gen3 {
+		t.Fatalf("generation after both switches = %d, want %d", got, gen3)
+	}
+	if got, want := f.changesSince(firstSeq).Paths, []string{"p.txt"}; !slices.Equal(got, want) {
+		t.Errorf("paths the switch to %d logged = %q, want %q", gen3, got, want)
+	}
 }
 
 // A reader during a HEAD switch sees the old overlay with the old generation,
@@ -1118,7 +1188,10 @@ func TestSwitchGenerationServesReadsWhileItLooksUpTheBase(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- f.resolver.SwitchGeneration(ctx, 2, 0) }()
+	go func() {
+		_, err := f.resolver.SwitchGeneration(ctx, 2, 0)
+		done <- err
+	}()
 	select {
 	case <-snapshot.paused:
 	case err := <-done:

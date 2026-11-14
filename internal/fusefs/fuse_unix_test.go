@@ -1079,12 +1079,14 @@ func packCount(t *testing.T, gitDir string) int {
 }
 
 // kernelDirent is one entry of a ReadDir or ReadDirPlus reply as the kernel
-// decodes it. Only a ReadDirPlus entry carries the child's size and mode.
+// decodes it. Only a ReadDirPlus entry carries the child's size, mode and
+// times, the times in Unix nanoseconds.
 type kernelDirent struct {
-	name   string
-	offset fuseops.DirOffset
-	size   uint64
-	mode   uint32
+	name         string
+	offset       fuseops.DirOffset
+	size         uint64
+	mode         uint32
+	mtime, ctime int64
 }
 
 // decodeDirents decodes a ReadDir reply, or a ReadDirPlus reply when plus is
@@ -1094,9 +1096,11 @@ type kernelDirent struct {
 func decodeDirents(buf []byte, plus bool) ([]kernelDirent, error) {
 	const entryOutHeader = 40 // nodeid, generation, and the entry and attribute timeouts
 	const direntHeader = 24   // ino, off, namelen and type
-	attrSize, modeOffset := 88, 60
+	// fuse_attr holds atime, mtime and ctime seconds from byte 24, and their
+	// nanoseconds after them, after crtime's seconds on macFUSE.
+	attrSize, modeOffset, nsecOffset := 88, 60, 48
 	if runtime.GOOS == "darwin" {
-		attrSize, modeOffset = 104, 72
+		attrSize, modeOffset, nsecOffset = 104, 72, 56
 	}
 	var out []kernelDirent
 	for len(buf) > 0 {
@@ -1108,6 +1112,10 @@ func decodeDirents(buf []byte, plus bool) ([]kernelDirent, error) {
 			attr := buf[entryOutHeader:]
 			d.size = binary.NativeEndian.Uint64(attr[8:])
 			d.mode = binary.NativeEndian.Uint32(attr[modeOffset:])
+			unixNano := func(sec, nsec int) int64 {
+				return time.Unix(int64(binary.NativeEndian.Uint64(attr[sec:])), int64(binary.NativeEndian.Uint32(attr[nsec:]))).UnixNano()
+			}
+			d.mtime, d.ctime = unixNano(32, nsecOffset+4), unixNano(40, nsecOffset+8)
 			buf = buf[entryOutHeader+attrSize:]
 		}
 		if len(buf) < direntHeader {
@@ -1206,7 +1214,9 @@ func TestReadDirPlusUsesReaddirMetadataWithoutHydration(t *testing.T) {
 		"file.txt": {name: "file.txt", offset: 2, size: 42, mode: syscall.S_IFREG | 0o644},
 		"run.sh":   {name: "run.sh", offset: 3, size: 7, mode: syscall.S_IFREG | 0o755},
 	} {
-		if got := entries[name]; got != want {
+		got := entries[name]
+		got.mtime, got.ctime = 0, 0
+		if got != want {
 			t.Fatalf("ReadDirPlus entry %s = %+v, want %+v", name, got, want)
 		}
 	}
