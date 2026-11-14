@@ -314,13 +314,13 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		},
 		{
 			Name:  "evict-cache",
-			Usage: "evict blobs last read before a cutoff, and the least recently read blobs until the blob cache fits a byte budget",
+			Usage: "evict blobs not served within a duration, and the least recently read blobs until the blob cache fits a byte budget",
 			Flags: []ucli.Flag{
 				&ucli.StringFlag{Name: "name", Usage: "repo name (required)"},
 				// Without --max-bytes there is no budget, and a shown default of
 				// 0 would read as one that empties the cache.
 				&ucli.Int64Flag{Name: "max-bytes", HideDefault: true, Usage: "byte budget the blob cache must fit"},
-				&ucli.DurationFlag{Name: "older-than", HideDefault: true, Usage: "evict every blob last read longer ago than this, such as 336h"},
+				&ucli.DurationFlag{Name: "older-than", HideDefault: true, Usage: "evict every blob not served within this, such as 336h; a blob can stay up to a day longer"},
 			},
 			Action: withController(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Controller) error {
 				name := strings.TrimSpace(c.String("name"))
@@ -334,14 +334,14 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				if c.IsSet("max-bytes") {
 					maxBytes = c.Int64("max-bytes")
 				}
-				var readBefore time.Time
+				var servedBefore time.Time
 				if c.IsSet("older-than") {
 					if c.Duration("older-than") <= 0 {
 						return fmt.Errorf("--older-than must be positive")
 					}
-					readBefore = time.Now().Add(-c.Duration("older-than"))
+					servedBefore = time.Now().Add(-c.Duration("older-than"))
 				}
-				res, err := svc.EvictCache(ctx, name, maxBytes, readBefore)
+				res, err := svc.EvictCache(ctx, name, maxBytes, servedBefore)
 				if err != nil {
 					return err
 				}

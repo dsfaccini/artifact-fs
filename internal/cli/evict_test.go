@@ -115,25 +115,28 @@ func TestEvictCacheCLIZeroBudgetEmptiesTheCache(t *testing.T) {
 	}
 }
 
-// --older-than evicts every blob last read before the cutoff, and a byte
-// budget beside it evicts the least recently read blobs left until the cache
-// fits.
-func TestEvictCacheCLIEvictsBlobsReadBeforeTheCutoff(t *testing.T) {
-	old, middle, recent := strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 40)
+// --older-than evicts every blob the daemon has not served within the
+// duration, and a byte budget beside it evicts the least recently read blobs
+// left until the cache fits. The daemon moves an access time only once it is
+// more than a day old, so an access time 24h30m old can belong to a blob served
+// half an hour ago, and --older-than 24h keeps it. It evicts a blob whose
+// access time is more than the duration plus that day old.
+func TestEvictCacheCLIEvictsBlobsNotServedWithinTheDuration(t *testing.T) {
+	unserved, maybeServed, recent := strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 40)
 	for _, tt := range []struct {
 		name string
 		args []string
 		kept map[string]bool
 		want string
 	}{
-		{"cutoff", []string{"--older-than", "48h"}, map[string]bool{old: false, middle: true, recent: true}, "evicted_blobs=1 evicted_bytes=10 hydrated_blobs=2 hydrated_bytes=20\n"},
-		{"cutoff_and_budget", []string{"--older-than", "48h", "--max-bytes", "10"}, map[string]bool{old: false, middle: false, recent: true}, "evicted_blobs=2 evicted_bytes=20 hydrated_blobs=1 hydrated_bytes=10\n"},
+		{"cutoff", []string{"--older-than", "24h"}, map[string]bool{unserved: false, maybeServed: true, recent: true}, "evicted_blobs=1 evicted_bytes=10 hydrated_blobs=2 hydrated_bytes=20\n"},
+		{"cutoff_and_budget", []string{"--older-than", "24h", "--max-bytes", "10"}, map[string]bool{unserved: false, maybeServed: false, recent: true}, "evicted_blobs=2 evicted_bytes=20 hydrated_blobs=1 hydrated_bytes=10\n"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := registerRepoWithCache(t)
 			now := time.Now()
-			installBlob(t, dir, old, "0123456789", now.Add(-72*time.Hour))
-			installBlob(t, dir, middle, "0123456789", now.Add(-30*time.Hour))
+			installBlob(t, dir, unserved, "0123456789", now.Add(-49*time.Hour))
+			installBlob(t, dir, maybeServed, "0123456789", now.Add(-24*time.Hour-30*time.Minute))
 			installBlob(t, dir, recent, "0123456789", now.Add(-time.Hour))
 
 			stdout, stderr, code := runCLI(t, append([]string{"evict-cache", "--name", "repo"}, tt.args...)...)

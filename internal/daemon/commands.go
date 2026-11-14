@@ -373,14 +373,21 @@ func (s *Controller) requestMount(ctx context.Context, name string, mount bool) 
 	}
 }
 
-// EvictCache evicts the blobs of name's blob cache last read before
-// readBefore, and the least recently read blobs until the cache holds at most
-// maxBytes, as blobcache.Evict does. A cache directory that repos share is
+// EvictCache evicts every blob of name's blob cache that the daemon has not
+// served since servedBefore, then the least recently read blobs until the
+// cache holds at most maxBytes, as blobcache.Evict does. A zero servedBefore
+// evicts no blob for its age. A blob's access time trails each serve by up to
+// blobcache.ReadRefresh, so the cut is that much earlier, and a blob can stay
+// up to ReadRefresh past servedBefore. A cache directory that repos share is
 // evicted as a whole.
-func (s *Controller) EvictCache(ctx context.Context, name string, maxBytes int64, readBefore time.Time) (blobcache.EvictResult, error) {
+func (s *Controller) EvictCache(ctx context.Context, name string, maxBytes int64, servedBefore time.Time) (blobcache.EvictResult, error) {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
 		return blobcache.EvictResult{}, err
+	}
+	var readBefore time.Time
+	if !servedBefore.IsZero() {
+		readBefore = servedBefore.Add(-blobcache.ReadRefresh)
 	}
 	return blobcache.Evict(ctx, cfg.BlobCacheDir, maxBytes, readBefore)
 }

@@ -33,10 +33,12 @@ const (
 	// evictBatch caps the blobs one lock hold removes, so a long eviction
 	// does not stall installs.
 	evictBatch = 128
-	// readRefresh is the age at which RecordRead moves a blob's access time.
-	// Linux relatime moves an access time at the same age.
-	readRefresh = 24 * time.Hour
 )
+
+// ReadRefresh is the age at which RecordRead moves a blob's access time, so a
+// blob's access time trails each serve by at most ReadRefresh. Linux relatime
+// moves an access time at the same age.
+const ReadRefresh = 24 * time.Hour
 
 // Stats counts the blobs in a cache directory.
 type Stats struct {
@@ -133,9 +135,9 @@ func Install(dir, oid, staged string) error {
 
 // RecordRead records a read of the cached blob at path, whose file info is
 // info, in its access time, which eviction orders and cuts by. It sets the
-// access time to now once it is more than readRefresh old, so the access time
-// trails the last read by at most that. It leaves the modification time,
-// which identifies the cached file. The file system alone records too little:
+// access time to now once it is more than ReadRefresh old. It leaves the
+// modification time, which identifies the cached file. The file system alone
+// records too little:
 // APFS moves an access time only while it is not newer than the modification
 // time, and a noatime mount never moves it.
 //
@@ -146,7 +148,7 @@ func Install(dir, oid, staged string) error {
 // usually trails the explicit time.
 func RecordRead(path string, info os.FileInfo) error {
 	now := time.Now()
-	if now.Sub(accessTime(info)) <= readRefresh {
+	if now.Sub(accessTime(info)) <= ReadRefresh {
 		return nil
 	}
 	ts := []unix.Timespec{unix.NsecToTimespec(now.UnixNano()), {Nsec: utimeOmit}}
