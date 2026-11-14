@@ -105,6 +105,10 @@ func TestE2EMountPollingWithSingleProcessor(t *testing.T) {
 		if err != nil {
 			t.Fatalf("child that mounted and read .git at GOMAXPROCS(1): %v\n%s", err, out.String())
 		}
+		// TestMain reports the mounts the child started, none when it skipped.
+		if !strings.Contains(out.String(), "e2e: started 1 FUSE mounts") {
+			t.Fatalf("child started no mount:\n%s", out.String())
+		}
 		return
 	case <-time.After(singleProcessorBound):
 	}
