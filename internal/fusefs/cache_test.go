@@ -1215,6 +1215,129 @@ func TestLateReplyKeepsTheNewerGeneration(t *testing.T) {
 	}
 }
 
+// switchDuringLookup makes the next lookup's resolve land before a switch to
+// nodes and its pass, and its record after them.
+func (f *cacheFixture) switchDuringLookup(nodes ...model.BaseNode) {
+	f.fs.testHookAfterLookupResolve = func() {
+		f.fs.testHookAfterLookupResolve = nil
+		f.switchTo(nodes...)
+		if err := f.mount.InvalidateChanged(); err != nil {
+			f.t.Fatal(err)
+		}
+	}
+}
+
+// A lookup that resolved before a switch and records its reply after the
+// switch pass read the inode table gets no invalidation from the pass, so
+// the kernel would cache the old size and read the old blob. The lookup
+// resolves again at the generation the switch made.
+func TestLookupThatASwitchOverlapsResolvesAgain(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "old-content", 0o100644))
+	f.switchDuringLookup(baseFile("file.txt", "new", 0o100644))
+	op := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "file.txt"}
+	if err := f.fs.LookUpInode(f.ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	read := &fuseops.ReadFileOp{Inode: op.Entry.Child, Handle: f.open(op.Entry.Child).Handle, Size: 64}
+	if err := f.fs.ReadFile(f.ctx, read); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(bytes.Join(read.Data, nil)); op.Entry.Attributes.Size != uint64(len("new")) || got != "new" {
+		t.Fatalf("lookup across the switch replied with size %d and reads %q, want %d and %q", op.Entry.Attributes.Size, got, len("new"), "new")
+	}
+}
+
+// A lookup that missed a name before a switch added it, and records its
+// negative entry after the switch pass read the negative entries, gets no
+// invalidation from the pass, so the kernel would answer ENOENT for a file
+// that exists. The lookup resolves again at the generation the switch made.
+func TestNegativeLookupThatASwitchOverlapsResolvesAgain(t *testing.T) {
+	if !negativeLookupEntries {
+		t.Skip("the mount caches no negative entries on this platform")
+	}
+	f := newCacheFixture(t)
+	f.switchDuringLookup(baseFile("new.txt", "new", 0o100644))
+	op := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "new.txt"}
+	if err := f.fs.LookUpInode(f.ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	if op.Entry.Child == 0 || op.Entry.Attributes.Size != uint64(len("new")) {
+		t.Fatalf("lookup across the switch that added new.txt replied with inode %d of size %d, want an inode of size %d", op.Entry.Child, op.Entry.Attributes.Size, len("new"))
+	}
+}
+
+// lateKernel is a kernel to which the replies for some inodes and names are
+// still on their way, so it answers the first invalidation of each with
+// ENOENT. It answers every invalidation of forgotten with ENOENT, and the
+// mount gets forgotten's FORGET with the first.
+type lateKernel struct {
+	*recordingNotifier
+	fs        *ArtifactFuse
+	late      map[fuseops.InodeID]bool
+	lateNames map[string]bool
+	forgotten fuseops.InodeID
+	// forgottenSends counts the invalidations of forgotten.
+	forgottenSends int
+}
+
+func (k *lateKernel) InvalidateInode(inode fuseops.InodeID, offset, length int64) error {
+	if inode == k.forgotten {
+		k.forgottenSends++
+		if k.forgottenSends == 1 {
+			_ = k.fs.ForgetInode(context.Background(), &fuseops.ForgetInodeOp{Inode: inode, N: 1})
+		}
+		return syscall.ENOENT
+	}
+	if k.late[inode] {
+		delete(k.late, inode)
+		return syscall.ENOENT
+	}
+	return k.recordingNotifier.InvalidateInode(inode, offset, length)
+}
+
+func (k *lateKernel) InvalidateEntry(parent fuseops.InodeID, name string) error {
+	if k.lateNames[name] {
+		delete(k.lateNames, name)
+		return syscall.ENOENT
+	}
+	return k.recordingNotifier.InvalidateEntry(parent, name)
+}
+
+// A lookup the mount recorded before the switch pass read the inode table
+// can reach the kernel after the pass's invalidations, which the kernel
+// answers with ENOENT and forgets. Linux then caches the old size, or the
+// name the switch removed. The pass sends such an invalidation again while
+// the mount holds the inode, and stops at the inode's FORGET.
+func TestSwitchPassSendsAnInvalidationAgainUntilItsReplyArrives(t *testing.T) {
+	f := newCacheFixture(t,
+		baseFile("edited.txt", "edited-1", 0o100644),
+		baseFile("gone.txt", "gone", 0o100644),
+		baseFile("forgotten.txt", "forgotten-1", 0o100644),
+	)
+	var root fuseops.InodeID = fuseops.RootInodeID
+	edited := f.lookup(root, "edited.txt")
+	gone := f.lookup(root, "gone.txt")
+	kernel := &lateKernel{
+		recordingNotifier: f.notifier,
+		fs:                f.fs,
+		late:              map[fuseops.InodeID]bool{edited: true},
+		lateNames:         map[string]bool{"gone.txt": true},
+		forgotten:         f.lookup(root, "forgotten.txt"),
+	}
+	f.fs.setNotifier(kernel)
+	f.switchTo(baseFile("edited.txt", "edited-2", 0o100644), baseFile("forgotten.txt", "forgotten-2", 0o100644))
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	inodes, entries := f.notifier.recorded()
+	if !slices.Contains(inodes, edited) || !slices.Contains(entries, kernelEntry{root, "gone.txt"}) {
+		t.Errorf("invalidated inodes %v and entries %v, want edited.txt's inode %d and the entry of gone.txt, inode %d, once their replies arrived", inodes, entries, edited, gone)
+	}
+	if kernel.forgottenSends != 1 {
+		t.Errorf("sent forgotten.txt's invalidation %d times, want once: its FORGET arrived with the first", kernel.forgottenSends)
+	}
+}
+
 // A write fills the kernel's pages with the written bytes. A commit of them
 // makes reconcile drop the overlay entry, and a later switch brings back the
 // blob the file held before the write, at the same size. The kernel last saw

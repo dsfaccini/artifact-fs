@@ -51,6 +51,7 @@ type MountedFS interface {
 	// there it only retires numbers, closes files and moves read generations.
 	// Of the inodes whose paths changed type, it retires every one that an
 	// open file is on there, and a lookup or getattr retires the others.
+	// It can take up to CacheTTL, while a reply is on its way to the kernel.
 	InvalidateChanged() error
 	// OpenFileGenerations returns the snapshot generations that open files
 	// read. A prune keeps them.
@@ -166,6 +167,9 @@ type ArtifactFuse struct {
 	// testHookResolvePerPath, when set, decides in place of resolvesPerPath
 	// whether the switch pass resolves its held paths one at a time.
 	testHookResolvePerPath func() bool
+	// testHookAfterLookupResolve, when set, runs in a lookup between its
+	// resolve and its record.
+	testHookAfterLookupResolve func()
 }
 
 type InodeRef struct {
@@ -641,11 +645,15 @@ func (fs *ArtifactFuse) dropLookups(id fuseops.InodeID, n uint64) {
 }
 
 // recordNegative records a negative entry for name in parent, which the
-// kernel caches for CacheTTL. Expired records go in sweeps whose cost each
-// record pays for once.
-func (fs *ArtifactFuse) recordNegative(parent fuseops.InodeID, name string) {
+// kernel caches for CacheTTL, and reports true, while the mount serves gen,
+// the generation the lookup that missed name resolved against. Expired
+// records go in sweeps whose cost each record pays for once.
+func (fs *ArtifactFuse) recordNegative(parent fuseops.InodeID, name string, gen int64) bool {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	if fs.engine.Generation() != gen {
+		return false
+	}
 	now := time.Now()
 	if len(fs.negatives) >= fs.negativeSweepAt {
 		for e, lapses := range fs.negatives {
@@ -656,6 +664,7 @@ func (fs *ArtifactFuse) recordNegative(parent fuseops.InodeID, name string) {
 		fs.negativeSweepAt = max(2*len(fs.negatives), 1024)
 	}
 	fs.negatives[kernelEntry{parent, name}] = now.Add(negativeRecordTTL)
+	return true
 }
 
 // takeNegative removes the live record of a negative entry for path and
@@ -700,8 +709,10 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // kernel can still cache pages of the replaced identity, which report keeps
 // in InodeRef.Prior. An overlay entry itself changes only through the mount,
 // which keeps the kernel's view of it current. A dormant mapping gets no
-// invalidation: the kernel holds nothing for it. A failure skips only what it
-// concerns, and the first one is returned.
+// invalidation: the kernel holds nothing for it. An invalidation the kernel
+// answers with ENOENT goes again while the mount holds its inode, for at most
+// CacheTTL. A failure skips only what it concerns, and the first one is
+// returned.
 //
 // The pass reads the overlay once, and finds each held inode's identity with
 // Engine.Identities: it diffs the generation each inode's base identity was
@@ -822,7 +833,14 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			currents = append(currents, MergedIdentity{Identity: id, Exists: exists, Err: err})
 		}
 	}
-	var entries []kernelEntry
+	// entries holds each name the pass invalidates, with the inode the mount
+	// holds while the kernel can hold the name: the named inode, or the
+	// parent of a negative entry.
+	type heldEntry struct {
+		kernelEntry
+		held fuseops.InodeID
+	}
+	var entries []heldEntry
 	// changed holds each held inode the pass invalidates. An entry
 	// invalidation leaves the kernel's attributes and pages of the inode, so
 	// the inode of a name that changed type is in changed too. A vanished
@@ -849,7 +867,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		hidden := k.prior.Type != ""
 		switch {
 		case !exists || current.Type != k.reported.Type:
-			entries = append(entries, k.entry)
+			entries = append(entries, heldEntry{k.entry, k.id})
 			if !exists {
 				vanished = append(vanished, k.pathMapping)
 			} else {
@@ -923,7 +941,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	}
 	fs.mu.Lock()
 	for e, id := range fs.retypedNames {
-		entries = append(entries, e)
+		entries = append(entries, heldEntry{e, id})
 		changed = append(changed, id)
 	}
 	clear(fs.retypedNames)
@@ -978,23 +996,34 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 			continue
 		}
 		if exists {
-			entries = append(entries, k.entry)
+			entries = append(entries, heldEntry{k.entry, k.entry.parent})
 			fs.mu.Lock()
 			delete(fs.negatives, k.entry)
 			fs.mu.Unlock()
 		}
 	}
-	// ENOENT means the kernel no longer holds the entry or inode.
-	sent := func(err error, what string) {
-		if !errors.Is(err, syscall.ENOENT) {
-			failed(err, "invalidate "+what)
-		}
+	// ENOENT means the kernel holds no such entry or inode. While the mount
+	// holds the invalidation's held inode, the reply that gives the kernel the
+	// entry or inode can still be on its way: a lookup recorded before the
+	// pass read the inode table. Linux caches what that reply carries,
+	// whatever the pass sent before it arrived, so the pass sends such an
+	// invalidation again until it lands or held's FORGET arrives. It stops
+	// CacheTTL after it read the table: the kernel lets a reply expire
+	// CacheTTL after it takes it.
+	type invalidation struct {
+		held fuseops.InodeID
+		send func() error
+		what string
 	}
+	var sends, again []invalidation
 	for _, e := range entries {
-		sent(notifier.InvalidateEntry(e.parent, e.name), fmt.Sprintf("entry %q", e.name))
+		sends = append(sends, invalidation{e.held, func() error { return notifier.InvalidateEntry(e.parent, e.name) }, fmt.Sprintf("entry %q", e.name)})
+	}
+	invalidateInode := func(id fuseops.InodeID) {
+		sends = append(sends, invalidation{id, func() error { return notifier.InvalidateInode(id, 0, 0) }, fmt.Sprintf("inode %d", id)})
 	}
 	for _, id := range changed {
-		sent(notifier.InvalidateInode(id, 0, 0), fmt.Sprintf("inode %d", id))
+		invalidateInode(id)
 	}
 	// A vanished directory reports no times.
 	vanishedIDs := map[fuseops.InodeID]bool{}
@@ -1003,10 +1032,28 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	}
 	for _, id := range relisted {
 		if !vanishedIDs[id] {
-			sent(notifier.InvalidateInode(id, 0, 0), fmt.Sprintf("inode %d", id))
+			invalidateInode(id)
 		}
 	}
-	return firstErr
+	deadline := now.Add(CacheTTL)
+	for wait := time.Millisecond; ; wait *= 2 {
+		for _, inv := range sends {
+			if err := inv.send(); errors.Is(err, syscall.ENOENT) {
+				again = append(again, inv)
+			} else {
+				failed(err, "invalidate "+inv.what)
+			}
+		}
+		fs.mu.RLock()
+		sends = slices.DeleteFunc(again, func(inv invalidation) bool { return fs.inodes[inv.held] == nil })
+		fs.mu.RUnlock()
+		again = nil
+		left := time.Until(deadline)
+		if len(sends) == 0 || left <= 0 {
+			return firstErr
+		}
+		time.Sleep(min(wait, left))
+	}
 }
 
 // perPathOverlayRatio is the most overlay entries per held path for which the
@@ -1719,30 +1766,45 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 			return nil
 		}
 
-		attrs, err := fs.engine.Attrs(b, childPath)
-		if negativeLookupEntries && errors.Is(err, iofs.ErrNotExist) {
-			// Child 0 is a negative entry, which the kernel caches.
-			op.Entry = fuseops.ChildInodeEntry{}
+		// A reply recorded after the switch pass read the inode table and the
+		// negative entries gets no invalidation from it, so a lookup that a
+		// switch overlapped resolves again.
+		for {
+			gen := fs.engine.Generation()
+			attrs, err := fs.engine.Attrs(b, childPath)
+			if fs.testHookAfterLookupResolve != nil {
+				fs.testHookAfterLookupResolve()
+			}
+			if negativeLookupEntries && errors.Is(err, iofs.ErrNotExist) {
+				if !fs.recordNegative(op.Parent, op.Name, gen) {
+					continue
+				}
+				// Child 0 is a negative entry, which the kernel caches.
+				op.Entry = fuseops.ChildInodeEntry{}
+				setChildEntryExpiry(&op.Entry, CacheTTL)
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if _, unmapped := fs.heldAt(childPath); unmapped && !exclusive {
+				return errUnmappedPath
+			}
+
+			fs.mu.Lock()
+			if fs.engine.Generation() != gen {
+				fs.mu.Unlock()
+				continue
+			}
+			ref := fs.allocEntry(op.Parent, op.Name, childPath, attrs)
+			fs.mu.Unlock()
+
+			op.Entry.Child = ref.ID
+			op.Entry.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
 			setChildEntryExpiry(&op.Entry, CacheTTL)
-			fs.recordNegative(op.Parent, op.Name)
+			fs.logReply(ctx, entryReply, "LookUpInode", ref.ID, attrs)
 			return nil
 		}
-		if err != nil {
-			return err
-		}
-		if _, unmapped := fs.heldAt(childPath); unmapped && !exclusive {
-			return errUnmappedPath
-		}
-
-		fs.mu.Lock()
-		ref := fs.allocEntry(op.Parent, op.Name, childPath, attrs)
-		fs.mu.Unlock()
-
-		op.Entry.Child = ref.ID
-		op.Entry.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
-		setChildEntryExpiry(&op.Entry, CacheTTL)
-		fs.logReply(ctx, entryReply, "LookUpInode", ref.ID, attrs)
-		return nil
 	})
 }
 
