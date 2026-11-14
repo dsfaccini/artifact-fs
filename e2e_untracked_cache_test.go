@@ -70,7 +70,7 @@ func TestE2EGitStatusWithTheUntrackedCache(t *testing.T) {
 	}{
 		{"a new untracked file at the root", func() { write("root.txt", "root\n") }, []string{"?? root.txt"}, nil},
 		{"a new untracked file in a tracked directory", func() { write("packages/wrangler/src/new.js", "new\n") }, []string{"?? packages/wrangler/src/new.js"}, nil},
-		{"a new untracked file in a new directory", func() { write("newdir/a/b.txt", "b\n") }, []string{"?? newdir/a/b.txt"}, nil},
+		{"a new untracked file in a new directory", func() { write("newdir/a/b.txt", "b\n") }, []string{"?? newdir/"}, nil},
 		{"an untracked file deleted", func() {
 			if err := os.Remove(filepath.Join(dir, "root.txt")); err != nil {
 				t.Fatal(err)
@@ -85,7 +85,7 @@ func TestE2EGitStatusWithTheUntrackedCache(t *testing.T) {
 			if err := os.RemoveAll(filepath.Join(dir, "newdir")); err != nil {
 				t.Fatal(err)
 			}
-		}, nil, []string{"?? newdir/a/b.txt"}},
+		}, nil, []string{"?? newdir/"}},
 		{"a new untracked log file", func() { write("packages/miniflare/debug.log", "log\n") }, []string{"?? packages/miniflare/debug.log"}, nil},
 		{"a .gitignore that ignores it", func() { write(".gitignore", "*.log\n") }, []string{"?? .gitignore"}, []string{"?? packages/miniflare/debug.log"}},
 		{"a tracked file edited", func() { write("README.md", "edited\n") }, []string{" M README.md"}, nil},
@@ -148,12 +148,16 @@ func TestE2EGitStatusWithTheUntrackedCache(t *testing.T) {
 
 // untrackedCacheStatus runs git status in dir with args before the command,
 // and returns its sorted porcelain lines and the number of directories Git
-// opened. It fails t unless Git used the untracked cache.
+// opened. It fails t unless Git used the untracked cache, which Git uses only
+// in the default untracked files mode unless status.showUntrackedFiles says
+// otherwise.
 func untrackedCacheStatus(t *testing.T, dir string, args ...string) ([]string, int) {
 	t.Helper()
 	trace := filepath.Join(t.TempDir(), "trace2.json")
-	cmd := commandIn(dir, "git", gitArgsWithSafeDirectory(dir, append(args, "status", "--porcelain", "--untracked-files=all")...)...)
-	cmd.Env = append(os.Environ(), "GIT_TRACE2_EVENT="+trace)
+	cmd := commandIn(dir, "git", gitArgsWithSafeDirectory(dir, append(args, "status", "--porcelain")...)...)
+	// Git writes the untracked cache's events nested deeper than the event
+	// target's default nesting of 2 keeps.
+	cmd.Env = append(os.Environ(), "GIT_TRACE2_EVENT="+trace, "GIT_TRACE2_EVENT_NESTING=10")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
