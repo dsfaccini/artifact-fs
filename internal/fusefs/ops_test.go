@@ -883,7 +883,7 @@ func TestRenameDirectoryRejectsDestinationChildCreatedDuringHydration(t *testing
 		Overlay:  ov,
 		Hydrator: hydrator,
 	}
-	if err := engine.Mkdir(context.Background(), "dst", 0o755); err != nil {
+	if _, err := engine.Mkdir(context.Background(), "dst", 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -897,7 +897,7 @@ func TestRenameDirectoryRejectsDestinationChildCreatedDuringHydration(t *testing
 		t.Fatalf("rename returned before hydration: %v", err)
 	}
 
-	if err := engine.Mkdir(context.Background(), "dst/concurrent", 0o755); err != nil {
+	if _, err := engine.Mkdir(context.Background(), "dst/concurrent", 0o755); err != nil {
 		t.Fatalf("concurrent destination mkdir: %v", err)
 	}
 	close(hydrator.proceed)

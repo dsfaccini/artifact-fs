@@ -377,17 +377,7 @@ func (e *Engine) Attrs(b *Blobs, path string) (Attrs, error) {
 		return Attrs{}, err
 	}
 	if n.FromOverlay {
-		a := Attrs{
-			Mode:  n.Overlay.Mode,
-			Size:  n.Overlay.SizeBytes,
-			Type:  n.Overlay.NodeType(),
-			Mtime: time.Unix(0, n.Overlay.MtimeUnixNs),
-			Ctime: time.Unix(0, n.Overlay.CtimeUnixNs),
-		}
-		if a.Type == "dir" {
-			a.Mtime, a.Ctime = e.Resolver.dirTimes(model.CleanPath(path), a.Mtime, a.Ctime)
-		}
-		return a, nil
+		return e.overlayAttrs(path, n.Overlay), nil
 	}
 	size := n.Base.SizeBytes
 	if (n.Base.Type == "file" || n.Base.Type == "symlink") && n.Base.SizeState != "known" && n.Base.ObjectOID != "" {
@@ -400,6 +390,21 @@ func (e *Engine) Attrs(b *Blobs, path string) (Attrs, error) {
 		mt, ct = e.Resolver.dirTimes(model.CleanPath(path), mt, ct)
 	}
 	return Attrs{Mode: normalizeMode(n.Base.Mode, n.Base.Type), Size: size, Type: n.Base.Type, Mtime: mt, Ctime: ct, Gen: gen, Blob: baseBlob(n.Base)}, nil
+}
+
+// overlayAttrs returns the attributes of path, which ov gives.
+func (e *Engine) overlayAttrs(path string, ov model.OverlayEntry) Attrs {
+	a := Attrs{
+		Mode:  ov.Mode,
+		Size:  ov.SizeBytes,
+		Type:  ov.NodeType(),
+		Mtime: time.Unix(0, ov.MtimeUnixNs),
+		Ctime: time.Unix(0, ov.CtimeUnixNs),
+	}
+	if a.Type == "dir" {
+		a.Mtime, a.Ctime = e.Resolver.dirTimes(model.CleanPath(path), a.Mtime, a.Ctime)
+	}
+	return a
 }
 
 // baseTime is the mtime and ctime of a base entry. Base entries use the HEAD
@@ -415,18 +420,15 @@ func baseTime(gen, commitTime int64) time.Time {
 // directory entry carries the times Attrs gives it.
 func (e *Engine) ReadDir(ctx context.Context, path string) ([]ReaddirEntry, int64, int64, error) {
 	entries, gen, commitTime, err := e.Resolver.ReaddirSnapshot(ctx, path)
-	for i, entry := range entries {
-		if entry.Type != "dir" {
-			continue
-		}
-		mt, ct := baseTime(gen, commitTime), baseTime(gen, commitTime)
-		if entry.FromOverlay {
-			mt, ct = time.Unix(0, entry.MtimeUnixNs), time.Unix(0, entry.CtimeUnixNs)
-		}
-		mt, ct = e.Resolver.dirTimes(model.CleanPath(filepath.Join(path, entry.Name)), mt, ct)
-		entries[i].MtimeUnixNs, entries[i].CtimeUnixNs = mt.UnixNano(), ct.UnixNano()
-	}
+	e.Resolver.childDirTimes(model.CleanPath(path), entries, baseTime(gen, commitTime))
 	return entries, gen, commitTime, err
+}
+
+// SwitchedListings returns the directories whose listing a switch changed
+// since its last call, or all true when a switch changed every listing, and
+// forgets them.
+func (e *Engine) SwitchedListings() (dirs map[string]bool, all bool) {
+	return e.Resolver.takeSwitchedListings()
 }
 
 // MissingPaths returns those of paths that the merged view lacks. It hydrates
@@ -705,10 +707,11 @@ func (e *Engine) Create(ctx context.Context, path string, mode uint32) error {
 	if err := e.requireAbsent(path); err != nil {
 		return err
 	}
+	absent := e.absentDirsAbove(path)
 	if _, err := e.Overlay.CreateFile(ctx, path, mode); err != nil {
 		return err
 	}
-	e.Resolver.listingChanged(parentDir(path))
+	e.entryChanged(path, absent)
 	return nil
 }
 
@@ -719,10 +722,11 @@ func (e *Engine) Symlink(ctx context.Context, path string, target string) error 
 	if err := e.requireAbsent(path); err != nil {
 		return err
 	}
+	absent := e.absentDirsAbove(path)
 	if _, err := e.Overlay.CreateSymlink(ctx, path, target); err != nil {
 		return err
 	}
-	e.Resolver.listingChanged(parentDir(path))
+	e.entryChanged(path, absent)
 	return nil
 }
 
@@ -786,7 +790,7 @@ func (e *Engine) Unlink(ctx context.Context, b *Blobs, path string, files openFi
 	if err := e.Overlay.Remove(ctx, path); err != nil {
 		return err
 	}
-	e.Resolver.listingChanged(parentDir(path))
+	e.Resolver.listingChanged(model.CleanPath(filepath.Dir(path)))
 	return nil
 }
 
@@ -815,8 +819,11 @@ func (e *Engine) pinOpenFiles(ctx context.Context, path string, files openFiles)
 // A rename of the last overlay entry below a directory the base lacks, which
 // only overlay entries imply, takes that directory out of its parent's
 // listing too. An untracked source leaves no delete marker behind to imply it.
+// A rename into a directory the merged view lacks, such as one a switch
+// removed below an open handle, adds that directory to its parent's listing.
 func (e *Engine) Rename(ctx context.Context, b *Blobs, oldPath, newPath string, files openFiles) error {
-	if err := e.rename(ctx, b, oldPath, newPath, files); err != nil {
+	absent, moved, err := e.rename(ctx, b, oldPath, newPath, files)
+	if err != nil {
 		return err
 	}
 	if model.CleanPath(oldPath) == model.CleanPath(newPath) {
@@ -824,41 +831,55 @@ func (e *Engine) Rename(ctx context.Context, b *Blobs, oldPath, newPath string, 
 	}
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
-	e.Resolver.listingChanged(parentDir(newPath))
+	e.Resolver.dirsRemoved(moved...)
+	e.entryChanged(newPath, absent)
 	e.entryChanged(oldPath, e.absentDirsAbove(oldPath))
 	return nil
 }
 
-func (e *Engine) rename(ctx context.Context, b *Blobs, oldPath, newPath string, files openFiles) error {
+// rename implements Rename. It returns the directories above newPath that the
+// merged view lacked, nearest first, and the old path of each directory it
+// moved.
+func (e *Engine) rename(ctx context.Context, b *Blobs, oldPath, newPath string, files openFiles) (absent, moved []string, err error) {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
 	oldPath = model.CleanPath(oldPath)
 	newPath = model.CleanPath(newPath)
 	source, err := e.Resolver.resolvePath(oldPath)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	if oldPath == newPath {
-		return nil
+		return nil, nil, nil
 	}
 	sourceType := resolvedNodeType(source)
 	destination, err := e.Resolver.resolvePath(newPath)
 	destinationExists := err == nil
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
+		return nil, nil, err
+	}
+	if !destinationExists {
+		absent = e.absentDirsAbove(newPath)
 	}
 	if sourceType == "dir" {
 		if strings.HasPrefix(newPath, oldPath+"/") {
-			return syscall.EINVAL
+			return nil, nil, syscall.EINVAL
 		}
 		if destinationExists && resolvedNodeType(destination) != "dir" {
-			return syscall.ENOTDIR
+			return nil, nil, syscall.ENOTDIR
 		}
-		return e.renameDirectory(ctx, b, oldPath, newPath)
+		moved, err := e.renameDirectory(ctx, b, oldPath, newPath)
+		return absent, moved, err
 	}
 	if destinationExists && resolvedNodeType(destination) == "dir" {
-		return syscall.EISDIR
+		return nil, nil, syscall.EISDIR
 	}
+	return absent, nil, e.renameFile(ctx, b, oldPath, newPath, source, destination, destinationExists, files)
+}
+
+// renameFile renames the file or symlink source at oldPath to newPath, over
+// destination when destinationExists.
+func (e *Engine) renameFile(ctx context.Context, b *Blobs, oldPath, newPath string, source, destination ResolvedNode, destinationExists bool, files openFiles) error {
 	gen := e.Resolver.Generation()
 	dst, dstOK, err := e.Resolver.Snapshot.LookupNode(ctx, gen, newPath)
 	if err != nil {
@@ -940,45 +961,51 @@ func resolvedNodeType(n ResolvedNode) string {
 	return n.Base.Type
 }
 
-func (e *Engine) renameDirectory(ctx context.Context, b *Blobs, oldPath, newPath string) error {
+// renameDirectory renames the directory at oldPath to newPath, and returns the
+// old path of each directory it moved.
+func (e *Engine) renameDirectory(ctx context.Context, b *Blobs, oldPath, newPath string) ([]string, error) {
 	if oldPath == "." || newPath == "." || strings.HasPrefix(newPath, oldPath+"/") {
-		return fs.ErrInvalid
+		return nil, fs.ErrInvalid
 	}
 	if destination, err := e.Resolver.resolvePath(newPath); err == nil {
 		if resolvedNodeType(destination) != "dir" {
-			return fs.ErrInvalid
+			return nil, fs.ErrInvalid
 		}
 		children, err := e.Resolver.readdirTypedAt(ctx, newPath, e.Resolver.Generation())
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if len(children) != 0 {
-			return syscall.ENOTEMPTY
+			return nil, syscall.ENOTEMPTY
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
+		return nil, err
 	}
 
 	destinationBasePaths, err := e.snapshotTreePaths(ctx, newPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sourceBasePaths, err := e.snapshotTreePaths(ctx, oldPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	visible, err := e.mergedTree(ctx, oldPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var blobs []model.BaseNode
+	var moved []string
 	for _, n := range visible {
+		if resolvedNodeType(n.node) == "dir" {
+			moved = append(moved, n.path)
+		}
 		if !n.node.FromOverlay && n.node.Base.Type != "dir" && n.node.Base.ObjectOID != "" {
 			blobs = append(blobs, n.node.Base)
 		}
 	}
 	if err := b.requireFiles(blobs); err != nil {
-		return err
+		return nil, err
 	}
 	// Each blob opens only while it is copied, so a large tree holds one
 	// descriptor at a time. A blob replaced since hydration stops the rename
@@ -990,15 +1017,15 @@ func (e *Engine) renameDirectory(ctx context.Context, b *Blobs, oldPath, newPath
 		}
 		if n.node.Base.Type == "dir" {
 			if err := e.Overlay.Mkdir(ctx, n.path, n.node.Base.Mode); err != nil {
-				return err
+				return nil, err
 			}
 			continue
 		}
 		if err := e.ensureOverlay(ctx, b, n.path); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return e.Overlay.RenameTree(ctx, oldPath, newPath, sourceBasePaths, destinationBasePaths)
+	return moved, e.Overlay.RenameTree(ctx, oldPath, newPath, sourceBasePaths, destinationBasePaths)
 }
 
 type resolvedTreeNode struct {
@@ -1065,18 +1092,27 @@ func (e *Engine) snapshotTreePaths(ctx context.Context, root string) ([]string, 
 	return out, nil
 }
 
-// Mkdir makes a directory at path, unless path exists.
-func (e *Engine) Mkdir(ctx context.Context, path string, mode uint32) error {
+// Mkdir makes a directory at path, unless path exists, and returns its
+// attributes.
+func (e *Engine) Mkdir(ctx context.Context, path string, mode uint32) (Attrs, error) {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
 	if err := e.requireAbsent(path); err != nil {
-		return err
+		return Attrs{}, err
 	}
+	absent := e.absentDirsAbove(path)
 	if err := e.Overlay.Mkdir(ctx, path, mode); err != nil {
-		return err
+		return Attrs{}, err
 	}
-	e.Resolver.listingChanged(parentDir(path))
-	return nil
+	e.entryChanged(path, absent)
+	ov, ok, err := e.Overlay.Lookup(ctx, path)
+	if err != nil {
+		return Attrs{}, err
+	}
+	if !ok {
+		return Attrs{}, fs.ErrNotExist
+	}
+	return e.overlayAttrs(path, ov), nil
 }
 
 func (e *Engine) Rmdir(ctx context.Context, path string) error {
@@ -1093,7 +1129,8 @@ func (e *Engine) Rmdir(ctx context.Context, path string) error {
 	if err := e.Overlay.Remove(ctx, path); err != nil {
 		return err
 	}
-	e.Resolver.listingChanged(parentDir(path))
+	e.Resolver.listingChanged(model.CleanPath(filepath.Dir(path)))
+	e.Resolver.dirsRemoved(model.CleanPath(path))
 	return nil
 }
 
@@ -1103,7 +1140,7 @@ func (e *Engine) Rmdir(ctx context.Context, path string) error {
 // The caller holds the transition read lock.
 func (e *Engine) absentDirsAbove(path string) []string {
 	var absent []string
-	for dir := parentDir(path); dir != "."; dir = parentDir(dir) {
+	for dir := model.CleanPath(filepath.Dir(path)); dir != "."; dir = model.CleanPath(filepath.Dir(dir)) {
 		if _, err := e.Resolver.resolvePath(dir); !errors.Is(err, fs.ErrNotExist) {
 			break
 		}
@@ -1116,9 +1153,9 @@ func (e *Engine) absentDirsAbove(path string) []string {
 // directory's listing, and so did each of absent, directories above path
 // that appeared or vanished with it.
 func (e *Engine) entryChanged(path string, absent []string) {
-	dirs := []string{parentDir(path)}
+	dirs := []string{model.CleanPath(filepath.Dir(path))}
 	for _, dir := range absent {
-		dirs = append(dirs, parentDir(dir))
+		dirs = append(dirs, model.CleanPath(filepath.Dir(dir)))
 	}
 	e.Resolver.listingChanged(dirs...)
 }
@@ -1178,7 +1215,7 @@ func (e *Engine) SetAttributes(ctx context.Context, b *Blobs, path, typ string, 
 				return err
 			}
 			if typ == "dir" {
-				e.Resolver.mtimeSetOn(model.CleanPath(path))
+				e.Resolver.mtimeSetOn(model.CleanPath(path), *mtime)
 			}
 		}
 		return nil

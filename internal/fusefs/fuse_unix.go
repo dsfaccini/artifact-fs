@@ -39,18 +39,18 @@ type MountedFS interface {
 	Unmount(ctx context.Context) error
 	// InvalidateChanged tells the kernel to drop what it caches for the mount
 	// and the merged view no longer matches: the attributes and pages of an
-	// inode whose type, permission bits or blob changed, the entry of a name
-	// that vanished or changed type, and a negative entry whose name now
-	// exists. It also retires the inode number of each path that vanished and
-	// the inode of each path that changed type, and closes each overlay file
-	// that a handle that is not detached holds and the overlay no longer
-	// names for the handle's path. It moves the read generation of each inode
-	// whose path kept its identity to the current one. Call it after a
-	// generation switch, holding no lock an op takes. FSKit takes no
-	// invalidations, so there it only retires numbers, closes files and moves
-	// read generations. Of the inodes whose paths changed type, it retires
-	// every one that an open file is on there, and a lookup or getattr
-	// retires the others.
+	// inode whose type, permission bits or blob changed, the attributes of a
+	// directory whose listing a switch changed, the entry of a name that
+	// vanished or changed type, and a negative entry whose name now exists.
+	// It also retires the inode number of each path that vanished and the
+	// inode of each path that changed type, and closes each overlay file that
+	// a handle that is not detached holds and the overlay no longer names for
+	// the handle's path. It moves the read generation of each inode whose
+	// path kept its identity to the current one. Call it after a generation
+	// switch, holding no lock an op takes. FSKit takes no invalidations, so
+	// there it only retires numbers, closes files and moves read generations.
+	// Of the inodes whose paths changed type, it retires every one that an
+	// open file is on there, and a lookup or getattr retires the others.
 	InvalidateChanged() error
 	// OpenFileGenerations returns the snapshot generations that open files
 	// read. A prune keeps them.
@@ -693,7 +693,9 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // is retired and invalidated otherwise. An inode whose identity the kernel
 // received from the base snapshot gets the identity comparison. One the
 // kernel last saw from the overlay is invalidated when it now resolves to a
-// base blob, whose bytes can differ from what was written. An inode whose
+// base blob, whose bytes can differ from what was written. A held directory
+// whose listing a switch changed since the last pass is invalidated too, for
+// its times, unless a reply at the current generation carried them. An inode whose
 // identity a reply replaced since the last pass is invalidated too: the
 // kernel can still cache pages of the replaced identity, which report keeps
 // in InodeRef.Prior. An overlay entry itself changes only through the mount,
@@ -734,6 +736,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// Each identity the pass resolves is at gen while the generation has not
 	// moved since.
 	gen := fs.engine.Generation()
+	listings, allListings := fs.engine.SwitchedListings()
 	fs.mu.RLock()
 	notifier := fs.notifier
 	send = send && notifier != nil
@@ -742,11 +745,18 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// existenceOnly holds every other mapping: those that need only the check
 	// that their path exists.
 	var existenceOnly []pathMapping
+	// relisted holds each held directory whose listing a switch changed. Its
+	// times moved, and the identities the pass compares hold no times. A
+	// reply at gen already carried them.
+	var relisted []fuseops.InodeID
 	for path, id := range fs.pathToInode {
+		ref := fs.inodes[id]
+		if send && ref != nil && ref.Type == "dir" && ref.Gen != gen && (allListings || listings[path]) {
+			relisted = append(relisted, id)
+		}
 		if path == "." || path == ".git" {
 			continue
 		}
-		ref := fs.inodes[id]
 		parent, ok := fs.pathToInode[model.CleanPath(filepath.Dir(path))]
 		if !send || ref == nil || !ok {
 			existenceOnly = append(existenceOnly, pathMapping{id, path})
@@ -985,6 +995,16 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	}
 	for _, id := range changed {
 		sent(notifier.InvalidateInode(id, 0, 0), fmt.Sprintf("inode %d", id))
+	}
+	// A vanished directory reports no times.
+	vanishedIDs := map[fuseops.InodeID]bool{}
+	for _, m := range vanished {
+		vanishedIDs[m.id] = true
+	}
+	for _, id := range relisted {
+		if !vanishedIDs[id] {
+			sent(notifier.InvalidateInode(id, 0, 0), fmt.Sprintf("inode %d", id))
+		}
 	}
 	return firstErr
 }
@@ -2506,17 +2526,16 @@ func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
 		if err != nil {
 			return err
 		}
-		if err := fs.engine.Mkdir(ctx, childPath, uint32(op.Mode)); err != nil {
+		attrs, err := fs.engine.Mkdir(ctx, childPath, uint32(op.Mode))
+		if err != nil {
 			return err
 		}
-		attrs := Attrs{Type: "dir", Mode: uint32(op.Mode)}
 		fs.mu.Lock()
 		ref := fs.createEntry(op.Parent, op.Name, childPath, attrs)
 		fs.mu.Unlock()
 
 		op.Entry.Child = ref.ID
-		now := time.Now()
-		op.Entry.Attributes = inodeAttrs(uint32(op.Mode)|uint32(os.ModeDir), 4096, "dir", now, now)
+		op.Entry.Attributes = inodeAttrs(attrs.Mode, uint64(attrs.Size), attrs.Type, attrs.Mtime, attrs.Ctime)
 		setChildEntryExpiry(&op.Entry, CacheTTL)
 		fs.logReply(ctx, entryReply, "MkDir", ref.ID, attrs)
 		return nil

@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
 	overlaystore "github.com/cloudflare/artifact-fs/internal/overlay"
@@ -484,6 +485,55 @@ func TestAnMtimeSetOnADirectoryShowsUntilItsListingChanges(t *testing.T) {
 	}
 }
 
+// A listing change after an mtime was set on a directory replaces the mtime,
+// as on a local file system, also when the set mtime lies in the future. Git
+// compares only mtime under core.trustctime=false. A switch that cannot tell
+// which listings it changed replaces it too. The directory is one the base
+// lacks: a switch's reconcile drops the overlay entry, and with it the set
+// mtime, of a directory the base holds.
+func TestAListingChangeReplacesAFutureMtimeSetOnADirectory(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		change func(f *cacheFixture, dir fuseops.InodeID)
+	}{
+		{"create", func(f *cacheFixture, dir fuseops.InodeID) {
+			if err := f.fs.CreateFile(f.ctx, &fuseops.CreateFileOp{Parent: dir, Name: "new.txt", Mode: 0o644}); err != nil {
+				f.t.Fatal(err)
+			}
+		}},
+		{"switch with an unknown diff", func(f *cacheFixture, _ fuseops.InodeID) {
+			gen := f.publish(dirTimesNodes...)
+			f.resolver.Snapshot = failingListingOf{SnapshotStore: f.snap, gen: f.resolver.Generation()}
+			sw, err := f.resolver.SwitchGeneration(f.ctx, gen, 0)
+			f.resolver.Snapshot = f.snap
+			if err != nil || sw.DiffErr == nil {
+				f.t.Fatalf("SwitchGeneration = diff error %v, %v; want a diff error", sw.DiffErr, err)
+			}
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newCacheFixture(t, dirTimesNodes...)
+			mkdir := &fuseops.MkDirOp{Parent: fuseops.RootInodeID, Name: "made", Mode: os.ModeDir | 0o755}
+			if err := f.fs.MkDir(f.ctx, mkdir); err != nil {
+				t.Fatal(err)
+			}
+			set := time.Now().Add(24 * time.Hour)
+			if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: mkdir.Entry.Child, Mtime: &set}); err != nil {
+				t.Fatal(err)
+			}
+			if got := f.dirTimes(fuseops.RootInodeID, "made"); got[0] != set.UnixNano() {
+				t.Fatalf("made's mtime after it was set = %d, want %d", got[0], set.UnixNano())
+			}
+			start := time.Now()
+			tt.change(f, mkdir.Entry.Child)
+			// The change moves the mtime and the ctime to its own time.
+			if got := f.dirTimes(fuseops.RootInodeID, "made"); got[0] < start.UnixNano() || got[0] >= set.UnixNano() || got[1] != got[0] {
+				t.Errorf("made's mtime and ctime after the change = %d, want both the change's time, no earlier than %d and earlier than %d", got, start.UnixNano(), set.UnixNano())
+			}
+		})
+	}
+}
+
 // A switch moves the times of each directory that gains, loses or retypes an
 // entry. A base directory otherwise reports the commit time, which two
 // commits can share.
@@ -531,23 +581,24 @@ func TestSwitchFromAnEmptyTreeMovesEveryDirectorysTimes(t *testing.T) {
 
 // Overlay entries below a directory the base lacks imply it. A rename of the
 // last of them, an untracked file that leaves no delete marker, removes the
-// directory from its parent's listing too.
-func TestRenameOutOfAnImpliedDirectoryMovesItsParentsTimes(t *testing.T) {
+// directory from its parent's listing, and with it each directory above that
+// only it implied: here imp/v and imp, which changes the root's listing.
+func TestRenameOutOfImpliedDirectoriesMovesTheTimesAboveThem(t *testing.T) {
 	const commitTime = 1_700_000_000
-	f := newCacheFixture(t, append(slices.Clone(dirTimesNodes), baseDir("imp", "imp"), baseFile("imp/b.txt", "b", 0o100644))...)
+	f := newCacheFixture(t, append(slices.Clone(dirTimesNodes), baseDir("imp", "imp"), baseDir("imp/v", "v"), baseFile("imp/v/b.txt", "b", 0o100644))...)
 	f.resolver.SetCommitTime(commitTime)
-	imp := f.lookup(fuseops.RootInodeID, "imp")
-	if err := f.fs.CreateFile(f.ctx, &fuseops.CreateFileOp{Parent: imp, Name: "u.txt", Mode: 0o644}); err != nil {
+	v := f.lookup(f.lookup(fuseops.RootInodeID, "imp"), "v")
+	if err := f.fs.CreateFile(f.ctx, &fuseops.CreateFileOp{Parent: v, Name: "u.txt", Mode: 0o644}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.resolver.SwitchGeneration(f.ctx, f.publish(dirTimesNodes...), commitTime); err != nil {
 		t.Fatal(err)
 	}
 	if got := readdirNames(t, f.resolver, "."); !slices.Contains(got, "imp") {
-		t.Fatalf("root after the switch lists %q, want imp implied by imp/u.txt", got)
+		t.Fatalf("root after the switch lists %q, want imp implied by imp/v/u.txt", got)
 	}
 	before := f.rootTimes()
-	if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: imp, OldName: "u.txt", NewParent: f.lookup(fuseops.RootInodeID, "d"), NewName: "u.txt"}); err != nil {
+	if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: v, OldName: "u.txt", NewParent: f.lookup(fuseops.RootInodeID, "d"), NewName: "u.txt"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := readdirNames(t, f.resolver, "."); slices.Contains(got, "imp") {
@@ -555,6 +606,62 @@ func TestRenameOutOfAnImpliedDirectoryMovesItsParentsTimes(t *testing.T) {
 	}
 	if after := f.rootTimes(); after[0] <= before[0] || after[1] <= before[1] {
 		t.Errorf("root: mtime and ctime %d before, %d after; want both later", before, after)
+	}
+}
+
+// An op through the inode of a directory a switch removed, such as a shell's
+// working directory, makes an entry there. The directory then appears again,
+// implied by that entry, and so does each removed directory above it. Here
+// imp/sub and imp appear, which changes the root's listing.
+func TestOpsInADirectoryASwitchRemovedMoveTheTimesAboveIt(t *testing.T) {
+	const commitTime = 1_700_000_000
+	type inodes struct {
+		sub, d, b fuseops.InodeID
+		handle    fuseops.HandleID
+	}
+	for _, tt := range []struct {
+		name string
+		op   func(f *cacheFixture, in inodes) error
+	}{
+		{"create", func(f *cacheFixture, in inodes) error {
+			return f.fs.CreateFile(f.ctx, &fuseops.CreateFileOp{Parent: in.sub, Name: "new.txt", Mode: 0o644})
+		}},
+		{"mkdir", func(f *cacheFixture, in inodes) error {
+			return f.fs.MkDir(f.ctx, &fuseops.MkDirOp{Parent: in.sub, Name: "new", Mode: os.ModeDir | 0o755})
+		}},
+		{"symlink", func(f *cacheFixture, in inodes) error {
+			return f.fs.CreateSymlink(f.ctx, &fuseops.CreateSymlinkOp{Parent: in.sub, Name: "link", Target: "b.txt"})
+		}},
+		{"rename into", func(f *cacheFixture, in inodes) error {
+			return f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: in.d, OldName: "a.txt", NewParent: in.sub, NewName: "a.txt"})
+		}},
+		{"write that recreates its path", func(f *cacheFixture, in inodes) error {
+			return f.fs.WriteFile(f.ctx, &fuseops.WriteFileOp{Inode: in.b, Handle: in.handle, Data: []byte("x")})
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newCacheFixture(t, append(slices.Clone(dirTimesNodes), baseDir("imp", "imp"), baseDir("imp/sub", "impsub"), baseFile("imp/sub/b.txt", "b", 0o100644))...)
+			f.resolver.SetCommitTime(commitTime)
+			sub := f.lookup(f.lookup(fuseops.RootInodeID, "imp"), "sub")
+			b := f.lookup(sub, "b.txt")
+			in := inodes{sub: sub, d: f.lookup(fuseops.RootInodeID, "d"), b: b, handle: f.openRW(b).Handle}
+			if _, err := f.resolver.SwitchGeneration(f.ctx, f.publish(dirTimesNodes...), commitTime); err != nil {
+				t.Fatal(err)
+			}
+			if got := readdirNames(t, f.resolver, "."); slices.Contains(got, "imp") {
+				t.Fatalf("root after the switch lists %q, want no imp", got)
+			}
+			before := f.rootTimes()
+			if err := tt.op(f, in); err != nil {
+				t.Fatal(err)
+			}
+			if got := readdirNames(t, f.resolver, "."); !slices.Contains(got, "imp") {
+				t.Fatalf("root after the op lists %q, want imp", got)
+			}
+			if after := f.rootTimes(); after[0] <= before[0] || after[1] <= before[1] {
+				t.Errorf("root: mtime and ctime %d before, %d after; want both later", before, after)
+			}
+		})
 	}
 }
 
@@ -617,6 +724,183 @@ func TestListingChangesMoveTimesPastAFutureCommitTime(t *testing.T) {
 	}
 	if created := f.dirTimes(fuseops.RootInodeID, "d"); created[0] <= switched[0] || created[1] <= switched[1] {
 		t.Errorf("d after a create: mtime and ctime %d before, %d after; want both later", switched, created)
+	}
+}
+
+// timesRecords returns the directories memory holds a listing change for and
+// those it holds a set mtime for.
+func (f *cacheFixture) timesRecords() (listed, mtimeSet []string) {
+	f.resolver.times.mu.Lock()
+	defer f.resolver.times.mu.Unlock()
+	return slices.Sorted(maps.Keys(f.resolver.times.listed)), slices.Sorted(maps.Keys(f.resolver.times.mtimeSet))
+}
+
+// The times memory records for a directory end with the directory: an rmdir
+// or a rename away forgets them. A switch that cannot tell which listings it
+// changed forgets every listing change before it, and every set mtime that it
+// reaches.
+func TestDirectoryTimesRecordsEndWithTheirDirectories(t *testing.T) {
+	f := newCacheFixture(t, dirTimesNodes...)
+	d := f.lookup(fuseops.RootInodeID, "d")
+	deep := f.lookup(f.lookup(d, "sub"), "deep")
+	mkdir := &fuseops.MkDirOp{Parent: d, Name: "empty", Mode: os.ModeDir | 0o755}
+	if err := f.fs.MkDir(f.ctx, mkdir); err != nil {
+		t.Fatal(err)
+	}
+	set := time.Unix(1_000_000_000, 0)
+	for _, dir := range []fuseops.InodeID{mkdir.Entry.Child, deep} {
+		if err := f.fs.CreateFile(f.ctx, &fuseops.CreateFileOp{Parent: dir, Name: "made.txt", Mode: 0o644}); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.fs.Unlink(f.ctx, &fuseops.UnlinkOp{Parent: dir, Name: "made.txt"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: dir, Mtime: &set}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(when string, wantListed, wantSet []string) {
+		t.Helper()
+		if listed, mtimeSet := f.timesRecords(); !slices.Equal(listed, wantListed) || !slices.Equal(mtimeSet, wantSet) {
+			t.Fatalf("%s: memory records listing changes of %q and set mtimes of %q, want %q and %q", when, listed, mtimeSet, wantListed, wantSet)
+		}
+	}
+	check("before the removals", []string{"d", "d/empty", "d/sub/deep"}, []string{"d/empty", "d/sub/deep"})
+	if err := f.fs.RmDir(f.ctx, &fuseops.RmDirOp{Parent: d, Name: "empty"}); err != nil {
+		t.Fatal(err)
+	}
+	check("after the rmdir", []string{"d", "d/sub/deep"}, []string{"d/sub/deep"})
+	// The rename changes e's listing past the mtime set on e, so e's set mtime
+	// shows no more.
+	e := f.lookup(fuseops.RootInodeID, "e")
+	if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: e, Mtime: &set}); err != nil {
+		t.Fatal(err)
+	}
+	check("after the mtime set on e", []string{"d", "d/sub/deep"}, []string{"d/sub/deep", "e"})
+	if err := f.fs.Rename(f.ctx, &fuseops.RenameOp{OldParent: d, OldName: "sub", NewParent: e, NewName: "sub"}); err != nil {
+		t.Fatal(err)
+	}
+	check("after the rename", []string{"d", "e"}, nil)
+	future := time.Now().Add(24 * time.Hour)
+	if err := f.fs.SetInodeAttributes(f.ctx, &fuseops.SetInodeAttributesOp{Inode: d, Mtime: &future}); err != nil {
+		t.Fatal(err)
+	}
+	f.resolver.Snapshot = failingListingOf{SnapshotStore: f.snap, gen: f.resolver.Generation()}
+	sw, err := f.resolver.SwitchGeneration(f.ctx, f.publish(dirTimesNodes...), 0)
+	f.resolver.Snapshot = f.snap
+	if err != nil || sw.DiffErr == nil {
+		t.Fatalf("SwitchGeneration = diff error %v, %v; want a diff error", sw.DiffErr, err)
+	}
+	// The set mtime lies past the switch, which replaces it only while its
+	// record shows that the switch came after it.
+	check("after a switch with an unknown diff", nil, []string{"d"})
+}
+
+// A directory's record holds a copy of its path. The path an op came with,
+// which the record's key can be cut from, then stays free to collect.
+func TestDirectoryTimesRecordsCopyTheirPaths(t *testing.T) {
+	f := newCacheFixture(t, dirTimesNodes...)
+	created := strings.Clone("e/new.txt")
+	if err := f.fs.engine.Create(f.ctx, created, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	set, mtime := strings.Clone("d"), time.Unix(1_000_000_000, 0)
+	if err := f.fs.engine.Do(f.ctx, nil, func(ctx context.Context, b *Blobs) error {
+		_, err := f.fs.engine.SetAttributes(ctx, b, set, "dir", nil, 0, nil, &mtime, nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.resolver.times.mu.Lock()
+	defer f.resolver.times.mu.Unlock()
+	for name, tt := range map[string]struct {
+		keys       []string
+		path, want string
+	}{
+		"listing change": {slices.Collect(maps.Keys(f.resolver.times.listed)), created, "e"},
+		"set mtime":      {slices.Collect(maps.Keys(f.resolver.times.mtimeSet)), set, "d"},
+	} {
+		if !slices.Equal(tt.keys, []string{tt.want}) {
+			t.Fatalf("memory records a %s for %q, want only %s", name, tt.keys, tt.want)
+		}
+		if unsafe.StringData(tt.keys[0]) == unsafe.StringData(tt.path) {
+			t.Errorf("the record of the %s shares the bytes of the path %q", name, tt.path)
+		}
+	}
+}
+
+// A listing builds no path for its child directories while memory records no
+// directory's times, so it costs no allocation for each of them.
+func TestListingBuildsNoChildPathsWhileNoDirectoryHasTimes(t *testing.T) {
+	const children = 50
+	nodes := []model.BaseNode{baseDir("dirs", "dirs"), baseDir("files", "files")}
+	for i := range children {
+		nodes = append(nodes, baseDir(fmt.Sprintf("dirs/%02d", i), fmt.Sprintf("t%02d", i)), baseFile(fmt.Sprintf("files/%02d", i), fmt.Sprintf("b%02d", i), 0o100644))
+	}
+	f := newCacheFixture(t, nodes...)
+	allocs := func(dir string) float64 {
+		return testing.AllocsPerRun(10, func() {
+			if _, _, _, err := f.fs.engine.ReadDir(f.ctx, dir); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	if dirs, files := allocs("dirs"), allocs("files"); dirs-files >= children/2 {
+		t.Errorf("a listing of %d directories allocates %v times, of %d files %v; want about as often", children, dirs, children, files)
+	}
+}
+
+// No identity the switch pass compares holds a directory's times. So the pass
+// invalidates the inode of each directory whose listing the switch changed,
+// or of every directory when the switch cannot tell which: the kernel
+// otherwise serves the directory's old times until they expire.
+func TestSwitchPassInvalidatesTheDirectoriesWhoseListingTheSwitchChanged(t *testing.T) {
+	f := newCacheFixture(t, dirTimesNodes...)
+	var root fuseops.InodeID = fuseops.RootInodeID
+	d, e := f.lookup(root, "d"), f.lookup(root, "e")
+	sub := f.lookup(d, "sub")
+	f.lookup(d, "a.txt")
+	nodes := append(slices.Clone(dirTimesNodes), baseFile("d/new.txt", "new", 0o100644))
+	nodes[slices.IndexFunc(nodes, func(n model.BaseNode) bool { return n.Path == "d" })] = baseDir("d", "d2")
+	f.switchTo(nodes...)
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if inodes, _ := f.notifier.recorded(); !slices.Equal(inodes, []fuseops.InodeID{d}) {
+		t.Errorf("invalidated inodes after d gained an entry = %v, want d's %d", inodes, d)
+	}
+
+	f.notifier = newRecordingNotifier()
+	f.fs.setNotifier(f.notifier)
+	f.resolver.Snapshot = failingListingOf{SnapshotStore: f.snap, gen: f.resolver.Generation()}
+	sw, err := f.resolver.SwitchGeneration(f.ctx, f.publish(dirTimesNodes...), 0)
+	f.resolver.Snapshot = f.snap
+	if err != nil || sw.DiffErr == nil {
+		t.Fatalf("SwitchGeneration = diff error %v, %v; want a diff error", sw.DiffErr, err)
+	}
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if inodes, _ := f.notifier.recorded(); !slices.Equal(sortedInodes(inodes), sortedInodes([]fuseops.InodeID{root, d, e, sub})) {
+		t.Errorf("invalidated inodes after a switch with an unknown diff = %v, want every directory's: %v", sortedInodes(inodes), sortedInodes([]fuseops.InodeID{root, d, e, sub}))
+	}
+}
+
+// MkDir replies with the times getattr then reports for the directory it
+// made, so the kernel's view of them does not move without a change.
+func TestMkDirRepliesWithTheTimesGetattrReports(t *testing.T) {
+	f := newCacheFixture(t, dirTimesNodes...)
+	op := &fuseops.MkDirOp{Parent: fuseops.RootInodeID, Name: "new", Mode: os.ModeDir | 0o755}
+	if err := f.fs.MkDir(f.ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	attrs := &fuseops.GetInodeAttributesOp{Inode: op.Entry.Child}
+	if err := f.fs.GetInodeAttributes(f.ctx, attrs); err != nil {
+		t.Fatal(err)
+	}
+	replied, got := op.Entry.Attributes, attrs.Attributes
+	if !replied.Mtime.Equal(got.Mtime) || !replied.Ctime.Equal(got.Ctime) {
+		t.Errorf("MkDir replied with mtime %v and ctime %v, getattr reports %v and %v", replied.Mtime, replied.Ctime, got.Mtime, got.Ctime)
 	}
 }
 
@@ -687,7 +971,8 @@ func entrySet(entries []kernelEntry) map[kernelEntry]int {
 // type. On Linux it also invalidates each
 // negative entry whose name now exists. A name made through the mount is
 // already positive in the kernel, so it gets no invalidation, and neither do
-// directories whose tree changed or overlay entries.
+// overlay entries. A directory whose listing changed gets its inode
+// invalidated, for its times: here the root and dir.
 func TestInvalidateChangedDropsWhatTheSwitchChanged(t *testing.T) {
 	f := newCacheFixture(t,
 		baseFile("same.txt", "same", 0o100644),
@@ -759,8 +1044,8 @@ func TestInvalidateChangedDropsWhatTheSwitchChanged(t *testing.T) {
 	}
 
 	inodes, entries := f.notifier.recorded()
-	if want := sortedInodes([]fuseops.InodeID{edited, chmod, swap}); !slices.Equal(sortedInodes(inodes), want) {
-		t.Errorf("invalidated inodes = %v, want %v (edited.txt, chmod.sh, swap); same.txt is inode %d, gone.txt %d, olddir %d, olddir/child.txt %d", sortedInodes(inodes), want, same, gone, olddir, child)
+	if want := sortedInodes([]fuseops.InodeID{root, edited, chmod, swap, dir}); !slices.Equal(sortedInodes(inodes), want) {
+		t.Errorf("invalidated inodes = %v, want %v (the root, edited.txt, chmod.sh, swap, dir); same.txt is inode %d, gone.txt %d, olddir %d, olddir/child.txt %d", sortedInodes(inodes), want, same, gone, olddir, child)
 	}
 	want := map[kernelEntry]int{
 		{root, "gone.txt"}:    1,
@@ -812,8 +1097,8 @@ func TestInvalidateChangedDropsVanishedNameLastReportedFromOverlay(t *testing.T)
 // A switch to a commit of the rename that also adds sub/b.txt makes reconcile
 // drop all three, so c.txt resolves to its base blob and the base sub/b.txt
 // shows through. The switch pass invalidates the inode the kernel last saw from
-// the overlay at c.txt, and on Linux the negative entry it cached for
-// sub/b.txt.
+// the overlay at c.txt, the root and sub, whose listings changed, and on Linux
+// the negative entry it cached for sub/b.txt.
 func TestInvalidateChangedFollowsReconcileOfACommittedRenameChain(t *testing.T) {
 	f := newCacheFixture(t, baseFile("a.txt", "a", 0o100644), baseDir("sub", "sub-1"))
 	var root fuseops.InodeID = fuseops.RootInodeID
@@ -843,8 +1128,8 @@ func TestInvalidateChangedFollowsReconcileOfACommittedRenameChain(t *testing.T) 
 	}
 
 	inodes, entries := f.notifier.recorded()
-	if want := []fuseops.InodeID{moved}; !slices.Equal(inodes, want) {
-		t.Errorf("invalidated inodes = %v, want %v, the inode at c.txt", inodes, want)
+	if want := sortedInodes([]fuseops.InodeID{moved, root, sub}); !slices.Equal(sortedInodes(inodes), want) {
+		t.Errorf("invalidated inodes = %v, want %v: the inode at c.txt, the root and sub", sortedInodes(inodes), want)
 	}
 	var want []kernelEntry
 	if negativeLookupEntries {
@@ -999,8 +1284,9 @@ func TestSwitchPassInvalidatesInodeAReplyUpdatedFirst(t *testing.T) {
 // A switch that turns a held file into a directory invalidates its entry and
 // its inode once, also when a getattr before the pass retired the inode. A
 // lookup before the pass already gave the kernel the directory under a new
-// inode, so the pass sends nothing. A later switch that keeps the directory
-// sends nothing either.
+// inode, so the pass sends nothing for it. Every time the pass also
+// invalidates the root, whose listing the retype changed. A later switch that
+// keeps the directory sends nothing.
 func TestSwitchPassInvalidatesRetypedEntryOnce(t *testing.T) {
 	for _, first := range []string{"pass", "lookup", "getattr"} {
 		t.Run(first, func(t *testing.T) {
@@ -1008,11 +1294,11 @@ func TestSwitchPassInvalidatesRetypedEntryOnce(t *testing.T) {
 			held := f.lookup(fuseops.RootInodeID, "swap")
 			dir := []model.BaseNode{baseDir("swap", "t1"), baseFile("swap/x.txt", "x", 0o100644)}
 			f.switchTo(dir...)
-			wantInodes, wantEntries := []fuseops.InodeID{held}, []kernelEntry{{fuseops.RootInodeID, "swap"}}
+			wantInodes, wantEntries := []fuseops.InodeID{held, fuseops.RootInodeID}, []kernelEntry{{fuseops.RootInodeID, "swap"}}
 			switch first {
 			case "lookup":
 				f.lookup(fuseops.RootInodeID, "swap")
-				wantInodes, wantEntries = nil, nil
+				wantInodes, wantEntries = []fuseops.InodeID{fuseops.RootInodeID}, nil
 			case "getattr":
 				f.getattr(held)
 			}
@@ -1083,7 +1369,7 @@ func TestSwitchPassInvalidatesInodeWithItsEntry(t *testing.T) {
 
 // The switch pass sends a vanished regular file only its entry invalidation,
 // because the file's content did not change: its open file keeps reading what
-// it read. When the path comes back unchanged, the pass maps it back to the
+// it read. The root, whose listing changed, gets its inode invalidated. When the path comes back unchanged, the pass maps it back to the
 // held inode and sends nothing.
 func TestSwitchPassSendsOnlyTheEntryOfAVanishedFile(t *testing.T) {
 	f := newCacheFixture(t, baseFile("file.txt", "blob-A", 0o100644))
@@ -1093,15 +1379,17 @@ func TestSwitchPassSendsOnlyTheEntryOfAVanishedFile(t *testing.T) {
 	if err := f.mount.InvalidateChanged(); err != nil {
 		t.Fatal(err)
 	}
-	if inodes, entries := f.notifier.recorded(); len(inodes) != 0 || !slices.Equal(entries, []kernelEntry{{fuseops.RootInodeID, "file.txt"}}) {
-		t.Fatalf("the switch that removed file.txt invalidated inodes %v and entries %v, want only the entry of file.txt", inodes, entries)
+	if inodes, entries := f.notifier.recorded(); !slices.Equal(inodes, []fuseops.InodeID{fuseops.RootInodeID}) || !slices.Equal(entries, []kernelEntry{{fuseops.RootInodeID, "file.txt"}}) {
+		t.Fatalf("the switch that removed file.txt invalidated inodes %v and entries %v, want the root's inode and the entry of file.txt", inodes, entries)
 	}
 	f.switchTo(baseFile("file.txt", "blob-A", 0o100644))
 	if err := f.mount.InvalidateChanged(); err != nil {
 		t.Fatal(err)
 	}
-	if inodes, _ := f.notifier.recorded(); len(inodes) != 0 {
-		t.Fatalf("the switch that restored file.txt invalidated inodes %v", inodes)
+	// A switch from the empty tree cannot tell which listings it changed, so it
+	// invalidates the root again.
+	if inodes, _ := f.notifier.recorded(); !slices.Equal(inodes, []fuseops.InodeID{fuseops.RootInodeID, fuseops.RootInodeID}) {
+		t.Fatalf("the switch that restored file.txt invalidated inodes %v, want only the root's again", inodes)
 	}
 	read := &fuseops.ReadFileOp{Inode: held, Handle: open.Handle, Size: 64, Dst: make([]byte, 64)}
 	if err := f.fs.ReadFile(f.ctx, read); err != nil {
@@ -1404,7 +1692,7 @@ func TestSwitchPassDoesTheSameWithAndWithoutTheOverlayRead(t *testing.T) {
 		return got
 	}
 	want := outcome{
-		inodes:      []string{"chmod.sh", "edited.txt", "swap", "written.txt"},
+		inodes:      []string{".", "chmod.sh", "d", "dir", "edited.txt", "swap", "written.txt"},
 		entries:     []string{". gone.txt", ". olddir", ". swap", "olddir child.txt"},
 		gens:        []int64{2},
 		swapRetired: true,

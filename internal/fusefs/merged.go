@@ -60,15 +60,31 @@ type dirTimes struct {
 	// listed holds the last change to each directory's listing: an entry an
 	// op through the mount or a generation switch added, removed or retyped.
 	// It raises the directory's mtime and ctime, as on a local file system.
+	// Each key is a copy, so it keeps no longer path it was cut from alive.
 	listed map[string]time.Time
 	// allListed is the last change to every directory's listing, from a
 	// switch that could not tell which listings it changed.
 	allListed time.Time
 	// latest is the latest time listed or allListed holds.
 	latest time.Time
-	// mtimeSet holds, for each directory whose mtime was set, the latest
-	// listing change before the set. Only a later change raises its mtime.
-	mtimeSet map[string]time.Time
+	// mtimeSet holds each directory whose mtime was set, until a listing
+	// change reaches the mtime it set. A listing change after the set
+	// replaces the mtime, as on a local file system.
+	mtimeSet map[string]mtimeSetting
+	// switched holds the directories whose listing a switch changed since
+	// the switch pass last took them, and allSwitched whether a switch
+	// changed every listing. No identity the pass compares holds a
+	// directory's times, so the pass invalidates what the kernel caches for
+	// these.
+	switched    map[string]bool
+	allSwitched bool
+}
+
+// mtimeSetting is an mtime set on a directory.
+type mtimeSetting struct {
+	// before is the latest listing change before the set.
+	before time.Time
+	value  time.Time
 }
 
 // SetDirFloor makes t the earliest ctime any directory reports.
@@ -98,58 +114,148 @@ func (r *Resolver) nextListingLocked() time.Time {
 func (r *Resolver) listingChanged(dirs ...string) {
 	r.times.mu.Lock()
 	defer r.times.mu.Unlock()
+	r.listingChangedLocked(dirs, false)
+}
+
+// listingChangedLocked implements listingChanged, and records dirs in
+// r.times.switched too when switched is true. The caller holds r.times.mu.
+func (r *Resolver) listingChangedLocked(dirs []string, switched bool) {
 	if r.times.listed == nil {
 		r.times.listed = map[string]time.Time{}
 	}
+	switched = switched && !r.times.allSwitched
+	if switched && r.times.switched == nil {
+		r.times.switched = map[string]bool{}
+	}
 	t := r.nextListingLocked()
 	for _, dir := range dirs {
-		r.times.listed[dir] = t
+		key := strings.Clone(dir)
+		r.times.listed[key] = t
+		if switched {
+			r.times.switched[key] = true
+		}
+		// The directory reports t from now on also without the record.
+		if set, ok := r.times.mtimeSet[dir]; ok && !set.value.After(t) {
+			delete(r.times.mtimeSet, dir)
+		}
 	}
 }
 
-// allListingsChanged records that the listing of every directory may have
-// changed now.
-func (r *Resolver) allListingsChanged() {
-	r.times.mu.Lock()
-	defer r.times.mu.Unlock()
-	r.times.allListed = r.nextListingLocked()
+// allListingsChangedLocked records that the listing of every directory may
+// have changed now. That change hides every listing change before it, so it
+// forgets them, and every set mtime it reaches. The caller holds r.times.mu.
+func (r *Resolver) allListingsChangedLocked() {
+	t := r.nextListingLocked()
+	r.times.allListed = t
+	clear(r.times.listed)
+	for dir, set := range r.times.mtimeSet {
+		if !set.value.After(t) {
+			delete(r.times.mtimeSet, dir)
+		}
+	}
 }
 
-// mtimeSetOn records that an mtime was set on dir, so that it shows until
+// listingsSwitched records the listing changes of a switch: those of
+// listings, or of every directory when all is true. takeSwitchedListings
+// returns them.
+func (r *Resolver) listingsSwitched(listings []string, all bool) {
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	if all {
+		r.allListingsChangedLocked()
+		r.times.switched, r.times.allSwitched = nil, true
+		return
+	}
+	r.listingChangedLocked(listings, true)
+}
+
+// takeSwitchedListings returns the directories whose listing a switch changed
+// since its last call, or all true when a switch changed every listing, and
+// forgets them.
+func (r *Resolver) takeSwitchedListings() (dirs map[string]bool, all bool) {
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	dirs, all = r.times.switched, r.times.allSwitched
+	r.times.switched, r.times.allSwitched = nil, false
+	return dirs, all
+}
+
+// mtimeSetOn records that mtime value was set on dir, so that it shows until
 // dir's listing changes again.
-func (r *Resolver) mtimeSetOn(dir string) {
+func (r *Resolver) mtimeSetOn(dir string, value time.Time) {
 	r.times.mu.Lock()
 	defer r.times.mu.Unlock()
 	if r.times.mtimeSet == nil {
-		r.times.mtimeSet = map[string]time.Time{}
+		r.times.mtimeSet = map[string]mtimeSetting{}
 	}
-	r.times.mtimeSet[dir] = r.times.latest
+	r.times.mtimeSet[strings.Clone(dir)] = mtimeSetting{before: r.times.latest, value: value}
+}
+
+// dirsRemoved forgets the times recorded for dirs, directories that no
+// longer exist.
+func (r *Resolver) dirsRemoved(dirs ...string) {
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	for _, dir := range dirs {
+		delete(r.times.listed, dir)
+		delete(r.times.mtimeSet, dir)
+	}
 }
 
 // dirTimes returns the mtime and ctime that directory dir reports, given the
 // ones the overlay or the snapshot gives it.
 func (r *Resolver) dirTimes(dir string, mtime, ctime time.Time) (time.Time, time.Time) {
-	later := func(a, b time.Time) time.Time {
-		if b.After(a) {
-			return b
-		}
-		return a
-	}
 	r.times.mu.Lock()
 	defer r.times.mu.Unlock()
+	return r.dirTimesLocked(dir, mtime, ctime)
+}
+
+// dirTimesLocked implements dirTimes. The caller holds r.times.mu.
+func (r *Resolver) dirTimesLocked(dir string, mtime, ctime time.Time) (time.Time, time.Time) {
 	changed := later(r.times.listed[dir], r.times.allListed)
 	if !changed.IsZero() {
-		if changed.After(r.times.mtimeSet[dir]) {
+		if set, ok := r.times.mtimeSet[dir]; !ok {
 			mtime = later(mtime, changed)
+		} else if changed.After(set.before) {
+			mtime = changed
 		}
 		ctime = later(ctime, changed)
 	}
 	return mtime, later(ctime, r.times.floor)
 }
 
-// parentDir returns the directory that holds path.
-func parentDir(path string) string {
-	return model.CleanPath(filepath.Dir(model.CleanPath(path)))
+// childDirTimes sets the times of each directory among entries, the
+// children of dir, to those dirTimes gives it, from base, the times of a
+// base entry.
+func (r *Resolver) childDirTimes(dir string, entries []ReaddirEntry, base time.Time) {
+	r.times.mu.Lock()
+	defer r.times.mu.Unlock()
+	// While no directory has a record, every lookup misses, so no child's
+	// path is built.
+	records := len(r.times.listed) > 0 || len(r.times.mtimeSet) > 0
+	for i, entry := range entries {
+		if entry.Type != "dir" {
+			continue
+		}
+		mt, ct := base, base
+		if entry.FromOverlay {
+			mt, ct = time.Unix(0, entry.MtimeUnixNs), time.Unix(0, entry.CtimeUnixNs)
+		}
+		var child string
+		if records {
+			child = model.CleanPath(filepath.Join(dir, entry.Name))
+		}
+		mt, ct = r.dirTimesLocked(child, mt, ct)
+		entries[i].MtimeUnixNs, entries[i].CtimeUnixNs = mt.UnixNano(), ct.UnixNano()
+	}
+}
+
+// later returns the later of a and b.
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
 }
 
 func (r *Resolver) SetGeneration(gen int64) { r.generation.Store(gen) }
@@ -186,11 +292,7 @@ func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime i
 	return sw, r.Overlay.ReconcileChecked(ctx, gen, baseLookup, sw.Changed, &r.transition, func() {
 		r.SetCommitTime(commitTime)
 		r.SetGeneration(gen)
-		if sw.Changed.Unknown {
-			r.allListingsChanged()
-		} else {
-			r.listingChanged(listings...)
-		}
+		r.listingsSwitched(listings, sw.Changed.Unknown)
 	})
 }
 
@@ -552,7 +654,7 @@ func switchedPaths(snap model.SnapshotStore, from, to int64, limit int) (switche
 	mark := func(p string, listing bool) bool {
 		paths = append(paths, p)
 		if listing {
-			listings = append(listings, parentDir(p))
+			listings = append(listings, model.CleanPath(filepath.Dir(p)))
 		}
 		return len(paths) <= limit
 	}
