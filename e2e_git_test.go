@@ -178,7 +178,6 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 		}
 		repo.close(t)
 	})
-	primeE2EMountPolling(t, repo.mountPath)
 	return repo
 }
 
@@ -242,7 +241,6 @@ func (r *mountedE2ERepo) restart(t *testing.T) {
 	r.svc = svc
 	r.cancel = cancel
 	r.errCh = errCh
-	primeE2EMountPolling(t, r.mountPath)
 }
 
 func testE2EGitCleanState(t *testing.T, repo *mountedE2ERepo) {
@@ -322,7 +320,7 @@ func testE2EGitStatusDetectsSameSizeRewriteAfterMtimeRestore(t *testing.T, repo 
 	} else {
 		updated[0] = 'x'
 	}
-	if err := os.WriteFile(readmePath, updated, 0o644); err != nil {
+	if err := writeMountFile(readmePath, updated, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chtimes(readmePath, indexedMtime, indexedMtime); err != nil {
@@ -351,7 +349,7 @@ func TestE2EGitColdStatusDetectsEditBeforeFirstStatus(t *testing.T) {
 	} else {
 		updated[0] = 'x'
 	}
-	if err := os.WriteFile(readmePath, updated, 0o644); err != nil {
+	if err := writeMountFile(readmePath, updated, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chtimes(readmePath, indexedMtime, indexedMtime); err != nil {
@@ -363,29 +361,29 @@ func TestE2EGitColdStatusDetectsEditBeforeFirstStatus(t *testing.T) {
 func testE2EGitStatusPorcelain(t *testing.T, repo *mountedE2ERepo) {
 	readmePath := filepath.Join(repo.mountPath, "README.md")
 	readmeOrig := readFileEventually(t, readmePath)
-	if err := os.WriteFile(readmePath, []byte(readmeOrig+"unstaged\n"), 0o644); err != nil {
+	if err := writeMountFile(readmePath, []byte(readmeOrig+"unstaged\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	packagePath := filepath.Join(repo.mountPath, "package.json")
-	if err := os.WriteFile(packagePath, []byte(`{"name":"e2e-test-repo","version":"2.0.0"}`+"\n"), 0o644); err != nil {
+	if err := writeMountFile(packagePath, []byte(`{"name":"e2e-test-repo","version":"2.0.0"}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitCmd(t, repo.mountPath, "add", "package.json")
 
 	licensePath := filepath.Join(repo.mountPath, "LICENSE-MIT")
 	licenseOrig := readFileEventually(t, licensePath)
-	if err := os.WriteFile(licensePath, []byte(licenseOrig+"staged\n"), 0o644); err != nil {
+	if err := writeMountFile(licensePath, []byte(licenseOrig+"staged\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitCmd(t, repo.mountPath, "add", "LICENSE-MIT")
-	if err := os.WriteFile(licensePath, []byte(licenseOrig+"staged\nunstaged\n"), 0o644); err != nil {
+	if err := writeMountFile(licensePath, []byte(licenseOrig+"staged\nunstaged\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	gitCmd(t, repo.mountPath, "mv", "SECURITY.md", "SECURITY-renamed.md")
 
-	if err := os.WriteFile(filepath.Join(repo.mountPath, "untracked.txt"), []byte("new\n"), 0o644); err != nil {
+	if err := writeMountFile(filepath.Join(repo.mountPath, "untracked.txt"), []byte("new\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -400,6 +398,8 @@ func testE2EGitStatusPorcelain(t *testing.T, repo *mountedE2ERepo) {
 
 func testE2EGitRenameTrackedDirectory(t *testing.T, repo *mountedE2ERepo) {
 	previousHead := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+	// The rename must carry the open file along, so the test process holds
+	// it, though a fork meanwhile can deadlock the mount (e2e_files_test.go).
 	openDescendant, err := os.Open(filepath.Join(repo.mountPath, "packages", "wrangler", "src", "index.js"))
 	if err != nil {
 		t.Fatal(err)
@@ -458,11 +458,11 @@ func testE2EGitRenameTrackedDirectory(t *testing.T, repo *mountedE2ERepo) {
 func testE2EGitCheckoutBranchSwitch(t *testing.T, repo *mountedE2ERepo) {
 	mainReadme := readFileEventually(t, filepath.Join(repo.mountPath, "README.md"))
 	gitCmd(t, repo.mountPath, "checkout", "-b", "feature")
-	if err := os.WriteFile(filepath.Join(repo.mountPath, "README.md"), []byte(mainReadme+"feature branch line\n"), 0o644); err != nil {
+	if err := writeMountFile(filepath.Join(repo.mountPath, "README.md"), []byte(mainReadme+"feature branch line\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitCmd(t, repo.mountPath, "rm", "LICENSE-MIT")
-	if err := os.WriteFile(filepath.Join(repo.mountPath, "feature.txt"), []byte("feature branch file\n"), 0o644); err != nil {
+	if err := writeMountFile(filepath.Join(repo.mountPath, "feature.txt"), []byte("feature branch file\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitCmd(t, repo.mountPath, "add", "README.md", "feature.txt")
@@ -496,7 +496,7 @@ func testE2EGitCheckoutBranchSwitch(t *testing.T, repo *mountedE2ERepo) {
 func testE2EGitCheckoutConflictKeepsLocalChanges(t *testing.T, repo *mountedE2ERepo) {
 	mainReadme := readFileEventually(t, filepath.Join(repo.mountPath, "README.md"))
 	gitCmd(t, repo.mountPath, "checkout", "-b", "feature")
-	if err := os.WriteFile(filepath.Join(repo.mountPath, "README.md"), []byte(mainReadme+"feature branch line\n"), 0o644); err != nil {
+	if err := writeMountFile(filepath.Join(repo.mountPath, "README.md"), []byte(mainReadme+"feature branch line\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitCmd(t, repo.mountPath, "add", "README.md")
@@ -511,7 +511,7 @@ func testE2EGitCheckoutConflictKeepsLocalChanges(t *testing.T, repo *mountedE2ER
 	waitForBranchAndStatus(t, repo.mountPath, "main", map[string]string{})
 
 	localChange := mainReadme + "local main change\n"
-	if err := os.WriteFile(filepath.Join(repo.mountPath, "README.md"), []byte(localChange), 0o644); err != nil {
+	if err := writeMountFile(filepath.Join(repo.mountPath, "README.md"), []byte(localChange), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -537,7 +537,7 @@ func testE2EGitCheckoutConflictKeepsLocalChanges(t *testing.T, repo *mountedE2ER
 func testE2EGitCheckoutRestorePath(t *testing.T, repo *mountedE2ERepo) {
 	readmePath := filepath.Join(repo.mountPath, "README.md")
 	readmeOrig := readFileEventually(t, readmePath)
-	if err := os.WriteFile(readmePath, []byte(readmeOrig+"local change\n"), 0o644); err != nil {
+	if err := writeMountFile(readmePath, []byte(readmeOrig+"local change\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	assertGitStatus(t, repo.mountPath, map[string]string{"README.md": " M"})
@@ -554,7 +554,7 @@ func testE2EGitCheckoutRestorePath(t *testing.T, repo *mountedE2ERepo) {
 
 func testE2EGitMergeAndRebase(t *testing.T, repo *mountedE2ERepo) {
 	gitCmd(t, repo.mountPath, "checkout", "-b", "feature")
-	writeTestFile(t, repo.mountPath, "FEATURE.md", "feature\n")
+	writeMountTestFile(t, repo.mountPath, "FEATURE.md", "feature\n")
 	gitCmd(t, repo.mountPath, "add", "FEATURE.md")
 	gitCmd(t, repo.mountPath,
 		"-c", "user.name=E2E Test",
@@ -565,7 +565,7 @@ func testE2EGitMergeAndRebase(t *testing.T, repo *mountedE2ERepo) {
 	waitForBranchAndStatus(t, repo.mountPath, "feature", map[string]string{})
 
 	gitCmd(t, repo.mountPath, "checkout", "main")
-	writeTestFile(t, repo.mountPath, "MAIN.md", "main\n")
+	writeMountTestFile(t, repo.mountPath, "MAIN.md", "main\n")
 	gitCmd(t, repo.mountPath, "add", "MAIN.md")
 	preMainCommitHEAD := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
 	gitCmd(t, repo.mountPath,
@@ -588,7 +588,7 @@ func testE2EGitMergeAndRebase(t *testing.T, repo *mountedE2ERepo) {
 	assertPathExists(t, filepath.Join(repo.mountPath, "MAIN.md"))
 
 	gitCmd(t, repo.mountPath, "checkout", "feature")
-	writeTestFile(t, repo.mountPath, "FEATURE-2.md", "feature two\n")
+	writeMountTestFile(t, repo.mountPath, "FEATURE-2.md", "feature two\n")
 	gitCmd(t, repo.mountPath, "add", "FEATURE-2.md")
 	preFeatureCommitHEAD := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
 	gitCmd(t, repo.mountPath,
@@ -619,7 +619,7 @@ func testE2EGitMergeAndRebase(t *testing.T, repo *mountedE2ERepo) {
 func testE2EGitCommitModifyTrackedFile(t *testing.T, repo *mountedE2ERepo) {
 	readmePath := filepath.Join(repo.mountPath, "README.md")
 	updated := readFileEventually(t, readmePath) + "committed tracked change\n"
-	if err := os.WriteFile(readmePath, []byte(updated), 0o644); err != nil {
+	if err := writeMountFile(readmePath, []byte(updated), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitCmd(t, repo.mountPath, "add", "README.md")
@@ -644,11 +644,11 @@ func testE2EGitCommitPreservesUnstagedAfterStagedCommit(t *testing.T, repo *moun
 	base := readFileEventually(t, readmePath)
 	staged := base + "staged line\n"
 	worktree := staged + "unstaged line\n"
-	if err := os.WriteFile(readmePath, []byte(staged), 0o644); err != nil {
+	if err := writeMountFile(readmePath, []byte(staged), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitCmd(t, repo.mountPath, "add", "README.md")
-	if err := os.WriteFile(readmePath, []byte(worktree), 0o644); err != nil {
+	if err := writeMountFile(readmePath, []byte(worktree), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	assertGitStatus(t, repo.mountPath, map[string]string{"README.md": "MM"})
@@ -672,6 +672,9 @@ func testE2EGitCommitPreservesUnstagedAfterStagedCommit(t *testing.T, repo *moun
 func testE2EGitCommitTrackedRename(t *testing.T, repo *mountedE2ERepo) {
 	sourcePath := filepath.Join(repo.mountPath, "SECURITY.md")
 	content := readFileEventually(t, sourcePath)
+	// The read through the open source after git mv is the test's subject,
+	// so the test process holds it, though a fork meanwhile can deadlock the
+	// mount (e2e_files_test.go).
 	openSource, err := os.Open(sourcePath)
 	if err != nil {
 		t.Fatal(err)
@@ -716,7 +719,7 @@ func testE2EGitCommitTrackedDelete(t *testing.T, repo *mountedE2ERepo) {
 func testE2EGitCommitExecutableBit(t *testing.T, repo *mountedE2ERepo) {
 	readmePath := filepath.Join(repo.mountPath, "README.md")
 	stagedContent := readFileEventually(t, readmePath) + "staged before chmod\n"
-	if err := os.WriteFile(readmePath, []byte(stagedContent), 0o644); err != nil {
+	if err := writeMountFile(readmePath, []byte(stagedContent), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitCmd(t, repo.mountPath, "add", "README.md")
@@ -824,14 +827,14 @@ func testE2EGitCommitSymlink(t *testing.T, repo *mountedE2ERepo) {
 func testE2EGitResetHardCleanAndStash(t *testing.T, repo *mountedE2ERepo) {
 	readmePath := filepath.Join(repo.mountPath, "README.md")
 	original := readFileEventually(t, readmePath)
-	if err := os.WriteFile(readmePath, []byte(original+"reset me\n"), 0o755); err != nil {
+	if err := writeMountFile(readmePath, []byte(original+"reset me\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(readmePath, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	addedPath := filepath.Join(repo.mountPath, "added-before-reset.txt")
-	if err := os.WriteFile(addedPath, []byte("discard me\n"), 0o644); err != nil {
+	if err := writeMountFile(addedPath, []byte("discard me\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitCmd(t, repo.mountPath, "add", "README.md", "added-before-reset.txt")
@@ -853,16 +856,16 @@ func testE2EGitResetHardCleanAndStash(t *testing.T, repo *mountedE2ERepo) {
 	if err := os.MkdirAll(untrackedDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeTestFile(t, untrackedDir, "nested.txt", "remove me\n")
+	writeMountTestFile(t, untrackedDir, "nested.txt", "remove me\n")
 	gitCmd(t, repo.mountPath, "clean", "-fd")
 	assertPathMissing(t, untrackedDir)
 	assertGitStatus(t, repo.mountPath, map[string]string{})
 
-	if err := os.WriteFile(readmePath, []byte(original+"stash me\n"), 0o644); err != nil {
+	if err := writeMountFile(readmePath, []byte(original+"stash me\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	untrackedPath := filepath.Join(repo.mountPath, "stash-untracked.txt")
-	if err := os.WriteFile(untrackedPath, []byte("untracked\n"), 0o644); err != nil {
+	if err := writeMountFile(untrackedPath, []byte("untracked\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitCmd(t, repo.mountPath, "stash", "push", "--include-untracked", "-m", "artifact-fs e2e")
@@ -919,7 +922,7 @@ func testE2EGitPush(t *testing.T, repo *mountedE2ERepo) {
 		t.Skip("skipping push against AFS_E2E_REPO")
 	}
 
-	writeTestFile(t, repo.mountPath, "PUSHED.md", "pushed from ArtifactFS\n")
+	writeMountTestFile(t, repo.mountPath, "PUSHED.md", "pushed from ArtifactFS\n")
 	gitCmd(t, repo.mountPath, "add", "PUSHED.md")
 	gitCmd(t, repo.mountPath,
 		"-c", "user.name=E2E Test",
@@ -1127,7 +1130,7 @@ func readFileEventually(t *testing.T, path string) string {
 	deadline := time.Now().Add(5 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(path)
+		data, err := readMountFile(path)
 		if err == nil {
 			return string(data)
 		}

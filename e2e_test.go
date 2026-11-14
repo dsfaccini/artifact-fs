@@ -108,6 +108,15 @@ func createLocalTestRepo(t *testing.T) string {
 	return "file://" + bareDir
 }
 
+// writeMountTestFile writes content to name in dir, a directory on a mount,
+// as writeTestFile does, in a child process.
+func writeMountTestFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := writeMountFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func writeTestFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
@@ -194,7 +203,6 @@ func TestE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("mount active at %s", mountPath)
-	primeE2EMountPolling(t, mountPath)
 
 	// headBlob is the content of path in HEAD, read outside the mount.
 	gitDir := filepath.Join(root, "repos", repoName, "git")
@@ -256,7 +264,7 @@ func TestE2E(t *testing.T) {
 
 	t.Run("fs/create_file", func(t *testing.T) {
 		p := filepath.Join(mountPath, "e2e-test-file.txt")
-		if err := os.WriteFile(p, []byte("hello e2e\n"), 0o644); err != nil {
+		if err := writeMountFile(p, []byte("hello e2e\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		assertFileContent(t, p, "hello e2e\n")
@@ -281,7 +289,7 @@ func TestE2E(t *testing.T) {
 
 	t.Run("fs/write_nested", func(t *testing.T) {
 		p := filepath.Join(mountPath, "e2e-test-dir", "nested.txt")
-		if err := os.WriteFile(p, []byte("nested\n"), 0o644); err != nil {
+		if err := writeMountFile(p, []byte("nested\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		assertFileContent(t, p, "nested\n")
@@ -329,7 +337,7 @@ func TestE2E(t *testing.T) {
 	t.Run("fs/modify_tracked", func(t *testing.T) {
 		p := filepath.Join(mountPath, "README.md")
 		appended := headBlob(t, "README.md") + "# e2e test marker\n"
-		if err := os.WriteFile(p, []byte(appended), 0o644); err != nil {
+		if err := writeMountFile(p, []byte(appended), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		assertFileContent(t, p, appended)
@@ -395,7 +403,7 @@ func TestE2EFilesystemDirectoryRenamePersistsAcrossRestart(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(replacementSource, "nested"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(replacementSource, "nested", "incoming.txt"), []byte("incoming\n"), 0o644); err != nil {
+	if err := writeMountFile(filepath.Join(replacementSource, "nested", "incoming.txt"), []byte("incoming\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := unix.Rename(replacementSource, trackedDestination); err != nil {
@@ -573,6 +581,8 @@ func testE2EOpenFileReadsWhileHEADKeepsPathAway(t *testing.T, repo *mountedE2ERe
 // kernel's attributes expire and fstat fetches them again.
 func testE2EOpenFileChangesAfterUnlink(t *testing.T, repo *mountedE2ERepo) {
 	path := filepath.Join(repo.mountPath, "README.md")
+	// The open file is the test's subject, so the test process holds it,
+	// though a fork meanwhile can deadlock the mount (e2e_files_test.go).
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -629,15 +639,11 @@ func testE2EKernelChecksPermissionBits(t *testing.T, repo *mountedE2ERepo) {
 	}
 
 	path := filepath.Join(repo.mountPath, "README.md")
-	if _, err := os.ReadFile(path); err != nil {
+	if _, err := readMountFile(path); err != nil {
 		t.Fatal(err)
 	}
 	chmod(path, 0o200)
-	f, err := os.Open(path)
-	if err == nil {
-		f.Close()
-	}
-	if !errors.Is(err, unix.EACCES) {
+	if _, err := readMountFile(path); !errors.Is(err, unix.EACCES) {
 		t.Errorf("open a file without read permission = %v, want EACCES", err)
 	}
 
@@ -645,12 +651,12 @@ func testE2EKernelChecksPermissionBits(t *testing.T, repo *mountedE2ERepo) {
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "allowed.txt"), nil, 0o644); err != nil {
+	if err := writeMountFile(filepath.Join(dir, "allowed.txt"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	chmod(dir, 0o555)
 	denied := filepath.Join(dir, "denied.txt")
-	if err := os.WriteFile(denied, nil, 0o644); !errors.Is(err, unix.EACCES) {
+	if err := writeMountFile(denied, nil, 0o644); !errors.Is(err, unix.EACCES) {
 		t.Errorf("create a file in a directory without write permission = %v, want EACCES", err)
 	}
 	if _, err := os.Lstat(denied); !errors.Is(err, os.ErrNotExist) {
@@ -659,7 +665,9 @@ func testE2EKernelChecksPermissionBits(t *testing.T, repo *mountedE2ERepo) {
 }
 
 // openAndReadE2E opens path, reads all of it, and keeps the file open until
-// the test ends.
+// the test ends. Its callers' subject is the open file, so the test process
+// holds it, though a fork meanwhile can deadlock the mount
+// (e2e_files_test.go).
 func openAndReadE2E(t *testing.T, path string) (*os.File, string) {
 	t.Helper()
 	f, err := os.Open(path)
@@ -706,7 +714,7 @@ func testE2EFilesystemDirectoryRenameConcurrentAccess(t *testing.T, repo *mounte
 	if err := os.MkdirAll(filepath.Join(left, "nested"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(left, "nested", "value.txt"), []byte("stable\n"), 0o644); err != nil {
+	if err := writeMountFile(filepath.Join(left, "nested", "value.txt"), []byte("stable\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	original, err := os.Stat(left)
@@ -743,7 +751,7 @@ func testE2EFilesystemDirectoryRenameConcurrentAccess(t *testing.T, repo *mounte
 						report(fmt.Errorf("readdir %q during rename: %w", root, err))
 						return
 					}
-					data, err := os.ReadFile(filepath.Join(root, "nested", "value.txt"))
+					data, err := readMountFile(filepath.Join(root, "nested", "value.txt"))
 					if err != nil {
 						if !os.IsNotExist(err) {
 							report(fmt.Errorf("read %q during rename: %w", root, err))
@@ -814,11 +822,11 @@ func testE2ECLIDirectoryMove(t *testing.T, repo *mountedE2ERepo) {
 	}
 	binaryPath := filepath.Join(deep, "payload.bin")
 	initialBinary := []byte{0x00, 0x01, 0x02, 0xfe, 0xff}
-	if err := os.WriteFile(binaryPath, initialBinary, 0o644); err != nil {
+	if err := writeMountFile(binaryPath, initialBinary, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	scriptPath := filepath.Join(source, "run.sh")
-	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\necho moved\n"), 0o755); err != nil {
+	if err := writeMountFile(scriptPath, []byte("#!/bin/sh\necho moved\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(scriptPath, 0o755); err != nil {
@@ -831,7 +839,7 @@ func testE2ECLIDirectoryMove(t *testing.T, repo *mountedE2ERepo) {
 	if err := os.MkdirAll(sibling, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(sibling, "untouched.txt"), []byte("sibling\n"), 0o644); err != nil {
+	if err := writeMountFile(filepath.Join(sibling, "untouched.txt"), []byte("sibling\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -843,6 +851,8 @@ func testE2ECLIDirectoryMove(t *testing.T, repo *mountedE2ERepo) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The moves must carry the open file along, so the test process holds
+	// it, though a fork meanwhile can deadlock the mount (e2e_files_test.go).
 	openFile, err := os.OpenFile(binaryPath, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -895,7 +905,7 @@ func testE2ECLIDirectoryMove(t *testing.T, repo *mountedE2ERepo) {
 	if !bytes.Equal(gotThroughHandle, wantBinary) {
 		t.Fatalf("open handle content = %v, want %v", gotThroughHandle, wantBinary)
 	}
-	if got, err := os.ReadFile(movedBinary); err != nil {
+	if got, err := readMountFile(movedBinary); err != nil {
 		t.Fatal(err)
 	} else if !bytes.Equal(got, wantBinary) {
 		t.Fatalf("moved binary content = %v, want %v", got, wantBinary)
@@ -942,7 +952,7 @@ func testE2ECLIDirectoryMove(t *testing.T, repo *mountedE2ERepo) {
 		t.Fatalf("cross-parent directory rename: %v", err)
 	}
 	assertPathMissing(t, filepath.Join(moved, "nested"))
-	if got, err := os.ReadFile(filepath.Join(crossParent, "deeper", "payload.bin")); err != nil {
+	if got, err := readMountFile(filepath.Join(crossParent, "deeper", "payload.bin")); err != nil {
 		t.Fatal(err)
 	} else if !bytes.Equal(got, wantBinary) {
 		t.Fatalf("cross-parent content = %v, want %v", got, wantBinary)
@@ -1082,7 +1092,7 @@ func testE2EReplaceVisibleEmptyTrackedDirectory(t *testing.T, repo *mountedE2ERe
 	if err := os.MkdirAll(filepath.Join(source, "nested"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(source, "nested", "incoming.txt"), []byte("incoming\n"), 0o644); err != nil {
+	if err := writeMountFile(filepath.Join(source, "nested", "incoming.txt"), []byte("incoming\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := unix.Rename(source, destination); err != nil {
@@ -1108,7 +1118,7 @@ func testE2EReplaceDeletedTrackedDirectory(t *testing.T, repo *mountedE2ERepo) {
 	if err := os.Mkdir(trackedReplacementSource, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(trackedReplacementSource, "incoming.txt"), []byte("incoming\n"), 0o644); err != nil {
+	if err := writeMountFile(filepath.Join(trackedReplacementSource, "incoming.txt"), []byte("incoming\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	run(t, repo.mountPath, "mv", "tracked-replacement-source", "packages/vitest-pool")
@@ -1122,13 +1132,13 @@ func testE2ERejectNonemptyDirectoryReplacement(t *testing.T, repo *mountedE2ERep
 	if err := os.MkdirAll(rejectedSource, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(rejectedSource, "source.txt"), []byte("source\n"), 0o644); err != nil {
+	if err := writeMountFile(filepath.Join(rejectedSource, "source.txt"), []byte("source\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(rejectedDestination, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(rejectedDestination, "destination.txt"), []byte("destination\n"), 0o644); err != nil {
+	if err := writeMountFile(filepath.Join(rejectedDestination, "destination.txt"), []byte("destination\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := unix.Rename(rejectedSource, rejectedDestination); !errors.Is(err, unix.ENOTEMPTY) {
@@ -1239,7 +1249,6 @@ func TestE2EVerifiedSource(t *testing.T) {
 			stopE2EDaemon(t, firstSvc, firstCancel, firstErrCh, mountPath)
 		}
 	}()
-	primeE2EMountPolling(t, mountPath)
 	if got, want := readFileStr(t, filepath.Join(mountPath, ".git")), "gitdir: "+gitDir+"\n"; got != want {
 		t.Fatalf("mounted .git = %q, want %q", got, want)
 	}
@@ -1263,10 +1272,10 @@ func TestE2EVerifiedSource(t *testing.T) {
 	}
 
 	overlayReadme := "# local verified overlay\n"
-	if err := os.WriteFile(filepath.Join(mountPath, "README.md"), []byte(overlayReadme), 0o644); err != nil {
+	if err := writeMountFile(filepath.Join(mountPath, "README.md"), []byte(overlayReadme), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(mountPath, "local-only.txt"), []byte("overlay\n"), 0o644); err != nil {
+	if err := writeMountFile(filepath.Join(mountPath, "local-only.txt"), []byte("overlay\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	status, err = ctl.Status(context.Background(), repoName)
@@ -1324,7 +1333,6 @@ func TestE2EVerifiedSource(t *testing.T) {
 		t.Fatalf("verified-source mount after restart: %v", err)
 	}
 	defer stopE2EDaemon(t, secondSvc, secondCancel, secondErrCh, mountPath)
-	primeE2EMountPolling(t, mountPath)
 
 	assertVerifiedSourceStatus(t, ctl, requiredCommit)
 	if head := strings.TrimSpace(gitCmd(t, mountPath, "rev-parse", "HEAD")); head != requiredCommit {
@@ -1466,7 +1474,7 @@ func assertFileContent(t *testing.T, path, want string) {
 
 func readFileStr(t *testing.T, path string) string {
 	t.Helper()
-	data, err := os.ReadFile(path)
+	data, err := readMountFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}

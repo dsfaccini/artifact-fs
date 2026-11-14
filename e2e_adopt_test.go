@@ -63,7 +63,6 @@ func TestE2EAdoptedWorktree(t *testing.T) {
 		t.Fatalf("adopted worktree mount: %v", err)
 	}
 	defer stopE2EDaemon(t, svc, cancel, errCh, mountPath)
-	primeE2EMountPolling(t, mountPath)
 	initial, err := ctl.Status(ctx, repoName)
 	if err != nil {
 		t.Fatal(err)
@@ -77,7 +76,7 @@ func TestE2EAdoptedWorktree(t *testing.T) {
 		t.Fatalf("core.fsmonitor = %q, want %q", got, want)
 	}
 	assertGitStatus(t, mountPath, map[string]string{})
-	writeTestFile(t, mountPath, "README.md", "# Edited through the adopted worktree\n")
+	writeMountTestFile(t, mountPath, "README.md", "# Edited through the adopted worktree\n")
 	assertGitStatus(t, mountPath, map[string]string{"README.md": " M"})
 
 	gitCmd(t, mountPath, "-c", "user.name=E2E Test", "-c", "user.email=e2e@test", "commit", "-am", "commit through the adopted worktree")
