@@ -21,9 +21,9 @@ import (
 // then lists a directory again only when the hook names a path in it, or,
 // when the hook answers with a full rescan or Git runs without it, when the
 // directory's stat data changed. git status stays right through each change
-// below. The HEAD move skips on FSKit, which the restart follows.
+// below. The HEAD move skips on FSKit, which the last restart follows.
 func TestE2EGitStatusWithTheUntrackedCache(t *testing.T) {
-	skipIfOverMountBudget(t, 2)
+	skipIfOverMountBudget(t, 3)
 	repo := newMountedE2ERepo(t)
 	dir := repo.mountPath
 	if got := strings.TrimSpace(gitCmd(t, dir, "config", "--get", "core.untrackedCache")); got != "true" {
@@ -62,6 +62,19 @@ func TestE2EGitStatusWithTheUntrackedCache(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+
+	// With the overlay empty, startup marks the baseline, whose token skips
+	// the delete logged before it.
+	write("gone.txt", "gone\n")
+	want["?? gone.txt"] = true
+	check(t, "a new untracked file")
+	if err := os.Remove(filepath.Join(dir, "gone.txt")); err != nil {
+		t.Fatal(err)
+	}
+	delete(want, "?? gone.txt")
+	repo.restart(t)
+	check(t, "a restart after the file was deleted")
+
 	for _, step := range []struct {
 		name   string
 		change func()
