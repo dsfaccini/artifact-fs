@@ -254,6 +254,8 @@ Git Credential Manager can still show its GUI prompt unless `GCM_INTERACTIVE=nev
 
 When the Git index matches the published snapshot and the overlay is empty, startup marks snapshot entries valid for Git's filesystem monitor before the mount serves the repo: before a prepared repo mounts, and before an async repo's gate opens. This lets the first `git status` use the daemon's change list instead of reading every tracked blob, and each later `git status` receives only the paths the overlay changed since Git's previous query, plus each file whose writes are not yet flushed. A HEAD change that writes no file, such as `git update-ref` or `git reset --soft`, also changes what the mount shows. The next query receives every path whose committed content, mode or type the change altered, except paths the overlay covers. The daemon logs those paths again once the kernel can no longer answer with attributes it cached from before the change, so a query that ran in between does not leave Git trusting them: right after the mount tells the kernel to drop what it cached, and on FSKit, where the mount cannot tell it, after the kernel's 1 second cache expires. The next query gets a rescan instead when more than 100,000 of those paths remain, when the snapshot holds no entries for the tree the mount showed before the change, as for an empty tree, or when the snapshot cannot be read. When the repo is mounted again, the daemon logs the same way what changed since the tree the overlay last served, such as a HEAD change while no daemon ran. The first query after the mount gets a rescan instead when more than 100,000 paths changed, when the snapshot cannot be read or no longer holds that tree, and on the first mount after an upgrade from a version that did not record the tree, unless startup marks the baseline again. A rescan after a mount reads every tracked file, because the mount numbers its inodes anew, so after that upgrade the first `git status` in a repo whose overlay holds changes reads every file. Paths with no `text` attribute, or under `text=auto`, `-text` or `binary`, are marked, unless `eol=lf` applies without `text=auto`. Paths under `text`, `text=input` or `eol=lf` without `text=auto` stay unmarked, because Git's check-in turns CRLF into LF and a blob that holds CRLF then differs from its file; Git compares those paths itself. `-text eol=lf` stays unmarked too, because `git check-attr` prints it like the literal `text=unset`, which Git converts under `eol=lf`. A `git status` that runs while the worktree is unmounted sees the empty mountpoint, so Git's next query gets a rescan. When startup marks the baseline again, its own query takes that rescan, and the first `git status` after the mount receives only the overlay's changes. ArtifactFS skips this baseline when the index or a `.gitattributes` blob is uncertain, when `core.attributesFile` is configured or `core.autocrlf` is set to anything but false, when an `eol=crlf`, `crlf`, `filter`, `ident` or `working-tree-encoding` attribute applies, or when staged work or overlay changes exist; Git then performs its normal status scan.
 
+The daemon turns on Git's untracked cache (`core.untrackedCache`) where it installs the fsmonitor hook. Git then lists a directory again only when the hook names a path in it, or, when the hook answers with a rescan or Git runs without the hook, when the directory's mtime or ctime changed. Each change to a directory's listing moves both, as the section on kernel caches below describes. Every directory reports a ctime no earlier than the mount's start, so a rescan after a mount lists every directory again.
+
 Use `--hydration-concurrency` to set each repo's number of hydration workers (default 4). A repo's workers share a pool of up to that many persistent `git cat-file --batch` processes that copy fetched blobs into the cache, so higher values trade memory for faster bulk hydration:
 
 ```bash
@@ -425,7 +427,7 @@ hydrator's batch fetches, use the promisor remotes, usually `origin`.
 ArtifactFS enables `extensions.worktreeConfig`, migrating shared `core.worktree`
 and `core.bare=true` settings into the primary worktree's config when necessary.
 Existing primary overrides are retained. It pins the adopted worktree's path,
-filesystem semantics and FSMonitor hook in that worktree's config; native
+filesystem semantics, FSMonitor hook and untracked cache in that worktree's config; native
 siblings retain their settings.
 
 Stop the owning daemon and wait for process exit and actual unmount before
@@ -433,9 +435,13 @@ restoring the saved gitfile, unlocking metadata or removing the worktree.
 `remove-repo` updates the registry and Git config and returns. The running daemon
 unmounts the repo at its next registry poll, so the return does not mean the live mount has stopped.
 It unsets what adoption pinned in the worktree's config for the mount
-(`core.fsmonitor`, `fsmonitor.allowRemote`, `core.filemode`, `core.ignorecase`
-and `core.symlinks`), so the worktree inherits its repository's settings again.
-A value the worktree's own config held before adoption does not come back. It
+(`core.fsmonitor`, `fsmonitor.allowRemote`, `core.untrackedCache`,
+`core.filemode`, `core.ignorecase` and `core.symlinks`), so the worktree
+inherits its repository's settings again. A value the worktree's own config
+held before adoption does not come back. The index keeps its untracked cache,
+which Git goes on using, because an unset `core.untrackedCache` keeps it.
+Without the hook Git checks each cached directory's stat data, so it lists
+again every directory whose stat data differs from what the mount reported. It
 keeps the worktree's path pins and `extensions.worktreeConfig`, which sibling
 worktrees may rely on. Preserve a recovery ref before deleting a
 branch containing local commits.
@@ -708,7 +714,7 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 |-------|--------|
 | Git submodules are not initialized | Gitlink paths appear as empty directories so status stays clean |
 | Checkout filters and EOL transforms are not applied to snapshot-only reads | Files use canonical blob bytes until Git writes a transformed overlay |
-| `git status` still scans directories to find untracked files; if the cold baseline is skipped because the index, attributes, or overlay are uncertain, Git also scans tracked content normally | Performance |
+| `git status` lists every directory to fill Git's untracked cache, and again after a rescan that follows a mount; if the cold baseline is skipped because the index, attributes, or overlay are uncertain, Git also scans tracked content normally | Performance |
 | `git reset` takes ~6.5s for index refresh | Performance -- same root cause as `git status` |
 
 ## Testing

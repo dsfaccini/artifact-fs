@@ -392,7 +392,7 @@ func TestRemoveRepoRestoresAdoptedWorktreeFilesystemConfig(t *testing.T) {
 			if got := strings.TrimSpace(runCmdOutput(t, "git", "config", "--file", worktreeConfig, "--get", "core.fsmonitor")); got != hook {
 				t.Fatalf("core.fsmonitor = %q, want %q", got, hook)
 			}
-			pinned := []string{"core.fsmonitor", "fsmonitor.allowRemote", "core.filemode", "core.ignorecase", "core.symlinks"}
+			pinned := []string{"core.fsmonitor", "fsmonitor.allowRemote", "core.untrackedCache", "core.filemode", "core.ignorecase", "core.symlinks"}
 			for _, key := range pinned {
 				runCmd(t, "git", "config", "--file", worktreeConfig, "--get", key)
 			}
