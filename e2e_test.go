@@ -847,6 +847,7 @@ func testE2EFilesystemDirectoryRenameConcurrentAccess(t *testing.T, repo *mounte
 	if slices.ContainsFunc(during, func(n int64) bool { return n < minReads }) {
 		t.Fatalf("readers read the file %v times during %d renames, want at least %d each", during, made, minReads)
 	}
+	t.Logf("readers read the file %v times during %d renames", during, made)
 	assertPathMissing(t, next)
 	if got := readFileStr(t, filepath.Join(current, "nested", "value.txt")); got != "stable\n" {
 		t.Fatalf("final concurrent content = %q", got)
