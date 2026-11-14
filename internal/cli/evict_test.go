@@ -160,6 +160,7 @@ func TestEvictCacheCLIRequiresMaxBytesOrOlderThan(t *testing.T) {
 	}{
 		{"neither", nil, "--max-bytes or --older-than required"},
 		{"zero_cutoff", []string{"--older-than", "0s"}, "--older-than must be positive"},
+		{"negative_cutoff", []string{"--older-than=-1h"}, "--older-than must be positive"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := registerRepoWithCache(t, strings.Repeat("a", 40))
@@ -191,5 +192,17 @@ func TestStatusCLIReadsCacheCountersWithoutWalking(t *testing.T) {
 	stdout, stderr, code := runCLI(t, "status", "--name", "repo")
 	if code != 0 || !strings.Contains(stdout, " hydrated_blobs=1 hydrated_bytes=10 ") {
 		t.Fatalf("status exit = %d, stdout=%q, stderr=%q; want 1 blob, 10 bytes", code, stdout, stderr)
+	}
+}
+
+// Without --max-bytes there is no byte budget, so the help shows no default
+// for it: a default of 0 reads as the budget that empties the cache.
+func TestEvictCacheCLIHelpShowsNoFlagDefaults(t *testing.T) {
+	stdout, stderr, code := runCLI(t, "evict-cache", "--help")
+	if code != 0 || !strings.Contains(stdout, "--older-than") {
+		t.Fatalf("evict-cache --help exit = %d, stdout=%q, stderr=%q; want the help", code, stdout, stderr)
+	}
+	if strings.Contains(stdout, "default:") {
+		t.Fatalf("evict-cache --help = %q, want no flag defaults", stdout)
 	}
 }

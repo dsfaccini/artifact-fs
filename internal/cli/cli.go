@@ -317,8 +317,10 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			Usage: "evict blobs last read before a cutoff, and the least recently read blobs until the blob cache fits a byte budget",
 			Flags: []ucli.Flag{
 				&ucli.StringFlag{Name: "name", Usage: "repo name (required)"},
-				&ucli.Int64Flag{Name: "max-bytes", Usage: "byte budget the blob cache must fit"},
-				&ucli.DurationFlag{Name: "older-than", Usage: "evict every blob last read longer ago than this, such as 336h"},
+				// Without --max-bytes there is no budget, and a shown default of
+				// 0 would read as one that empties the cache.
+				&ucli.Int64Flag{Name: "max-bytes", HideDefault: true, Usage: "byte budget the blob cache must fit"},
+				&ucli.DurationFlag{Name: "older-than", HideDefault: true, Usage: "evict every blob last read longer ago than this, such as 336h"},
 			},
 			Action: withController(ctx, root, stderr, func(c *ucli.Command, svc *daemon.Controller) error {
 				name := strings.TrimSpace(c.String("name"))
