@@ -399,7 +399,8 @@ func testE2EGitStatusPorcelain(t *testing.T, repo *mountedE2ERepo) {
 func testE2EGitRenameTrackedDirectory(t *testing.T, repo *mountedE2ERepo) {
 	previousHead := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
 	// The rename must carry the open file along, so the test process holds
-	// it, though a fork meanwhile can deadlock the mount (e2e_files_test.go).
+	// it until it reads it after the rename, though a fork meanwhile can
+	// deadlock the mount (e2e_files_test.go).
 	openDescendant, err := os.Open(filepath.Join(repo.mountPath, "packages", "wrangler", "src", "index.js"))
 	if err != nil {
 		t.Fatal(err)
@@ -407,6 +408,19 @@ func testE2EGitRenameTrackedDirectory(t *testing.T, repo *mountedE2ERepo) {
 	defer openDescendant.Close()
 
 	gitCmd(t, repo.mountPath, "mv", "packages/wrangler", "packages/wrangler-renamed")
+	// The open file's subject ends with this read, so it closes before the
+	// next fork.
+	data, err := io.ReadAll(openDescendant)
+	closeErr := openDescendant.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if !strings.Contains(string(data), "wrangler") {
+		t.Fatalf("open tracked descendant after git mv = %q", data)
+	}
 
 	assertPathMissing(t, filepath.Join(repo.mountPath, "packages", "wrangler"))
 	renamedRoot := filepath.Join(repo.mountPath, "packages", "wrangler-renamed")
@@ -426,11 +440,6 @@ func testE2EGitRenameTrackedDirectory(t *testing.T, repo *mountedE2ERepo) {
 		t.Fatal(err)
 	} else if info.Mode().Perm()&0o111 == 0 {
 		t.Fatalf("renamed executable mode = %#o", info.Mode().Perm())
-	}
-	if data, err := io.ReadAll(openDescendant); err != nil {
-		t.Fatal(err)
-	} else if !strings.Contains(string(data), "wrangler") {
-		t.Fatalf("open tracked descendant after git mv = %q", data)
 	}
 	assertGitStatus(t, repo.mountPath, map[string]string{
 		"packages/wrangler/bin/run.sh -> packages/wrangler-renamed/bin/run.sh":                           "R ",
@@ -673,15 +682,19 @@ func testE2EGitCommitTrackedRename(t *testing.T, repo *mountedE2ERepo) {
 	sourcePath := filepath.Join(repo.mountPath, "SECURITY.md")
 	content := readFileEventually(t, sourcePath)
 	// The read through the open source after git mv is the test's subject,
-	// so the test process holds it, though a fork meanwhile can deadlock the
-	// mount (e2e_files_test.go).
+	// so the test process holds it until that read, though a fork meanwhile
+	// can deadlock the mount (e2e_files_test.go).
 	openSource, err := os.Open(sourcePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer openSource.Close()
 	gitCmd(t, repo.mountPath, "mv", "SECURITY.md", "SECURITY-renamed.md")
-	if got, err := io.ReadAll(openSource); err != nil || string(got) != content {
+	got, err := io.ReadAll(openSource)
+	if closeErr := openSource.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if err != nil || string(got) != content {
 		t.Fatalf("read through the open source after git mv = %q, %v; want %q", got, err, content)
 	}
 	assertGitStatus(t, repo.mountPath, map[string]string{"SECURITY.md -> SECURITY-renamed.md": "R "})

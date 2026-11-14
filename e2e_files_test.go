@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -80,6 +83,8 @@ func fileOp(args []string) error {
 		}
 		_, err = fmt.Printf("%d %d", elapsed.Nanoseconds(), total)
 		return err
+	case len(args) >= 2 && args[0] == "read-loop":
+		return readLoop(args[1:])
 	}
 	return fmt.Errorf("unknown file operation %q", args)
 }
@@ -120,6 +125,34 @@ func readFilesConcurrently(root string, paths []string, workers int) (time.Durat
 	return time.Since(start), total, firstErr
 }
 
+// readLoop reads each of paths in turn, again and again until stdin closes.
+// For each read it writes a line: the path's index, then ok and the quoted
+// content, or err, the errno and the quoted error.
+func readLoop(paths []string) error {
+	var closed atomic.Bool
+	go func() {
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		closed.Store(true)
+	}()
+	out := bufio.NewWriter(os.Stdout)
+	for !closed.Load() {
+		for i, path := range paths {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				var errno syscall.Errno
+				errors.As(err, &errno)
+				fmt.Fprintf(out, "%d err %d %q\n", i, errno, err.Error())
+			} else {
+				fmt.Fprintf(out, "%d ok %q\n", i, data)
+			}
+			if err := out.Flush(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // childFileOp runs the test binary as a child that performs the file
 // operation args name, with stdin as its input, and returns its output. A
 // failed operation returns an *os.PathError that carries the child's errno.
@@ -157,6 +190,84 @@ func readMountFile(path string) ([]byte, error) {
 func writeMountFile(path string, data []byte, perm os.FileMode) error {
 	_, err := childFileOp(data, "write", path, strconv.FormatUint(uint64(perm.Perm()), 8))
 	return err
+}
+
+// readMountFilesUntil reads each of paths in turn in one child process, again
+// and again until stop closes or each returns false, and calls each with every
+// read's result. A failed read carries the child's errno, as readMountFile's.
+func readMountFilesUntil(paths []string, stop <-chan struct{}, each func(path string, data []byte, err error) bool) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(exe, append([]string{fileOpArg, "read-loop"}, paths...)...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	var closeOnce sync.Once
+	closeStdin := func() { closeOnce.Do(func() { _ = stdin.Close() }) }
+	stopped := make(chan struct{})
+	defer close(stopped)
+	go func() {
+		select {
+		case <-stop:
+		case <-stopped:
+		}
+		closeStdin()
+	}()
+	var parseErr error
+	lines := bufio.NewScanner(stdout)
+	lines.Buffer(nil, 1<<20)
+	for lines.Scan() {
+		path, data, err, ok := parseReadLine(paths, lines.Text())
+		if !ok {
+			parseErr = fmt.Errorf("read-loop line %q", lines.Text())
+		}
+		if !ok || !each(path, data, err) {
+			closeStdin()
+			_, _ = io.Copy(io.Discard, stdout)
+			break
+		}
+	}
+	closeStdin()
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("read-loop child: %w: %s", err, stderr.String())
+	}
+	return parseErr
+}
+
+// parseReadLine parses a line readLoop wrote about one of paths.
+func parseReadLine(paths []string, line string) (path string, data []byte, readErr error, ok bool) {
+	indexText, rest, _ := strings.Cut(line, " ")
+	index, err := strconv.Atoi(indexText)
+	if err != nil || index < 0 || index >= len(paths) {
+		return "", nil, nil, false
+	}
+	path = paths[index]
+	if quoted, isData := strings.CutPrefix(rest, "ok "); isData {
+		content, err := strconv.Unquote(quoted)
+		return path, []byte(content), nil, err == nil
+	}
+	errnoText, quoted, _ := strings.Cut(strings.TrimPrefix(rest, "err "), " ")
+	errno, err := strconv.Atoi(errnoText)
+	message, unquoteErr := strconv.Unquote(quoted)
+	if err != nil || unquoteErr != nil {
+		return "", nil, nil, false
+	}
+	if errno != 0 {
+		return path, nil, &os.PathError{Op: "read", Path: path, Err: syscall.Errno(errno)}, true
+	}
+	return path, nil, errors.New(message), true
 }
 
 // readMountFiles reads each of paths below root in one child process, with

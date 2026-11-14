@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -548,7 +549,6 @@ func testE2EOpenFileReadsAfterUnlink(t *testing.T, repo *mountedE2ERepo) {
 // it expire and a read makes the kernel fetch them again.
 func testE2EOpenFileReadsWhileHEADKeepsPathAway(t *testing.T, repo *mountedE2ERepo) {
 	path := filepath.Join(repo.mountPath, "README.md")
-	f, want := openAndReadE2E(t, path)
 	gitDir := filepath.Join(repo.root, "repos", repoName, "git")
 	head, err := gitOutput("", "--git-dir", gitDir, "rev-parse", "HEAD")
 	if err != nil {
@@ -566,9 +566,14 @@ func testE2EOpenFileReadsWhileHEADKeepsPathAway(t *testing.T, repo *mountedE2ERe
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Only the HEAD move forks while the file is open.
+	f, want := openAndReadE2E(t, path)
 	moveMainE2E(t, repo, gitDir, away, head)
 	time.Sleep(kernelCacheExpiry)
 	got, readErr := readAtE2E(f, len(want))
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 	moveMainE2E(t, repo, gitDir, head, away)
 	if readErr != nil || got != want {
 		t.Fatalf("read through the open file while HEAD kept its path away = %q, %v; want %q", got, readErr, want)
@@ -722,6 +727,11 @@ func testE2EFilesystemDirectoryRenameConcurrentAccess(t *testing.T, repo *mounte
 		t.Fatal(err)
 	}
 
+	// Each reader must read the file at least minReads times while the
+	// renames run, so its reads interleave with the renames instead of landing
+	// before or after them. minReads matches the renames the loop makes
+	// before it checks the readers.
+	const renames, minReads = 40, 40
 	stop := make(chan struct{})
 	errCh := make(chan error, 1)
 	var workers sync.WaitGroup
@@ -733,8 +743,32 @@ func testE2EFilesystemDirectoryRenameConcurrentAccess(t *testing.T, repo *mounte
 		default:
 		}
 	}
-	for range 4 {
+	files := []string{filepath.Join(left, "nested", "value.txt"), filepath.Join(right, "nested", "value.txt")}
+	var reads [4]atomic.Int64
+	for i := range reads {
 		workers.Go(func() {
+			// A child reads the file, because the test process forks git
+			// meanwhile (e2e_files_test.go).
+			var reader sync.WaitGroup
+			reader.Go(func() {
+				err := readMountFilesUntil(files, stop, func(path string, data []byte, err error) bool {
+					switch {
+					case err != nil && !os.IsNotExist(err):
+						report(fmt.Errorf("read %q during rename: %w", path, err))
+						return false
+					case err == nil && string(data) != "stable\n":
+						report(fmt.Errorf("read %q during rename = %q", path, data))
+						return false
+					case err == nil:
+						reads[i].Add(1)
+					}
+					return true
+				})
+				if err != nil {
+					report(err)
+				}
+			})
+			defer reader.Wait()
 			started.Done()
 			for {
 				select {
@@ -749,16 +783,6 @@ func testE2EFilesystemDirectoryRenameConcurrentAccess(t *testing.T, repo *mounte
 					}
 					if _, err := os.ReadDir(root); err != nil && !os.IsNotExist(err) {
 						report(fmt.Errorf("readdir %q during rename: %w", root, err))
-						return
-					}
-					data, err := readMountFile(filepath.Join(root, "nested", "value.txt"))
-					if err != nil {
-						if !os.IsNotExist(err) {
-							report(fmt.Errorf("read %q during rename: %w", root, err))
-							return
-						}
-					} else if string(data) != "stable\n" {
-						report(fmt.Errorf("read %q during rename = %q", root, data))
 						return
 					}
 				}
@@ -782,15 +806,34 @@ func testE2EFilesystemDirectoryRenameConcurrentAccess(t *testing.T, repo *mounte
 	})
 	started.Wait()
 
+	var before [len(reads)]int64
+	for i := range reads {
+		before[i] = reads[i].Load()
+	}
+	readsDuringRenames := func() []int64 {
+		during := make([]int64, len(reads))
+		for i := range reads {
+			during[i] = reads[i].Load() - before[i]
+		}
+		return during
+	}
+	enough := func() bool {
+		return !slices.ContainsFunc(readsDuringRenames(), func(n int64) bool { return n < minReads })
+	}
 	current, next := left, right
 	var renameErr error
-	for range 40 {
+	made := 0
+	for deadline := time.Now().Add(30 * time.Second); made < renames || !enough(); made++ {
+		if time.Now().After(deadline) {
+			break
+		}
 		if renameErr = unix.Rename(current, next); renameErr != nil {
 			break
 		}
 		current, next = next, current
 		time.Sleep(time.Millisecond)
 	}
+	during := readsDuringRenames()
 	close(stop)
 	workers.Wait()
 	if renameErr != nil {
@@ -800,6 +843,9 @@ func testE2EFilesystemDirectoryRenameConcurrentAccess(t *testing.T, repo *mounte
 	case err := <-errCh:
 		t.Fatal(err)
 	default:
+	}
+	if slices.ContainsFunc(during, func(n int64) bool { return n < minReads }) {
+		t.Fatalf("readers read the file %v times during %d renames, want at least %d each", during, made, minReads)
 	}
 	assertPathMissing(t, next)
 	if got := readFileStr(t, filepath.Join(current, "nested", "value.txt")); got != "stable\n" {
@@ -852,7 +898,8 @@ func testE2ECLIDirectoryMove(t *testing.T, repo *mountedE2ERepo) {
 		t.Fatal(err)
 	}
 	// The moves must carry the open file along, so the test process holds
-	// it, though a fork meanwhile can deadlock the mount (e2e_files_test.go).
+	// it until it reads it after the mv, though a fork meanwhile can
+	// deadlock the mount (e2e_files_test.go).
 	openFile, err := os.OpenFile(binaryPath, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -905,6 +952,10 @@ func testE2ECLIDirectoryMove(t *testing.T, repo *mountedE2ERepo) {
 	if !bytes.Equal(gotThroughHandle, wantBinary) {
 		t.Fatalf("open handle content = %v, want %v", gotThroughHandle, wantBinary)
 	}
+	// The open file's subject ends here, so it closes before the next fork.
+	if err := openFile.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if got, err := readMountFile(movedBinary); err != nil {
 		t.Fatal(err)
 	} else if !bytes.Equal(got, wantBinary) {
@@ -917,6 +968,9 @@ func testE2ECLIDirectoryMove(t *testing.T, repo *mountedE2ERepo) {
 	if !slices.Contains(names, "payload.bin") {
 		t.Fatalf("moved directory handle entries = %v", names)
 	}
+	// An openat through the moved directory descriptor is the test's
+	// subject, so the test process opens the file, and closes it before the
+	// next fork (e2e_files_test.go).
 	childFD, err := unix.Openat(dirFD, "payload.bin", unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		t.Fatalf("openat through moved directory descriptor: %v", err)
