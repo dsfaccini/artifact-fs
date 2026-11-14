@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -34,7 +36,7 @@ func TestOpenHydratedRehydratesBlobEvictedAfterValidation(t *testing.T) {
 			return
 		}
 		evicted = true
-		if res, err := blobcache.Evict(context.Background(), cfg.BlobCacheDir, 0); err != nil || res.Evicted != 1 {
+		if res, err := blobcache.Evict(context.Background(), cfg.BlobCacheDir, 0, time.Time{}); err != nil || res.Evicted != 1 {
 			t.Errorf("evict = %+v, %v; want one blob evicted", res, err)
 		}
 	}
@@ -127,5 +129,78 @@ func TestFailedBlobWriteNeverReachesTheCachePath(t *testing.T) {
 	}
 	if st, err := blobcache.ReadStats(cfg.BlobCacheDir); err != nil || st != (blobcache.Stats{}) {
 		t.Fatalf("cache stats = %+v, %v; want none", st, err)
+	}
+}
+
+// A cached blob's access time is the read time evict-cache orders and cuts
+// by. APFS moves an access time only while it is not newer than the
+// modification time, and a noatime mount never moves it, so serving a blob
+// moves its access time to now once it is a day old. Serving leaves a fresher
+// access time, and the modification time, which identifies the verified file.
+func TestServingACachedBlobRecordsTheReadOnceADay(t *testing.T) {
+	t.Parallel()
+	open := func(ctx context.Context, h *Service, cfg model.RepoPaths, node model.BaseNode) error {
+		f, _, err := h.OpenHydrated(ctx, cfg, node)
+		if err == nil {
+			err = f.Close()
+		}
+		return err
+	}
+	readBlob := func(ctx context.Context, h *Service, cfg model.RepoPaths, node model.BaseNode) error {
+		_, err := h.ReadBlob(ctx, cfg, node, 64)
+		return err
+	}
+	for _, tc := range []struct {
+		name     string
+		serve    func(context.Context, *Service, model.RepoPaths, model.BaseNode) error
+		age      time.Duration
+		recorded bool
+	}{
+		{name: "open of a blob read two days ago", serve: open, age: 48 * time.Hour, recorded: true},
+		{name: "open of a blob read an hour ago", serve: open, age: time.Hour},
+		// Linux relatime moves the access time on ReadBlob's read as well, so
+		// only APFS and noatime mounts tell this row's record apart.
+		{name: "symlink read of a blob read two days ago", serve: readBlob, age: 48 * time.Hour, recorded: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := model.RepoPaths{ID: "repo", BlobCacheDir: t.TempDir()}
+			node := model.BaseNode{RepoID: cfg.ID, Path: "a.txt", ObjectOID: strings.Repeat("ab", 20), SizeState: "known", SizeBytes: 7}
+			path := cacheFile(t, cfg.BlobCacheDir, node.ObjectOID)
+			if err := os.WriteFile(path, []byte("content"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			mtime := time.Now().Add(-72 * time.Hour)
+			if err := os.Chtimes(path, time.Now().Add(-tc.age), mtime); err != nil {
+				t.Fatal(err)
+			}
+			fetcher := &fakeBlobFetcher{verifyOK: true}
+			h := New(fetcher)
+			t.Cleanup(h.Stop)
+
+			cutoff := time.Now().Add(-time.Minute)
+			for range 2 {
+				if err := tc.serve(t.Context(), h, cfg, node); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if fetcher.VerifyCalls() != 1 {
+				t.Fatalf("VerifyBlob calls = %d, want 1: the blob stays verified", fetcher.VerifyCalls())
+			}
+			if st, err := os.Stat(path); err != nil || !st.ModTime().Equal(mtime) {
+				t.Fatalf("blob mtime = %v, %v; want %v", st.ModTime(), err, mtime)
+			}
+			res, err := blobcache.Evict(t.Context(), cfg.BlobCacheDir, math.MaxInt64, cutoff)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := int64(1)
+			if tc.recorded {
+				want = 0
+			}
+			if res.Evicted != want {
+				t.Fatalf("evicted %d blobs read before the cutoff, want %d", res.Evicted, want)
+			}
+		})
 	}
 }

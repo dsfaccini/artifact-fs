@@ -115,14 +115,65 @@ func TestEvictCacheCLIZeroBudgetEmptiesTheCache(t *testing.T) {
 	}
 }
 
-func TestEvictCacheCLIRequiresMaxBytes(t *testing.T) {
-	registerRepoWithCache(t, strings.Repeat("a", 40))
-	stdout, stderr, code := runCLI(t, "evict-cache", "--name", "repo")
-	if code == 0 {
-		t.Fatalf("evict-cache without --max-bytes exit = 0, stdout=%q", stdout)
+// --older-than evicts every blob last read before the cutoff, and a byte
+// budget beside it evicts the least recently read blobs left until the cache
+// fits.
+func TestEvictCacheCLIEvictsBlobsReadBeforeTheCutoff(t *testing.T) {
+	old, middle, recent := strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 40)
+	for _, tt := range []struct {
+		name string
+		args []string
+		kept map[string]bool
+		want string
+	}{
+		{"cutoff", []string{"--older-than", "48h"}, map[string]bool{old: false, middle: true, recent: true}, "evicted_blobs=1 evicted_bytes=10 hydrated_blobs=2 hydrated_bytes=20\n"},
+		{"cutoff_and_budget", []string{"--older-than", "48h", "--max-bytes", "10"}, map[string]bool{old: false, middle: false, recent: true}, "evicted_blobs=2 evicted_bytes=20 hydrated_blobs=1 hydrated_bytes=10\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := registerRepoWithCache(t)
+			now := time.Now()
+			installBlob(t, dir, old, "0123456789", now.Add(-72*time.Hour))
+			installBlob(t, dir, middle, "0123456789", now.Add(-30*time.Hour))
+			installBlob(t, dir, recent, "0123456789", now.Add(-time.Hour))
+
+			stdout, stderr, code := runCLI(t, append([]string{"evict-cache", "--name", "repo"}, tt.args...)...)
+			if code != 0 {
+				t.Fatalf("evict-cache exit = %d, stderr=%q", code, stderr)
+			}
+			if stdout != tt.want {
+				t.Fatalf("stdout = %q, want %q", stdout, tt.want)
+			}
+			for oid, kept := range tt.kept {
+				if _, err := os.Stat(blobcache.Path(dir, oid)); (err == nil) != kept {
+					t.Fatalf("blob %s present = %v, want %v", oid[:2], err == nil, kept)
+				}
+			}
+		})
 	}
-	if !strings.Contains(stderr, "max-bytes") {
-		t.Fatalf("stderr = %q, want it to name max-bytes", stderr)
+}
+
+func TestEvictCacheCLIRequiresMaxBytesOrOlderThan(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"neither", nil, "--max-bytes or --older-than required"},
+		{"zero_cutoff", []string{"--older-than", "0s"}, "--older-than must be positive"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := registerRepoWithCache(t, strings.Repeat("a", 40))
+			stdout, stderr, code := runCLI(t, append([]string{"evict-cache", "--name", "repo"}, tt.args...)...)
+			if code == 0 {
+				t.Fatalf("evict-cache %v exit = 0, stdout=%q", tt.args, stdout)
+			}
+			if !strings.Contains(stderr, tt.want) {
+				t.Fatalf("stderr = %q, want %q", stderr, tt.want)
+			}
+			if _, err := os.Stat(blobcache.Path(dir, strings.Repeat("a", 40))); err != nil {
+				t.Fatalf("blob after a refused evict-cache: %v", err)
+			}
+		})
 	}
 }
 

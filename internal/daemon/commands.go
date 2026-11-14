@@ -373,13 +373,14 @@ func (s *Controller) requestMount(ctx context.Context, name string, mount bool) 
 	}
 }
 
-// EvictCache evicts the least recently accessed blobs from name's blob cache
-// until it holds at most maxBytes. A cache directory that repos share is
+// EvictCache evicts the blobs of name's blob cache last read before
+// readBefore, and the least recently read blobs until the cache holds at most
+// maxBytes, as blobcache.Evict does. A cache directory that repos share is
 // evicted as a whole.
-func (s *Controller) EvictCache(ctx context.Context, name string, maxBytes int64) (blobcache.EvictResult, error) {
+func (s *Controller) EvictCache(ctx context.Context, name string, maxBytes int64, readBefore time.Time) (blobcache.EvictResult, error) {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
 		return blobcache.EvictResult{}, err
 	}
-	return blobcache.Evict(ctx, cfg.BlobCacheDir, maxBytes)
+	return blobcache.Evict(ctx, cfg.BlobCacheDir, maxBytes, readBefore)
 }

@@ -312,6 +312,8 @@ func (s *Service) OpenHydrated(ctx context.Context, repo model.RepoPaths, node m
 		}
 		st, err := f.Stat()
 		if err == nil && s.isVerified(key, st) {
+			// A failed record leaves the read unrecorded, never unserved.
+			_ = blobcache.RecordRead(cachePath, st)
 			return f, size, nil
 		}
 		_ = f.Close()
@@ -357,6 +359,7 @@ func (s *Service) ReadBlob(ctx context.Context, repo model.RepoPaths, node model
 		}
 		st, statErr := f.Stat()
 		if statErr == nil && s.isVerified(key, st) {
+			_ = blobcache.RecordRead(cachePath, st)
 			data, readErr := readCachedBlobFrom(f, size, maxBytes)
 			_ = f.Close()
 			return data, readErr

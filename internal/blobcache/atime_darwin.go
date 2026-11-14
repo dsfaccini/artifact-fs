@@ -14,3 +14,7 @@ func accessTime(info os.FileInfo) time.Time {
 	}
 	return info.ModTime()
 }
+
+// utimeOmit is UTIME_OMIT from <sys/stat.h>, which golang.org/x/sys/unix does
+// not define for darwin.
+const utimeOmit = -2
