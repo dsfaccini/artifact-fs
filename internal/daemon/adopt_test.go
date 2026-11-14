@@ -16,6 +16,8 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
+	"github.com/cloudflare/artifact-fs/internal/overlay"
+	"github.com/cloudflare/artifact-fs/internal/snapshot"
 )
 
 func TestAdoptGitDirPreservesGitStateAndScopesConfig(t *testing.T) {
@@ -392,7 +394,7 @@ func TestRemoveRepoRestoresAdoptedWorktreeFilesystemConfig(t *testing.T) {
 			if got := strings.TrimSpace(runCmdOutput(t, "git", "config", "--file", worktreeConfig, "--get", "core.fsmonitor")); got != hook {
 				t.Fatalf("core.fsmonitor = %q, want %q", got, hook)
 			}
-			pinned := []string{"core.fsmonitor", "fsmonitor.allowRemote", "core.filemode", "core.ignorecase", "core.symlinks"}
+			pinned := []string{"core.fsmonitor", "fsmonitor.allowRemote", "core.untrackedCache", "core.filemode", "core.ignorecase", "core.symlinks"}
 			for _, key := range pinned {
 				runCmd(t, "git", "config", "--file", worktreeConfig, "--get", key)
 			}
@@ -411,6 +413,76 @@ func TestRemoveRepoRestoresAdoptedWorktreeFilesystemConfig(t *testing.T) {
 				t.Fatalf("status after remove-repo and a mode change = %q, want clean as core.filemode=false makes it", got)
 			}
 		})
+	}
+}
+
+// The clean baseline that startup marks runs Git on a private worktree. An
+// untracked cache that Git wrote would name that worktree. Once remove-repo
+// unsets core.untrackedCache, native Git keeps the cache and warns on every
+// status that it cannot use it.
+func TestRemoveRepoAfterTheCleanBaselineLeavesNativeStatusQuiet(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	dir := gittest.PrivateTempDir(t)
+	source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
+	runCmd(t, "git", "init", "--initial-branch=main", source)
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", source, "add", "README.md")
+	runCmd(t, "git", "-C", source, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
+	runCmd(t, "git", "-C", source, "worktree", "add", "-b", "topic", worktree)
+	gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
+	svc, err := New(ctx, filepath.Join(dir, "state"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := snapshot.New(ctx, stored.MetaDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Close()
+	ov, err := overlay.New(ctx, stored.RepoPaths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ov.Close()
+	headOID, _, gen, err := snap.ReadState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.bootstrapCleanStatusIndex(ctx, stored, headOID, gen, snap, ov); err != nil {
+		t.Fatal(err)
+	}
+	// A hook that reports no changes leaves the entries the baseline marked
+	// FSMonitor-valid, which ls-files -f prints in lowercase.
+	hook := filepath.Join(t.TempDir(), "fsmonitor")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "-c", "core.fsmonitor="+hook, "ls-files", "-f")); got != "h README.md" {
+		t.Fatalf("ls-files -f after the baseline = %q, want README.md marked valid", got)
+	}
+	if err := svc.ctl().RemoveRepo(ctx, cfg.Name); err != nil {
+		t.Fatal(err)
+	}
+	status := exec.Command("git", "-C", worktree, "status", "--porcelain")
+	var stdout, stderr bytes.Buffer
+	status.Stdout, status.Stderr = &stdout, &stderr
+	if err := status.Run(); err != nil {
+		t.Fatalf("git status after remove-repo: %v\n%s", err, stderr.String())
+	}
+	if stdout.String() != "" || stderr.String() != "" {
+		t.Fatalf("git status after remove-repo printed %q and on stderr %q, want nothing", stdout.String(), stderr.String())
 	}
 }
 
