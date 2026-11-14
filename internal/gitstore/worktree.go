@@ -250,7 +250,8 @@ func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.Repo
 
 // ConfigureFSMonitorHook installs ArtifactFS's hook without probing the
 // worktree, which may still be gated during startup. It writes only the hook
-// config. An adopted worktree writes it to config.worktree, which
+// config and core.untrackedCache=true, which turns on Git's untracked cache
+// beside the hook. An adopted worktree writes them to config.worktree, which
 // ConfigureAdoptedWorktree must have enabled.
 //
 // The hook is the link FSMonitorHookLink returns, which Git runs without a
@@ -391,17 +392,17 @@ func ParseFSMonitorHookLink(path string) (stateRoot string, id model.RepoID, ok 
 }
 
 // ReleaseAdoptedWorktree hands a worktree back to native Git once remove-repo
-// releases it. It unsets the FSMonitor hook and the filesystem settings that
-// ConfigureAdoptedWorktree pinned for the mount, so the worktree inherits its
-// repository's settings again. It unsets a key only while it holds the value
-// adoption writes, so an adoption that failed before writing it leaves the
-// worktree's own value. A value the worktree's own config held before a
-// successful adoption does not come back, because adoption overwrote it. The
-// core.worktree and core.bare pins stay, because they match the registered
-// worktree. extensions.worktreeConfig stays on because sibling worktrees may
-// now keep their own settings in config.worktree. It unsets the hook script
-// in the git dir and a hook link for the repo's ID under any state root, so
-// it also unsets a link the mount made before the state root moved.
+// releases it. It unsets the FSMonitor hook, core.untrackedCache, and the
+// filesystem settings that ConfigureAdoptedWorktree pinned for the mount, so
+// the worktree inherits its repository's settings again. It unsets a key only
+// while it holds the value adoption writes, so an adoption that failed before
+// writing it leaves the worktree's own value. A value the worktree's own config
+// held before a successful adoption does not come back, because adoption
+// overwrote it. The core.worktree and core.bare pins stay, because they match
+// the registered worktree. extensions.worktreeConfig stays on because sibling
+// worktrees may now keep their own settings in config.worktree. It unsets the
+// hook script in the git dir and a hook link for the repo's ID under any state
+// root, so it also unsets a link the mount made before the state root moved.
 func (s *Store) ReleaseAdoptedWorktree(ctx context.Context, repo model.RepoConfig) error {
 	// --worktree resolves to this file, but fails once the extension is off.
 	worktreeConfig := filepath.Join(repo.GitDir, "config.worktree")
@@ -597,7 +598,11 @@ func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.
 	}
 	validInput := []byte(strings.Join(validPaths, "\x00") + "\x00")
 	updateEnv := append([]string{FSMonitorBootstrapEnv + "=1"}, env...)
-	if _, err := runGitInput(ctx, repo.GitDir, updateEnv, validInput, "-c", "core.hooksPath="+privateHooks, "update-index", "--fsmonitor", "--fsmonitor-valid", "-z", "--stdin"); err != nil {
+	// An untracked cache this Git wrote would name the private worktree. Once
+	// remove-repo unsets core.untrackedCache, native Git keeps such a cache
+	// and warns on every status that it cannot use it, so this Git drops the
+	// cache. The mount's next status builds it again.
+	if _, err := runGitInput(ctx, repo.GitDir, updateEnv, validInput, "-c", "core.hooksPath="+privateHooks, "-c", "core.untrackedCache=false", "update-index", "--fsmonitor", "--fsmonitor-valid", "-z", "--stdin"); err != nil {
 		return skip()
 	}
 	if err := ctx.Err(); err != nil {
