@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
-	"sync"
 	"testing"
 	"time"
 
@@ -220,7 +219,6 @@ func runE2EBenchmarkOnce(t *testing.T, repo e2eBenchRepoSpec, iteration int, hyd
 		t.Fatal(err)
 	}
 	defer stopE2EDaemon(t, svc, cancel, errCh, mountPath)
-	primeE2EMountPolling(t, mountPath)
 
 	hydrateDur, hydratedBytes, err := readColdFilesThroughMount(mountPath, targets, callerWorkers)
 	if err != nil {
@@ -294,61 +292,18 @@ func countUnknownSizes(nodes []model.BaseNode) int {
 }
 
 // readColdFilesThroughMount reads each target through the mount with
-// callerWorkers readers, so each read hydrates its blob through the daemon. It
-// returns how long the reads took and how many bytes they returned.
+// callerWorkers readers in a child process, so each read hydrates its blob
+// through the daemon. It returns how long the reads took and how many bytes
+// they returned.
 func readColdFilesThroughMount(mountPath string, targets []model.BaseNode, callerWorkers int) (time.Duration, int64, error) {
 	if len(targets) == 0 {
 		return 0, 0, nil
 	}
-
-	jobs := make(chan model.BaseNode)
-	errCh := make(chan error, 1)
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var totalBytes int64
-
-	worker := func() {
-		defer wg.Done()
-		for n := range jobs {
-			data, err := os.ReadFile(filepath.Join(mountPath, n.Path))
-			if err != nil {
-				select {
-				case errCh <- fmt.Errorf("read %s: %w", n.Path, err):
-				default:
-				}
-				return
-			}
-
-			mu.Lock()
-			totalBytes += int64(len(data))
-			mu.Unlock()
-		}
+	paths := make([]string, len(targets))
+	for i, n := range targets {
+		paths[i] = n.Path
 	}
-
-	for range callerWorkers {
-		wg.Add(1)
-		go worker()
-	}
-
-	start := time.Now()
-	for _, n := range targets {
-		select {
-		case err := <-errCh:
-			close(jobs)
-			wg.Wait()
-			return 0, 0, err
-		case jobs <- n:
-		}
-	}
-	close(jobs)
-	wg.Wait()
-
-	select {
-	case err := <-errCh:
-		return 0, 0, err
-	default:
-	}
-	return time.Since(start), totalBytes, nil
+	return readMountFiles(mountPath, paths, callerWorkers)
 }
 
 func summarizeBenchRuns(runs []e2eBenchRun) []e2eBenchSummary {

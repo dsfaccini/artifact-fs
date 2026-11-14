@@ -22,6 +22,11 @@ import (
 var e2eMountsStarted atomic.Int64
 
 func TestMain(m *testing.M) {
+	// E2E tests read and write mount files through this binary in a child
+	// process.
+	if len(os.Args) > 1 && os.Args[1] == fileOpArg {
+		os.Exit(runFileOp(os.Args[2:]))
+	}
 	// Git runs this binary as the FSMonitor hook, through the hook link or
 	// the hook script, in every test that installs the hook.
 	if _, _, ok := gitstore.ParseFSMonitorHookLink(os.Args[0]); ok || len(os.Args) > 1 && os.Args[1] == "fsmonitor-hook" {

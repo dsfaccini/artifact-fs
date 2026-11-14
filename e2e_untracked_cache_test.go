@@ -58,7 +58,7 @@ func TestE2EGitStatusWithTheUntrackedCache(t *testing.T) {
 		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, path)), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, path), []byte(content), 0o644); err != nil {
+		if err := writeMountFile(filepath.Join(dir, path), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}

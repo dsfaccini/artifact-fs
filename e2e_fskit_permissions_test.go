@@ -31,7 +31,7 @@ func TestE2EFSKitMountChecksOwnerPermissions(t *testing.T) {
 	newFile := func(t *testing.T, name, content string, mode os.FileMode) string {
 		t.Helper()
 		path := filepath.Join(repo.mountPath, name)
-		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		if err := writeMountFile(path, []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Chmod(path, mode); err != nil {
@@ -41,10 +41,13 @@ func TestE2EFSKitMountChecksOwnerPermissions(t *testing.T) {
 	}
 	requireContent := func(t *testing.T, path, want string) {
 		t.Helper()
-		if got, err := os.ReadFile(path); err != nil || string(got) != want {
+		if got, err := readMountFile(path); err != nil || string(got) != want {
 			t.Fatalf("%s = %q, %v; want %q", filepath.Base(path), got, err, want)
 		}
 	}
+	// The opens below are the subtests' subject, so the test process makes
+	// them. FSKit runs on macOS, where Linux's close-on-exec FLUSH from a
+	// vfork child (e2e_files_test.go) does not apply.
 	requireEACCES := func(t *testing.T, what string, err error) {
 		t.Helper()
 		if !errors.Is(err, syscall.EACCES) {

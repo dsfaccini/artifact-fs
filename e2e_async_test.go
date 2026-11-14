@@ -73,7 +73,6 @@ func TestE2EAsyncPreparedGitDirBlocksUntilReady(t *testing.T) {
 		t.Fatal("ReadDir did not unblock after async prepare completed")
 	}
 
-	primeE2EMountPolling(t, repo.mountPath)
 	entries := lsDir(t, repo.mountPath)
 	assertContains(t, entries, ".git")
 	assertContains(t, entries, "README.md")
@@ -125,7 +124,6 @@ func TestE2EAsyncPreparedGitDirFailureThenRetry(t *testing.T) {
 		return false, "state=" + st.State + " prepare_error=" + st.PrepareError
 	})
 
-	primeE2EMountPolling(t, repo.mountPath)
 	entries := lsDir(t, repo.mountPath)
 	assertContains(t, entries, "README.md")
 	assertGitStatus(t, repo.mountPath, map[string]string{})
