@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1202,6 +1203,117 @@ func publishWhileDown(t *testing.T, cfg model.RepoConfig, commit string, prune b
 	}
 }
 
+// A switch that rewrites a file in its commit's second raises the file's
+// mtime, and a daemon restart keeps the raise: one after the switch, one that
+// serves a HEAD that moved while no daemon ran, and one after the switch that
+// cannot read which generation the overlay served.
+func TestRaisedMtimeOutlastsARestart(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct{ whileDown, servedUnreadable bool }{
+		"switched before the restart":  {},
+		"moved while down":             {whileDown: true},
+		"served generation unreadable": {servedUnreadable: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			tmp := shortTempDir(t)
+			svc, _ := newDaemonWithRepo(t, tmp, AddRepoOptions{})
+			if err := svc.syncRepos(ctx); err != nil {
+				t.Fatal(err)
+			}
+			svc.prepareWorkers.Wait()
+			root := filepath.Join(tmp, "artifact-fs")
+			cfg, err := registry.ReadRepo(ctx, registryPath(root), "repo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			remote := filepath.Join(tmp, "remote")
+			second, err := strconv.ParseInt(strings.TrimSpace(runCmdOutput(t, "git", "-C", remote, "show", "-s", "--format=%ct", "HEAD")), 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := readmeMtime(t, runningRuntime(svc, cfg.ID)); got != second {
+				t.Fatalf("README.md's mtime before the switch = %d, want its commit time %d", got, second)
+			}
+			// README.md keeps its size, so only its mtime can tell Git of
+			// the change.
+			if err := os.WriteFile(filepath.Join(remote, "README.md"), []byte("next\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runCmd(t, "git", "-C", remote, "add", "README.md")
+			commit := exec.Command("git", "-C", remote, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "next")
+			date := "@" + strconv.FormatInt(second, 10) + " +0000"
+			commit.Env = append(os.Environ(), "GIT_AUTHOR_DATE="+date, "GIT_COMMITTER_DATE="+date)
+			if out, err := commit.CombinedOutput(); err != nil {
+				t.Fatalf("commit: %v\n%s", err, out)
+			}
+			next := strings.TrimSpace(runCmdOutput(t, "git", "-C", remote, "rev-parse", "HEAD"))
+			runCmd(t, "git", "--git-dir", cfg.GitDir, "fetch", "--no-tags", "origin", "main")
+			if !c.whileDown {
+				runCmd(t, "git", "--git-dir", cfg.GitDir, "update-ref", "refs/heads/main", next)
+				rt := runningRuntime(svc, cfg.ID)
+				if err := svc.reconcileHEAD(ctx, rt); err != nil {
+					t.Fatal(err)
+				}
+				if got := readmeMtime(t, rt); got != second+1 {
+					t.Fatalf("README.md's mtime after the switch = %d, want %d", got, second+1)
+				}
+			}
+			if err := svc.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if c.whileDown {
+				runCmd(t, "git", "--git-dir", cfg.GitDir, "update-ref", "refs/heads/main", next)
+			}
+			if c.servedUnreadable {
+				// The restart serves the generation the switch recorded,
+				// but cannot read which one the overlay served.
+				db, err := meta.OpenDB(cfg.OverlayDBPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				if _, err := db.ExecContext(ctx, `UPDATE overlay_instance SET served_generation = 'unreadable'`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			restarted, err := New(ctx, root, discardLogger())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = restarted.Close() })
+			restarted.mount = fakeMount
+			if err := restarted.syncRepos(ctx); err != nil {
+				t.Fatal(err)
+			}
+			restarted.prepareWorkers.Wait()
+			rt := runningRuntime(restarted, cfg.ID)
+			if rt == nil || rt.head.oid != next {
+				t.Fatalf("runtime after the restart = %+v, want it serving %s", rt, next)
+			}
+			if got := readmeMtime(t, rt); got != second+1 {
+				t.Fatalf("README.md's mtime after the restart = %d, want %d", got, second+1)
+			}
+		})
+	}
+}
+
+// readmeMtime returns the mtime, in Unix seconds, that rt reports for
+// README.md.
+func readmeMtime(t *testing.T, rt *repoRuntime) int64 {
+	t.Helper()
+	var mtime int64
+	if err := rt.engine.Do(t.Context(), nil, func(_ context.Context, b *fusefs.Blobs) error {
+		a, err := rt.engine.Attrs(b, "README.md")
+		mtime = a.Mtime.Unix()
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return mtime
+}
+
 // requireStatusWithFSMonitorOff checks that git status through the hook's
 // answer for since matches the status with fsmonitor off, want, and returns
 // the paths the hook answered.
@@ -1432,7 +1544,7 @@ func (f *headReconcileFixture) switchToNext() {
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	if err := f.svc.switchGeneration(f.ctx, f.rt, gen, 0); err != nil {
+	if err := f.svc.switchGeneration(f.ctx, f.rt, gen, 0, nil); err != nil {
 		f.t.Fatal(err)
 	}
 }
@@ -1532,14 +1644,14 @@ func TestConcurrentSwitchesRetireTheGenerationsTheyReplaced(t *testing.T) {
 	pause := &pausingListing{SnapshotStore: f.rt.resolver.Snapshot, gen: gens[0], paused: make(chan struct{}), resume: make(chan struct{})}
 	f.rt.resolver.Snapshot = pause
 	first := make(chan error, 1)
-	go func() { first <- f.svc.switchGeneration(f.ctx, f.rt, gens[0], 0) }()
+	go func() { first <- f.svc.switchGeneration(f.ctx, f.rt, gens[0], 0, nil) }()
 	select {
 	case <-pause.paused:
 	case err := <-first:
 		t.Fatalf("switch to %d returned before it listed the generation: %v", gens[0], err)
 	}
 	second := make(chan error, 1)
-	go func() { second <- f.svc.switchGeneration(f.ctx, f.rt, gens[1], 0) }()
+	go func() { second <- f.svc.switchGeneration(f.ctx, f.rt, gens[1], 0, nil) }()
 	waitForSwitchBehindAnother(t.Name())
 	close(pause.resume)
 	for _, done := range []chan error{first, second} {

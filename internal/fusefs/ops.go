@@ -385,7 +385,7 @@ func (e *Engine) Attrs(b *Blobs, path string) (Attrs, error) {
 			return Attrs{}, err
 		}
 	}
-	mt, ct := baseTime(gen, commitTime), baseTime(gen, commitTime)
+	mt, ct := baseTime(gen, commitTime, n.Base.RaisedMtime), baseTime(gen, commitTime, n.Base.RaisedMtime)
 	if n.Base.Type == "dir" {
 		mt, ct = e.Resolver.dirTimes(model.CleanPath(path), mt, ct)
 	}
@@ -407,9 +407,13 @@ func (e *Engine) overlayAttrs(path string, ov model.OverlayEntry) Attrs {
 	return a
 }
 
-// baseTime is the mtime and ctime of a base entry. Base entries use the HEAD
-// commit timestamp so tools like make see a stable, meaningful value.
-func baseTime(gen, commitTime int64) time.Time {
+// baseTime is the mtime and ctime of a base entry: raised, its RaisedMtime,
+// when that is not 0. Base entries otherwise use the HEAD commit timestamp so
+// tools like make see a stable, meaningful value.
+func baseTime(gen, commitTime, raised int64) time.Time {
+	if raised != 0 {
+		return time.Unix(raised, 0)
+	}
 	if commitTime == 0 {
 		commitTime = gen // fallback: commit time unavailable
 	}
@@ -420,7 +424,7 @@ func baseTime(gen, commitTime int64) time.Time {
 // directory entry carries the times Attrs gives it.
 func (e *Engine) ReadDir(ctx context.Context, path string) ([]ReaddirEntry, int64, int64, error) {
 	entries, gen, commitTime, err := e.Resolver.ReaddirSnapshot(ctx, path)
-	e.Resolver.childDirTimes(model.CleanPath(path), entries, baseTime(gen, commitTime))
+	e.Resolver.childDirTimes(model.CleanPath(path), entries, baseTime(gen, commitTime, 0))
 	return entries, gen, commitTime, err
 }
 

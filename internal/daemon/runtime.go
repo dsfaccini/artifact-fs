@@ -177,13 +177,11 @@ func (rt *repoRuntime) phase() string {
 // then on, records it as running and mounts it. head is the generation it
 // serves. An async repo passes the gate that holds FUSE ops until its
 // preparation ends; a prepared repo passes nil.
-func (s *Service) startRuntime(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, ov *overlay.Store, head servedHead, gate *fusefs.ReadyGate) *repoRuntime {
+func (s *Service) startRuntime(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, ov *overlay.Store, head servedHead, commitTime int64, gate *fusefs.ReadyGate) *repoRuntime {
 	h := hydrator.New(s.git)
 	resolver := &fusefs.Resolver{Snapshot: snap, Overlay: ov}
 	resolver.SetGeneration(head.gen)
-	if head.oid != "" {
-		s.refreshCommitTime(ctx, cfg, head.oid, resolver, "commit timestamp unavailable, mtime will use generation fallback")
-	}
+	resolver.SetCommitTime(commitTime)
 	runtimeCtx, cancel := context.WithCancel(ctx)
 	opCtx, cancelOps := context.WithCancel(context.WithoutCancel(ctx))
 	sizes := newSizeUpdateBatcher(snap, s.logger, cfg.Name)

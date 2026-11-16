@@ -591,9 +591,24 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	} else {
 		s.logger.Warn("commit timestamp unavailable", "repo", cfg.Name, "error", err)
 	}
-	if err := s.switchGeneration(ctx, rt, gen, commitTime); err != nil {
+	// The gate opens in the s.mu hold that checks the request, so a newer
+	// request's reset lands before the check or after the open.
+	err := s.switchGeneration(ctx, rt, gen, commitTime, func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.running[cfg.ID] != rt || !samePrepare(rt.cfg, cfg) {
+			return errPrepareSuperseded
+		}
+		rt.gate.MarkReady()
+		runHook(s.gateOpened)
+		return nil
+	})
+	if err != nil {
 		return err
 	}
+	// Every record reads rt.prepare and rt.head, so they change only after
+	// the pass: status stops reporting preparing once the kernel dropped what
+	// the switch changed.
 	s.mu.Lock()
 	if s.running[cfg.ID] != rt || !samePrepare(rt.cfg, cfg) {
 		s.mu.Unlock()
@@ -601,10 +616,13 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	}
 	rt.cfg.PrepareState = model.PrepareStateReady
 	rt.cfg.PrepareError = ""
-	rt.head = servedHead{oid: headOID, ref: headRef, gen: gen}
+	// A HEAD reconcile during the pass can have switched further, and it sets
+	// the served HEAD it switched to.
+	if rt.resolver.Generation() == gen {
+		rt.head = servedHead{oid: headOID, ref: headRef, gen: gen}
+	}
 	rt.prepare = model.PrepareStateReady
 	s.mu.Unlock()
-	rt.gate.MarkReady()
 	s.recordRuntimeState(rt)
 	s.startRepoBackground(rt)
 	return nil

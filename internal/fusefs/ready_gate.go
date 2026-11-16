@@ -14,6 +14,12 @@ type ReadyGate struct {
 	err    error
 	done   chan struct{}
 	closed bool
+	// passes counts the switch passes that run. The kernel can hold a
+	// directory's lock while a lookup there waits at the gate, and a pass's
+	// entry invalidation waits for that lock, so a Reset while passes run
+	// holds ops only once the last pass ends.
+	passes   int
+	resetDue bool
 }
 
 func NewReadyGate(ready bool) *ReadyGate {
@@ -68,6 +74,14 @@ func (g *ReadyGate) Reset() {
 	if !g.ready && g.err == nil {
 		return
 	}
+	if g.passes > 0 {
+		g.resetDue = true
+		return
+	}
+	g.reset()
+}
+
+func (g *ReadyGate) reset() {
 	g.ready = false
 	g.err = nil
 	g.done = make(chan struct{})
@@ -80,6 +94,7 @@ func (g *ReadyGate) MarkReady() {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.resetDue = false
 	if g.ready {
 		return
 	}
@@ -100,6 +115,10 @@ func (g *ReadyGate) MarkFailed(err error) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.resetDue {
+		g.resetDue = false
+		g.ready = false
+	}
 	if g.err != nil {
 		g.err = err
 		return
@@ -111,5 +130,47 @@ func (g *ReadyGate) MarkFailed(err error) {
 	if !g.closed {
 		close(g.done)
 		g.closed = true
+	}
+}
+
+// StartPass starts a switch pass unless g holds ops, and reports whether it
+// did. EndPass ends a pass that started.
+func (g *ReadyGate) StartPass() bool {
+	if g == nil {
+		return true
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.ready && g.err == nil {
+		return false
+	}
+	g.passes++
+	return true
+}
+
+// WaitPass waits until g holds no ops, then starts a switch pass. It returns
+// ctx's error, and starts no pass, once ctx ends.
+func (g *ReadyGate) WaitPass(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if g.StartPass() {
+			return nil
+		}
+		_ = g.Wait(ctx)
+	}
+}
+
+func (g *ReadyGate) EndPass() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.passes--
+	if g.passes == 0 && g.resetDue {
+		g.resetDue = false
+		g.reset()
 	}
 }
