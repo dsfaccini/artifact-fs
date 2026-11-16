@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -99,14 +100,27 @@ func TestStopWhileARefreshWaitsForThePrepareLockRecordsNoFailure(t *testing.T) {
 		}
 		before = rec
 		f.ticks <- time.Now()
-		<-f.busy
+		select {
+		case f.ticks <- time.Now():
+			stopped <- errors.New("a refresh fetched while a preparation of its repo held the prepare lock")
+			return
+		case <-f.busy:
+		}
 		// The preparation is one of the runtime's workers, which the stop's
-		// drain waits for, so it goes on once the stop ended rt.ctx.
-		go func() { stopped <- f.svc.unmount(f.cfg.ID) }()
-		<-f.rt.ctx.Done()
+		// drain waits for, so it goes on once the stop ended rt.ctx, or once
+		// a stop that failed before that returned.
+		stopDone := make(chan struct{})
+		go func() {
+			stopped <- f.svc.unmount(f.cfg.ID)
+			close(stopDone)
+		}()
+		select {
+		case <-f.rt.ctx.Done():
+		case <-stopDone:
+		}
 	})
 	if err := <-stopped; err != nil {
-		t.Fatalf("stop while the refresh waits for the prepare lock: %v", err)
+		t.Fatal(err)
 	}
 	rec, ok, err := f.svc.registry.GetRuntime(ctx, f.cfg.ID)
 	if err != nil || !ok {
