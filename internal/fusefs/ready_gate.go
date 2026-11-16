@@ -14,9 +14,10 @@ type ReadyGate struct {
 	err    error
 	done   chan struct{}
 	closed bool
-	// passes counts the switch passes that run. A gated lookup holds its
-	// parent directory's lock, which a pass's entry invalidation takes, so a
-	// Reset while passes run holds ops only once the last pass ends.
+	// passes counts the switch passes that run. The kernel can hold a
+	// directory's lock while a lookup there waits at the gate, and a pass's
+	// entry invalidation waits for that lock, so a Reset while passes run
+	// holds ops only once the last pass ends.
 	passes   int
 	resetDue bool
 }

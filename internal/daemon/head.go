@@ -108,14 +108,15 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 // switchGeneration switches rt's resolver to gen, runs activate when it is
 // not nil, then tells the kernel to drop what it caches that the switch
 // changed. It records when the previous generation retired, and returns
-// activate's error once it sent the pass.
+// activate's error.
 //
-// A lookup that waits at rt's gate holds its parent directory's lock, which
-// an entry invalidation takes. So the pass starts only while the gate holds
-// no ops, and a Reset of the gate holds ops only once the pass ends. While
-// the gate holds ops, one of rt's workers sends the pass when the gate opens
-// or fails, and a stop of rt cancels it. An activation opens the gate in
-// activate, so its pass follows.
+// The kernel can hold a directory's lock while a lookup there waits at rt's
+// gate, and an entry invalidation waits for that lock. So the pass starts
+// only while the gate holds no ops, and a Reset of the gate holds ops only
+// once the pass ends. While the gate holds ops, switchGeneration returns
+// before the pass, and one of rt's workers sends it once the gate opens or
+// fails. A stop of rt cancels it. An activation opens the gate in activate,
+// so its pass follows at once.
 func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, commitTime int64, activate func() error) error {
 	sw, err := rt.resolver.SwitchGeneration(ctx, gen, commitTime)
 	if err != nil {

@@ -130,9 +130,10 @@ type Service struct {
 	// connection ended, unless the runtime was stopping or served a newer
 	// mount. joinFinished runs as a join goroutine ends. readyRecorded runs
 	// after an async preparation persisted ready, before it activates the
-	// runtime. passDeferred runs on the worker that sends a switch pass the
-	// gate held, before it waits for the gate.
-	runtimeStarted, mountReleased, joinRecorded, joinFinished, readyRecorded, passDeferred func()
+	// runtime. gateOpening runs as an activation opens its runtime's gate,
+	// holding s.mu. passDeferred runs on the worker that sends a switch pass
+	// the gate held, before it waits for the gate.
+	runtimeStarted, mountReleased, joinRecorded, joinFinished, readyRecorded, gateOpening, passDeferred func()
 	// headReconcileBackoff is the first retry delay after a failed HEAD
 	// reconcile; zero means headReconcileMinBackoff.
 	headReconcileBackoff time.Duration
