@@ -2,6 +2,9 @@ package daemon
 
 import (
 	"errors"
+	"fmt"
+	"os/exec"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -9,18 +12,19 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
-// refreshDuringPrepare is an async repo whose refresh loop ticks only on
-// ticks. atLock runs once, while the next preparation of the repo holds its
-// prepare lock, and busy receives once a refresh finds that lock held.
-type refreshDuringPrepare struct {
+// lockedPreparation is an async repo whose refresh loop ticks only on ticks.
+// atLock runs once, while the next preparation of the repo holds its prepare
+// lock, and busy receives once a refresh or a fetch command finds that lock
+// held.
+type lockedPreparation struct {
 	*servedAsyncRepo
 	ticks chan time.Time
 	busy  chan struct{}
 }
 
-func newRefreshDuringPrepare(t *testing.T, atLock func(*refreshDuringPrepare)) *refreshDuringPrepare {
+func newLockedPreparation(t *testing.T, atLock func(*lockedPreparation)) *lockedPreparation {
 	t.Helper()
-	f := &refreshDuringPrepare{ticks: make(chan time.Time), busy: make(chan struct{}, 1)}
+	f := &lockedPreparation{ticks: make(chan time.Time), busy: make(chan struct{}, 1)}
 	var armed atomic.Bool
 	f.servedAsyncRepo = newServedAsyncRepo(t, func(svc *Service) {
 		svc.refreshTicks = f.ticks
@@ -59,7 +63,7 @@ func newRefreshDuringPrepare(t *testing.T, atLock func(*refreshDuringPrepare)) *
 // second tick; one that waits for the lock reports the lock busy.
 func TestRefreshWaitsForAPreparationOfItsRepo(t *testing.T) {
 	t.Parallel()
-	f := newRefreshDuringPrepare(t, func(f *refreshDuringPrepare) {
+	f := newLockedPreparation(t, func(f *lockedPreparation) {
 		f.ticks <- time.Now()
 		select {
 		case f.ticks <- time.Now():
@@ -93,7 +97,7 @@ func TestStopWhileARefreshWaitsForThePrepareLockRecordsNoFailure(t *testing.T) {
 	ctx := t.Context()
 	var before model.RepoRuntimeRecord
 	stopped := make(chan error, 1)
-	f := newRefreshDuringPrepare(t, func(f *refreshDuringPrepare) {
+	f := newLockedPreparation(t, func(f *lockedPreparation) {
 		rec, ok, err := f.svc.registry.GetRuntime(ctx, f.cfg.ID)
 		if err != nil || !ok {
 			t.Errorf("runtime record before the stop = %v, %v; want it recorded", ok, err)
@@ -131,5 +135,63 @@ func TestStopWhileARefreshWaitsForThePrepareLockRecordsNoFailure(t *testing.T) {
 	}
 	if rec.LastFetchResult != before.LastFetchResult || !rec.LastFetchAt.Equal(before.LastFetchAt) {
 		t.Fatalf("last fetch after the stop = %q at %v, want %q at %v as before the refresh", rec.LastFetchResult, rec.LastFetchAt, before.LastFetchResult, before.LastFetchAt)
+	}
+}
+
+// The fetch command waits while a preparation of its repo holds the repo's
+// prepare lock, as a refresh does. The registry shows the repo ready once the
+// preparation recorded ready, before it releases the lock, so the command's
+// state checks pass there. A fetch command that fetched returns while the
+// preparation holds the lock; one that waits reports the lock busy, then
+// fetches the commit the remote gained.
+func TestFetchCommandWaitsForAPreparationOfItsRepo(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	fetched := make(chan error, 1)
+	f := newLockedPreparation(t, func(f *lockedPreparation) {
+		// The remote gains a commit only the fetch command can fetch.
+		commit := exec.Command("git", "-C", f.remote, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-q", "-m", "three")
+		if out, err := commit.CombinedOutput(); err != nil {
+			fetched <- fmt.Errorf("commit to the remote: %v\n%s", err, out)
+			return
+		}
+		go func() { fetched <- f.svc.ctl().FetchNow(ctx, f.cfg.Name) }()
+		select {
+		case err := <-fetched:
+			fetched <- fmt.Errorf("the fetch command returned %v while a preparation of its repo held the prepare lock", err)
+		case <-f.busy:
+		}
+	})
+	if err := <-fetched; err != nil {
+		t.Fatal(err)
+	}
+	tip := strings.TrimSpace(runCmdOutput(t, "git", "-C", f.remote, "rev-parse", "HEAD"))
+	if got := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", f.cfg.GitDir, "rev-parse", "refs/remotes/origin/main")); got != tip {
+		t.Fatalf("origin/main after the fetch command = %s, want the remote's tip %s", got, tip)
+	}
+}
+
+// The fetch command reads the repo again once it holds the prepare lock: what
+// held the lock can have changed the repo's fetch ref or refresh policy. Here
+// set-refresh turns the refresh off while the command waits, and the command
+// refuses the repo instead of fetching it.
+func TestFetchCommandReadsTheRepoAgainUnderTheLock(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	fetched := make(chan error, 1)
+	newLockedPreparation(t, func(f *lockedPreparation) {
+		go func() { fetched <- f.svc.ctl().FetchNow(ctx, f.cfg.Name) }()
+		select {
+		case err := <-fetched:
+			fetched <- fmt.Errorf("the fetch command returned %v while a preparation of its repo held the prepare lock", err)
+			return
+		case <-f.busy:
+		}
+		if err := f.svc.ctl().SetRefresh(ctx, f.cfg.Name, model.RefreshPolicy{RemoteRefreshDisabled: true}); err != nil {
+			t.Errorf("set-refresh while the fetch command waits: %v", err)
+		}
+	})
+	if err := <-fetched; err == nil || !strings.Contains(err.Error(), "remote refresh is disabled") {
+		t.Fatalf("fetch command after set-refresh turned the refresh off = %v, want it refused", err)
 	}
 }
