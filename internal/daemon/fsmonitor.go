@@ -74,6 +74,28 @@ func (s *Service) configureStatusOptimization(ctx context.Context, cfg model.Rep
 	}
 }
 
+// configureCurrentStatusOptimization writes cfg's status optimization config
+// under cfg's prepare lock while cfg's config version is the registry's. It
+// runs on the sync loop, so it never waits for the lock, which a preparation
+// can hold for up to its timeout: it skips the write while another step holds
+// the lock.
+func (s *Service) configureCurrentStatusOptimization(ctx context.Context, cfg model.RepoConfig) {
+	ran, err := s.tryRepoPrepareLock(cfg.Name, func() error {
+		latest, err := s.registry.GetRepo(ctx, cfg.Name)
+		if err != nil || latest.ConfigVersion != cfg.ConfigVersion {
+			return err
+		}
+		s.configureStatusOptimization(ctx, cfg)
+		return nil
+	})
+	switch {
+	case err != nil && ctx.Err() == nil:
+		s.logger.Warn("git status optimization setup skipped", "repo", cfg.Name, "error", err)
+	case err == nil && !ran:
+		s.logger.Info("git status optimization setup skipped while another step holds the repo's prepare lock", "repo", cfg.Name)
+	}
+}
+
 // FSMonitorHook answers Git's fsmonitor hook protocol version 2 from the
 // overlay, which records changes made through the mount. Its token carries the
 // overlay database's id and change sequence, so Git receives only the paths

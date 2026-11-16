@@ -428,7 +428,8 @@ siblings retain their settings.
 
 Stop the owning daemon and wait for process exit and actual unmount before
 restoring the saved gitfile, unlocking metadata or removing the worktree.
-`remove-repo` updates the registry and Git config and returns. The running daemon
+`remove-repo` first waits while a preparation of the worktree runs or the daemon
+checks it before it mounts it. Then it updates the registry and Git config and returns. The running daemon
 unmounts the repo at its next registry poll, so the return does not mean the live mount has stopped.
 It unsets what adoption pinned in the worktree's config for the mount
 (`core.fsmonitor`, `fsmonitor.allowRemote`, `core.untrackedCache`,
