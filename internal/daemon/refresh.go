@@ -72,6 +72,11 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 				return nil
 			})
 			if err != nil {
+				// A stop ends rt.ctx, also while the refresh waits for the
+				// lock, and that is no fetch failure to record.
+				if rt.ctx.Err() != nil {
+					return
+				}
 				s.mu.Lock()
 				rt.fetch.state = fetchFailed
 				s.mu.Unlock()
