@@ -146,7 +146,7 @@ func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *pre
 		gate = fusefs.NewReadyGate(true)
 	}
 	res.kept = true
-	rt := s.startRuntime(ctx, cfg, snap, ov, servedHead{oid: res.source.Commit, ref: res.source.Ref, gen: gen}, commitTime, gate)
+	rt := s.startRuntime(ctx, cfg, snap, ov, servedHead{oid: res.source.Commit, ref: res.source.Ref, gen: gen}, commitTime, gate, true)
 	s.startRepoBackground(rt)
 	return nil
 }
@@ -255,7 +255,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 	if cfg.PrepareState == model.PrepareStateFailed {
 		gate.MarkFailed(prepareGateError(cfg.PrepareError))
 	}
-	s.startRuntime(ctx, cfg, snap, ov, servedHead{oid: headOID, ref: headRef, gen: gen}, commitTime, gate)
+	s.startRuntime(ctx, cfg, snap, ov, servedHead{oid: headOID, ref: headRef, gen: gen}, commitTime, gate, false)
 	return nil
 }
 

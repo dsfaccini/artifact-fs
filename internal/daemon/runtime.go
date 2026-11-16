@@ -129,6 +129,10 @@ type repoRuntime struct {
 	// stopping holds from a stop's start until its unmount fails or the
 	// runtime is gone. Nothing mounts or reconciles HEAD meanwhile.
 	stopping bool
+	// statusPending holds while the mount serves without the status
+	// optimization config, which it skipped while another step held the
+	// repo's prepare lock. retryMount writes it at a later sync.
+	statusPending bool
 	// stop is the stop of the runtime that runs, nil otherwise.
 	stop *unmountOp
 	// kept and keptWarning are what the last prune recorded in
@@ -176,8 +180,9 @@ func (rt *repoRuntime) phase() string {
 // startRuntime builds cfg's runtime around snap and ov, which it owns from
 // then on, records it as running and mounts it. head is the generation it
 // serves. An async repo passes the gate that holds FUSE ops until its
-// preparation ends; a prepared repo passes nil.
-func (s *Service) startRuntime(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, ov *overlay.Store, head servedHead, commitTime int64, gate *fusefs.ReadyGate) *repoRuntime {
+// preparation ends; a prepared repo passes nil. prepareLocked is
+// attachMount's.
+func (s *Service) startRuntime(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, ov *overlay.Store, head servedHead, commitTime int64, gate *fusefs.ReadyGate, prepareLocked bool) *repoRuntime {
 	h := hydrator.New(s.git)
 	resolver := &fusefs.Resolver{Snapshot: snap, Overlay: ov}
 	resolver.SetGeneration(head.gen)
@@ -219,7 +224,7 @@ func (s *Service) startRuntime(ctx context.Context, cfg model.RepoConfig, snap *
 	// A runtime that starts ends the backoff of the mounts before it. The next
 	// registry sync retries a first mount that failed; later failures back off.
 	s.mountSucceeded(cfg.ID)
-	if _, err := s.attachMount(rt); err != nil {
+	if _, err := s.attachMount(rt, prepareLocked); err != nil {
 		s.recordFailure(cfg, phaseMount, err, time.Now().Add(registrySyncInterval), s.runtimeState(rt))
 	}
 	runHook(s.runtimeStarted)
@@ -227,15 +232,21 @@ func (s *Service) startRuntime(ctx context.Context, cfg model.RepoConfig, snap *
 }
 
 // retryMount mounts rt when it has no mount and its mount backoff has
-// passed, and records the outcome.
+// passed, and records the outcome. While rt's mount serves without its
+// status optimization config, it writes the config instead.
 func (s *Service) retryMount(rt *repoRuntime) {
 	s.mu.Lock()
 	cfg := rt.cfg
+	statusPending := rt.statusPending && rt.mount == mountServing && !rt.stopping
 	s.mu.Unlock()
+	if statusPending {
+		s.configureCurrentStatusOptimization(rt, cfg)
+		return
+	}
 	if !s.mountDue(cfg) {
 		return
 	}
-	attached, err := s.attachMount(rt)
+	attached, err := s.attachMount(rt, false)
 	if _, settling := errors.AsType[*settlingError](err); settling {
 		s.recordFailure(cfg, phaseMount, err, time.Now().Add(registrySyncInterval))
 		return
@@ -262,7 +273,13 @@ func (s *Service) retryMount(rt *repoRuntime) {
 // abandoned mount that has not ended, returns a settlingError, and the next
 // attempt checks again. The mount waits at most mountTimeout, and rt's op
 // context is the parent of every op's context.
-func (s *Service) attachMount(rt *repoRuntime) (bool, error) {
+//
+// The mount of a prepared repo writes the git dir's status optimization
+// config, which the repo's prepare lock guards. prepareLocked says whether
+// the caller holds that lock. Otherwise the caller runs on the sync loop,
+// and the mount writes the config only while the lock is free, or leaves it
+// to retryMount.
+func (s *Service) attachMount(rt *repoRuntime, prepareLocked bool) (bool, error) {
 	s.mu.Lock()
 	cfg, state, failed, abandoned := rt.cfg, rt.mount, rt.mfs, rt.abandoned
 	settled := rt.stopping || state == mountServing || state == mountUnmounted || rt.ctx.Err() != nil
@@ -343,7 +360,11 @@ func (s *Service) attachMount(rt *repoRuntime) (bool, error) {
 	})
 	s.joinMount(rt, mfs)
 	if !isPendingOrFailedPrepareState(cfg.PrepareState) {
-		s.configureStatusOptimization(rt.ctx, cfg)
+		if prepareLocked {
+			s.configureStatusOptimization(rt.ctx, cfg)
+		} else {
+			s.configureCurrentStatusOptimization(rt, cfg)
+		}
 	}
 	return true, nil
 }
