@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1050,8 +1052,9 @@ func (g *commitTimestampGit) CommitTimestamp(ctx context.Context, repo model.Rep
 
 // A prepare request can reset the gate while a switch pass runs, here a HEAD
 // reconcile's. The reset holds ops only once the pass ends: a lookup it held
-// could block the pass's entry invalidations. The end of the request's
-// preparation during the pass replaces the reset.
+// could block the pass's entry invalidations. A failure of the request's
+// preparation during the pass replaces the reset. Its activation waits for
+// the reconcile's headMu, so it cannot open the gate during this pass.
 func TestGateResetDuringASwitchPassTakesEffectWhenThePassEnds(t *testing.T) {
 	t.Parallel()
 	for _, tt := range []struct {
@@ -1061,7 +1064,6 @@ func TestGateResetDuringASwitchPassTakesEffectWhenThePassEnds(t *testing.T) {
 		end model.PrepareState
 	}{
 		{name: "reset"},
-		{name: "reset then ready", end: model.PrepareStateReady},
 		{name: "reset then failed", end: model.PrepareStateFailed},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1086,11 +1088,7 @@ func TestGateResetDuringASwitchPassTakesEffectWhenThePassEnds(t *testing.T) {
 					t.Errorf("prepare request during the pass: %v", err)
 					return
 				}
-				switch tt.end {
-				case model.PrepareStateReady:
-					// The activation's pass follows its open of the gate.
-					<-r.passes
-				case model.PrepareStateFailed:
+				if tt.end == model.PrepareStateFailed {
 					for {
 						st, err := r.svc.ctl().Status(ctx, r.cfg.Name)
 						if err != nil {
@@ -1131,10 +1129,6 @@ func TestGateResetDuringASwitchPassTakesEffectWhenThePassEnds(t *testing.T) {
 			case "":
 				if !errors.Is(err, context.Canceled) {
 					t.Fatalf("op at the gate after the pass = %v, want it held for the request's preparation", err)
-				}
-			case model.PrepareStateReady:
-				if err != nil {
-					t.Fatalf("op at the gate after the pass = %v, want it through: the preparation ended ready during the pass", err)
 				}
 			case model.PrepareStateFailed:
 				if err == nil || errors.Is(err, context.Canceled) {
@@ -1195,15 +1189,10 @@ func TestLateAsyncPrepareInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 
 	next := commitFile(t, r.remote, "README.md", "two\n")
 	late.Store(true)
-	// reconcileHEAD runs under headMu, so only the activation can switch the
-	// resolver. The activation's prune waits for headMu.
-	r.rt.headMu.Lock()
 	if err := r.requestPrepare(ctx, "late"); err != nil {
-		r.rt.headMu.Unlock()
 		t.Fatal(err)
 	}
 	pass := <-r.passes
-	r.rt.headMu.Unlock()
 	if err := r.gate.Wait(ctx); err != nil {
 		t.Fatalf("gate after the late preparation = %v, want open", err)
 	}
@@ -1280,18 +1269,24 @@ func TestSupersededActivationSendsItsPassOnlyOnceTheGateOpens(t *testing.T) {
 	r.svc.prepareWorkers.Wait()
 }
 
-// A HEAD reconcile can switch further during an activation's pass: the
-// gate is open, and HEAD moves again. The activation then keeps the served
-// HEAD the reconcile recorded, which the resolver serves, so status reports
-// the commit and generation the mount serves.
-func TestActivationKeepsTheServedHEADOfAReconcileDuringItsPass(t *testing.T) {
+// HEAD can move again during an activation's pass, once the gate is open. The
+// activation holds headMu through its pass, so a HEAD reconcile that starts
+// then waits for the activation to record its served HEAD, and switches
+// further afterward. Status then reports the commit and generation the mount
+// serves.
+func TestHeadReconcileDuringAnActivationsPassWaitsForTheActivation(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 	var r *servedAsyncRepo
 	var armed atomic.Bool
+	reconciled := make(chan error, 1)
 	r = newServedAsyncRepo(t, nil, func() {
 		if !armed.CompareAndSwap(true, false) {
 			return
+		}
+		if r.rt.headMu.TryLock() {
+			r.rt.headMu.Unlock()
+			t.Error("the activation's pass runs without headMu")
 		}
 		prev, err := exec.Command("git", "--git-dir", r.cfg.GitDir, "rev-parse", "HEAD~1").Output()
 		if err != nil {
@@ -1302,9 +1297,7 @@ func TestActivationKeepsTheServedHEADOfAReconcileDuringItsPass(t *testing.T) {
 			t.Errorf("move HEAD during the pass: %v\n%s", err, out)
 			return
 		}
-		if err := r.svc.reconcileHEAD(ctx, r.rt); err != nil {
-			t.Errorf("HEAD reconcile during the pass: %v", err)
-		}
+		go func() { reconciled <- r.svc.reconcileHEAD(ctx, r.rt) }()
 	})
 
 	commitFile(t, r.remote, "README.md", "two\n")
@@ -1316,6 +1309,9 @@ func TestActivationKeepsTheServedHEADOfAReconcileDuringItsPass(t *testing.T) {
 	if armed.Load() {
 		t.Fatal("the late activation sent no pass")
 	}
+	if err := <-reconciled; err != nil {
+		t.Fatalf("HEAD reconcile that started during the pass: %v", err)
+	}
 	head := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", r.cfg.GitDir, "rev-parse", "HEAD"))
 	rec, _, err := r.svc.registry.GetRuntime(ctx, r.cfg.ID)
 	if err != nil {
@@ -1323,6 +1319,377 @@ func TestActivationKeepsTheServedHEADOfAReconcileDuringItsPass(t *testing.T) {
 	}
 	if gen := r.rt.resolver.Generation(); rec.ServedCommit != head || rec.ServedGeneration != gen {
 		t.Fatalf("status after the activation serves %s at generation %d; want HEAD %s at generation %d, which the resolver serves", rec.ServedCommit, rec.ServedGeneration, head, gen)
+	}
+}
+
+// resolvedHEADGit sends each HEAD it resolves to resolved while armed.
+type resolvedHEADGit struct {
+	model.GitStore
+	armed    atomic.Bool
+	resolved chan string
+}
+
+func (g *resolvedHEADGit) ResolveHEAD(ctx context.Context, repo model.RepoConfig) (string, string, error) {
+	oid, ref, err := g.GitStore.ResolveHEAD(ctx, repo)
+	if g.armed.Load() {
+		g.resolved <- oid
+	}
+	return oid, ref, err
+}
+
+// treeIndexGit runs before ahead of each BuildTreeIndex.
+type treeIndexGit struct {
+	model.GitStore
+	before func(headOID string)
+}
+
+func (g *treeIndexGit) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headOID string) ([]model.BaseNode, error) {
+	g.before(headOID)
+	return g.GitStore.BuildTreeIndex(ctx, repo, headOID)
+}
+
+// HEAD can move outside the mount during a re-prepare, after the preparation
+// read it. A HEAD reconcile then serves the moved HEAD, and its rebase leaves
+// the watcher no change to signal. The activation keeps what the reconcile
+// serves, whether the reconcile published before the preparation did or
+// after, so the mount and status serve HEAD. The gate held ops during the
+// reconcile, so its pass waits for a worker, which this test holds. The
+// activation still records the end of the preparation only after a pass of
+// its own.
+func TestActivationKeepsTheServedHEADOfAReconcileDuringItsPreparation(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		// beforePublish moves HEAD as the preparation builds the tree it
+		// publishes. Otherwise HEAD moves once the preparation recorded ready.
+		beforePublish bool
+	}{
+		{name: "reconcile after the preparation published"},
+		{name: "reconcile before the preparation published", beforePublish: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			var r *servedAsyncRepo
+			var g *resolvedHEADGit
+			ticks := make(chan time.Time)
+			var armed atomic.Bool
+			var prepared, moved string
+			release := make(chan struct{})
+			defer close(release)
+			// move points HEAD at a new commit with the first commit's tree,
+			// then lets the watcher poll once and waits for the reconcile the
+			// poll signals to end.
+			move := func() {
+				if !armed.CompareAndSwap(true, false) {
+					return
+				}
+				tree := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", r.cfg.GitDir, "rev-parse", "HEAD~1^{tree}"))
+				moved = strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", r.cfg.GitDir, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit-tree", tree, "-p", "HEAD", "-m", "moved"))
+				runCmd(t, "git", "--git-dir", r.cfg.GitDir, "update-ref", "HEAD", moved)
+				g.armed.Store(true)
+				ticks <- time.Now()
+				// The reconcile's resolve, then servesHEAD's after its rebase.
+				for range 2 {
+					if oid := <-g.resolved; oid != moved {
+						t.Errorf("HEAD reconcile resolved %s, want the moved HEAD %s", oid, moved)
+					}
+				}
+				g.armed.Store(false)
+			}
+			r = newServedAsyncRepo(t, func(svc *Service) {
+				svc.headPollTicks = ticks
+				g = &resolvedHEADGit{GitStore: svc.git, resolved: make(chan string, 2)}
+				svc.git = &treeIndexGit{GitStore: g, before: func(headOID string) {
+					if tt.beforePublish && headOID == prepared {
+						move()
+					}
+				}}
+				svc.readyRecorded = func() {
+					if !tt.beforePublish {
+						move()
+					}
+				}
+				svc.passDeferred = func() { <-release }
+			}, nil)
+
+			prepared = commitFile(t, r.remote, "README.md", "two\n")
+			armed.Store(true)
+			if err := r.requestPrepare(ctx, "again"); err != nil {
+				t.Fatal(err)
+			}
+			r.svc.prepareWorkers.Wait()
+			if armed.Load() {
+				t.Fatal("HEAD never moved during the preparation")
+			}
+			if head := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", r.cfg.GitDir, "rev-parse", "HEAD")); head != moved {
+				t.Fatalf("HEAD after the activation = %s, want the moved HEAD %s", head, moved)
+			}
+			readme, err := r.rt.resolver.ResolvePath("README.md")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", r.cfg.GitDir, "rev-parse", moved+":README.md")); readme.Base.ObjectOID != want {
+				t.Errorf("README.md the mount serves after the activation is blob %s, want the moved HEAD's %s", readme.Base.ObjectOID, want)
+			}
+			rec, _, err := r.svc.registry.GetRuntime(ctx, r.cfg.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gen := r.rt.resolver.Generation(); rec.ServedCommit != moved || rec.ServedGeneration != gen {
+				t.Errorf("status after the activation serves %s at generation %d; want the moved HEAD %s at generation %d, which the resolver serves", rec.ServedCommit, rec.ServedGeneration, moved, gen)
+			}
+			select {
+			case pass := <-r.passes:
+				if gen := r.rt.resolver.Generation(); pass.held || pass.gen != gen {
+					t.Errorf("activation's pass at generation %d, with ops held at the gate: %v; want generation %d, which the resolver serves, with the gate open", pass.gen, pass.held, gen)
+				}
+			default:
+				t.Errorf("status after the activation reports %q while no pass since the reconcile's switch invalidated the kernel", rec.State)
+			}
+		})
+	}
+}
+
+// An activation that keeps the generation the mount serves can keep one below
+// its prune bound, the generations before the preparation's own. The prune
+// keeps it, so the mount still serves HEAD's files. The kept generation's
+// files take their times from HEAD's commit, also when the resolver had
+// switched to another generation that an activation then failed to activate.
+func TestActivationKeepsTheGenerationItServesThroughItsPrune(t *testing.T) {
+	t.Parallel()
+	t.Run("a superseded preparation published past it", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		var r *servedAsyncRepo
+		var supersede atomic.Bool
+		var first string
+		r = newServedAsyncRepo(t, func(svc *Service) {
+			// The superseded activation's switch retires the generation the
+			// mount serves, and the retention window does not keep it.
+			svc.generationRetention = time.Nanosecond
+			// A newer request supersedes the preparation as its activation
+			// reads the commit time it switches the resolver with, and the
+			// remote returns to the commit the mount serves.
+			svc.git = &commitTimestampGit{GitStore: svc.git, before: func() {
+				if !supersede.CompareAndSwap(true, false) {
+					return
+				}
+				if err := svc.registry.BeginPrepare(ctx, r.cfg, model.PrepareStatePreparing, "newer"); err != nil {
+					t.Errorf("newer prepare request: %v", err)
+					return
+				}
+				repo, err := svc.registry.GetRepo(ctx, r.cfg.Name)
+				if err != nil {
+					t.Errorf("read the newer request: %v", err)
+					return
+				}
+				svc.resetRunningPrepareState(repo)
+				runCmd(t, "git", "-C", r.remote, "reset", "-q", "--hard", first)
+			}}
+		}, nil)
+		first = strings.TrimSpace(runCmdOutput(t, "git", "-C", r.remote, "rev-parse", "HEAD"))
+
+		// The late commit's time differs from the first's.
+		if err := os.WriteFile(filepath.Join(r.remote, "README.md"), []byte("two\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runCmd(t, "git", "-C", r.remote, "add", "README.md")
+		late := exec.Command("git", "-C", r.remote, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "late")
+		late.Env = append(os.Environ(), "GIT_AUTHOR_DATE=1600000000 +0000", "GIT_COMMITTER_DATE=1600000000 +0000")
+		if out, err := late.CombinedOutput(); err != nil {
+			t.Fatalf("commit to the remote: %v\n%s", err, out)
+		}
+		supersede.Store(true)
+		if err := r.requestPrepare(ctx, "late"); err != nil {
+			t.Fatal(err)
+		}
+		r.svc.prepareWorkers.Wait()
+		if supersede.Load() {
+			t.Fatal("the late preparation never activated")
+		}
+		// The next sync starts the newer request's preparation.
+		if err := r.svc.syncRepos(ctx); err != nil {
+			t.Fatal(err)
+		}
+		r.svc.prepareWorkers.Wait()
+		requireServesHEADFiles(t, r)
+	})
+	t.Run("a pushed moved HEAD prepared after the retention window", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		var r *servedAsyncRepo
+		var g *resolvedHEADGit
+		ticks := make(chan time.Time)
+		var armed atomic.Bool
+		var prepared, moved string
+		// commitMoved makes the same commit in repo as in the git dir: the
+		// first commit's tree on prepared, at a fixed time.
+		commitMoved := func(repo ...string) string {
+			tree := strings.TrimSpace(runCmdOutput(t, "git", append(repo, "rev-parse", prepared+"~1^{tree}")...))
+			cmd := exec.Command("git", append(repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit-tree", tree, "-p", prepared, "-m", "moved")...)
+			cmd.Env = append(os.Environ(), "GIT_AUTHOR_DATE=1700000000 +0000", "GIT_COMMITTER_DATE=1700000000 +0000")
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("commit-tree in %v: %v", repo, err)
+			}
+			return strings.TrimSpace(string(out))
+		}
+		r = newServedAsyncRepo(t, func(svc *Service) {
+			svc.headPollTicks = ticks
+			svc.generationRetention = time.Nanosecond
+			g = &resolvedHEADGit{GitStore: svc.git, resolved: make(chan string, 2)}
+			// HEAD moves as the preparation builds its tree, and the
+			// reconcile a poll signals serves it before the preparation
+			// publishes.
+			svc.git = &treeIndexGit{GitStore: g, before: func(headOID string) {
+				if headOID != prepared || !armed.CompareAndSwap(true, false) {
+					return
+				}
+				moved = commitMoved("--git-dir", r.cfg.GitDir)
+				runCmd(t, "git", "--git-dir", r.cfg.GitDir, "update-ref", "HEAD", moved)
+				g.armed.Store(true)
+				ticks <- time.Now()
+				for range 2 {
+					<-g.resolved
+				}
+				g.armed.Store(false)
+			}}
+		}, nil)
+
+		prepared = commitFile(t, r.remote, "README.md", "two\n")
+		armed.Store(true)
+		if err := r.requestPrepare(ctx, "again"); err != nil {
+			t.Fatal(err)
+		}
+		r.svc.prepareWorkers.Wait()
+		if armed.Load() {
+			t.Fatal("HEAD never moved during the preparation")
+		}
+		// The remote gets the moved HEAD, and the repo prepares again.
+		if pushed := commitMoved("-C", r.remote); pushed != moved {
+			t.Fatalf("remote's moved commit = %s, want %s", pushed, moved)
+		}
+		runCmd(t, "git", "-C", r.remote, "reset", "-q", "--hard", moved)
+		if err := r.requestPrepare(ctx, "pushed"); err != nil {
+			t.Fatal(err)
+		}
+		r.svc.prepareWorkers.Wait()
+		requireServesHEADFiles(t, r)
+	})
+}
+
+// bootstrapGit runs after once each clean-index bootstrap has returned.
+type bootstrapGit struct {
+	model.GitStore
+	after func()
+}
+
+func (g *bootstrapGit) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.RepoConfig, snapshotOID string, validate func() (bool, error)) (bool, error) {
+	bootstrapped, err := g.GitStore.BootstrapCleanIndexForFSMonitor(ctx, repo, snapshotOID, validate)
+	g.after()
+	return bootstrapped, err
+}
+
+// requireServesHEADFiles fails t unless r's mount serves the README.md of
+// r's HEAD, with the times of HEAD's commit.
+func requireServesHEADFiles(t *testing.T, r *servedAsyncRepo) {
+	t.Helper()
+	gen := r.rt.resolver.Generation()
+	if got, want := r.rt.resolver.CommitTime(), strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", r.cfg.GitDir, "log", "-1", "--format=%ct", "HEAD")); strconv.FormatInt(got, 10) != want {
+		t.Errorf("commit time at generation %d, which the resolver serves, = %d, want HEAD's %s", gen, got, want)
+	}
+	readme, err := r.rt.resolver.ResolvePath("README.md")
+	if err != nil {
+		t.Fatalf("README.md at generation %d, which the resolver serves: %v", gen, err)
+	}
+	if want := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", r.cfg.GitDir, "rev-parse", "HEAD:README.md")); readme.Base.ObjectOID != want {
+		t.Fatalf("README.md at generation %d, which the resolver serves, is blob %s, want HEAD's %s", gen, readme.Base.ObjectOID, want)
+	}
+}
+
+// The activation's clean-index bootstrap marks the index entries of the
+// preparation's commit valid for the fsmonitor hook. HEAD can move right
+// after the bootstrap read it. Whichever of the activation and the reconcile
+// a poll signals switches first, the change log then names README.md, whose
+// content the mount serves differs from its bootstrapped entry, so Git
+// checks it again.
+func TestChangeLogCoversAHEADMoveAfterTheActivationsBootstrap(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	var r *servedAsyncRepo
+	var g *resolvedHEADGit
+	ticks := make(chan time.Time)
+	var armed, waited atomic.Bool
+	var bootstrapSeq int64
+	r = newServedAsyncRepo(t, func(svc *Service) {
+		svc.headPollTicks = ticks
+		g = &resolvedHEADGit{GitStore: svc.git, resolved: make(chan string, 2)}
+		svc.git = &bootstrapGit{GitStore: g, after: func() {
+			if !armed.CompareAndSwap(true, false) {
+				return
+			}
+			changes, _, err := overlay.ReadChangesSince(ctx, r.cfg.RepoPaths, 0)
+			if err != nil {
+				t.Errorf("read the change log after the bootstrap: %v", err)
+			}
+			bootstrapSeq = changes.Seq
+			tree := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", r.cfg.GitDir, "rev-parse", "HEAD~1^{tree}"))
+			moved := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", r.cfg.GitDir, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit-tree", tree, "-p", "HEAD", "-m", "moved"))
+			runCmd(t, "git", "--git-dir", r.cfg.GitDir, "update-ref", "HEAD", moved)
+			g.armed.Store(true)
+			// A reconcile waits while the activation holds headMu; otherwise
+			// it switches first.
+			if r.rt.headMu.TryLock() {
+				r.rt.headMu.Unlock()
+				ticks <- time.Now()
+				for range 2 {
+					<-g.resolved
+				}
+				waited.Store(true)
+				return
+			}
+			go func() { ticks <- time.Now() }()
+		}}
+	}, nil)
+
+	commitFile(t, r.remote, "README.md", "two\n")
+	armed.Store(true)
+	if err := r.requestPrepare(ctx, "again"); err != nil {
+		t.Fatal(err)
+	}
+	r.svc.prepareWorkers.Wait()
+	if armed.Load() {
+		t.Fatal("the activation never bootstrapped the index")
+	}
+	if !waited.Load() {
+		for range 2 {
+			<-g.resolved
+		}
+	}
+	g.armed.Store(false)
+	// A hook that names no path: Git trusts every entry marked valid.
+	hook := filepath.Join(t.TempDir(), "fsmonitor")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if valid := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", r.cfg.GitDir, "--work-tree", r.cfg.MountPath, "-c", "core.fsmonitor="+hook, "ls-files", "-f", "README.md")); !strings.HasPrefix(valid, "h ") {
+		t.Fatalf("README.md's index entry after the bootstrap = %q, want it marked valid for the fsmonitor hook", valid)
+	}
+	indexBlob := strings.Fields(runCmdOutput(t, "git", "--git-dir", r.cfg.GitDir, "ls-files", "-s", "README.md"))[1]
+	readme, err := r.rt.resolver.ResolvePath("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readme.Base.ObjectOID == indexBlob {
+		t.Fatalf("the mount serves README.md's bootstrapped blob %s, want the moved HEAD's", indexBlob)
+	}
+	changes, _, err := overlay.ReadChangesSince(ctx, r.cfg.RepoPaths, bootstrapSeq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(changes.Paths, "README.md") {
+		t.Fatalf("change log since the bootstrap = %v; want README.md, whose index entry is valid at blob %s while the mount serves %s", changes.Paths, indexBlob, readme.Base.ObjectOID)
 	}
 }
 

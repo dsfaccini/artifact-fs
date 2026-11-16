@@ -193,9 +193,9 @@ func (s *Service) logSwitchedAfterCacheTTL(rt *repoRuntime, name string, switche
 	})
 }
 
-// pruneGenerations prunes snap's generations below keepFrom, except those
-// that rt, when not nil, retired within the retention window, and those its
-// serving mount's open files read. An inode whose attributes the kernel received
+// pruneGenerations prunes snap's generations below keepFrom and, when rt is
+// not nil, below the one its resolver serves, except those rt retired within
+// the retention window, and those its serving mount's open files read. An inode whose attributes the kernel received
 // before a switch keeps reading the generation they came from until it asks
 // again. It then records the generations it kept for open files. The caller
 // holds rt.headMu when rt is not nil, so prunes record them one at a time.
@@ -203,6 +203,7 @@ func (s *Service) pruneGenerations(ctx context.Context, rt *repoRuntime, snap *s
 	var open []int64
 	var mfs fusefs.MountedFS
 	if rt != nil {
+		keepFrom = min(keepFrom, rt.resolver.Generation())
 		s.mu.Lock()
 		serving := rt.mount == mountServing
 		if serving {

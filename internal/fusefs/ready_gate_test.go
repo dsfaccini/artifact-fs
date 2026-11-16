@@ -52,3 +52,21 @@ func TestReadyGateMarkReadyAfterFailureRecovers(t *testing.T) {
 		t.Fatalf("Wait after failure/ready: %v", err)
 	}
 }
+
+// A Reset while a switch pass runs holds ops only once the pass ends. A
+// MarkReady before then replaces the Reset, as when a preparation ends ready
+// during a pass that waited for the gate, so the gate stays open.
+func TestReadyGateMarkReadyDuringAPassReplacesItsReset(t *testing.T) {
+	g := NewReadyGate(true)
+	if !g.StartPass() {
+		t.Fatal("StartPass on an open gate started no pass")
+	}
+	g.Reset()
+	g.MarkReady()
+	g.EndPass()
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := g.Wait(canceled); err != nil {
+		t.Fatalf("Wait after the pass = %v, want the gate open", err)
+	}
+}
