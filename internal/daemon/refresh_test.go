@@ -170,3 +170,28 @@ func TestFetchCommandWaitsForAPreparationOfItsRepo(t *testing.T) {
 		t.Fatalf("origin/main after the fetch command = %s, want the remote's tip %s", got, tip)
 	}
 }
+
+// The fetch command reads the repo again once it holds the prepare lock: what
+// held the lock can have changed the repo's fetch ref or refresh policy. Here
+// set-refresh turns the refresh off while the command waits, and the command
+// refuses the repo instead of fetching it.
+func TestFetchCommandReadsTheRepoAgainUnderTheLock(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	fetched := make(chan error, 1)
+	newLockedPreparation(t, func(f *lockedPreparation) {
+		go func() { fetched <- f.svc.ctl().FetchNow(ctx, f.cfg.Name) }()
+		select {
+		case err := <-fetched:
+			fetched <- fmt.Errorf("the fetch command returned %v while a preparation of its repo held the prepare lock", err)
+			return
+		case <-f.busy:
+		}
+		if err := f.svc.ctl().SetRefresh(ctx, f.cfg.Name, model.RefreshPolicy{RemoteRefreshDisabled: true}); err != nil {
+			t.Errorf("set-refresh while the fetch command waits: %v", err)
+		}
+	})
+	if err := <-fetched; err == nil || !strings.Contains(err.Error(), "remote refresh is disabled") {
+		t.Fatalf("fetch command after set-refresh turned the refresh off = %v, want it refused", err)
+	}
+}

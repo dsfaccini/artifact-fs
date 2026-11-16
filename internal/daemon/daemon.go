@@ -32,6 +32,10 @@ const (
 	// fusefs.CacheTTL after the resolver stops serving it, so attributes the
 	// kernel received just before or just after the switch expire first.
 	defaultGenerationRetention = 2 * fusefs.CacheTTL
+	// fetchTimeout bounds what a refresh and a fetch command run under the
+	// repo's prepare lock, which every preparation and refresh of the repo
+	// waits for.
+	fetchTimeout = 30 * time.Second
 )
 
 const (

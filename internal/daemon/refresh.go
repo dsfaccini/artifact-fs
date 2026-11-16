@@ -63,7 +63,7 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 			var state aheadBehind
 			var abErr error
 			err := s.withRepoPrepareLock(rt.ctx, cfg.Name, func() error {
-				ctx, cancel := context.WithTimeout(rt.ctx, 30*time.Second)
+				ctx, cancel := context.WithTimeout(rt.ctx, fetchTimeout)
 				defer cancel()
 				if err := s.git.FetchNonInteractive(ctx, cfg); err != nil {
 					return err

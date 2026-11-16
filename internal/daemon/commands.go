@@ -241,6 +241,33 @@ func (s *Controller) FetchNow(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
+	if err := fetchable(cfg); err != nil {
+		return err
+	}
+	// A preparation and a refresh fetch into the same tracking ref, and two
+	// fetches that overlap fail each other's ref update. The check above
+	// refuses a repo the registry shows preparing, so the command does not
+	// wait out that preparation.
+	return s.withRepoPrepareLock(ctx, cfg.Name, func() error {
+		// What held the lock can have changed the repo's fetch ref or
+		// refresh policy.
+		cfg, err := s.registry.GetRepo(ctx, name)
+		if err != nil {
+			return err
+		}
+		if err := fetchable(cfg); err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(ctx, fetchTimeout)
+		defer cancel()
+		// Status reads the fetch from FETCH_HEAD. Ahead and behind come from
+		// the daemon's next refresh.
+		return s.git.FetchNonInteractive(ctx, cfg)
+	})
+}
+
+// fetchable returns why the fetch command refuses cfg, or nil.
+func fetchable(cfg model.RepoConfig) error {
 	if cfg.PrepareState == model.PrepareStatePreparing || cfg.PrepareState == model.PrepareStateSyncPreparing {
 		return fusefs.ErrRepoNotReady
 	}
@@ -250,15 +277,7 @@ func (s *Controller) FetchNow(ctx context.Context, name string) error {
 	if cfg.RemoteRefreshDisabled {
 		return errors.New("remote refresh is disabled for this repository")
 	}
-	// A preparation and a refresh fetch into the same tracking ref, and two
-	// fetches that overlap fail each other's ref update. The checks above
-	// refuse a repo the registry shows preparing, so the command does not
-	// wait out that preparation.
-	return s.withRepoPrepareLock(ctx, cfg.Name, func() error {
-		// Status reads the fetch from FETCH_HEAD. Ahead and behind come from
-		// the daemon's next refresh.
-		return s.git.FetchNonInteractive(ctx, cfg)
-	})
+	return nil
 }
 
 // Prepare asks for a new preparation of name. A sync repo prepares in the
