@@ -961,8 +961,10 @@ func testE2EGitResetHardCleanAndStash(t *testing.T, repo *mountedE2ERepo) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Mode().Perm() != 0o644 {
-		t.Fatalf("README.md mode after reset --hard = %#o, want 0644", st.Mode().Perm())
+	// Git writes the file with the umask applied, which decides group and
+	// other write.
+	if st.Mode().Perm()&^0o022 != 0o644 {
+		t.Fatalf("README.md mode after reset --hard = %#o, want 0644 apart from group and other write", st.Mode().Perm())
 	}
 
 	untrackedDir := filepath.Join(repo.mountPath, "untracked-dir")

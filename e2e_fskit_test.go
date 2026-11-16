@@ -151,7 +151,7 @@ func TestSharedMountReadOnlyTestChangesMountHelper(t *testing.T) {
 
 	ctx := context.Background()
 	remoteURL := createLocalTestRepo(t)
-	root := t.TempDir()
+	root := privateE2EStateRoot(t)
 	mountDir := t.TempDir()
 	logs := &synchronizedBuffer{}
 	svc, err := daemon.New(ctx, root, newE2ELogger(logs))
