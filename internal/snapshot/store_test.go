@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -56,6 +57,49 @@ func TestPublishAndLookupNode(t *testing.T) {
 	_, ok = lookupNode(t, s, gen, "nonexistent")
 	if ok {
 		t.Fatal("expected not found")
+	}
+}
+
+// LookupNode runs a statement the store prepared once, and modernc keeps its
+// SQLite handle across calls. modernc resets the handle when the rows close,
+// also after a Scan fails on a row. A handle left on its row would keep its
+// connection's read transaction open, so every later lookup on that
+// connection would miss the commits made since.
+func TestLookupNodeAfterAFailedScanSeesLaterCommits(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "snap.sqlite")
+	s, err := New(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	// Every lookup runs on the one connection, through the one handle.
+	s.db.SetMaxOpenConns(1)
+	gen, err := s.PublishGeneration(ctx, "head1", "main", []model.BaseNode{
+		{RepoID: "r", Path: ".", Type: "dir", Mode: 0o755, SizeState: "known"},
+		{RepoID: "r", Path: "f", Type: "file", Mode: 0o644, ObjectOID: "abc123", SizeState: "known", SizeBytes: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := meta.OpenDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	// Scan fails on a text size_bytes, after the step returned the row.
+	if _, err := writer.ExecContext(ctx, `UPDATE base_nodes SET size_bytes='x' WHERE generation=? AND path='f'`, gen); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.LookupNode(ctx, gen, "f"); err == nil {
+		t.Fatal("lookup of a text size_bytes succeeded, want a Scan error")
+	}
+	if _, err := writer.ExecContext(ctx, `UPDATE base_nodes SET size_bytes=7 WHERE generation=? AND path='f'`, gen); err != nil {
+		t.Fatal(err)
+	}
+	n, ok := lookupNode(t, s, gen, "f")
+	if !ok || n.SizeBytes != 7 {
+		t.Fatalf("lookup after a commit found %v, %+v; want size 7", ok, n)
 	}
 }
 
