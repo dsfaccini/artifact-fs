@@ -150,26 +150,37 @@ func normalizeSource(cfg *model.RepoConfig, opts AddRepoOptions) error {
 	return nil
 }
 
+// RemoveRepo unregisters name. For an adopted worktree it first waits for the
+// repo's prepare lock, which guards the git dir's config that the release
+// writes, so no preparation or mount of the repo pins a setting after the
+// release. A regular repo's removal writes no git config and does not wait
+// for a preparation of the repo.
 func (s *Controller) RemoveRepo(ctx context.Context, name string) error {
 	cfg, err := s.registry.GetRepo(ctx, name)
 	if err != nil {
 		return err
 	}
-	return s.withRepoConfigLock(ctx, cfg.Name, func() error {
-		latest, err := s.registry.GetRepo(ctx, name)
-		if err != nil {
-			return err
-		}
-		if latest.ConfigVersion != cfg.ConfigVersion {
-			return registry.ErrRepoChanged
-		}
-		if latest.AdoptGitDir {
-			if err := s.git.ReleaseAdoptedWorktree(ctx, latest); err != nil {
+	remove := func() error {
+		return s.withRepoConfigLock(ctx, cfg.Name, func() error {
+			latest, err := s.registry.GetRepo(ctx, name)
+			if err != nil {
 				return err
 			}
-		}
-		return s.registry.RemoveRepo(ctx, name)
-	})
+			if latest.ConfigVersion != cfg.ConfigVersion {
+				return registry.ErrRepoChanged
+			}
+			if latest.AdoptGitDir {
+				if err := s.git.ReleaseAdoptedWorktree(ctx, latest); err != nil {
+					return err
+				}
+			}
+			return s.registry.RemoveRepo(ctx, name)
+		})
+	}
+	if !cfg.AdoptGitDir {
+		return remove()
+	}
+	return s.withRepoPrepareLock(ctx, cfg.Name, remove)
 }
 
 func (s *Controller) ListRepos(ctx context.Context) ([]model.RepoConfig, error) {

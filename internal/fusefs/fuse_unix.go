@@ -763,8 +763,7 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	now := time.Now()
 	// Each identity the pass resolves is at gen while the generation has not
 	// moved since.
-	gen := fs.engine.Generation()
-	listings, allListings := fs.engine.SwitchedListings()
+	gen, listings, allListings := fs.engine.SwitchedListings()
 	fs.mu.RLock()
 	notifier := fs.notifier
 	send = send && notifier != nil

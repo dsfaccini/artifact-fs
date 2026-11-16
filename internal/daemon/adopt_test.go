@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -10,9 +11,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -748,5 +751,278 @@ func TestAdoptedMountConfiguresWorktreeOnce(t *testing.T) {
 	// ConfigureAdoptedWorktree is the only caller of --git-common-dir.
 	if got := strings.Count(string(data), "rev-parse --path-format=absolute --git-common-dir\n"); got != 1 {
 		t.Fatalf("adopted mount validated the worktree %d times, want 1:\n%s", got, data)
+	}
+}
+
+// configHookGit runs beforeAdopt ahead of each ConfigureAdoptedWorktree and
+// beforeStatus ahead of each ConfigureStatusOptimization.
+type configHookGit struct {
+	model.GitStore
+	beforeAdopt, beforeStatus func()
+}
+
+func (g *configHookGit) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoConfig) error {
+	runHook(g.beforeAdopt)
+	return g.GitStore.ConfigureAdoptedWorktree(ctx, repo)
+}
+
+func (g *configHookGit) ConfigureStatusOptimization(ctx context.Context, repo model.RepoConfig, stateRoot string) error {
+	runHook(g.beforeStatus)
+	return g.GitStore.ConfigureStatusOptimization(ctx, repo, stateRoot)
+}
+
+// adoptedRemoval is an adopted worktree registered with a daemon that has not
+// synced yet and mounts through mount. Once armed, remove runs remove-repo of
+// the worktree from a hook at the step under test.
+type adoptedRemoval struct {
+	svc            *Service
+	git            *configHookGit
+	cfg            model.RepoConfig
+	worktreeConfig string
+	mount          mountFunc
+	armed          atomic.Bool
+	busy           chan struct{}
+	removed        chan error
+}
+
+func newAdoptedRemoval(t *testing.T) *adoptedRemoval {
+	t.Helper()
+	ctx := t.Context()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, worktree := filepath.Join(dir, "source"), filepath.Join(dir, "worktree")
+	runCmd(t, "git", "init", "--initial-branch=main", source)
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", source, "add", "README.md")
+	runCmd(t, "git", "-C", source, "-c", "user.name=test", "-c", "user.email=test@invalid", "commit", "-m", "base")
+	runCmd(t, "git", "-C", source, "worktree", "add", "--no-checkout", "-b", "topic", worktree)
+	gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
+	runCmd(t, "git", "--git-dir", gitDir, "read-tree", "HEAD")
+	if err := os.Rename(filepath.Join(worktree, ".git"), filepath.Join(dir, "topic.gitfile")); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := New(ctx, filepath.Join(dir, "state"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { svc.Close() })
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "adopted", GitDir: gitDir, MountPath: worktree}, RepoSpec: model.RepoSpec{AdoptGitDir: true}, Enabled: true}
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = svc.registry.GetRepo(ctx, cfg.Name); err != nil {
+		t.Fatal(err)
+	}
+	f := &adoptedRemoval{svc: svc, git: &configHookGit{GitStore: svc.git}, cfg: cfg, worktreeConfig: filepath.Join(gitDir, "config.worktree"), mount: fakeMount, busy: make(chan struct{}, 1), removed: make(chan error, 1)}
+	svc.git = f.git
+	svc.lockBusy = func(lockName string) {
+		if lockName != cfg.Name+".prepare.lock" {
+			return
+		}
+		select {
+		case f.busy <- struct{}{}:
+		default:
+		}
+	}
+	svc.mount = func(ctx, opCtx context.Context, repo model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
+		return f.mount(ctx, opCtx, repo, engine, gate, logger, redact)
+	}
+	return f
+}
+
+// remove starts remove-repo of the worktree once armed, and returns once
+// remove-repo waits for the repo's prepare lock or has returned.
+func (f *adoptedRemoval) remove() {
+	if !f.armed.CompareAndSwap(true, false) {
+		return
+	}
+	go func() { f.removed <- f.svc.ctl().RemoveRepo(context.Background(), f.cfg.Name) }()
+	select {
+	case <-f.busy:
+	case err := <-f.removed:
+		f.removed <- err
+	}
+}
+
+// requireReleased fails t unless remove-repo ran, succeeded, and left none of
+// the settings an adopted mount pins in the worktree's config.worktree.
+func (f *adoptedRemoval) requireReleased(t *testing.T) {
+	t.Helper()
+	if f.armed.Load() {
+		t.Fatal("the step under test never ran")
+	}
+	if err := <-f.removed; err != nil {
+		t.Fatalf("remove-repo: %v", err)
+	}
+	if _, err := f.svc.registry.GetRepo(t.Context(), f.cfg.Name); err == nil {
+		t.Fatal("repo still registered after remove-repo")
+	}
+	var left []string
+	for _, key := range []string{"core.fsmonitor", "fsmonitor.allowRemote", "core.untrackedCache", "core.filemode", "core.ignorecase", "core.symlinks"} {
+		out, err := exec.Command("git", "config", "--file", f.worktreeConfig, "--get", key).Output()
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && exitErr.ExitCode() == 1 {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("read %s: %v", key, err)
+		}
+		left = append(left, key+"="+strings.TrimSpace(string(out)))
+	}
+	if len(left) != 0 {
+		t.Fatalf("remove-repo left %v in config.worktree", left)
+	}
+}
+
+// Remove-repo of an adopted worktree waits for the daemon's mount check of
+// it. Otherwise the mount check pins settings in config.worktree after
+// remove-repo released them, and no later step unsets them.
+func TestRemoveRepoWaitsForTheMountCheckOfAnAdoptedWorktree(t *testing.T) {
+	t.Parallel()
+	for _, step := range []string{"worktree config", "mount", "status config"} {
+		t.Run(step, func(t *testing.T) {
+			t.Parallel()
+			f := newAdoptedRemoval(t)
+			switch step {
+			case "worktree config":
+				f.git.beforeAdopt = f.remove
+			case "mount":
+				f.mount = func(ctx, opCtx context.Context, repo model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
+					f.remove()
+					return fakeMount(ctx, opCtx, repo, engine, gate, logger, redact)
+				}
+			case "status config":
+				f.git.beforeStatus = f.remove
+			}
+			f.armed.Store(true)
+			if err := f.svc.syncRepos(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			f.requireReleased(t)
+		})
+	}
+}
+
+// A mount that the sync loop retries writes the status config under the
+// repo's prepare lock, and only while the repo's config is the registry's.
+// Remove-repo during the retried mount, or during its status config write,
+// then leaves no setting behind.
+func TestRemoveRepoDuringARetriedMountOfAnAdoptedWorktree(t *testing.T) {
+	t.Parallel()
+	for _, step := range []string{"mount", "status config"} {
+		t.Run(step, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			f := newAdoptedRemoval(t)
+			var mounts atomic.Int32
+			f.mount = func(ctx, opCtx context.Context, repo model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
+				if mounts.Add(1) == 1 {
+					return nil, errors.New("the first mount fails")
+				}
+				if step == "mount" {
+					f.remove()
+				}
+				return fakeMount(ctx, opCtx, repo, engine, gate, logger, redact)
+			}
+			if step == "status config" {
+				f.git.beforeStatus = f.remove
+			}
+			if err := f.svc.syncRepos(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if mounts.Load() != 1 {
+				t.Fatalf("the mount check mounted %d times, want 1", mounts.Load())
+			}
+			f.armed.Store(true)
+			if err := f.svc.syncRepos(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if mounts.Load() != 2 {
+				t.Fatalf("the sync after a failed mount mounted %d times in all, want 2", mounts.Load())
+			}
+			f.requireReleased(t)
+		})
+	}
+}
+
+// A retried mount runs on the sync loop and never waits for the prepare
+// lock, which a preparation can hold for up to its timeout. It skips the
+// status config while another step holds the lock, and a later sync writes
+// it.
+func TestRetriedMountSkipsTheStatusConfigWhileThePrepareLockIsHeld(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	f := newAdoptedRemoval(t)
+	var mounts atomic.Int32
+	f.mount = func(ctx, opCtx context.Context, repo model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
+		if mounts.Add(1) == 1 {
+			return nil, errors.New("the first mount fails")
+		}
+		return fakeMount(ctx, opCtx, repo, engine, gate, logger, redact)
+	}
+	if err := f.svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The mount check's clean-index bootstrap wrote the hook. Unset it, so
+	// core.fsmonitor shows whether the retried mount writes the status config.
+	runCmd(t, "git", "config", "--file", f.worktreeConfig, "--unset", "core.fsmonitor")
+	held, release, unlocked := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		unlocked <- f.svc.withRepoPrepareLock(ctx, f.cfg.Name, func() error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	synced := make(chan error, 1)
+	go func() { synced <- f.svc.syncRepos(ctx) }()
+	select {
+	case err := <-synced:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-f.busy:
+		close(release)
+		t.Fatal("the retried mount waited for the prepare lock that another step held")
+	}
+	close(release)
+	if err := <-unlocked; err != nil {
+		t.Fatal(err)
+	}
+	if mounts.Load() != 2 {
+		t.Fatalf("the sync after a failed mount mounted %d times in all, want 2", mounts.Load())
+	}
+	if got := strings.TrimSpace(runCmdOutput(t, "git", "config", "--file", f.worktreeConfig, "--get", "core.filemode")); got != "true" {
+		t.Fatalf("core.filemode = %q after the mount check, want true", got)
+	}
+	if out, err := exec.Command("git", "config", "--file", f.worktreeConfig, "--get", "core.fsmonitor").Output(); err == nil {
+		t.Fatalf("core.fsmonitor = %q after a retried mount while another step held the prepare lock, want it unset", out)
+	}
+}
+
+// Remove-repo of a regular repo does not wait for a preparation of it, which
+// can hold the prepare lock through a clone for up to its timeout.
+func TestRemoveRepoOfARegularRepoDoesNotWaitForItsPreparation(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	removed := make(chan error, 1)
+	f := newLockedPreparation(t, func(f *lockedPreparation) {
+		go func() { removed <- f.svc.ctl().RemoveRepo(ctx, f.cfg.Name) }()
+		select {
+		case err := <-removed:
+			removed <- err
+		case <-f.busy:
+			t.Error("remove-repo of a regular repo waited for a preparation that held its prepare lock")
+		}
+	})
+	if err := <-removed; err != nil {
+		t.Fatalf("remove-repo: %v", err)
+	}
+	if _, err := f.svc.registry.GetRepo(ctx, f.cfg.Name); err == nil {
+		t.Fatal("repo still registered after remove-repo")
 	}
 }

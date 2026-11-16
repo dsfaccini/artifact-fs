@@ -962,6 +962,59 @@ func TestSwitchPassInvalidatesTheDirectoriesWhoseListingTheSwitchChanged(t *test
 	}
 }
 
+// A switch that lands while a switch pass takes its listing changes leaves
+// its own to the next pass. The pass skips a directory whose last reply came
+// at the generation it compares at, so a pass that took a later switch's
+// changes with an earlier generation would skip a directory that switch
+// relisted, and no later pass would find the change.
+func TestASwitchDuringAPassLeavesItsListingChangesToTheNextPass(t *testing.T) {
+	f := newCacheFixture(t, dirTimesNodes...)
+	d := f.lookup(fuseops.RootInodeID, "d")
+	// The first switch changes only e's listing.
+	nodes1 := append(slices.Clone(dirTimesNodes), baseFile("e/c.txt", "c", 0o100644))
+	nodes1[slices.IndexFunc(nodes1, func(n model.BaseNode) bool { return n.Path == "e" })] = baseDir("e", "e2")
+	f.switchTo(nodes1...)
+	// A reply at the first switch's generation carries d's times.
+	f.getattr(d)
+	// The second switch changes d's listing.
+	nodes2 := append(slices.Clone(nodes1), baseFile("d/new.txt", "new", 0o100644))
+	nodes2[slices.IndexFunc(nodes2, func(n model.BaseNode) bool { return n.Path == "d" })] = baseDir("d", "d2")
+	gen2 := f.publish(nodes2...)
+	// The first pass starts the second switch as it takes its listing
+	// changes, and goes on once the switch has landed or waits for the
+	// transition lock.
+	var started bool
+	var switchErr error
+	switched := make(chan struct{})
+	f.resolver.testHookBeforeTakeListings = func() {
+		if started {
+			return
+		}
+		started = true
+		go func() {
+			defer close(switched)
+			_, switchErr = f.resolver.SwitchGeneration(f.ctx, gen2, 0)
+		}()
+		waitParked(switched, "sync.(*RWMutex).Lock", "(*Store).ReconcileChecked")
+	}
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if !started {
+		t.Fatal("the pass took its listing changes without starting the second switch")
+	}
+	<-switched
+	if switchErr != nil {
+		t.Fatal(switchErr)
+	}
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if inodes, _ := f.notifier.recorded(); !slices.Contains(inodes, d) {
+		t.Errorf("invalidated inodes = %v, want d's %d, whose listing the second switch changed", inodes, d)
+	}
+}
+
 // MkDir replies with the times getattr then reports for the directory it
 // made, so the kernel's view of them does not move without a change.
 func TestMkDirRepliesWithTheTimesGetattrReports(t *testing.T) {
