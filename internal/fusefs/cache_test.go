@@ -17,6 +17,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unsafe"
 
@@ -1212,6 +1213,238 @@ func TestLateReplyKeepsTheNewerGeneration(t *testing.T) {
 	}
 	if got := string(bytes.Join(read.Data, nil)); got != "new" || uint64(len(got)) != getattr.Attributes.Size {
 		t.Fatalf("read after the kernel took the %d-byte size of the newer reply = %q, want %q", getattr.Attributes.Size, got, "new")
+	}
+}
+
+// switchDuringLookup makes the next lookup's resolve land before a switch to
+// nodes and its pass, and its record after them.
+func (f *cacheFixture) switchDuringLookup(nodes ...model.BaseNode) {
+	f.fs.testHookAfterLookupResolve = func() {
+		f.fs.testHookAfterLookupResolve = nil
+		f.switchTo(nodes...)
+		if err := f.mount.InvalidateChanged(); err != nil {
+			f.t.Fatal(err)
+		}
+	}
+}
+
+// A lookup that resolved before a switch and records its reply after the
+// switch pass read the inode table gets no invalidation from the pass, so
+// the kernel would cache the old size and read the old blob. The lookup
+// resolves again at the generation the switch made.
+func TestLookupThatASwitchOverlapsResolvesAgain(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "old-content", 0o100644))
+	f.switchDuringLookup(baseFile("file.txt", "new", 0o100644))
+	op := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "file.txt"}
+	if err := f.fs.LookUpInode(f.ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	read := &fuseops.ReadFileOp{Inode: op.Entry.Child, Handle: f.open(op.Entry.Child).Handle, Size: 64}
+	if err := f.fs.ReadFile(f.ctx, read); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(bytes.Join(read.Data, nil)); op.Entry.Attributes.Size != uint64(len("new")) || got != "new" {
+		t.Fatalf("lookup across the switch replied with size %d and reads %q, want %d and %q", op.Entry.Attributes.Size, got, len("new"), "new")
+	}
+}
+
+// A lookup that missed a name before a switch added it, and records its
+// negative entry after the switch pass read the negative entries, gets no
+// invalidation from the pass, so the kernel would answer ENOENT for a file
+// that exists. The lookup resolves again at the generation the switch made.
+func TestNegativeLookupThatASwitchOverlapsResolvesAgain(t *testing.T) {
+	if !negativeLookupEntries {
+		t.Skip("the mount caches no negative entries on this platform")
+	}
+	f := newCacheFixture(t)
+	f.switchDuringLookup(baseFile("new.txt", "new", 0o100644))
+	op := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "new.txt"}
+	if err := f.fs.LookUpInode(f.ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	if op.Entry.Child == 0 || op.Entry.Attributes.Size != uint64(len("new")) {
+		t.Fatalf("lookup across the switch that added new.txt replied with inode %d of size %d, want an inode of size %d", op.Entry.Child, op.Entry.Attributes.Size, len("new"))
+	}
+}
+
+// lateKernel is a kernel to which the replies for some inodes and names are
+// still on their way, so it answers the first misses of each with ENOENT. It
+// answers every invalidation of forgotten with ENOENT, and the mount gets
+// forgotten's FORGET with the first.
+type lateKernel struct {
+	*recordingNotifier
+	fs         *ArtifactFuse
+	misses     map[fuseops.InodeID]int
+	nameMisses map[string]int
+	forgotten  fuseops.InodeID
+	// sends and nameSends count the invalidations of each inode and name.
+	sends     map[fuseops.InodeID]int
+	nameSends map[string]int
+}
+
+// lateKernelFor makes a lateKernel the notifier of f's mount.
+func lateKernelFor(f *cacheFixture) *lateKernel {
+	k := &lateKernel{recordingNotifier: f.notifier, fs: f.fs, misses: map[fuseops.InodeID]int{}, nameMisses: map[string]int{}, sends: map[fuseops.InodeID]int{}, nameSends: map[string]int{}}
+	f.fs.setNotifier(k)
+	return k
+}
+
+func (k *lateKernel) InvalidateInode(inode fuseops.InodeID, offset, length int64) error {
+	k.sends[inode]++
+	if inode == k.forgotten {
+		if k.sends[inode] == 1 {
+			_ = k.fs.ForgetInode(context.Background(), &fuseops.ForgetInodeOp{Inode: inode, N: 1})
+		}
+		return syscall.ENOENT
+	}
+	if k.misses[inode] > 0 {
+		k.misses[inode]--
+		return syscall.ENOENT
+	}
+	return k.recordingNotifier.InvalidateInode(inode, offset, length)
+}
+
+func (k *lateKernel) InvalidateEntry(parent fuseops.InodeID, name string) error {
+	k.nameSends[name]++
+	if k.nameMisses[name] > 0 {
+		k.nameMisses[name]--
+		return syscall.ENOENT
+	}
+	return k.recordingNotifier.InvalidateEntry(parent, name)
+}
+
+// A lookup the mount recorded before the switch pass read the inode table
+// can reach the kernel after the pass's invalidations, which the kernel
+// answers with ENOENT and forgets. Linux then caches the old size, or the
+// name the switch removed. The pass sends such an invalidation again while
+// the mount holds the inode, and stops at the inode's FORGET.
+func TestSwitchPassSendsAnInvalidationAgainUntilItsReplyArrives(t *testing.T) {
+	f := newCacheFixture(t,
+		baseFile("edited.txt", "edited-1", 0o100644),
+		baseFile("gone.txt", "gone", 0o100644),
+		baseFile("forgotten.txt", "forgotten-1", 0o100644),
+	)
+	var root fuseops.InodeID = fuseops.RootInodeID
+	edited := f.lookup(root, "edited.txt")
+	gone := f.lookup(root, "gone.txt")
+	kernel := lateKernelFor(f)
+	kernel.misses[edited] = 1
+	kernel.nameMisses["gone.txt"] = 1
+	kernel.forgotten = f.lookup(root, "forgotten.txt")
+	f.switchTo(baseFile("edited.txt", "edited-2", 0o100644), baseFile("forgotten.txt", "forgotten-2", 0o100644))
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	inodes, entries := f.notifier.recorded()
+	if !slices.Contains(inodes, edited) || !slices.Contains(entries, kernelEntry{root, "gone.txt"}) {
+		t.Errorf("invalidated inodes %v and entries %v, want edited.txt's inode %d and the entry of gone.txt, inode %d, once their replies arrived", inodes, entries, edited, gone)
+	}
+	if n := kernel.sends[kernel.forgotten]; n != 1 {
+		t.Errorf("sent forgotten.txt's invalidation %d times, want once: its FORGET arrived with the first", n)
+	}
+}
+
+// The kernel can answer an inode's invalidation with ENOENT and never send
+// its FORGET, as for a reply it dropped. The pass, which holds the HEAD
+// reconcile, sends the invalidation again for at most CacheTTL.
+func TestSwitchPassSendsAnInvalidationAgainForAtMostCacheTTL(t *testing.T) {
+	f := newCacheFixture(t, baseFile("file.txt", "old", 0o100644))
+	inode := f.lookup(fuseops.RootInodeID, "file.txt")
+	kernel := lateKernelFor(f)
+	kernel.misses[inode] = 1000
+	f.switchTo(baseFile("file.txt", "new", 0o100644))
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
+		took := time.Since(start)
+		if inodes, _ := f.notifier.recorded(); took > CacheTTL || slices.Contains(inodes, inode) {
+			t.Fatalf("the pass sent file.txt's invalidation %d times over %v, and the kernel took it: %v; want the pass to stop within %v, before the kernel takes it", kernel.sends[inode], took, slices.Contains(inodes, inode), CacheTTL)
+		}
+	})
+}
+
+// From Linux 6.19 to 7.1 the kernel drops no negative entry, and answers its
+// invalidation with ENOENT. The entry's parent stays held, so the pass sends
+// that invalidation once.
+func TestSwitchPassSendsANegativeEntryInvalidationOnce(t *testing.T) {
+	if !negativeLookupEntries {
+		t.Skip("the mount caches no negative entries on this platform")
+	}
+	f := newCacheFixture(t)
+	if got := f.lookup(fuseops.RootInodeID, "new.txt"); got != 0 {
+		t.Fatalf("lookup of missing new.txt = inode %d", got)
+	}
+	kernel := lateKernelFor(f)
+	kernel.nameMisses["new.txt"] = 1000
+	f.switchTo(baseFile("new.txt", "new", 0o100644))
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if n := kernel.nameSends["new.txt"]; n != 1 {
+		t.Fatalf("sent the negative entry of new.txt %d times, want once", n)
+	}
+}
+
+// An open file keeps its inode held after a switch removed its path and the
+// pass dropped its name. A switch that restores the path unchanged maps the
+// inode back, with no dentry for the name. So when the next switch removes
+// the path again, the kernel answers the entry invalidation with ENOENT and
+// no FORGET comes. The pass sends it once.
+func TestSwitchPassSendsTheEntryOfAMappedBackOpenFileOnce(t *testing.T) {
+	file := baseFile("f.txt", "blob", 0o100644)
+	f := newCacheFixture(t, file)
+	held := f.lookup(fuseops.RootInodeID, "f.txt")
+	f.open(held)
+	kernel := lateKernelFor(f)
+	for _, nodes := range [][]model.BaseNode{nil, {file}} {
+		f.switchTo(nodes...)
+		if err := f.mount.InvalidateChanged(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A lookup here would give the kernel a dentry again.
+	f.fs.mu.RLock()
+	mapped := f.fs.pathToInode["f.txt"]
+	f.fs.mu.RUnlock()
+	if mapped != held {
+		t.Fatalf("f.txt came back unchanged mapped to inode %d, want the held inode %d", mapped, held)
+	}
+	kernel.nameMisses["f.txt"] = 1000
+	f.switchTo()
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if n := kernel.nameSends["f.txt"]; n != 2 {
+		t.Fatalf("sent the entry of f.txt %d times, want once for each switch that removed it", n)
+	}
+}
+
+// After a switch removed an open file's path, the kernel's entry for the
+// name can expire, and a lookup before the pass then answers it negative.
+// That negative entry replaces the dentry the inode's entry reply gave the
+// kernel, so no reply with that dentry is on its way. From Linux 6.19 to 7.1
+// the pass's entry invalidation gets ENOENT for the negative dentry, and the
+// inode gets no FORGET. The pass sends it once.
+func TestSwitchPassSendsTheEntryOfANameALookupMissedOnce(t *testing.T) {
+	if !negativeLookupEntries {
+		t.Skip("the mount caches no negative entries on this platform")
+	}
+	f := newCacheFixture(t, baseFile("f.txt", "blob", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "f.txt")
+	f.open(held)
+	kernel := lateKernelFor(f)
+	kernel.nameMisses["f.txt"] = 1000
+	f.switchTo()
+	if got := f.lookup(fuseops.RootInodeID, "f.txt"); got != 0 {
+		t.Fatalf("lookup of f.txt after the switch removed it = inode %d, want a negative entry", got)
+	}
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if n := kernel.nameSends["f.txt"]; n != 1 {
+		t.Fatalf("sent the entry of f.txt %d times, want once", n)
 	}
 }
 
