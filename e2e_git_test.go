@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -339,7 +340,6 @@ func testE2EGitStatusDetectsSameSizeRewriteAfterMtimeRestore(t *testing.T, repo 
 func testE2EGitStatusDetectsSameSecondRewriteFromAHEADMove(t *testing.T, repo *mountedE2ERepo) {
 	gitDir := filepath.Join(repo.root, "repos", repoName, "git")
 	readmePath := filepath.Join(repo.mountPath, "README.md")
-	assertGitStatus(t, repo.mountPath, map[string]string{})
 	head, err := gitOutput("", "--git-dir", gitDir, "rev-parse", "HEAD")
 	if err != nil {
 		t.Fatal(err)
@@ -348,6 +348,19 @@ func testE2EGitStatusDetectsSameSecondRewriteFromAHEADMove(t *testing.T, repo *m
 	if err != nil {
 		t.Fatal(err)
 	}
+	second, err := strconv.ParseInt(committed, 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The clean-status bootstrap can leave README.md's stat data zeroed in
+	// the index, which Git takes as changed. A status that compares
+	// README.md records its stat data, and one in a later second than the
+	// commit records it as not racy, so Git trusts it.
+	waitForCondition(t, 5*time.Second, "a second past the commit time", func() (bool, string) {
+		return time.Now().Unix() > second, ""
+	})
+	gitCmdQuiet(t, repo.mountPath, "update-index", "--no-fsmonitor-valid", "README.md")
+	assertGitStatus(t, repo.mountPath, map[string]string{})
 	readme := []byte(readFileEventually(t, readmePath))
 	if len(readme) == 0 {
 		t.Fatal("README.md is empty")
