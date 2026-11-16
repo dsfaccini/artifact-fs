@@ -222,9 +222,11 @@ type InodeRef struct {
 	// separate open after the create, and a create grants its creator access
 	// whatever the mode.
 	CreateOpenPending bool
-	// EntryReplied says the mount recorded an entry reply for the inode
-	// since the switch pass last sent an invalidation of its name, so a reply
-	// with the name's dentry can still be on its way to the kernel.
+	// EntryReplied says the mount recorded an entry reply for the inode, and
+	// no negative reply for its name since, after the switch pass last took
+	// the name to invalidate it, so a reply with the name's dentry can still
+	// be on its way to the kernel. The pass clears it when it takes the name,
+	// also with send false, when it sends nothing.
 	EntryReplied bool
 }
 
@@ -650,15 +652,21 @@ func (fs *ArtifactFuse) dropLookups(id fuseops.InodeID, n uint64) {
 	}
 }
 
-// recordNegative records a negative entry for name in parent, which the
-// kernel caches for CacheTTL, and reports true, while the mount serves gen,
-// the generation the lookup that missed name resolved against. Expired
-// records go in sweeps whose cost each record pays for once.
-func (fs *ArtifactFuse) recordNegative(parent fuseops.InodeID, name string, gen int64) bool {
+// recordNegative records a negative entry for name in parent, at path,
+// which the kernel caches for CacheTTL, and reports true, while the mount
+// serves gen, the generation the lookup that missed name resolved against.
+// The kernel runs one fresh lookup of a name at a time, so an entry reply
+// for the inode still mapped at path reached it before this lookup, and the
+// negative entry replaces that reply's dentry. Expired records go in sweeps
+// whose cost each record pays for once.
+func (fs *ArtifactFuse) recordNegative(parent fuseops.InodeID, name, path string, gen int64) bool {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	if fs.engine.Generation() != gen {
 		return false
+	}
+	if ref := fs.inodes[fs.pathToInode[path]]; ref != nil {
+		ref.EntryReplied = false
 	}
 	now := time.Now()
 	if len(fs.negatives) >= fs.negativeSweepAt {
@@ -717,8 +725,8 @@ func (fs *ArtifactFuse) setNotifier(n kernelNotifier) {
 // which keeps the kernel's view of it current. A dormant mapping gets no
 // invalidation: the kernel holds nothing for it. An inode invalidation the
 // kernel answers with ENOENT goes again while the mount holds the inode, and
-// an entry invalidation while it holds the inode and recorded an entry reply
-// for it since it last sent the name's, for at most CacheTTL. A failure skips
+// an entry invalidation while it holds the inode and InodeRef.EntryReplied
+// says a reply with the name can still be on its way, for at most CacheTTL. A failure skips
 // only what it concerns, and the first one is returned.
 //
 // The pass reads the overlay once, and finds each held inode's identity with
@@ -841,7 +849,8 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		}
 	}
 	// entries holds each name the pass invalidates, with the inode it names,
-	// or 0 for a negative entry.
+	// or 0 for a negative entry. The loop after the retyped names sets 0 for
+	// a name that got no entry reply since the pass last took it.
 	type heldEntry struct {
 		kernelEntry
 		held fuseops.InodeID
@@ -951,11 +960,11 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 		changed = append(changed, id)
 	}
 	clear(fs.retypedNames)
-	// An entry invalidation that gets ENOENT goes again only when an entry
-	// reply came since the pass last sent it. Otherwise the kernel can hold
-	// the inode with no dentry for the name: an open file keeps its inode
-	// after an earlier pass dropped the name, and the inode maps back when
-	// its path returns.
+	// An entry invalidation that gets ENOENT goes again only when
+	// EntryReplied is set. Otherwise the kernel can hold the inode with no
+	// dentry for the name: an open file keeps its inode after an earlier pass
+	// dropped the name, and the inode maps back when its path returns, or a
+	// negative lookup replaced the dentry.
 	for i, e := range entries {
 		if ref := fs.inodes[e.held]; ref != nil && ref.EntryReplied {
 			ref.EntryReplied = false
@@ -1027,10 +1036,11 @@ func (fs *ArtifactFuse) invalidateChanged(send bool) error {
 	// whatever the pass sent before it arrived, so the pass sends such an
 	// invalidation again until it lands or held's FORGET arrives. It stops
 	// CacheTTL after it read the table: the kernel lets a reply expire
-	// CacheTTL after it takes it. A negative entry's invalidation, held 0,
-	// goes once. Up to 6.18 and from 7.2, Linux takes the parent's lock
-	// before it looks up the name, so it waits for a lookup in flight there.
-	// From 6.19 to 7.1 it drops no negative entry at all.
+	// CacheTTL after it takes it. An invalidation with held 0 goes once: a
+	// negative entry's, and a name's that got no entry reply since the pass
+	// last took it. Up to 6.18 and from 7.2, Linux takes the parent's lock
+	// before it looks up a name, so it waits for a negative lookup in flight
+	// there. From 6.19 to 7.1 it drops no negative entry at all.
 	type invalidation struct {
 		held fuseops.InodeID
 		send func() error
@@ -1797,7 +1807,7 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 				fs.testHookAfterLookupResolve()
 			}
 			if negativeLookupEntries && errors.Is(err, iofs.ErrNotExist) {
-				if !fs.recordNegative(op.Parent, op.Name, gen) {
+				if !fs.recordNegative(op.Parent, op.Name, childPath, gen) {
 					continue
 				}
 				// Child 0 is a negative entry, which the kernel caches.

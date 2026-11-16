@@ -1421,6 +1421,33 @@ func TestSwitchPassSendsTheEntryOfAMappedBackOpenFileOnce(t *testing.T) {
 	}
 }
 
+// After a switch removed an open file's path, the kernel's entry for the
+// name can expire, and a lookup before the pass then answers it negative.
+// That negative entry replaces the dentry the inode's entry reply gave the
+// kernel, so no reply with that dentry is on its way. From Linux 6.19 to 7.1
+// the pass's entry invalidation gets ENOENT for the negative dentry, and the
+// inode gets no FORGET. The pass sends it once.
+func TestSwitchPassSendsTheEntryOfANameALookupMissedOnce(t *testing.T) {
+	if !negativeLookupEntries {
+		t.Skip("the mount caches no negative entries on this platform")
+	}
+	f := newCacheFixture(t, baseFile("f.txt", "blob", 0o100644))
+	held := f.lookup(fuseops.RootInodeID, "f.txt")
+	f.open(held)
+	kernel := lateKernelFor(f)
+	kernel.nameMisses["f.txt"] = 1000
+	f.switchTo()
+	if got := f.lookup(fuseops.RootInodeID, "f.txt"); got != 0 {
+		t.Fatalf("lookup of f.txt after the switch removed it = inode %d, want a negative entry", got)
+	}
+	if err := f.mount.InvalidateChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if n := kernel.nameSends["f.txt"]; n != 1 {
+		t.Fatalf("sent the entry of f.txt %d times, want once", n)
+	}
+}
+
 // A write fills the kernel's pages with the written bytes. A commit of them
 // makes reconcile drop the overlay entry, and a later switch brings back the
 // blob the file held before the write, at the same size. The kernel last saw
