@@ -1246,7 +1246,7 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 	// lacks, and removing an entry the new base matches leave the merged view
 	// as it was. Two removals change it: a delete marker's over a base path,
 	// which reveals the base, and a file entry's whose mode differs from the
-	// base's in group or other write, which overlayEntryMatchesBase ignores.
+	// base's in ignoredModeBits.
 	// The transaction holds the write lock from BEGIN, so no write lands
 	// between reading the log and applying the result.
 	if err := suspendChangeLog(ctx, tx); err != nil {
@@ -1295,7 +1295,7 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 					logged = append(logged, e.Path)
 				}
 			case model.OverlayKindCreate, model.OverlayKindModify, model.OverlayKindRename:
-				if base := r.bases[e.Path].node; base.Mode != 0 && (e.Mode^base.Mode)&0o777 != 0 {
+				if dropShowsBaseMode(e, r.bases[e.Path].node) {
 					logged = append(logged, e.Path)
 				}
 			}
@@ -1561,19 +1561,29 @@ func (r *reconciler) classify(entries []model.OverlayEntry, final bool) (reconci
 	return p, nil
 }
 
-// overlayEntryMatchesBase reports whether e's content and mode are base's.
-// The group and other write bits do not count: each process that writes
-// through the mount applies its own umask, which sets or clears them, so a
-// file Git writes back with base's content can differ from base in those bits
-// alone.
+// ignoredModeBits are group and other write, which Git does not record. Each
+// process that writes through the mount applies its own umask, which sets or
+// clears them, so a file Git writes back with its base's content can differ
+// from the base in them alone.
+const ignoredModeBits = 0o022
+
+// overlayEntryMatchesBase reports whether e's content and mode are base's,
+// apart from ignoredModeBits.
 func overlayEntryMatchesBase(e model.OverlayEntry, base model.BaseNode) (bool, error) {
-	if base.Mode != 0 && (e.Mode^base.Mode)&0o777&^0o022 != 0 {
+	if base.Mode != 0 && (e.Mode^base.Mode)&0o777&^ignoredModeBits != 0 {
 		return false, nil
 	}
 	if e.Kind == model.OverlayKindSymlink {
 		return model.ReaderMatchesBlobOID(strings.NewReader(e.TargetPath), int64(len(e.TargetPath)), base.ObjectOID)
 	}
 	return model.FileMatchesBlobOID(e.BackingPath, base.ObjectOID)
+}
+
+// dropShowsBaseMode reports whether a drop of e, which overlayEntryMatchesBase
+// matched with base, changes the path's mode in the merged view to base's:
+// whether the two differ in ignoredModeBits.
+func dropShowsBaseMode(e model.OverlayEntry, base model.BaseNode) bool {
+	return base.Mode != 0 && (e.Mode^base.Mode)&ignoredModeBits != 0
 }
 
 // suspendChangeLog drops the triggers for the rest of tx, so a bulk operation

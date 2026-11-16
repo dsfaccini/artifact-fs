@@ -144,7 +144,7 @@ func runE2EBenchmarkOnce(t *testing.T, repo e2eBenchRepoSpec, iteration int, hyd
 	t.Helper()
 
 	skipIfOverMountBudget(t, 1)
-	root := t.TempDir()
+	root := privateE2EStateRoot(t)
 	mountDir := newE2EMountDir(t)
 	mountPath := filepath.Join(mountDir, repoName)
 	if err := os.MkdirAll(mountPath, 0o755); err != nil {
