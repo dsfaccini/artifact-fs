@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -217,6 +218,36 @@ func TestGenerationCleanup(t *testing.T) {
 		if commitTime, ok, err := s.CommitTime(ctx, gen); err != nil || ok != want || ok && commitTime != 100+gen {
 			t.Fatalf("generation %d's commit time = %d, %v, %v; want it recorded %v after pruning below 2", gen, commitTime, ok, err, want)
 		}
+	}
+}
+
+// A carry of a generation into itself keeps each raised row later than the
+// commit time, although the reset runs before the carry reads the rows.
+func TestRecordBaseTimesCarriesAGenerationIntoItself(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	nodes := []model.BaseNode{{RepoID: "r", Path: ".", Type: "dir", Mode: 0o755, SizeState: "known"}}
+	for _, p := range []string{"a", "b", "c"} {
+		nodes = append(nodes, model.BaseNode{RepoID: "r", Path: p, Type: "file", Mode: 0o644, ObjectOID: p, SizeState: "known"})
+	}
+	gen, err := s.PublishGeneration(ctx, "h1", "main", nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordBaseTimes(ctx, gen, 100, 0, map[string]int64{"a": 105, "b": 103}); err != nil {
+		t.Fatal(err)
+	}
+	raised, err := s.RaisedMtimes(ctx, gen)
+	if want := map[string]int64{"a": 105, "b": 103}; err != nil || !maps.Equal(raised, want) {
+		t.Fatalf("raised mtimes = %v, %v; want %v", raised, err, want)
+	}
+	if err := s.RecordBaseTimes(ctx, gen, 104, gen, map[string]int64{"c": 106}); err != nil {
+		t.Fatal(err)
+	}
+	// b's raise is not later than the new commit time, so it drops.
+	raised, err = s.RaisedMtimes(ctx, gen)
+	if want := map[string]int64{"a": 105, "c": 106}; err != nil || !maps.Equal(raised, want) {
+		t.Fatalf("raised mtimes after a carry into itself = %v, %v; want %v", raised, err, want)
 	}
 }
 

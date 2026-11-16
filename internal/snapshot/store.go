@@ -267,7 +267,9 @@ func (s *Store) RecordBaseTimes(ctx context.Context, generation, commitTime, car
 	if _, err := tx.ExecContext(ctx, `INSERT INTO generation_times(generation, commit_time) VALUES(?,?) ON CONFLICT(generation) DO UPDATE SET commit_time=excluded.commit_time`, generation, commitTime); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE base_nodes SET raised_mtime=0 WHERE generation=? AND raised_mtime != 0`, generation); err != nil {
+	// A carry of generation into itself keeps each row it would carry, which
+	// the reset would otherwise clear before the carry reads it.
+	if _, err := tx.ExecContext(ctx, `UPDATE base_nodes SET raised_mtime=0 WHERE generation=? AND raised_mtime != 0 AND (generation != ? OR raised_mtime <= ?)`, generation, carry, commitTime); err != nil {
 		return err
 	}
 	stmt, err := tx.PrepareContext(ctx, `UPDATE base_nodes SET raised_mtime=? WHERE generation=? AND path=?`)
