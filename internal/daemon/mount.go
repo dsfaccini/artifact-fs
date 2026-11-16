@@ -103,7 +103,7 @@ func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *pre
 			ov.Close()
 		}
 	}()
-	switched := s.switchedSinceServed(prepareCtx, cfg.Name, ov, snap, gen)
+	switched, served := s.switchedSinceServed(prepareCtx, cfg.Name, ov, snap, gen)
 	// attachMount checks this before each mount. Checking it here too
 	// keeps the index of a native worktree untouched.
 	if cfg.AdoptGitDir {
@@ -119,6 +119,10 @@ func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *pre
 		if err := s.git.EnsureIndexInitialized(prepareCtx, cfg); err != nil {
 			return err
 		}
+	}
+	commitTime, err := s.recordBaseTimes(prepareCtx, cfg, snap, served, gen, res.source.Commit)
+	if err != nil {
+		return err
 	}
 	baseLookup := func(path string) (model.BaseNode, bool, error) {
 		return snap.LookupNode(prepareCtx, gen, path)
@@ -142,29 +146,57 @@ func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *pre
 		gate = fusefs.NewReadyGate(true)
 	}
 	res.kept = true
-	rt := s.startRuntime(ctx, cfg, snap, ov, servedHead{oid: res.source.Commit, ref: res.source.Ref, gen: gen}, gate)
+	rt := s.startRuntime(ctx, cfg, snap, ov, servedHead{oid: res.source.Commit, ref: res.source.Ref, gen: gen}, commitTime, gate)
 	s.startRepoBackground(rt)
 	return nil
 }
 
-// switchedSinceServed returns what changed between the generation ov's change
-// log is current with and gen, such as a HEAD move while no runtime served
-// the repo. It is Unknown when ov recorded no generation or snap no longer
-// holds it.
-func (s *Service) switchedSinceServed(ctx context.Context, name string, ov *overlay.Store, snap *snapshot.Store, gen int64) model.SwitchedPaths {
+// switchedSinceServed returns what changed between served, the generation
+// ov's change log is current with, and gen, such as a HEAD move while no
+// runtime served the repo. It is Unknown when ov recorded no generation or
+// snap no longer holds it. served is 0 when ov's read of it failed.
+func (s *Service) switchedSinceServed(ctx context.Context, name string, ov *overlay.Store, snap *snapshot.Store, gen int64) (switched model.SwitchedPaths, served int64) {
 	served, err := ov.ServedGeneration(ctx)
 	if err != nil {
 		s.logger.Warn("served generation read failed; Git rescans the work tree", "repo", name, "error", err)
-		return model.SwitchedPaths{Unknown: true}
+		return model.SwitchedPaths{Unknown: true}, 0
 	}
 	if served == gen {
-		return model.SwitchedPaths{}
+		return model.SwitchedPaths{}, served
 	}
-	switched, err := fusefs.SwitchedPaths(ctx, snap, ov, served, gen)
+	switched, err = fusefs.SwitchedPaths(ctx, snap, ov, served, gen)
 	if err != nil {
 		s.logger.Warn("generation diff failed; Git rescans the work tree", "repo", name, "error", err)
 	}
-	return switched
+	return switched, served
+}
+
+// recordBaseTimes records the times of gen, which a runtime starts to serve,
+// as a switch from served records them: the commit time of oid, gen's
+// commit, and the mtimes fusefs.RaiseMtimes raises. A gen that served
+// already keeps its recorded times. It returns the commit time, or 0 when
+// git cannot read it.
+func (s *Service) recordBaseTimes(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, served, gen int64, oid string) (int64, error) {
+	if gen == 0 || oid == "" {
+		return 0, nil
+	}
+	commitTime, err := s.git.CommitTimestamp(ctx, cfg, oid)
+	if err != nil {
+		s.logger.Warn("commit timestamp unavailable, mtime will use generation fallback", "repo", cfg.Name, "error", err)
+		commitTime = 0
+	}
+	if served == gen {
+		if recorded, ok, err := snap.CommitTime(ctx, gen); err != nil || ok && recorded != 0 {
+			return commitTime, err
+		}
+	}
+	// A served generation recorded no times when it was pruned, or when a
+	// build that records none served it. Its switch then raises nothing.
+	servedCommit, _, err := snap.CommitTime(ctx, served)
+	if err != nil {
+		return 0, err
+	}
+	return commitTime, fusefs.RaiseMtimes(ctx, snap, served, gen, servedCommit, commitTime)
 }
 
 // hasPublishedGeneration reports whether cfg's snapshot store holds a
@@ -209,7 +241,12 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		snap.Close()
 		return err
 	}
-	if err := ov.MarkServed(ctx, gen, s.switchedSinceServed(ctx, cfg.Name, ov, snap, gen)); err != nil {
+	switched, served := s.switchedSinceServed(ctx, cfg.Name, ov, snap, gen)
+	commitTime, err := s.recordBaseTimes(ctx, cfg, snap, served, gen, headOID)
+	if err == nil {
+		err = ov.MarkServed(ctx, gen, switched)
+	}
+	if err != nil {
 		ov.Close()
 		snap.Close()
 		return err
@@ -218,7 +255,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 	if cfg.PrepareState == model.PrepareStateFailed {
 		gate.MarkFailed(prepareGateError(cfg.PrepareError))
 	}
-	s.startRuntime(ctx, cfg, snap, ov, servedHead{oid: headOID, ref: headRef, gen: gen}, gate)
+	s.startRuntime(ctx, cfg, snap, ov, servedHead{oid: headOID, ref: headRef, gen: gen}, commitTime, gate)
 	return nil
 }
 

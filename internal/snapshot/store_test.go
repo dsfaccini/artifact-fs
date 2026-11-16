@@ -198,12 +198,24 @@ func TestGenerationCleanup(t *testing.T) {
 		}
 	}
 
+	for gen := range int64(3) {
+		if err := s.RecordBaseTimes(ctx, gen+1, 100+gen+1, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok, err := s.CommitTime(ctx, 1); err != nil || !ok {
+		t.Fatalf("generation 1's commit time recorded = %v, %v; want true", ok, err)
+	}
+
 	if err := s.PruneGenerations(ctx, 2); err != nil {
 		t.Fatal(err)
 	}
 	for gen, want := range map[int64]bool{1: false, 2: true, 3: true} {
 		if _, ok := lookupNode(t, s, gen, "f.txt"); ok != want {
 			t.Fatalf("generation %d holds f.txt = %v, want %v after pruning below 2", gen, ok, want)
+		}
+		if commitTime, ok, err := s.CommitTime(ctx, gen); err != nil || ok != want || ok && commitTime != 100+gen {
+			t.Fatalf("generation %d's commit time = %d, %v, %v; want it recorded %v after pruning below 2", gen, commitTime, ok, err, want)
 		}
 	}
 }

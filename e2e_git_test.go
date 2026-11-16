@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -328,6 +329,92 @@ func testE2EGitStatusDetectsSameSizeRewriteAfterMtimeRestore(t *testing.T, repo 
 	}
 
 	assertGitStatus(t, repo.mountPath, map[string]string{"README.md": " M"})
+}
+
+// A HEAD move outside the mount to a commit in the served commit's second,
+// which rewrites README.md at its size, still changes README.md's stat data.
+// Git compares mtimes in whole seconds, and both commits' time is the mtime
+// of every base file they share. git status finds the rewrite with the
+// fsmonitor hook, which names README.md, and without it.
+func testE2EGitStatusDetectsSameSecondRewriteFromAHEADMove(t *testing.T, repo *mountedE2ERepo) {
+	gitDir := filepath.Join(repo.root, "repos", repoName, "git")
+	readmePath := filepath.Join(repo.mountPath, "README.md")
+	assertGitStatus(t, repo.mountPath, map[string]string{})
+	head, err := gitOutput("", "--git-dir", gitDir, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := gitOutput("", "--git-dir", gitDir, "show", "-s", "--format=%ct", head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme := []byte(readFileEventually(t, readmePath))
+	if len(readme) == 0 {
+		t.Fatal("README.md is empty")
+	}
+	if readme[0] == 'x' {
+		readme[0] = 'y'
+	} else {
+		readme[0] = 'x'
+	}
+	blobDir := t.TempDir()
+	writeTestFile(t, blobDir, "README.md", string(readme))
+	blob, err := gitOutput("", "--git-dir", gitDir, "hash-object", "-w", filepath.Join(blobDir, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := gitOutput("", "--git-dir", gitDir, "ls-tree", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []string
+	for line := range strings.SplitSeq(tree, "\n") {
+		if !strings.HasSuffix(line, "\tREADME.md") {
+			entries = append(entries, line)
+		}
+	}
+	entries = append(entries, "100644 blob "+blob+"\tREADME.md")
+	// The blobless clone lacks the blobs no one read, so mktree must not check them.
+	mktree := exec.Command("git", "--git-dir", gitDir, "mktree", "--missing")
+	mktree.Stdin = strings.NewReader(strings.Join(entries, "\n") + "\n")
+	var stderr bytes.Buffer
+	mktree.Stderr = &stderr
+	treeOID, err := mktree.Output()
+	if err != nil {
+		t.Fatalf("git mktree: %v: %s", err, stderr.String())
+	}
+	commitTree := exec.Command("git", "--git-dir", gitDir, "-c", "user.name=E2E Test", "-c", "user.email=e2e@test",
+		"commit-tree", strings.TrimSpace(string(treeOID)), "-p", head, "-m", "rewrite README.md at its size in its commit's second")
+	date := "@" + committed + " +0000"
+	commitTree.Env = append(os.Environ(), "GIT_AUTHOR_DATE="+date, "GIT_COMMITTER_DATE="+date)
+	stderr.Reset()
+	commitTree.Stderr = &stderr
+	out, err := commitTree.Output()
+	if err != nil {
+		t.Fatalf("git commit-tree: %v: %s", err, stderr.String())
+	}
+	next := strings.TrimSpace(string(out))
+	if _, err := gitOutput("", "--git-dir", gitDir, "update-ref", "refs/heads/main", next, head); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, 30*time.Second, "the daemon serves "+next, func() (bool, string) {
+		st, err := repo.ctl.Status(context.Background(), repoName)
+		if err != nil {
+			return false, err.Error()
+		}
+		return st.CurrentHEADOID == next, "HEAD " + st.CurrentHEADOID
+	})
+	// The index holds the served commit's README.md, which HEAD and the work
+	// tree both changed.
+	want := map[string]string{"README.md": "MM"}
+	assertGitStatus(t, repo.mountPath, want)
+	stdout, statusStderr, err := gitCmdResult(repo.mountPath, "-c", "core.fsmonitor=false", "status", "--short", "--untracked-files=all")
+	if err != nil {
+		t.Fatalf("git status without the hook: %v: %s", err, statusStderr)
+	}
+	if got, err := parseStatusOutput(stdout); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("git status without the hook = %v, %v; want %v", got, err, want)
+	}
 }
 
 // This test keeps its own mount: its subject is the first Git status after a

@@ -563,6 +563,76 @@ func TestSwitchMovesTheTimesOfTheDirectoriesWhoseListingItChanges(t *testing.T) 
 	}
 }
 
+// switchAt publishes nodes and switches the mount's resolver to them, at
+// commitTime.
+func (f *cacheFixture) switchAt(commitTime int64, nodes ...model.BaseNode) {
+	f.t.Helper()
+	if _, err := f.resolver.SwitchGeneration(f.ctx, f.publish(nodes...), commitTime); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// fileTimes returns the mtime and ctime, in Unix seconds, that getattr
+// reports for name in parent.
+func (f *cacheFixture) fileTimes(parent fuseops.InodeID, name string) [2]int64 {
+	f.t.Helper()
+	op := &fuseops.GetInodeAttributesOp{Inode: f.lookup(parent, name)}
+	if err := f.fs.GetInodeAttributes(f.ctx, op); err != nil {
+		f.t.Fatalf("GetInodeAttributes(%s): %v", name, err)
+	}
+	return [2]int64{op.Attributes.Mtime.Unix(), op.Attributes.Ctime.Unix()}
+}
+
+// A switch that changes a file's blob moves the file's mtime and ctime one
+// second past the mtime it reported, also when both commits share a second.
+// Git compares stat data in whole seconds, so a change that keeps the size
+// would otherwise leave the stat data Git's index holds. A file whose blob
+// the switch keeps keeps its mtime, until a later commit passes it.
+func TestSwitchRaisesTheMtimeOfEachFileWhoseBlobItChanges(t *testing.T) {
+	const second = 1_700_000_000
+	keep := baseFile("keep.txt", "keep", 0o100644)
+	c1 := []model.BaseNode{baseFile("f.txt", "aaaa", 0o100644), keep}
+	f := newCacheFixture(t, c1...)
+	f.resolver.SetCommitTime(second)
+	want := func(step string, fileTime, keepTime int64) {
+		t.Helper()
+		for name, want := range map[string]int64{"f.txt": fileTime, "keep.txt": keepTime} {
+			if got := f.fileTimes(fuseops.RootInodeID, name); got != [2]int64{want, want} {
+				t.Errorf("%s: %s reports mtime and ctime %d, want %d", step, name, got, want)
+			}
+		}
+	}
+	want("C1", second, second)
+	f.switchAt(second, baseFile("f.txt", "bbbb", 0o100644), keep)
+	want("C2 in C1's second", second+1, second)
+	f.switchAt(second, baseFile("f.txt", "cccc", 0o100644), keep)
+	want("C3 in the same second", second+2, second)
+	f.switchAt(second, c1...)
+	want("C1 again", second+3, second)
+	kept := []model.BaseNode{baseFile("f.txt", "aaaa", 0o100644), baseFile("keep.txt", "kept", 0o100644)}
+	f.switchAt(second, kept...)
+	want("a change to keep.txt alone", second+3, second+1)
+	f.switchAt(second+10, kept...)
+	want("a later commit", second+10, second+10)
+}
+
+// A listing reports the times getattr reports for a file a switch raised.
+// The kernel caches either reply as the file's attributes.
+func TestListingReportsTheRaisedMtimeGetattrReports(t *testing.T) {
+	const second = 1_700_000_000
+	f := newCacheFixture(t, baseFile("f.txt", "aaaa", 0o100644))
+	f.resolver.SetCommitTime(second)
+	f.switchAt(second, baseFile("f.txt", "bbbb", 0o100644))
+	want := [2]int64{second + 1, second + 1}
+	if got := f.fileTimes(fuseops.RootInodeID, "f.txt"); got != want {
+		t.Errorf("getattr reports f.txt's mtime and ctime %d, want %d", got, want)
+	}
+	listed := readDirPlus(t, f.fs, fuseops.RootInodeID)["f.txt"]
+	if got := [2]int64{listed.mtime / 1e9, listed.ctime / 1e9}; got != want || listed.mtime%1e9 != 0 || listed.ctime%1e9 != 0 {
+		t.Errorf("the listing reports f.txt's mtime and ctime %d and %d ns, want %d s", listed.mtime, listed.ctime, want)
+	}
+}
+
 // A switch that cannot tell which listings it changes, here from an empty
 // tree, moves the mtime and ctime of every directory. Git can trust a
 // directory's mtime alone, under core.trustctime=false.

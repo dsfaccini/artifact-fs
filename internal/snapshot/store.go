@@ -14,7 +14,8 @@ import (
 )
 
 // migrations build the snapshot schema. Migration 1 creates it, or brings an
-// older build's database to it.
+// older build's database to it. Migration 2 records the times each served
+// generation reports: its commit time, and the mtimes a switch raised past it.
 var migrations = []meta.Migration{meta.SQL(
 	`CREATE TABLE IF NOT EXISTS repo_state (
 	  key TEXT PRIMARY KEY,
@@ -35,6 +36,13 @@ var migrations = []meta.Migration{meta.SQL(
 	`CREATE INDEX IF NOT EXISTS idx_base_nodes_gen_oid ON base_nodes(generation, object_oid);`,
 	`DROP TABLE IF EXISTS learned_path_stats;`,
 	`DROP TABLE IF EXISTS blob_cache_index;`,
+), meta.SQL(
+	`ALTER TABLE base_nodes ADD COLUMN raised_mtime INTEGER NOT NULL DEFAULT 0;`,
+	`CREATE INDEX IF NOT EXISTS idx_base_nodes_gen_raised ON base_nodes(generation) WHERE raised_mtime != 0;`,
+	`CREATE TABLE IF NOT EXISTS generation_times (
+	  generation INTEGER PRIMARY KEY,
+	  commit_time INTEGER NOT NULL
+	);`,
 )}
 
 var _ model.SnapshotStore = (*Store)(nil)
@@ -122,6 +130,9 @@ func (s *Store) PruneGenerations(ctx context.Context, keepFrom int64, keep ...in
 			if _, err := s.db.ExecContext(ctx, `DELETE FROM base_nodes WHERE generation >= ? AND generation < ?`, from, to); err != nil {
 				return err
 			}
+			if _, err := s.db.ExecContext(ctx, `DELETE FROM generation_times WHERE generation >= ? AND generation < ?`, from, to); err != nil {
+				return err
+			}
 		}
 		from = max(from, to+1)
 	}
@@ -194,9 +205,9 @@ func (s *Store) UpdateHEADRef(ctx context.Context, ref string) error {
 }
 
 func (s *Store) LookupNode(ctx context.Context, generation int64, path string) (model.BaseNode, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT path, type, mode, object_oid, size_state, size_bytes FROM base_nodes WHERE generation=? AND path=?`, generation, path)
+	row := s.db.QueryRowContext(ctx, `SELECT path, type, mode, object_oid, size_state, size_bytes, raised_mtime FROM base_nodes WHERE generation=? AND path=?`, generation, path)
 	var n model.BaseNode
-	if err := row.Scan(&n.Path, &n.Type, &n.Mode, &n.ObjectOID, &n.SizeState, &n.SizeBytes); err != nil {
+	if err := row.Scan(&n.Path, &n.Type, &n.Mode, &n.ObjectOID, &n.SizeState, &n.SizeBytes, &n.RaisedMtime); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.BaseNode{}, false, nil
 		}
@@ -207,7 +218,7 @@ func (s *Store) LookupNode(ctx context.Context, generation int64, path string) (
 
 // listChildrenQuery has no ORDER BY: sorting by path makes SQLite walk the whole
 // generation through the primary key instead of the parent_path index.
-const listChildrenQuery = `SELECT path, type, mode, object_oid, size_state, size_bytes FROM base_nodes WHERE generation=? AND parent_path=?`
+const listChildrenQuery = `SELECT path, type, mode, object_oid, size_state, size_bytes, raised_mtime FROM base_nodes WHERE generation=? AND parent_path=?`
 
 // ListChildren returns direct children of parentPath, unordered, using a
 // path-based lookup (no inode join, no collision risk).
@@ -221,12 +232,67 @@ func (s *Store) ListChildren(generation int64, parentPath string) ([]model.BaseN
 	var out []model.BaseNode
 	for rows.Next() {
 		var n model.BaseNode
-		if err := rows.Scan(&n.Path, &n.Type, &n.Mode, &n.ObjectOID, &n.SizeState, &n.SizeBytes); err != nil {
+		if err := rows.Scan(&n.Path, &n.Type, &n.Mode, &n.ObjectOID, &n.SizeState, &n.SizeBytes, &n.RaisedMtime); err != nil {
 			return nil, err
 		}
 		out = append(out, n)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) RaisedMtimes(ctx context.Context, generation int64) (map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT path, raised_mtime FROM base_nodes WHERE generation=? AND raised_mtime != 0`, generation)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	raised := map[string]int64{}
+	for rows.Next() {
+		var path string
+		var mtime int64
+		if err := rows.Scan(&path, &mtime); err != nil {
+			return nil, err
+		}
+		raised[path] = mtime
+	}
+	return raised, rows.Err()
+}
+
+func (s *Store) RecordBaseTimes(ctx context.Context, generation, commitTime int64, raised map[string]int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO generation_times(generation, commit_time) VALUES(?,?) ON CONFLICT(generation) DO UPDATE SET commit_time=excluded.commit_time`, generation, commitTime); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE base_nodes SET raised_mtime=0 WHERE generation=? AND raised_mtime != 0`, generation); err != nil {
+		return err
+	}
+	stmt, err := tx.PrepareContext(ctx, `UPDATE base_nodes SET raised_mtime=? WHERE generation=? AND path=?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for path, mtime := range raised {
+		if _, err := stmt.ExecContext(ctx, mtime, generation, path); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// CommitTime returns the commit time RecordBaseTimes recorded for
+// generation. ok is false when it recorded none, as for a generation no
+// runtime served, one served before the store recorded commit times, or a
+// pruned one.
+func (s *Store) CommitTime(ctx context.Context, generation int64) (commitTime int64, ok bool, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT commit_time FROM generation_times WHERE generation=?`, generation).Scan(&commitTime)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	return commitTime, err == nil, err
 }
 
 // UpdateSizes sets the size of each blob in sizes on every row of generation

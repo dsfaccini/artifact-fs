@@ -32,6 +32,14 @@ func (f *fakeSnapshot) ListChildren(_ int64, path string) ([]model.BaseNode, err
 	return nil, nil
 }
 
+func (f *fakeSnapshot) RaisedMtimes(context.Context, int64) (map[string]int64, error) {
+	return nil, nil
+}
+
+func (f *fakeSnapshot) RecordBaseTimes(context.Context, int64, int64, map[string]int64) error {
+	return nil
+}
+
 // newOverlay returns a real overlay store that holds, in order, a directory
 // for each of paths that ends in "/", a delete marker for each that starts
 // with "-", and an empty file for each other path.

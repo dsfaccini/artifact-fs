@@ -31,6 +31,12 @@ const (
 	oidIndex     = `CREATE INDEX IF NOT EXISTS idx_base_nodes_gen_oid ON base_nodes(generation, object_oid);`
 	snapshotRows = `INSERT INTO repo_state(key, value) VALUES ('current_generation', '1'), ('head_oid', 'head1'), ('head_ref', 'main');
 	INSERT INTO base_nodes(generation, path, parent_path, type, mode, object_oid, size_state, size_bytes) VALUES (1, 'README.md', '.', 'file', 420, 'abc', 'known', 42);`
+	raisedMtime = `ALTER TABLE base_nodes ADD COLUMN raised_mtime INTEGER NOT NULL DEFAULT 0;`
+	raisedIndex = `CREATE INDEX IF NOT EXISTS idx_base_nodes_gen_raised ON base_nodes(generation) WHERE raised_mtime != 0;`
+	timesTable  = `CREATE TABLE IF NOT EXISTS generation_times (
+	  generation INTEGER PRIMARY KEY,
+	  commit_time INTEGER NOT NULL
+	);`
 )
 
 // legacySnapshots are databases that earlier builds created, named for the
@@ -61,8 +67,10 @@ var legacySnapshots = map[string][]string{
 	"43ec712": {repoStateTable, baseNodesTable, parentIndex, snapshotRows},
 	// main before migrations.
 	"25971f7": {repoStateTable, baseNodesTable, parentIndex, oidIndex, snapshotRows},
-	// This schema, after migration 1.
+	// The schema after migration 1.
 	"user_version 1": {repoStateTable, baseNodesTable, parentIndex, oidIndex, snapshotRows, `PRAGMA user_version = 1`},
+	// The schema after migration 2.
+	"user_version 2": {repoStateTable, baseNodesTable, parentIndex, oidIndex, raisedMtime, raisedIndex, timesTable, snapshotRows, `PRAGMA user_version = 2`},
 }
 
 func openSnapshot(path string) func() (io.Closer, error) {
@@ -101,6 +109,15 @@ func TestNewMigratesEarlierSchemas(t *testing.T) {
 			want := model.BaseNode{Path: "README.md", Type: "file", Mode: 420, ObjectOID: "abc", SizeState: "known", SizeBytes: 42}
 			if !ok || node != want {
 				t.Fatalf("README.md = %+v, %v; want %+v", node, ok, want)
+			}
+			if err := s.RecordBaseTimes(ctx, 1, 100, map[string]int64{"README.md": 101}); err != nil {
+				t.Fatal(err)
+			}
+			if node, _, err := s.LookupNode(ctx, 1, "README.md"); err != nil || node.RaisedMtime != 101 {
+				t.Fatalf("README.md after its mtime was raised = %+v, %v; want RaisedMtime 101", node, err)
+			}
+			if commitTime, ok, err := s.CommitTime(ctx, 1); err != nil || !ok || commitTime != 100 {
+				t.Fatalf("generation 1's commit time = %d, %v, %v; want 100", commitTime, ok, err)
 			}
 		})
 	}
