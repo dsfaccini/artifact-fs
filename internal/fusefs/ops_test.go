@@ -102,6 +102,14 @@ func (g *generationSnapshot) ListChildren(gen int64, path string) ([]model.BaseN
 	return g.kids[gen][path], nil
 }
 
+func (g *generationSnapshot) RaisedMtimes(context.Context, int64) (map[string]int64, error) {
+	return nil, nil
+}
+
+func (g *generationSnapshot) RecordBaseTimes(context.Context, int64, int64, int64, map[string]int64) error {
+	return nil
+}
+
 func (o *blockingCopyOverlay) EnsureCopyOnWriteFrom(ctx context.Context, repo model.RepoPaths, path string, base model.BaseNode, src *os.File) (model.OverlayEntry, error) {
 	close(o.beforeCopy)
 	<-o.continueCopy

@@ -35,6 +35,7 @@ func TestE2ESharedMount(t *testing.T) {
 	shared.runReadOnly(t, "GitConcurrentReads", testE2EGitConcurrentReads)
 	shared.run(t, "KernelCacheFollowsHEADMoveOutsideTheMount", testE2EKernelCacheFollowsHEADMoveOutsideTheMount)
 	shared.run(t, "GitStatusDetectsSameSizeRewriteAfterMtimeRestore", testE2EGitStatusDetectsSameSizeRewriteAfterMtimeRestore)
+	shared.run(t, "GitStatusDetectsSameSecondRewriteFromAHEADMove", testE2EGitStatusDetectsSameSecondRewriteFromAHEADMove)
 	shared.run(t, "GitStatusPorcelain", testE2EGitStatusPorcelain)
 	shared.run(t, "GitTestUntrackedCache", testE2EGitTestUntrackedCache)
 	shared.run(t, "GitRenameTrackedDirectory", testE2EGitRenameTrackedDirectory)

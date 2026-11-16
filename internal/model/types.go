@@ -201,6 +201,11 @@ type BaseNode struct {
 	ObjectOID string
 	SizeState string // unknown, known
 	SizeBytes int64
+	// RaisedMtime is the Unix second a file or symlink reports as its mtime
+	// and ctime in place of its generation's commit time, or 0. A switch that
+	// changes the node's blob raises it past the mtime the path reported
+	// before, as fusefs.RaiseMtimes describes.
+	RaisedMtime int64
 }
 
 type OverlayKind string
@@ -349,6 +354,15 @@ type GitStore interface {
 type SnapshotStore interface {
 	LookupNode(ctx context.Context, generation int64, path string) (BaseNode, bool, error)
 	ListChildren(generation int64, parentPath string) ([]BaseNode, error)
+	// RaisedMtimes returns the RaisedMtime of each node of generation that
+	// has one, by path.
+	RaisedMtimes(ctx context.Context, generation int64) (map[string]int64, error)
+	// RecordBaseTimes records commitTime as generation's commit time, and
+	// the RaisedMtime of its nodes: raised, by path, and for each other node
+	// that generation carry holds at the same path and type, its RaisedMtime
+	// there when later than commitTime. Every other node of generation then
+	// has none. A carry of 0 carries nothing.
+	RecordBaseTimes(ctx context.Context, generation, commitTime, carry int64, raised map[string]int64) error
 }
 
 // MaxSwitchedPaths is the most paths one log of a switch writes, the overlay

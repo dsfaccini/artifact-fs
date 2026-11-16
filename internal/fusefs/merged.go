@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -289,6 +290,12 @@ func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime i
 	if sw.Replaced != 0 && sw.Replaced != gen {
 		sw.Changed, listings, sw.DiffErr = switchedPathsFor(ctx, r.Snapshot, r.Overlay, sw.Replaced, gen)
 	}
+	// Readers take gen's times from its nodes once the switch lands.
+	if sw.Replaced != gen {
+		if err := RaiseMtimes(ctx, r.Snapshot, sw.Replaced, gen, r.CommitTime(), commitTime); err != nil {
+			return sw, fmt.Errorf("raise mtimes: %w", err)
+		}
+	}
 	return sw, r.Overlay.ReconcileChecked(ctx, gen, baseLookup, sw.Changed, &r.transition, func() {
 		r.SetCommitTime(commitTime)
 		r.SetGeneration(gen)
@@ -472,7 +479,7 @@ func mergeChildren(path string, children []model.BaseNode, ovEntries []model.Ove
 			})
 			continue
 		}
-		out = append(out, ReaddirEntry{Name: e.name, Type: e.typ, Mode: e.base.Mode, ObjectOID: e.base.ObjectOID, SizeState: e.base.SizeState, SizeBytes: e.base.SizeBytes})
+		out = append(out, ReaddirEntry{Name: e.name, Type: e.typ, Mode: e.base.Mode, ObjectOID: e.base.ObjectOID, SizeState: e.base.SizeState, SizeBytes: e.base.SizeBytes, RaisedMtime: e.base.RaisedMtime})
 	}
 	return out
 }
@@ -609,7 +616,7 @@ func (r *Resolver) ChangedPaths(from, to int64, paths []string) (changed map[str
 		}
 		return dirs
 	}
-	mark := func(p string, _ bool) bool {
+	mark := func(p string, _, _ bool) bool {
 		changed[p] = true
 		return true
 	}
@@ -651,7 +658,7 @@ func switchedPathsFor(ctx context.Context, snap model.SnapshotStore, ov model.Ov
 // limit paths changed.
 func switchedPaths(snap model.SnapshotStore, from, to int64, limit int) (switched model.SwitchedPaths, listings []string, err error) {
 	var paths []string
-	mark := func(p string, listing bool) bool {
+	mark := func(p string, listing, _ bool) bool {
 		paths = append(paths, p)
 		if listing {
 			listings = append(listings, model.CleanPath(filepath.Dir(p)))
@@ -667,15 +674,74 @@ func switchedPaths(snap model.SnapshotStore, from, to int64, limit int) (switche
 	return model.SwitchedPaths{Paths: paths}, slices.Compact(listings), nil
 }
 
+// RaiseMtimes records the times the nodes of generation to report once a
+// switch from generation from serves it: toCommit, to's commit time, and the
+// RaisedMtime of each node. fromCommit is from's commit time. Each file or
+// symlink whose blob the switch changes reports one second past the mtime it
+// reported in from, or toCommit when that is later. Git compares mtimes and
+// ctimes in whole seconds, so two commits in one second would otherwise give
+// a change that keeps the size the stat data Git's index holds, and Git would
+// take the file as unchanged. Every other path both generations hold at the
+// same type keeps a raised mtime, or reports toCommit when that is later. A
+// commit time of 0, which a failed read gives, raises nothing, and nor does a
+// from that holds no root entries.
+func RaiseMtimes(ctx context.Context, snap model.SnapshotStore, from, to, fromCommit, toCommit int64) error {
+	raised, carry, err := raisedMtimes(ctx, snap, from, to, fromCommit, toCommit)
+	if err != nil {
+		return err
+	}
+	return snap.RecordBaseTimes(ctx, to, toCommit, carry, raised)
+}
+
+// raisedMtimes returns the RaisedMtime of each node of to whose blob the
+// switch changes, and the generation whose raised mtimes to carries: from, or
+// 0 when it carries none.
+func raisedMtimes(ctx context.Context, snap model.SnapshotStore, from, to, fromCommit, toCommit int64) (map[string]int64, int64, error) {
+	if from == 0 || fromCommit == 0 || toCommit == 0 {
+		return nil, 0, nil
+	}
+	before, err := snap.RaisedMtimes(ctx, from)
+	if err != nil {
+		return nil, 0, err
+	}
+	// A toCommit past every mtime from reports raises nothing, so a switch to
+	// a later commit skips the walk.
+	latest := fromCommit
+	for _, t := range before {
+		latest = max(latest, t)
+	}
+	if toCommit > latest {
+		return nil, 0, nil
+	}
+	raised := map[string]int64{}
+	mark := func(p string, _, rewritten bool) bool {
+		if rewritten {
+			last, ok := before[p]
+			if !ok {
+				last = fromCommit
+			}
+			raised[p] = max(toCommit, last+1)
+		}
+		return true
+	}
+	descend := func(dirs []string, dir string) []string { return append(dirs, dir) }
+	if ok, err := diff(snap, from, to, mark, descend); !ok {
+		return nil, 0, err
+	}
+	maps.DeleteFunc(raised, func(_ string, t int64) bool { return t <= toCommit })
+	return raised, from, nil
+}
+
 // diff walks down from the root of generations from and to of snap. For each
 // directory it lists, it calls mark with each child that the generations give
 // different types, modes or blobs or that only one of them holds, with listing
-// true when only one holds it or its type differs, and walk with each child
-// directory that can hold such children. mark returns false to stop the walk.
-// walk returns the stack of directories to list, with the directory pushed
-// when diff should list it. ok is false when from holds no root entries or
-// mark stopped the walk.
-func diff(snap model.SnapshotStore, from, to int64, mark func(path string, listing bool) bool, walk func(dirs []string, dir string) []string) (ok bool, err error) {
+// true when only one holds it or its type differs, and rewritten true when
+// both hold it as a file, or both as a symlink, with different blobs. It calls
+// walk with each child directory that can hold such children. mark returns
+// false to stop the walk. walk returns the stack of directories to list, with
+// the directory pushed when diff should list it. ok is false when from holds
+// no root entries or mark stopped the walk.
+func diff(snap model.SnapshotStore, from, to int64, mark func(path string, listing, rewritten bool) bool, walk func(dirs []string, dir string) []string) (ok bool, err error) {
 	for dirs := []string{"."}; len(dirs) > 0; {
 		dir := dirs[len(dirs)-1]
 		dirs = dirs[:len(dirs)-1]
@@ -695,7 +761,8 @@ func diff(snap model.SnapshotStore, from, to int64, mark func(path string, listi
 			b, kept := added[a.Path]
 			delete(added, a.Path)
 			if !kept || a.Type != b.Type || a.Mode != b.Mode || baseBlob(a) != baseBlob(b) {
-				if !mark(a.Path, !kept || a.Type != b.Type) {
+				listing := !kept || a.Type != b.Type
+				if !mark(a.Path, listing, !listing && a.Type != "dir" && baseBlob(a) != baseBlob(b)) {
 					return false, nil
 				}
 			}
@@ -704,7 +771,7 @@ func diff(snap model.SnapshotStore, from, to int64, mark func(path string, listi
 			}
 		}
 		for _, b := range added {
-			if !mark(b.Path, true) {
+			if !mark(b.Path, true, false) {
 				return false, nil
 			}
 			if b.Type == "dir" {

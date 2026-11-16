@@ -300,6 +300,8 @@ type ReaddirEntry struct {
 	FromOverlay bool
 	MtimeUnixNs int64
 	CtimeUnixNs int64
+	// RaisedMtime is a base entry's model.BaseNode.RaisedMtime.
+	RaisedMtime int64
 }
 
 func (e ReaddirEntry) direntType() fuseutil.DirentType {
@@ -1242,7 +1244,7 @@ func (fs *ArtifactFuse) markWritten(id fuseops.InodeID, path string) {
 // content at InodeRef.Gen, whose attributes the kernel last received. When
 // handles read different content, the most recently opened handle that reads
 // any decides. A held file's size comes from a stat of the file it reads; a
-// base blob keeps the mtime last reported, its commit time. heldAttrs returns
+// base blob keeps the mtime last reported. heldAttrs returns
 // false when no handle reads content and the inode holds no base content.
 func (fs *ArtifactFuse) heldAttrs(id fuseops.InodeID) (Attrs, bool) {
 	fs.mu.RLock()
@@ -2237,7 +2239,7 @@ func readdirAttrs(e ReaddirEntry, gen, commitTime int64) (mode uint32, size int6
 	if e.FromOverlay || typ == "dir" {
 		return mode, size, typ, time.Unix(0, e.MtimeUnixNs), time.Unix(0, e.CtimeUnixNs)
 	}
-	mt := baseTime(gen, commitTime)
+	mt := baseTime(gen, commitTime, e.RaisedMtime)
 	return mode, size, typ, mt, mt
 }
 
