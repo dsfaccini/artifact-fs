@@ -1177,24 +1177,17 @@ func TestLateAsyncPrepareInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 		if !late.Load() {
 			return
 		}
-		// Any record during the pass, here the refresh loop's after a fetch,
-		// reports what the runtime holds then.
-		start := time.Now()
-		r.rt.refresh <- time.Millisecond
-		defer func() { r.rt.refresh <- time.Hour }()
-		for {
-			rec, _, err := r.svc.registry.GetRuntime(ctx, r.cfg.ID)
-			if err != nil {
-				t.Errorf("runtime record during the pass: %v", err)
-				statesAtPass <- ""
-				return
-			}
-			if rec.LastFetchAt.After(start) {
-				statesAtPass <- rec.State
-				return
-			}
-			time.Sleep(time.Millisecond)
+		// Any record during the pass reports what the runtime holds then.
+		// The activation holds the repo's prepare lock through the pass, and
+		// a refresh waits for it, so the pass writes the record itself.
+		r.svc.recordRuntimeState(r.rt)
+		rec, _, err := r.svc.registry.GetRuntime(ctx, r.cfg.ID)
+		if err != nil {
+			t.Errorf("runtime record during the pass: %v", err)
+			statesAtPass <- ""
+			return
 		}
+		statesAtPass <- rec.State
 	})
 	r.svc.mu.Lock()
 	firstGen := r.rt.head.gen

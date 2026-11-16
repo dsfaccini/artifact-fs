@@ -737,7 +737,7 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 | `git checkout` | Supported | Re-indexes tree and reconciles overlay; Git updates its own index |
 | `git merge --no-ff` | Supported | Publishes merge commits and reconciles the merged worktree |
 | `git rebase` | Supported | Reconciles rewritten commits and branch state |
-| `git fetch` | Supported | Background refresh loop fetches the fetch ref, or a `--require-commit` repo's `--ref`, periodically. Run `git fetch` in the git dir for other branches |
+| `git fetch` | Supported | Background refresh loop fetches the fetch ref, or a `--require-commit` repo's `--ref`, periodically, and waits while a preparation of the repo runs. Run `git fetch` in the git dir for other branches |
 | `git pull --ff-only` | Supported | Publishes the fast-forwarded snapshot and reconciles the overlay |
 | `git push` | Supported | Uses the configured upstream and ambient credentials |
 

@@ -27,13 +27,16 @@ func (s *core) withRepoLock(ctx context.Context, lockName string, fn func() erro
 		return err
 	}
 	defer lockFile.Close()
-	for {
+	for first := true; ; first = false {
 		err = unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
 			break
 		}
 		if err != unix.EWOULDBLOCK && err != unix.EAGAIN {
 			return err
+		}
+		if first && s.lockBusy != nil {
+			s.lockBusy(lockName)
 		}
 		timer := time.NewTimer(repoConfigLockRetry)
 		select {

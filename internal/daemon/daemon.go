@@ -94,6 +94,9 @@ type core struct {
 	// generationRetention is how long a retired generation stays readable;
 	// zero means defaultGenerationRetention.
 	generationRetention time.Duration
+	// lockBusy, a test hook nil in production, runs with a repo lock's file
+	// name when withRepoLock finds the lock held, before it waits.
+	lockBusy func(lockName string)
 }
 
 // Controller carries out one CLI command. It never mounts. It reaches the
@@ -166,6 +169,9 @@ type Service struct {
 	// headPollInterval. Every watcher reads from this one channel, so each
 	// tick reaches one of them.
 	headPollTicks <-chan time.Time
+	// refreshTicks, when set, replaces each refresh loop's ticker. Every loop
+	// reads from this one channel, so each tick reaches one of them.
+	refreshTicks <-chan time.Time
 	// records holds what recordRuntime last wrote for each repo. recordMu
 	// serializes the writes, and is taken before mu.
 	recordMu sync.Mutex
