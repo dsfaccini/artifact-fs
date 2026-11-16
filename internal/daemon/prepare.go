@@ -599,8 +599,8 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 		if s.running[cfg.ID] != rt || !samePrepare(rt.cfg, cfg) {
 			return errPrepareSuperseded
 		}
-		runHook(s.gateOpening)
 		rt.gate.MarkReady()
+		runHook(s.gateOpened)
 		return nil
 	})
 	if err != nil {
@@ -616,7 +616,11 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	}
 	rt.cfg.PrepareState = model.PrepareStateReady
 	rt.cfg.PrepareError = ""
-	rt.head = servedHead{oid: headOID, ref: headRef, gen: gen}
+	// A HEAD reconcile during the pass can have switched further, and it sets
+	// the served HEAD it switched to.
+	if rt.resolver.Generation() == gen {
+		rt.head = servedHead{oid: headOID, ref: headRef, gen: gen}
+	}
 	rt.prepare = model.PrepareStateReady
 	s.mu.Unlock()
 	s.recordRuntimeState(rt)

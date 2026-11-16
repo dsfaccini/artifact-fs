@@ -1286,11 +1286,59 @@ func TestSupersededActivationSendsItsPassOnlyOnceTheGateOpens(t *testing.T) {
 	r.svc.prepareWorkers.Wait()
 }
 
+// A HEAD reconcile can switch further during an activation's pass: the
+// gate is open, and HEAD moves again. The activation then keeps the served
+// HEAD the reconcile recorded, which the resolver serves, so status reports
+// the commit and generation the mount serves.
+func TestActivationKeepsTheServedHEADOfAReconcileDuringItsPass(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	var r *servedAsyncRepo
+	var armed atomic.Bool
+	r = newServedAsyncRepo(t, nil, func() {
+		if !armed.CompareAndSwap(true, false) {
+			return
+		}
+		prev, err := exec.Command("git", "--git-dir", r.cfg.GitDir, "rev-parse", "HEAD~1").Output()
+		if err != nil {
+			t.Errorf("resolve HEAD~1 during the pass: %v", err)
+			return
+		}
+		if out, err := exec.Command("git", "--git-dir", r.cfg.GitDir, "update-ref", "HEAD", strings.TrimSpace(string(prev))).CombinedOutput(); err != nil {
+			t.Errorf("move HEAD during the pass: %v\n%s", err, out)
+			return
+		}
+		if err := r.svc.reconcileHEAD(ctx, r.rt); err != nil {
+			t.Errorf("HEAD reconcile during the pass: %v", err)
+		}
+	})
+
+	commitFile(t, r.remote, "README.md", "two\n")
+	armed.Store(true)
+	if err := r.requestPrepare(ctx, "late"); err != nil {
+		t.Fatal(err)
+	}
+	r.svc.prepareWorkers.Wait()
+	if armed.Load() {
+		t.Fatal("the late activation sent no pass")
+	}
+	head := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", r.cfg.GitDir, "rev-parse", "HEAD"))
+	rec, _, err := r.svc.registry.GetRuntime(ctx, r.cfg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gen := r.rt.resolver.Generation(); rec.ServedCommit != head || rec.ServedGeneration != gen {
+		t.Fatalf("status after the activation serves %s at generation %d; want HEAD %s at generation %d, which the resolver serves", rec.ServedCommit, rec.ServedGeneration, head, gen)
+	}
+}
+
 // A newer prepare request can land as an activation opens the gate. The
 // activation opens it in the s.mu hold that checks its request, so the
 // request's reset lands before the check, which supersedes the activation,
 // or after the open. A reset between the two would find the gate shut, and
-// the open would then let ops through while the newer preparation runs.
+// the open would then let ops through while the newer preparation runs. The
+// request starts once the activation opened the gate, and lands once the
+// activation releases s.mu.
 func TestPrepareRequestAsAnActivationOpensTheGateHoldsOps(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
@@ -1305,17 +1353,17 @@ func TestPrepareRequestAsAnActivationOpensTheGateHoldsOps(t *testing.T) {
 		}
 	}
 	r = newServedAsyncRepo(t, func(svc *Service) {
-		svc.gateOpening = func() {
+		svc.gateOpened = func() {
 			if !late.CompareAndSwap(true, false) {
 				return
 			}
 			newer.Store(true)
 			if svc.mu.TryLock() {
-				// The activation opens the gate outside the hold that checked
-				// its request, so the request lands in between.
 				svc.mu.Unlock()
-				request()
-				return
+				t.Error("the activation opened the gate outside the s.mu hold that checked its request")
+			}
+			if holdsOps(r.gate) {
+				t.Error("the gate holds ops once the activation opened it")
 			}
 			go request()
 		}
