@@ -34,6 +34,10 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 	retry := newRefreshRetrier(baseInterval)
 	ticker := time.NewTicker(baseInterval)
 	defer ticker.Stop()
+	ticks := ticker.C
+	if s.refreshTicks != nil {
+		ticks = s.refreshTicks
+	}
 	for {
 		select {
 		case <-rt.ctx.Done():
@@ -45,25 +49,35 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 			baseInterval = interval
 			retry = newRefreshRetrier(baseInterval)
 			ticker.Reset(baseInterval)
-		case <-ticker.C:
+		case <-ticks:
 			s.mu.Lock()
 			cfg := rt.cfg
 			s.mu.Unlock()
 			if cfg.RemoteRefreshDisabled {
 				continue
 			}
-			ctx, cancel := context.WithTimeout(rt.ctx, 30*time.Second)
-			err := s.git.FetchNonInteractive(ctx, cfg)
+			// A preparation fetches into the same tracking ref, and two
+			// fetches that overlap fail each other's ref update. So the
+			// refresh waits for the repo's prepare lock, and its timeout
+			// starts once it holds the lock.
+			var state aheadBehind
+			var abErr error
+			err := s.withRepoPrepareLock(rt.ctx, cfg.Name, func() error {
+				ctx, cancel := context.WithTimeout(rt.ctx, 30*time.Second)
+				defer cancel()
+				if err := s.git.FetchNonInteractive(ctx, cfg); err != nil {
+					return err
+				}
+				state, abErr = s.fetchState(ctx, cfg)
+				return nil
+			})
 			if err != nil {
-				cancel()
 				s.mu.Lock()
 				rt.fetch.state = fetchFailed
 				s.mu.Unlock()
 				ticker.Reset(s.retryFailure(cfg, retry, err, s.runtimeState(rt)))
 				continue
 			}
-			state, abErr := s.fetchState(ctx, cfg)
-			cancel()
 			retry.succeed()
 			ticker.Reset(baseInterval)
 			s.mu.Lock()
