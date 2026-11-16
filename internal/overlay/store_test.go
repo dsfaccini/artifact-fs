@@ -1449,6 +1449,74 @@ func TestReconcileAfterCommit(t *testing.T) {
 	}
 }
 
+// The umask of each process that writes through the mount sets or clears the
+// group and other write bits, and Git records neither. A reconcile drops an
+// entry whose content and mode are the base's apart from those two bits, and
+// keeps one that differs in any other bit. A drop that changes the path's
+// mode to the base's logs the path, because Git trusts every index entry the
+// fsmonitor hook does not name.
+func TestReconcileIgnoresOnlyGroupAndOtherWrite(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		mode     uint32
+		baseMode uint32
+		kept     bool
+		// logged is whether the reconcile logs the path.
+		logged bool
+	}{
+		{name: "umask 022", mode: 0o644, baseMode: 0o100644},
+		{name: "umask 002", mode: 0o664, baseMode: 0o100644, logged: true},
+		{name: "umask 000", mode: 0o666, baseMode: 0o100644, logged: true},
+		{name: "executable under umask 002", mode: 0o775, baseMode: 0o100755, logged: true},
+		{name: "executable bit", mode: 0o755, baseMode: 0o100644, kept: true},
+		{name: "umask 027", mode: 0o640, baseMode: 0o100644, kept: true},
+		{name: "group read", mode: 0o604, baseMode: 0o100644, kept: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, cfg := testStore(t)
+			ctx := context.Background()
+			data := []byte("as committed\n")
+			if _, err := s.CreateFile(ctx, "file.txt", tt.mode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.WriteFile(ctx, "file.txt", 0, data); err != nil {
+				t.Fatal(err)
+			}
+			// The handle closes, which logs its writes.
+			if err := s.FlushFile(ctx, "file.txt"); err != nil {
+				t.Fatal(err)
+			}
+			if e, ok := lookupEntry(t, s, "file.txt"); !ok || e.Kind != model.OverlayKindCreate || e.Mode != tt.mode {
+				t.Fatalf("entry before reconcile = %+v, %v; want a create entry with mode %#o", e, ok, tt.mode)
+			}
+			base := model.BaseNode{Path: "file.txt", Type: "file", Mode: tt.baseMode, ObjectOID: testBlobOID(data)}
+			before := changesSince(t, cfg, 0).Seq
+			if err := reconcile(ctx, s, func(path string) (model.BaseNode, bool) {
+				return base, path == base.Path
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var want []string
+			if tt.logged {
+				want = []string{"file.txt"}
+			}
+			if got := changesSince(t, cfg, before).Paths; !slices.Equal(got, want) {
+				t.Fatalf("changed paths after reconcile = %q, want %q", got, want)
+			}
+			e, ok := lookupEntry(t, s, "file.txt")
+			if !tt.kept {
+				if ok {
+					t.Fatalf("entry with mode %#o over a base with mode %#o = %+v, want it reconciled away", tt.mode, tt.baseMode, e)
+				}
+				return
+			}
+			if !ok || e.Kind != model.OverlayKindModify || e.Mode != tt.mode || e.SourceOID != base.ObjectOID || e.SourceMode != tt.baseMode {
+				t.Fatalf("entry with mode %#o over a base with mode %#o = %+v, %v; want it kept as a modify of the base with its mode", tt.mode, tt.baseMode, e, ok)
+			}
+		})
+	}
+}
+
 func testBlobOID(data []byte) string {
 	h := sha1.New()
 	_, _ = fmt.Fprintf(h, "blob %d\x00", len(data))

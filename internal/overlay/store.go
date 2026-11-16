@@ -1242,9 +1242,11 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 		return nil, err
 	}
 	defer tx.Rollback()
-	// Removing an entry the new base matches, rebasing an entry, and removing
-	// a delete marker for a path the new base lacks leave the merged view as
-	// it was. Only a removed delete marker over a base path is a change for Git.
+	// Rebasing an entry, removing a delete marker for a path the new base
+	// lacks, and removing an entry the new base matches leave the merged view
+	// as it was. Two removals change it: a delete marker's over a base path,
+	// which reveals the base, and a file entry's whose mode differs from the
+	// base's in group or other write, which overlayEntryMatchesBase ignores.
 	// The transaction holds the write lock from BEGIN, so no write lands
 	// between reading the log and applying the result.
 	if err := suspendChangeLog(ctx, tx); err != nil {
@@ -1271,7 +1273,7 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 			return nil, err
 		}
 	}
-	var revealed []string
+	var logged []string
 	// Guard the mutations so that a change the log does not show, such as
 	// another Store's reconcile, is not lost.
 	stmt, err := tx.PrepareContext(ctx, `DELETE FROM overlay_entries WHERE path=? AND kind=? AND source_oid=? AND source_mode=? AND mode=? AND mtime_unix_ns=? AND ctime_unix_ns=?`)
@@ -1287,8 +1289,15 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 		}
 		if n, err := res.RowsAffected(); err == nil && n > 0 {
 			deleted = append(deleted, e)
-			if e.Kind == model.OverlayKindDelete && plan.revealsBase[e.Path] {
-				revealed = append(revealed, e.Path)
+			switch e.Kind {
+			case model.OverlayKindDelete:
+				if plan.revealsBase[e.Path] {
+					logged = append(logged, e.Path)
+				}
+			case model.OverlayKindCreate, model.OverlayKindModify, model.OverlayKindRename:
+				if base := r.bases[e.Path].node; base.Mode != 0 && (e.Mode^base.Mode)&0o777 != 0 {
+					logged = append(logged, e.Path)
+				}
 			}
 		}
 	}
@@ -1303,12 +1312,12 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 		}
 	}
 	// An entry shows the same content before and after the switch, unless the
-	// plan removed a delete marker over a base path, which revealed holds.
+	// plan removed it with a change that logged holds.
 	covered := func(path string) bool {
 		_, found := slices.BinarySearchFunc(entries, path, func(e model.OverlayEntry, p string) int { return strings.Compare(e.Path, p) })
 		return found
 	}
-	if err := resumeChangeLog(ctx, tx, revealed...); err != nil {
+	if err := resumeChangeLog(ctx, tx, logged...); err != nil {
 		return nil, err
 	}
 	if err := logSwitched(ctx, tx, switched, covered, s.MaxSwitchedPaths); err != nil {
@@ -1552,8 +1561,13 @@ func (r *reconciler) classify(entries []model.OverlayEntry, final bool) (reconci
 	return p, nil
 }
 
+// overlayEntryMatchesBase reports whether e's content and mode are base's.
+// The group and other write bits do not count: each process that writes
+// through the mount applies its own umask, which sets or clears them, so a
+// file Git writes back with base's content can differ from base in those bits
+// alone.
 func overlayEntryMatchesBase(e model.OverlayEntry, base model.BaseNode) (bool, error) {
-	if base.Mode != 0 && e.Mode&0o777 != base.Mode&0o777 {
+	if base.Mode != 0 && (e.Mode^base.Mode)&0o777&^0o022 != 0 {
 		return false, nil
 	}
 	if e.Kind == model.OverlayKindSymlink {

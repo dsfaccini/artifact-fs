@@ -137,6 +137,22 @@ func run(t *testing.T, dir string, name string, args ...string) string {
 	return stdout.String()
 }
 
+// privateE2EStateRoot returns a new state root that only the current user
+// can write, as daemon.New requires. A t.TempDir follows the umask.
+func privateE2EStateRoot(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// daemon.New resolves the state root's symlinks, such as macOS's /var.
+	root, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
 func TestE2E(t *testing.T) {
 	if os.Getenv("AFS_RUN_E2E_TESTS") != "1" {
 		t.Skip("skipping e2e tests (set AFS_RUN_E2E_TESTS=1 to run)")
@@ -150,11 +166,7 @@ func TestE2E(t *testing.T) {
 		t.Logf("using local test repo: %s", remoteURL)
 	}
 
-	// daemon.New resolves the state root's symlinks, such as macOS's /var.
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	root := privateE2EStateRoot(t)
 	mountDir := newE2EMountDir(t)
 	mountPath := filepath.Join(mountDir, repoName)
 	if err := os.MkdirAll(mountPath, 0o755); err != nil {
@@ -1239,11 +1251,7 @@ func TestE2EVerifiedSource(t *testing.T) {
 	run(t, "", "git", "clone", remoteURL, updateWork)
 	run(t, updateWork, "git", "checkout", "main")
 
-	// daemon.New resolves the state root's symlinks, such as macOS's /var.
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	root := privateE2EStateRoot(t)
 	mountDir := newE2EMountDir(t)
 	mountPath := filepath.Join(mountDir, repoName)
 	cfg := model.RepoConfig{
