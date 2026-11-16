@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -889,31 +888,128 @@ func TestHeadReconcileServesReadsMatchingReportedSize(t *testing.T) {
 	}
 }
 
-// invalidatingMount records the generation the resolver serves each time the
-// daemon asks the mount to invalidate the kernel's caches.
+// invalidatingMount records, each time the daemon asks the mount to
+// invalidate the kernel's caches, the generation the resolver serves and
+// whether an op would wait at gate. A lookup that waits at the gate holds its
+// parent directory's lock, which the kernel's entry invalidation takes, so an
+// invalidation then blocks until the lookup ends. during, when not nil, runs
+// first.
 type invalidatingMount struct {
 	*fakeMountedFS
 	resolver *fusefs.Resolver
-	gens     chan int64
+	gate     *fusefs.ReadyGate
+	during   func()
+	passes   chan switchPass
+}
+
+type switchPass struct {
+	gen  int64
+	held bool
 }
 
 func (m *invalidatingMount) InvalidateChanged() error {
-	m.gens <- m.resolver.Generation()
+	if m.during != nil {
+		m.during()
+	}
+	m.passes <- switchPass{gen: m.resolver.Generation(), held: holdsOps(m.gate)}
 	return nil
+}
+
+// holdsOps reports whether an op that reaches gate now would wait.
+func holdsOps(gate *fusefs.ReadyGate) bool {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return errors.Is(gate.Wait(ctx), context.Canceled)
+}
+
+func newInvalidatingMount(resolver *fusefs.Resolver, gate *fusefs.ReadyGate) *invalidatingMount {
+	return &invalidatingMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, resolver: resolver, gate: gate, passes: make(chan switchPass, 4)}
 }
 
 func TestHeadReconcileInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 	t.Parallel()
 	f := newHeadReconcileFixture(t)
-	mount := &invalidatingMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, resolver: f.rt.resolver, gens: make(chan int64, 1)}
+	mount := newInvalidatingMount(f.rt.resolver, nil)
 	f.svc.mu.Lock()
 	f.rt.mfs, f.rt.mount = mount, mountServing
 	f.svc.mu.Unlock()
 
 	f.updateMain(f.nextOID)
 	f.signal()
-	if gen := <-mount.gens; gen != f.oldGen+1 {
-		t.Fatalf("mount invalidated while the resolver served generation %d, want the new generation %d", gen, f.oldGen+1)
+	if pass := <-mount.passes; pass.gen != f.oldGen+1 {
+		t.Fatalf("mount invalidated while the resolver served generation %d, want the new generation %d", pass.gen, f.oldGen+1)
+	}
+}
+
+// A HEAD reconcile can switch while the gate holds ops: an async repo's
+// preparation moves the branch, and the watcher sees it before the
+// preparation opens the gate. The reconcile's pass then waits for the gate.
+func TestHeadReconcileInvalidatesOnlyOnceTheGateOpens(t *testing.T) {
+	t.Parallel()
+	f := newIdleHeadReconcileFixture(t, time.Millisecond)
+	gate := fusefs.NewReadyGate(false)
+	mount := newInvalidatingMount(f.rt.resolver, gate)
+	f.svc.mu.Lock()
+	f.rt.gate, f.rt.mfs, f.rt.mount = gate, mount, mountServing
+	f.svc.mu.Unlock()
+
+	f.updateMain(f.nextOID)
+	if err := f.svc.reconcileHEAD(f.ctx, f.rt); err != nil {
+		t.Fatal(err)
+	}
+	gate.MarkReady()
+	if pass := <-mount.passes; pass.held || pass.gen != f.oldGen+1 {
+		t.Fatalf("mount invalidated at generation %d, with ops held at the gate: %v; want generation %d with the gate open", pass.gen, pass.held, f.oldGen+1)
+	}
+}
+
+// A prepare request can reset the gate while a switch pass runs. The reset
+// holds ops only once the pass ends: a lookup it held could block the pass's
+// entry invalidations, and the preparation that opens the gate again can wait
+// for the pass. The end of that preparation during the pass replaces the
+// reset.
+func TestGateResetDuringASwitchPassTakesEffectWhenThePassEnds(t *testing.T) {
+	t.Parallel()
+	prepareErr := errors.New("prepare failed")
+	for _, tt := range []struct {
+		name string
+		// after the reset, during the pass.
+		after func(*fusefs.ReadyGate)
+		// want is what an op that reaches the gate after the pass gets:
+		// context.Canceled for one the gate holds.
+		want error
+	}{
+		{name: "reset", after: func(*fusefs.ReadyGate) {}, want: context.Canceled},
+		{name: "reset then ready", after: (*fusefs.ReadyGate).MarkReady, want: nil},
+		{name: "reset then failed", after: func(g *fusefs.ReadyGate) { g.MarkFailed(prepareErr) }, want: prepareErr},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			f := newIdleHeadReconcileFixture(t, time.Millisecond)
+			gate := fusefs.NewReadyGate(true)
+			mount := newInvalidatingMount(f.rt.resolver, gate)
+			// resetRunningPrepareState resets the gate for a prepare request.
+			mount.during = func() {
+				gate.Reset()
+				tt.after(gate)
+			}
+			f.svc.mu.Lock()
+			f.rt.gate, f.rt.mfs, f.rt.mount = gate, mount, mountServing
+			f.svc.mu.Unlock()
+
+			f.updateMain(f.nextOID)
+			if err := f.svc.reconcileHEAD(f.ctx, f.rt); err != nil {
+				t.Fatal(err)
+			}
+			if pass := <-mount.passes; pass.held || pass.gen != f.oldGen+1 {
+				t.Fatalf("mount invalidated at generation %d, with ops held at the gate: %v; want generation %d with the gate open", pass.gen, pass.held, f.oldGen+1)
+			}
+			canceled, cancel := context.WithCancel(context.Background())
+			cancel()
+			if err := gate.Wait(canceled); !errors.Is(err, tt.want) || tt.want == nil && err != nil {
+				t.Fatalf("op at the gate after the pass = %v, want %v", err, tt.want)
+			}
+		})
 	}
 }
 
@@ -922,7 +1018,8 @@ func TestHeadReconcileInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 // checks only the config. The kernel then caches entries from the open gate,
 // and the late preparation moves HEAD to the remote's new tip. Its activation
 // must invalidate the kernel's caches once the resolver serves the new
-// generation, before it opens the gate.
+// generation, and only once it opened the gate: a lookup the gate held would
+// block the invalidations until the lookup ended.
 func TestLateAsyncPrepareInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
@@ -936,11 +1033,36 @@ func TestLateAsyncPrepareInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = svc.Close() }()
-	gens := make(chan int64, 1)
-	svc.mount = func(_, _ context.Context, _ model.RepoPaths, engine *fusefs.Engine, _ *fusefs.ReadyGate, _ *slog.Logger, _ func(string) string) (fusefs.MountedFS, error) {
-		return &invalidatingMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, resolver: engine.Resolver, gens: gens}, nil
-	}
+	passes := make(chan switchPass, 4)
+	// statesAtPass receives, during each pass of the late preparation, the
+	// state status reports.
+	var late atomic.Bool
+	statesAtPass := make(chan string, 4)
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + remote, Branch: "main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Hour}, Enabled: true}
+	// A pass that waits for the gate waits here also until status no longer
+	// reports the late preparation, so it cannot beat the activation's record.
+	svc.passDeferred = func() {
+		for late.Load() {
+			if st, err := svc.ctl().Status(ctx, cfg.Name); err != nil || st.State != string(model.PrepareStatePreparing) {
+				return
+			}
+		}
+	}
+	svc.mount = func(_, _ context.Context, _ model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, _ *slog.Logger, _ func(string) string) (fusefs.MountedFS, error) {
+		mount := newInvalidatingMount(engine.Resolver, gate)
+		mount.passes = passes
+		mount.during = func() {
+			if !late.Load() {
+				return
+			}
+			st, err := svc.ctl().Status(ctx, cfg.Name)
+			if err != nil {
+				t.Errorf("status during the pass: %v", err)
+			}
+			statesAtPass <- st.State
+		}
+		return mount, nil
+	}
 	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -960,7 +1082,7 @@ func TestLateAsyncPrepareInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 	firstGen, gate := rt.head.gen, rt.gate
 	svc.mu.Unlock()
 	select {
-	case <-gens:
+	case <-passes:
 	default:
 	}
 
@@ -968,23 +1090,18 @@ func TestLateAsyncPrepareInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 	if err := svc.registry.BeginPrepare(ctx, ready, model.PrepareStatePreparing, "late"); err != nil {
 		t.Fatal(err)
 	}
+	late.Store(true)
 	// reconcileHEAD runs under headMu, so only the activation can switch the
-	// resolver until the gate opens. The activation's prune waits for headMu.
+	// resolver. The activation's prune waits for headMu.
 	rt.headMu.Lock()
 	if err := svc.syncRepos(ctx); err != nil {
 		rt.headMu.Unlock()
 		t.Fatal(err)
 	}
-	gateErr := gate.Wait(ctx)
-	var invalidated []int64
-	select {
-	case gen := <-gens:
-		invalidated = append(invalidated, gen)
-	default:
-	}
+	pass := <-passes
 	rt.headMu.Unlock()
-	if gateErr != nil {
-		t.Fatalf("gate after the late preparation = %v, want open", gateErr)
+	if err := gate.Wait(ctx); err != nil {
+		t.Fatalf("gate after the late preparation = %v, want open", err)
 	}
 	svc.prepareWorkers.Wait()
 
@@ -994,8 +1111,13 @@ func TestLateAsyncPrepareInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 	if runningRuntime(svc, ready.ID) != rt || served.oid != next || served.gen == firstGen {
 		t.Fatalf("after the late preparation the runtime serves %s at generation %d, want the same runtime serving %s at a generation after %d", served.oid, served.gen, next, firstGen)
 	}
-	if want := []int64{served.gen}; !slices.Equal(invalidated, want) {
-		t.Fatalf("mount invalidated at generations %v before the gate opened, want %v, the generation the activation switched to", invalidated, want)
+	if pass.held || pass.gen != served.gen {
+		t.Fatalf("mount invalidated at generation %d, with ops held at the gate: %v; want generation %d, the generation the activation switched to, with the gate open", pass.gen, pass.held, served.gen)
+	}
+	// Once status no longer reports the preparation, the kernel holds nothing
+	// the switch changed.
+	if state := <-statesAtPass; state != string(model.PrepareStatePreparing) {
+		t.Fatalf("status during the activation's pass = %q, want %q: the activation records the end of the preparation only after the pass", state, model.PrepareStatePreparing)
 	}
 }
 

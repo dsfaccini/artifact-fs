@@ -591,20 +591,23 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	} else {
 		s.logger.Warn("commit timestamp unavailable", "repo", cfg.Name, "error", err)
 	}
-	if err := s.switchGeneration(ctx, rt, gen, commitTime); err != nil {
+	err := s.switchGeneration(ctx, rt, gen, commitTime, func() error {
+		s.mu.Lock()
+		if s.running[cfg.ID] != rt || !samePrepare(rt.cfg, cfg) {
+			s.mu.Unlock()
+			return errPrepareSuperseded
+		}
+		rt.cfg.PrepareState = model.PrepareStateReady
+		rt.cfg.PrepareError = ""
+		rt.head = servedHead{oid: headOID, ref: headRef, gen: gen}
+		rt.prepare = model.PrepareStateReady
+		s.mu.Unlock()
+		rt.gate.MarkReady()
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	if s.running[cfg.ID] != rt || !samePrepare(rt.cfg, cfg) {
-		s.mu.Unlock()
-		return errPrepareSuperseded
-	}
-	rt.cfg.PrepareState = model.PrepareStateReady
-	rt.cfg.PrepareError = ""
-	rt.head = servedHead{oid: headOID, ref: headRef, gen: gen}
-	rt.prepare = model.PrepareStateReady
-	s.mu.Unlock()
-	rt.gate.MarkReady()
 	s.recordRuntimeState(rt)
 	s.startRepoBackground(rt)
 	return nil
