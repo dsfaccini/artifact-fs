@@ -74,25 +74,34 @@ func (s *Service) configureStatusOptimization(ctx context.Context, cfg model.Rep
 	}
 }
 
-// configureCurrentStatusOptimization writes cfg's status optimization config
-// under cfg's prepare lock while cfg's config version is the registry's. It
-// runs on the sync loop, so it never waits for the lock, which a preparation
-// can hold for up to its timeout: it skips the write while another step holds
-// the lock.
-func (s *Service) configureCurrentStatusOptimization(ctx context.Context, cfg model.RepoConfig) {
+// configureCurrentStatusOptimization writes the status optimization config
+// of rt's mount under the repo's prepare lock, while cfg's config version is
+// the registry's. It runs on the sync loop, so it never waits for the lock,
+// which a preparation can hold for up to its timeout. While another step
+// holds the lock, it marks the write pending for retryMount.
+func (s *Service) configureCurrentStatusOptimization(rt *repoRuntime, cfg model.RepoConfig) {
 	ran, err := s.tryRepoPrepareLock(cfg.Name, func() error {
-		latest, err := s.registry.GetRepo(ctx, cfg.Name)
+		latest, err := s.registry.GetRepo(rt.ctx, cfg.Name)
 		if err != nil || latest.ConfigVersion != cfg.ConfigVersion {
 			return err
 		}
-		s.configureStatusOptimization(ctx, cfg)
+		s.configureStatusOptimization(rt.ctx, cfg)
 		return nil
 	})
+	busy := !ran && err == nil
+	s.mu.Lock()
+	wasPending := rt.statusPending
+	rt.statusPending = busy
+	s.mu.Unlock()
 	switch {
-	case err != nil && ctx.Err() == nil:
-		s.logger.Warn("git status optimization setup skipped", "repo", cfg.Name, "error", err)
-	case err == nil && !ran:
-		s.logger.Info("git status optimization setup skipped while another step holds the repo's prepare lock", "repo", cfg.Name)
+	case busy && !wasPending:
+		s.logger.Info("git status optimization setup deferred while another step holds the repo's prepare lock", "repo", cfg.Name)
+	case err == nil || rt.ctx.Err() != nil:
+	case ran:
+		// A remove-repo that held the lock leaves nothing to write.
+		s.logger.Info("git status optimization setup skipped", "repo", cfg.Name, "error", err)
+	default:
+		s.logger.Warn("git status optimization setup failed", "repo", cfg.Name, "error", err)
 	}
 }
 

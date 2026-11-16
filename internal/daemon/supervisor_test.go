@@ -7,11 +7,13 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -491,5 +493,104 @@ func TestStartMountRedactsTheRemoteFromFuseErrors(t *testing.T) {
 	line := fmt.Sprintf("Op 0x00000002 *fuseops.ReadFileOp] -> Error: %q", "fetch "+d.workDir+": exit status 128")
 	if got := d.mounts.redactor()(line); strings.Contains(got, d.workDir) || !strings.Contains(got, "REDACTED_REMOTE") {
 		t.Fatalf("redact(%q) = %q, want the remote redacted", line, got)
+	}
+}
+
+// A retried mount that found the prepare lock held writes its status config
+// at a later sync, once the lock is free. For a verified source that write
+// pins core.worktree to the mount point, and nothing else writes the pin.
+func TestRetriedMountWritesTheStatusConfigOnceThePrepareLockFrees(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	runCmd(t, "git", "init", "--initial-branch", "main", remote)
+	commit := commitFile(t, remote, "README.md", "verified\n")
+	runCmd(t, "git", "-C", remote, "config", "uploadpack.allowFilter", "true")
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+	svc.refreshTicks = make(chan time.Time)
+	busy := make(chan struct{}, 1)
+	svc.lockBusy = func(lockName string) {
+		if lockName != "verified.prepare.lock" {
+			return
+		}
+		select {
+		case busy <- struct{}{}:
+		default:
+		}
+	}
+	var mounts atomic.Int32
+	svc.mount = func(ctx, opCtx context.Context, repo model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
+		if mounts.Add(1) == 1 {
+			return nil, errors.New("the first mount fails")
+		}
+		return fakeMount(ctx, opCtx, repo, engine, gate, logger, redact)
+	}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "verified"}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + remote, Branch: "refs/heads/main", RequiredCommit: commit, HistoryDepth: 1}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Hour}, Enabled: true}
+	if err := svc.ctl().AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = svc.registry.GetRepo(ctx, cfg.Name); err != nil {
+		t.Fatal(err)
+	}
+	pin := func() string {
+		t.Helper()
+		out, err := exec.Command("git", "--git-dir", cfg.GitDir, "config", "--get", "core.worktree").Output()
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && exitErr.ExitCode() == 1 {
+			return ""
+		}
+		if err != nil {
+			t.Fatalf("read core.worktree: %v", err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if mounts.Load() != 1 {
+		t.Fatalf("the mount check mounted %d times, want 1", mounts.Load())
+	}
+	held, release, unlocked := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		unlocked <- svc.withRepoPrepareLock(ctx, cfg.Name, func() error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	synced := make(chan error, 1)
+	go func() { synced <- svc.syncRepos(ctx) }()
+	select {
+	case err := <-synced:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-busy:
+		close(release)
+		t.Fatal("the retried mount waited for the prepare lock that another step held")
+	}
+	if mounts.Load() != 2 {
+		t.Fatalf("the sync after a failed mount mounted %d times in all, want 2", mounts.Load())
+	}
+	if got := pin(); got != "" {
+		t.Fatalf("core.worktree = %q after a retried mount while another step held the prepare lock, want it unset", got)
+	}
+	close(release)
+	if err := <-unlocked; err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if mounts.Load() != 2 {
+		t.Fatalf("the mount served, yet the next sync mounted again: %d mounts in all, want 2", mounts.Load())
+	}
+	if got := pin(); got != cfg.MountPath {
+		t.Fatalf("core.worktree = %q at the sync after the prepare lock was free, want %q", got, cfg.MountPath)
 	}
 }

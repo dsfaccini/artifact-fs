@@ -950,8 +950,8 @@ func TestRemoveRepoDuringARetriedMountOfAnAdoptedWorktree(t *testing.T) {
 
 // A retried mount runs on the sync loop and never waits for the prepare
 // lock, which a preparation can hold for up to its timeout. It skips the
-// status config while another step holds the lock, and the repo's next mount
-// writes it.
+// status config while another step holds the lock, and a later sync writes
+// it.
 func TestRetriedMountSkipsTheStatusConfigWhileThePrepareLockIsHeld(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
