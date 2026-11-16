@@ -55,7 +55,7 @@ func addSyncRepo(t *testing.T, root, source string, extra ...string) model.RepoC
 
 // fetch updates the fetch ref's tracking ref and leaves HEAD where it is.
 func TestFetchCLIFetchesTheFetchRef(t *testing.T) {
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	t.Setenv("ARTIFACT_FS_ROOT", root)
 	source := filepath.Join(t.TempDir(), "source")
 	first := commitToSource(t, source, "first\n")
@@ -79,7 +79,7 @@ func TestFetchCLIFetchesTheFetchRef(t *testing.T) {
 
 // fetch refuses a repo whose remote refresh is off, and fetches nothing.
 func TestFetchCLIRefusesARepoWithRefreshOff(t *testing.T) {
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	t.Setenv("ARTIFACT_FS_ROOT", root)
 	source := filepath.Join(t.TempDir(), "source")
 	first := commitToSource(t, source, "first\n")
@@ -103,7 +103,7 @@ func TestFetchCLIRefusesARepoWithRefreshOff(t *testing.T) {
 // fetch instead of prompting.
 func TestFetchCLIFailsWithoutPrompting(t *testing.T) {
 	askpassRuns := gittest.IsolatePrompts(t)
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	t.Setenv("ARTIFACT_FS_ROOT", root)
 	source := filepath.Join(t.TempDir(), "source")
 	commitToSource(t, source, "main\n")

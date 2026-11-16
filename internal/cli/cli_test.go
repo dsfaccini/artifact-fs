@@ -14,6 +14,7 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/registry"
@@ -102,7 +103,7 @@ func TestFormatStatusLineQuotesTheKeptGenerationsWarning(t *testing.T) {
 }
 
 func TestAddRepoAsyncCLIRegistersWithoutClone(t *testing.T) {
-	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+	t.Setenv("ARTIFACT_FS_ROOT", gittest.StateRoot(t))
 	var stdout, stderr bytes.Buffer
 
 	code := Run(context.Background(), []string{
@@ -197,7 +198,7 @@ func TestAddRepoAsyncCLIFlagValidation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+			t.Setenv("ARTIFACT_FS_ROOT", gittest.StateRoot(t))
 			var stdout, stderr bytes.Buffer
 			code := Run(context.Background(), tt.args, &stdout, &stderr)
 			if code == 0 {
@@ -266,7 +267,7 @@ func TestAddRepoCLIRejectsUnsafeNames(t *testing.T) {
 		"repo=name": optionRejection,
 	} {
 		t.Run(name, func(t *testing.T) {
-			t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+			t.Setenv("ARTIFACT_FS_ROOT", gittest.StateRoot(t))
 			var stdout, stderr bytes.Buffer
 			args := []string{"add-repo", "--name", name, "--async", "--remote", "https://github.com/example/repo.git"}
 			if code := Run(context.Background(), args, &stdout, &stderr); code == 0 {
@@ -304,7 +305,7 @@ func registeredRepo(t *testing.T, root, name string) model.RepoConfig {
 // set-refresh stores the policy it prints, and a stored "never" reads back
 // with no interval.
 func TestSetRefreshCLIStoresThePolicy(t *testing.T) {
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	t.Setenv("ARTIFACT_FS_ROOT", root)
 	if _, stderr, code := runCLI(t, "add-repo", "--name", "repo", "--remote", "https://github.com/example/repo.git", "--async"); code != 0 {
 		t.Fatalf("add-repo exit = %d, stderr=%q", code, stderr)
@@ -345,7 +346,7 @@ func TestSetRefreshCLIStoresThePolicy(t *testing.T) {
 // add-repo stores the kept-generations warning threshold, 50 by default,
 // set-warn-kept-generations changes it, and status prints it.
 func TestWarnKeptGenerationsCLIStoresTheThreshold(t *testing.T) {
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	t.Setenv("ARTIFACT_FS_ROOT", root)
 	for name, args := range map[string][]string{"default": nil, "explicit": {"--warn-kept-generations", "7"}} {
 		if _, stderr, code := runCLI(t, append([]string{"add-repo", "--name", name, "--remote", "https://github.com/example/repo.git", "--async"}, args...)...); code != 0 {
@@ -381,7 +382,7 @@ func TestWarnKeptGenerationsCLIStoresTheThreshold(t *testing.T) {
 // remove-repo drops the repo from the registry, and fails for a name that is
 // not registered.
 func TestRemoveRepoCLIUnregistersTheRepo(t *testing.T) {
-	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+	t.Setenv("ARTIFACT_FS_ROOT", gittest.StateRoot(t))
 	for _, name := range []string{"repo", "other"} {
 		if _, stderr, code := runCLI(t, "add-repo", "--name", name, "--remote", "https://github.com/example/"+name+".git", "--async"); code != 0 {
 			t.Fatalf("add-repo %s exit = %d, stderr=%q", name, code, stderr)
@@ -418,7 +419,7 @@ func TestRemoveRepoCLIUnregistersTheRepo(t *testing.T) {
 }
 
 func TestPrepareCLIReportsQueuedPrepare(t *testing.T) {
-	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+	t.Setenv("ARTIFACT_FS_ROOT", gittest.StateRoot(t))
 	var stdout, stderr bytes.Buffer
 	ctx := context.Background()
 	code := Run(ctx, []string{
@@ -445,7 +446,7 @@ func TestPrepareCLIReportsQueuedPrepare(t *testing.T) {
 // An async repo that is ready and follows its ref has nothing to prepare, so
 // prepare queues nothing and must not claim to prepare.
 func TestPrepareCLIReportsNothingToPrepare(t *testing.T) {
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	t.Setenv("ARTIFACT_FS_ROOT", root)
 	ctx := context.Background()
 	if _, stderr, code := runCLI(t, "add-repo", "--name", "repo", "--remote", "https://github.com/example/repo.git", "--async"); code != 0 {
@@ -480,7 +481,7 @@ func TestPrepareCLIReportsNothingToPrepare(t *testing.T) {
 // --adopt-gitdir and --prepared-gitdir take no --remote, and --require-commit
 // takes no --fetch-ref.
 func TestAddRepoHelpDescribesRegistration(t *testing.T) {
-	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+	t.Setenv("ARTIFACT_FS_ROOT", gittest.StateRoot(t))
 	stdout, stderr, code := runCLI(t, "add-repo", "--help")
 	if code != 0 {
 		t.Fatalf("add-repo --help exit = %d, stderr=%q", code, stderr)
@@ -499,7 +500,7 @@ func TestAddRepoHelpDescribesRegistration(t *testing.T) {
 // status prints every time in UTC, last_fetch included, whatever the local
 // time zone.
 func TestStatusCLIPrintsLastFetchInUTC(t *testing.T) {
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	t.Setenv("ARTIFACT_FS_ROOT", root)
 	ctx := context.Background()
 	if _, stderr, code := runCLI(t, "add-repo", "--name", "repo", "--remote", "https://github.com/example/repo.git", "--async"); code != 0 {
@@ -544,7 +545,7 @@ func TestStatusCLIPrintsLastFetchInUTC(t *testing.T) {
 func TestMountCommandsFailWithoutDaemon(t *testing.T) {
 	for _, command := range []string{"unmount", "remount"} {
 		t.Run(command, func(t *testing.T) {
-			root := t.TempDir()
+			root := gittest.StateRoot(t)
 			t.Setenv("ARTIFACT_FS_ROOT", root)
 			ctx := context.Background()
 			var stdout, stderr bytes.Buffer
@@ -580,7 +581,7 @@ func TestMountCommandsFailWithoutDaemon(t *testing.T) {
 // urfave/cli prints a usage error itself unless OnUsageError handles it, and
 // Run prints the returned error again.
 func TestUsageErrorPrintsOnce(t *testing.T) {
-	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+	t.Setenv("ARTIFACT_FS_ROOT", gittest.StateRoot(t))
 	var stdout, stderr bytes.Buffer
 	if code := Run(context.Background(), []string{"status", "--nam", "repo"}, &stdout, &stderr); code == 0 {
 		t.Fatalf("status with an unknown flag exit = 0, stdout=%q", stdout.String())
@@ -594,7 +595,7 @@ func TestUsageErrorPrintsOnce(t *testing.T) {
 }
 
 func TestStatusCLIPrintsDaemonMountError(t *testing.T) {
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	t.Setenv("ARTIFACT_FS_ROOT", root)
 	ctx := context.Background()
 	var stdout, stderr bytes.Buffer
@@ -623,7 +624,7 @@ func TestStatusCLIPrintsDaemonMountError(t *testing.T) {
 // The hook reads a state root only while ensureStateRoot accepts it, as every
 // other command does.
 func TestFSMonitorHookCLIRefusesAWritableStateRoot(t *testing.T) {
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	t.Setenv("ARTIFACT_FS_ROOT", root)
 	ctx := context.Background()
 	svc, err := daemon.NewController(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -666,7 +667,7 @@ func TestFSMonitorHookCLIRefusesAWritableStateRoot(t *testing.T) {
 // Git runs the hook link with the hook protocol version and its last token.
 // The link answers what the hook script's fsmonitor-hook --name answers.
 func TestFSMonitorHookLinkAnswersWhatTheScriptAnswers(t *testing.T) {
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	t.Setenv("ARTIFACT_FS_ROOT", root)
 	ctx := context.Background()
 	svc, err := daemon.NewController(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -721,7 +722,7 @@ func TestFSMonitorHookLinkAnswersWhatTheScriptAnswers(t *testing.T) {
 }
 
 func TestFSMonitorHookCLIAnswersGitToken(t *testing.T) {
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	t.Setenv("ARTIFACT_FS_ROOT", root)
 	ctx := context.Background()
 	svc, err := daemon.NewController(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))

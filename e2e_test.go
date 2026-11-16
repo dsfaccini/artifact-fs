@@ -22,6 +22,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/daemon"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/logging"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"golang.org/x/sys/unix"
@@ -137,16 +138,11 @@ func run(t *testing.T, dir string, name string, args ...string) string {
 	return stdout.String()
 }
 
-// privateE2EStateRoot returns a new state root that only the current user
-// can write, as daemon.New requires. A t.TempDir follows the umask.
+// privateE2EStateRoot returns a new state root from gittest.StateRoot, with
+// its symlinks resolved, as daemon.New resolves them, such as macOS's /var.
 func privateE2EStateRoot(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	// daemon.New resolves the state root's symlinks, such as macOS's /var.
-	root, err := filepath.EvalSymlinks(dir)
+	root, err := filepath.EvalSymlinks(gittest.StateRoot(t))
 	if err != nil {
 		t.Fatal(err)
 	}

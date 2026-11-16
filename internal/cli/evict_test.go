@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/blobcache"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/registry"
 )
 
@@ -18,7 +19,7 @@ import (
 // into its blob cache, accessed in the order given. It returns the cache dir.
 func registerRepoWithCache(t *testing.T, oids ...string) string {
 	t.Helper()
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	t.Setenv("ARTIFACT_FS_ROOT", root)
 	ctx := context.Background()
 	var stdout, stderr bytes.Buffer
