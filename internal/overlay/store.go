@@ -161,12 +161,12 @@ func New(ctx context.Context, cfg model.RepoPaths) (*Store, error) {
 	lookupStmt, err := db.PrepareContext(ctx, `SELECT `+overlayCols+` FROM overlay_entries WHERE path=?`)
 	if err != nil {
 		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("open %s: %w", cfg.OverlayDBPath, err)
 	}
 	belowStmt, err := db.PrepareContext(ctx, `SELECT 1 FROM overlay_entries WHERE path >= ? AND path < ? LIMIT 1`)
 	if err != nil {
 		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("open %s: %w", cfg.OverlayDBPath, err)
 	}
 	return &Store{MaxSwitchedPaths: model.MaxSwitchedPaths, db: db, lookupStmt: lookupStmt, belowStmt: belowStmt, repo: cfg, upperDir: upperDir, pending: map[string]*pendingWrite{}}, nil
 }
@@ -241,7 +241,7 @@ func runHook(hook func()) {
 }
 
 // overlayCols is the column list for overlay_entries queries. Keep in sync with
-// the Scan call in queryEntries and the single-row scan in Lookup.
+// the Scan calls in queryEntries and lookupCommitted.
 const overlayCols = `path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path`
 
 func (s *Store) Lookup(ctx context.Context, path string) (model.OverlayEntry, bool, error) {

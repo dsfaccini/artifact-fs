@@ -72,12 +72,12 @@ func New(ctx context.Context, path string) (*Store, error) {
 	lookupStmt, err := db.PrepareContext(ctx, lookupNodeQuery)
 	if err != nil {
 		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	childrenStmt, err := db.PrepareContext(ctx, listChildrenQuery)
 	if err != nil {
 		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	return &Store{db: db, lookupStmt: lookupStmt, childrenStmt: childrenStmt}, nil
 }
