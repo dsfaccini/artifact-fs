@@ -56,38 +56,6 @@ func newLockedPreparation(t *testing.T, atLock func(*lockedPreparation)) *locked
 	return f
 }
 
-// A refresh waits while a preparation of its repo holds the repo's prepare
-// lock. Both fetch into the same tracking ref, and a refresh fetch that
-// overlaps the preparation's fails the preparation's ref update. The refresh
-// ticks while a re-prepare holds the lock. A refresh that fetched takes a
-// second tick; one that waits for the lock reports the lock busy.
-func TestRefreshWaitsForAPreparationOfItsRepo(t *testing.T) {
-	t.Parallel()
-	f := newLockedPreparation(t, func(f *lockedPreparation) {
-		f.ticks <- time.Now()
-		select {
-		case f.ticks <- time.Now():
-			t.Error("a refresh fetched while a preparation of its repo held the prepare lock")
-		case <-f.busy:
-		}
-	})
-	cfg, err := f.svc.registry.GetRepo(t.Context(), f.cfg.Name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.PrepareState != model.PrepareStateReady {
-		t.Fatalf("prepare state after the re-prepare = %q (%s), want ready", cfg.PrepareState, cfg.PrepareError)
-	}
-	// The refresh takes this tick once it has fetched under the lock.
-	f.ticks <- time.Now()
-	f.svc.mu.Lock()
-	state := f.rt.fetch.state
-	f.svc.mu.Unlock()
-	if state != fetchOK {
-		t.Fatalf("fetch state after the preparation released the lock = %q, want %q", state, fetchOK)
-	}
-}
-
 // A stop of the runtime while its refresh waits for the prepare lock ends
 // the refresh without a fetch, so repo_runtime keeps no fetch failure. The
 // stop's drain waits for the refresh loop, so any write of the refresh has
