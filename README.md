@@ -540,7 +540,8 @@ still cache what the mount reported before: names, missing names, attributes
 and file pages. The mount reports entries, negative entries and attributes with
 a 1 s TTL. The synthesized `.git` file never changes, and the mount reports it
 with a 1 minute TTL. Every base file and directory reports the time of the HEAD
-commit the mount serves as its mtime. When an op through the mount or a HEAD
+commit the mount serves as its mtime and ctime, except a file a HEAD change
+raised. When an op through the mount or a HEAD
 change adds, removes, renames or retypes an entry, its directory's mtime and
 ctime move to that moment, as on a local file system, or past the commit time
 when that lies in the future. An mtime set on the directory shows until its
@@ -551,6 +552,42 @@ ctime no earlier than the mount's start. Git's untracked cache then still sees
 a change made before a restart while Git compares ctime, as it does by default
 (`core.trustctime`). With `core.trustctime=false`, a restart can hide such a
 change.
+
+Git compares a file's mtime and ctime in whole seconds. Two commits made in
+one second give their files the same mtime, so a HEAD change between them that
+rewrites a file at its size would leave the file's stat data as Git's index
+holds it, and `git status` would miss the change, with the fsmonitor hook and
+without it. So a HEAD change that changes a file's or symlink's blob raises its
+mtime and ctime to one second past the mtime it reported before, unless the new
+commit's time is later. A file whose blob a HEAD change keeps keeps a raised
+mtime until a later commit's time passes it. A path's mtime thus only grows
+while its content changes. Two effects follow:
+
+- A file can report an mtime later than its commit's time: a chain of commits
+  in one second, or a checkout of an older commit, raises each changed file
+  past the mtime it reported last. Tools that compare mtimes, such as `make`,
+  see such a file as newer.
+- Git takes an index entry whose mtime is not earlier than the index file's as
+  racy, and hashes the file again at each `git status` until it writes the
+  index in a later second. A commit made within the last second, or a raised
+  mtime that lies in the future, makes its files racy that way, and hashing a
+  file reads its blob, which a blobless clone may fetch.
+
+The snapshot database records the raised mtimes of each generation, so a
+daemon restart keeps them, also when it cannot read which generation the mount
+served last. A restart that serves a HEAD that moved while no daemon ran raises
+from that generation. It raises nothing when the snapshot no longer holds the
+generation, when the restart cannot read which one it was, or when a version
+that recorded no raised mtimes served it. Each file the move changed then
+reports the new commit's time, which can be an mtime the file reported before.
+
+Two rarer cases still leave a change's stat data as Git's index holds it. A
+file that a HEAD change removes, and a later one in the same second adds back
+with other content of its old size, reports the commit's time as before the
+removal; only its new inode number shows the change, which Git ignores under
+`core.checkStat=minimal`. A file whose content a move to an older commit keeps
+reports that commit's earlier time, so a later same-second change can bring it
+back to a second for which Git's index holds other content of the same size.
 
 On every backend, an inode reads the generation of the attributes the kernel
 last received for it, or a later one in which its path has the same type, mode

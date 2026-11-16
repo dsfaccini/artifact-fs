@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -75,14 +74,6 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 			s.mu.Unlock()
 			s.recordRuntimeState(rt, phaseFetch)
 		}
-	}
-}
-
-func (s *Service) refreshCommitTime(ctx context.Context, cfg model.RepoConfig, oid string, resolver *fusefs.Resolver, warnMsg string) {
-	if ts, err := s.git.CommitTimestamp(ctx, cfg, oid); err == nil {
-		resolver.SetCommitTime(ts)
-	} else {
-		s.logger.Warn(warnMsg, "repo", cfg.Name, "error", err)
 	}
 }
 
