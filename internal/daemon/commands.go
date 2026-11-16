@@ -250,9 +250,15 @@ func (s *Controller) FetchNow(ctx context.Context, name string) error {
 	if cfg.RemoteRefreshDisabled {
 		return errors.New("remote refresh is disabled for this repository")
 	}
-	// Status reads the fetch from FETCH_HEAD. Ahead and behind come from the
-	// daemon's next refresh.
-	return s.git.FetchNonInteractive(ctx, cfg)
+	// A preparation and a refresh fetch into the same tracking ref, and two
+	// fetches that overlap fail each other's ref update. The checks above
+	// refuse a repo the registry shows preparing, so the command does not
+	// wait out that preparation.
+	return s.withRepoPrepareLock(ctx, cfg.Name, func() error {
+		// Status reads the fetch from FETCH_HEAD. Ahead and behind come from
+		// the daemon's next refresh.
+		return s.git.FetchNonInteractive(ctx, cfg)
+	})
 }
 
 // Prepare asks for a new preparation of name. A sync repo prepares in the
