@@ -582,19 +582,10 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	if rt == nil {
 		return nil
 	}
-	if err := s.bootstrapCleanStatusIndex(ctx, cfg, headOID, gen, rt.snapshot, rt.overlay); err != nil {
-		return err
-	}
-	commitTime := int64(0)
-	if ts, err := s.git.CommitTimestamp(ctx, cfg, headOID); err == nil {
-		commitTime = ts
-	} else {
-		s.logger.Warn("commit timestamp unavailable", "repo", cfg.Name, "error", err)
-	}
 	// HEAD can move after the preparation read it, and a HEAD reconcile then
 	// serves the moved HEAD at another generation. Its rebase leaves the
 	// watcher no change to signal. So while a runtime that follows HEAD
-	// serves it, the activation keeps what it serves and switches nowhere.
+	// serves it, the activation keeps the generation it serves.
 	rt.headMu.Lock()
 	defer rt.headMu.Unlock()
 	s.mu.Lock()
@@ -604,6 +595,27 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	if cfg.RequiredCommit == "" {
 		oid, ref, err := s.git.ResolveHEAD(ctx, cfg)
 		keep = err == nil && oid == served.oid && ref == served.ref
+	}
+	switchTo := gen
+	if keep {
+		switchTo = served.gen
+	}
+	// The clean-index bootstrap matches the index with gen, so it runs only
+	// when the mount serves gen.
+	if switchTo == gen {
+		if err := s.bootstrapCleanStatusIndex(ctx, cfg, headOID, gen, rt.snapshot, rt.overlay); err != nil {
+			return err
+		}
+	}
+	commitTime := rt.resolver.CommitTime()
+	if !keep {
+		served = servedHead{oid: headOID, ref: headRef, gen: gen}
+		commitTime = 0
+		if ts, err := s.git.CommitTimestamp(ctx, cfg, headOID); err == nil {
+			commitTime = ts
+		} else {
+			s.logger.Warn("commit timestamp unavailable", "repo", cfg.Name, "error", err)
+		}
 	}
 	// The gate opens in the s.mu hold that checks the request, so a newer
 	// request's reset lands before the check or after the open.
@@ -617,16 +629,9 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 		runHook(s.gateOpened)
 		return nil
 	}
-	var err error
-	if keep && served.gen != gen {
-		err = activate()
-	} else {
-		err = s.switchGeneration(ctx, rt, gen, commitTime, activate)
-	}
-	if !keep {
-		served = servedHead{oid: headOID, ref: headRef, gen: gen}
-	}
-	if err != nil {
+	// A switch to the generation the mount serves sends a pass too, so the
+	// kernel drops what an earlier switch changed before the record below.
+	if err := s.switchGeneration(ctx, rt, switchTo, commitTime, activate); err != nil {
 		return err
 	}
 	// Every record reads rt.prepare and rt.head, so they change only after
