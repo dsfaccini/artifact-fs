@@ -49,6 +49,11 @@ var _ model.SnapshotStore = (*Store)(nil)
 
 type Store struct {
 	db *sql.DB
+	// Lookups and listings run lookupStmt and childrenStmt. Prepared once,
+	// they skip SQLite's parse and plan, which cost more than running the
+	// query.
+	lookupStmt   *sql.Stmt
+	childrenStmt *sql.Stmt
 }
 
 type stateQueryer interface {
@@ -64,10 +69,22 @@ func New(ctx context.Context, path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
-	return &Store{db: db}, nil
+	lookupStmt, err := db.PrepareContext(ctx, lookupNodeQuery)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	childrenStmt, err := db.PrepareContext(ctx, listChildrenQuery)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Store{db: db, lookupStmt: lookupStmt, childrenStmt: childrenStmt}, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	return errors.Join(s.lookupStmt.Close(), s.childrenStmt.Close(), s.db.Close())
+}
 
 // testHookAfterGenerationRead, when set, runs in a publish between its read of
 // the current generation and its first write. Keep the call between the two:
@@ -204,8 +221,10 @@ func (s *Store) UpdateHEADRef(ctx context.Context, ref string) error {
 	return err
 }
 
+const lookupNodeQuery = `SELECT path, type, mode, object_oid, size_state, size_bytes, raised_mtime FROM base_nodes WHERE generation=? AND path=?`
+
 func (s *Store) LookupNode(ctx context.Context, generation int64, path string) (model.BaseNode, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT path, type, mode, object_oid, size_state, size_bytes, raised_mtime FROM base_nodes WHERE generation=? AND path=?`, generation, path)
+	row := s.lookupStmt.QueryRowContext(ctx, generation, path)
 	var n model.BaseNode
 	if err := row.Scan(&n.Path, &n.Type, &n.Mode, &n.ObjectOID, &n.SizeState, &n.SizeBytes, &n.RaisedMtime); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -224,7 +243,7 @@ const listChildrenQuery = `SELECT path, type, mode, object_oid, size_state, size
 // path-based lookup (no inode join, no collision risk).
 func (s *Store) ListChildren(generation int64, parentPath string) ([]model.BaseNode, error) {
 	pp := model.CleanPath(parentPath)
-	rows, err := s.db.Query(listChildrenQuery, generation, pp)
+	rows, err := s.childrenStmt.Query(generation, pp)
 	if err != nil {
 		return nil, err
 	}

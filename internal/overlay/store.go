@@ -122,10 +122,14 @@ type Store struct {
 	// model.MaxSwitchedPaths. Change it only before the store is in use.
 	MaxSwitchedPaths int
 
-	db       *sql.DB
-	repo     model.RepoPaths
-	upperDir string
-	mu       sync.Mutex
+	db *sql.DB
+	// Lookups run lookupStmt and belowStmt. Prepared once, they skip SQLite's
+	// parse and plan, which cost more than running the query.
+	lookupStmt *sql.Stmt
+	belowStmt  *sql.Stmt
+	repo       model.RepoPaths
+	upperDir   string
+	mu         sync.Mutex
 	// pending holds the files written since their last commit. It changes
 	// only under mu; pendingMu also guards it for readers that do not take mu.
 	// A commit of pending values happens before the map forgets them, so a
@@ -154,7 +158,17 @@ func New(ctx context.Context, cfg model.RepoPaths) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("open %s: %w", cfg.OverlayDBPath, err)
 	}
-	return &Store{MaxSwitchedPaths: model.MaxSwitchedPaths, db: db, repo: cfg, upperDir: upperDir, pending: map[string]*pendingWrite{}}, nil
+	lookupStmt, err := db.PrepareContext(ctx, `SELECT `+overlayCols+` FROM overlay_entries WHERE path=?`)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	belowStmt, err := db.PrepareContext(ctx, `SELECT 1 FROM overlay_entries WHERE path >= ? AND path < ? LIMIT 1`)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Store{MaxSwitchedPaths: model.MaxSwitchedPaths, db: db, lookupStmt: lookupStmt, belowStmt: belowStmt, repo: cfg, upperDir: upperDir, pending: map[string]*pendingWrite{}}, nil
 }
 
 // commitPendingFromBackingFiles commits the size and mtime of each path a
@@ -207,7 +221,7 @@ func (s *Store) Close() error {
 	s.mu.Lock()
 	flushErr := s.flushAllLocked(context.Background())
 	s.mu.Unlock()
-	return errors.Join(flushErr, s.db.Close())
+	return errors.Join(flushErr, s.lookupStmt.Close(), s.belowStmt.Close(), s.db.Close())
 }
 
 // testHookBetweenReads, when set, runs in a read between its two reads: the
@@ -260,7 +274,7 @@ func (s *Store) pendingValues() map[string]pendingWrite {
 }
 
 func (s *Store) lookupCommitted(ctx context.Context, path string) (model.OverlayEntry, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+overlayCols+` FROM overlay_entries WHERE path=?`, path)
+	row := s.lookupStmt.QueryRowContext(ctx, path)
 	var e model.OverlayEntry
 	if err := row.Scan(&e.Path, &e.Kind, &e.BackingPath, &e.Mode, &e.SizeBytes, &e.MtimeUnixNs, &e.CtimeUnixNs, &e.SourceOID, &e.SourceMode, &e.TargetPath); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1801,12 +1815,14 @@ func (s *Store) ListByPrefix(ctx context.Context, prefix string) ([]model.Overla
 // reads at most one row of the path index.
 func (s *Store) HasEntryBelow(ctx context.Context, path string) (bool, error) {
 	path = model.CleanPath(path)
-	query, args := `SELECT 1 FROM overlay_entries LIMIT 1`, []any{}
-	if path != "." {
-		query, args = `SELECT 1 FROM overlay_entries WHERE path >= ? AND path < ? LIMIT 1`, []any{path + "/", path + "0"}
+	var row *sql.Row
+	if path == "." {
+		row = s.db.QueryRowContext(ctx, `SELECT 1 FROM overlay_entries LIMIT 1`)
+	} else {
+		row = s.belowStmt.QueryRowContext(ctx, path+"/", path+"0")
 	}
 	var one int
-	err := s.db.QueryRowContext(ctx, query, args...).Scan(&one)
+	err := row.Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
