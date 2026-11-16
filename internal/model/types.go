@@ -358,9 +358,9 @@ type SnapshotStore interface {
 	// has one, by path.
 	RaisedMtimes(ctx context.Context, generation int64) (map[string]int64, error)
 	// RecordBaseTimes records commitTime as generation's commit time, and
-	// the RaisedMtime of its nodes: the RaisedMtime of each node that
-	// generation carry holds at the same path and type, when later than
-	// commitTime, then raised, by path. Every other node of generation then
+	// the RaisedMtime of its nodes: raised, by path, and for each other node
+	// that generation carry holds at the same path and type, its RaisedMtime
+	// there when later than commitTime. Every other node of generation then
 	// has none. A carry of 0 carries nothing.
 	RecordBaseTimes(ctx context.Context, generation, commitTime, carry int64, raised map[string]int64) error
 }
