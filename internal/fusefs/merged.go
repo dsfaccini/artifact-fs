@@ -47,6 +47,10 @@ type Resolver struct {
 	times    dirTimes
 	Snapshot model.SnapshotStore
 	Overlay  model.OverlayStore
+
+	// testHookBeforeTakeListings, when set, runs in takeSwitchedListings
+	// between its generation read and its take of the records.
+	testHookBeforeTakeListings func()
 }
 
 // dirTimes holds the directory times that only memory records. Git's
@@ -170,15 +174,24 @@ func (r *Resolver) listingsSwitched(listings []string, all bool) {
 	r.listingChangedLocked(listings, true)
 }
 
-// takeSwitchedListings returns the directories whose listing a switch changed
-// since its last call, or all true when a switch changed every listing, and
-// forgets them.
-func (r *Resolver) takeSwitchedListings() (dirs map[string]bool, all bool) {
+// takeSwitchedListings returns the generation readers resolve against, and
+// the directories whose listing a switch changed since its last call, or all
+// true when a switch changed every listing, and forgets them. A switch sets
+// its generation and records its listings in one hold of the transition write
+// lock, so under the read lock the directories are those of the switches up
+// to gen.
+func (r *Resolver) takeSwitchedListings() (gen int64, dirs map[string]bool, all bool) {
+	r.transition.RLock()
+	defer r.transition.RUnlock()
+	gen = r.Generation()
+	if r.testHookBeforeTakeListings != nil {
+		r.testHookBeforeTakeListings()
+	}
 	r.times.mu.Lock()
 	defer r.times.mu.Unlock()
 	dirs, all = r.times.switched, r.times.allSwitched
 	r.times.switched, r.times.allSwitched = nil, false
-	return dirs, all
+	return gen, dirs, all
 }
 
 // mtimeSetOn records that mtime value was set on dir, so that it shows until

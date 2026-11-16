@@ -428,10 +428,10 @@ func (e *Engine) ReadDir(ctx context.Context, path string) ([]ReaddirEntry, int6
 	return entries, gen, commitTime, err
 }
 
-// SwitchedListings returns the directories whose listing a switch changed
-// since its last call, or all true when a switch changed every listing, and
-// forgets them.
-func (e *Engine) SwitchedListings() (dirs map[string]bool, all bool) {
+// SwitchedListings returns the generation the engine serves, and the
+// directories whose listing a switch up to it changed since its last call, or
+// all true when a switch changed every listing, and forgets them.
+func (e *Engine) SwitchedListings() (gen int64, dirs map[string]bool, all bool) {
 	return e.Resolver.takeSwitchedListings()
 }
 
