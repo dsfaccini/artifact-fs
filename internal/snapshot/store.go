@@ -258,7 +258,7 @@ func (s *Store) RaisedMtimes(ctx context.Context, generation int64) (map[string]
 	return raised, rows.Err()
 }
 
-func (s *Store) RecordBaseTimes(ctx context.Context, generation, commitTime int64, raised map[string]int64) error {
+func (s *Store) RecordBaseTimes(ctx context.Context, generation, commitTime, carry int64, raised map[string]int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -269,6 +269,14 @@ func (s *Store) RecordBaseTimes(ctx context.Context, generation, commitTime int6
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE base_nodes SET raised_mtime=0 WHERE generation=? AND raised_mtime != 0`, generation); err != nil {
 		return err
+	}
+	// Carry in one statement: a switch to an older commit carries every
+	// raised row, and row by row that holds the write lock for seconds in a
+	// large repo. raised_mtime != 0 lets SQLite use the partial index.
+	if carry != 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE base_nodes AS t SET raised_mtime=f.raised_mtime FROM base_nodes AS f WHERE f.generation=? AND f.raised_mtime != 0 AND f.raised_mtime > ? AND t.generation=? AND t.path=f.path AND t.type=f.type`, carry, commitTime, generation); err != nil {
+			return err
+		}
 	}
 	stmt, err := tx.PrepareContext(ctx, `UPDATE base_nodes SET raised_mtime=? WHERE generation=? AND path=?`)
 	if err != nil {

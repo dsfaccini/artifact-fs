@@ -106,7 +106,7 @@ func (g *generationSnapshot) RaisedMtimes(context.Context, int64) (map[string]in
 	return nil, nil
 }
 
-func (g *generationSnapshot) RecordBaseTimes(context.Context, int64, int64, map[string]int64) error {
+func (g *generationSnapshot) RecordBaseTimes(context.Context, int64, int64, int64, map[string]int64) error {
 	return nil
 }
 

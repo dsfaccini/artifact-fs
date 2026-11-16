@@ -681,27 +681,28 @@ func switchedPaths(snap model.SnapshotStore, from, to int64, limit int) (switche
 // reported in from, or toCommit when that is later. Git compares mtimes and
 // ctimes in whole seconds, so two commits in one second would otherwise give
 // a change that keeps the size the stat data Git's index holds, and Git would
-// take the file as unchanged. Every other path both generations hold keeps a
-// raised mtime, or reports toCommit when that is later. A commit time of 0,
-// which a failed read gives, raises nothing, and nor does a from that holds
-// no root entries.
+// take the file as unchanged. Every other path both generations hold at the
+// same type keeps a raised mtime, or reports toCommit when that is later. A
+// commit time of 0, which a failed read gives, raises nothing, and nor does a
+// from that holds no root entries.
 func RaiseMtimes(ctx context.Context, snap model.SnapshotStore, from, to, fromCommit, toCommit int64) error {
-	raised, err := raisedMtimes(ctx, snap, from, to, fromCommit, toCommit)
+	raised, carry, err := raisedMtimes(ctx, snap, from, to, fromCommit, toCommit)
 	if err != nil {
 		return err
 	}
-	return snap.RecordBaseTimes(ctx, to, toCommit, raised)
+	return snap.RecordBaseTimes(ctx, to, toCommit, carry, raised)
 }
 
-// raisedMtimes returns the RaisedMtime of each node of to that RaiseMtimes
-// records.
-func raisedMtimes(ctx context.Context, snap model.SnapshotStore, from, to, fromCommit, toCommit int64) (map[string]int64, error) {
+// raisedMtimes returns the RaisedMtime of each node of to whose blob the
+// switch changes, and the generation whose raised mtimes to carries: from, or
+// 0 when it carries none.
+func raisedMtimes(ctx context.Context, snap model.SnapshotStore, from, to, fromCommit, toCommit int64) (map[string]int64, int64, error) {
 	if from == 0 || fromCommit == 0 || toCommit == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 	before, err := snap.RaisedMtimes(ctx, from)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	// A toCommit past every mtime from reports raises nothing, so a switch to
 	// a later commit skips the walk.
@@ -710,33 +711,25 @@ func raisedMtimes(ctx context.Context, snap model.SnapshotStore, from, to, fromC
 		latest = max(latest, t)
 	}
 	if toCommit > latest {
-		return nil, nil
+		return nil, 0, nil
 	}
 	raised := map[string]int64{}
-	gone := map[string]bool{}
-	mark := func(p string, listing, rewritten bool) bool {
+	mark := func(p string, _, rewritten bool) bool {
 		if rewritten {
 			last, ok := before[p]
 			if !ok {
 				last = fromCommit
 			}
 			raised[p] = max(toCommit, last+1)
-		} else if listing {
-			gone[p] = true
 		}
 		return true
 	}
 	descend := func(dirs []string, dir string) []string { return append(dirs, dir) }
 	if ok, err := diff(snap, from, to, mark, descend); !ok {
-		return nil, err
-	}
-	for p, t := range before {
-		if _, rewritten := raised[p]; !rewritten && !gone[p] {
-			raised[p] = t
-		}
+		return nil, 0, err
 	}
 	maps.DeleteFunc(raised, func(_ string, t int64) bool { return t <= toCommit })
-	return raised, nil
+	return raised, from, nil
 }
 
 // diff walks down from the root of generations from and to of snap. For each

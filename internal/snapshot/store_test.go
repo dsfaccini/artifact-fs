@@ -199,7 +199,7 @@ func TestGenerationCleanup(t *testing.T) {
 	}
 
 	for gen := range int64(3) {
-		if err := s.RecordBaseTimes(ctx, gen+1, 100+gen+1, nil); err != nil {
+		if err := s.RecordBaseTimes(ctx, gen+1, 100+gen+1, 0, nil); err != nil {
 			t.Fatal(err)
 		}
 	}

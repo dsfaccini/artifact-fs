@@ -1204,11 +1204,16 @@ func publishWhileDown(t *testing.T, cfg model.RepoConfig, commit string, prune b
 }
 
 // A switch that rewrites a file in its commit's second raises the file's
-// mtime, and a daemon restart keeps the raise: one after the switch, and one
-// that serves a HEAD that moved while no daemon ran.
+// mtime, and a daemon restart keeps the raise: one after the switch, one that
+// serves a HEAD that moved while no daemon ran, and one after the switch that
+// cannot read which generation the overlay served.
 func TestRaisedMtimeOutlastsARestart(t *testing.T) {
 	t.Parallel()
-	for name, whileDown := range map[string]bool{"switched before the restart": false, "moved while down": true} {
+	for name, c := range map[string]struct{ whileDown, servedUnreadable bool }{
+		"switched before the restart":  {},
+		"moved while down":             {whileDown: true},
+		"served generation unreadable": {servedUnreadable: true},
+	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			ctx := t.Context()
@@ -1245,7 +1250,7 @@ func TestRaisedMtimeOutlastsARestart(t *testing.T) {
 			}
 			next := strings.TrimSpace(runCmdOutput(t, "git", "-C", remote, "rev-parse", "HEAD"))
 			runCmd(t, "git", "--git-dir", cfg.GitDir, "fetch", "--no-tags", "origin", "main")
-			if !whileDown {
+			if !c.whileDown {
 				runCmd(t, "git", "--git-dir", cfg.GitDir, "update-ref", "refs/heads/main", next)
 				rt := runningRuntime(svc, cfg.ID)
 				if err := svc.reconcileHEAD(ctx, rt); err != nil {
@@ -1258,8 +1263,20 @@ func TestRaisedMtimeOutlastsARestart(t *testing.T) {
 			if err := svc.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if whileDown {
+			if c.whileDown {
 				runCmd(t, "git", "--git-dir", cfg.GitDir, "update-ref", "refs/heads/main", next)
+			}
+			if c.servedUnreadable {
+				// The restart serves the generation the switch recorded,
+				// but cannot read which one the overlay served.
+				db, err := meta.OpenDB(cfg.OverlayDBPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				if _, err := db.ExecContext(ctx, `UPDATE overlay_instance SET served_generation = 'unreadable'`); err != nil {
+					t.Fatal(err)
+				}
 			}
 			restarted, err := New(ctx, root, discardLogger())
 			if err != nil {

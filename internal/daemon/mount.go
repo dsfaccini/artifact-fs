@@ -173,22 +173,22 @@ func (s *Service) switchedSinceServed(ctx context.Context, name string, ov *over
 
 // recordBaseTimes records the times of gen, which a runtime starts to serve,
 // as a switch from served records them: the commit time of oid, gen's
-// commit, and the mtimes fusefs.RaiseMtimes raises. A gen that served
-// already keeps its recorded times. It returns the commit time, or 0 when
-// git cannot read it.
+// commit, and the mtimes fusefs.RaiseMtimes raises. It returns the commit
+// time, or 0 when git cannot read it.
 func (s *Service) recordBaseTimes(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, served, gen int64, oid string) (int64, error) {
 	if gen == 0 || oid == "" {
 		return 0, nil
+	}
+	// A gen that recorded times keeps them, also when the read of served
+	// failed. A start serves again only the latest generation, and its times
+	// came from the generation the overlay served before it.
+	if recorded, ok, err := snap.CommitTime(ctx, gen); err != nil || ok && recorded != 0 {
+		return recorded, err
 	}
 	commitTime, err := s.git.CommitTimestamp(ctx, cfg, oid)
 	if err != nil {
 		s.logger.Warn("commit timestamp unavailable, mtime will use generation fallback", "repo", cfg.Name, "error", err)
 		commitTime = 0
-	}
-	if served == gen {
-		if recorded, ok, err := snap.CommitTime(ctx, gen); err != nil || ok && recorded != 0 {
-			return commitTime, err
-		}
 	}
 	// A served generation recorded no times when it was pruned, or when a
 	// build that records none served it. Its switch then raises nothing.

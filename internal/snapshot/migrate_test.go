@@ -110,7 +110,7 @@ func TestNewMigratesEarlierSchemas(t *testing.T) {
 			if !ok || node != want {
 				t.Fatalf("README.md = %+v, %v; want %+v", node, ok, want)
 			}
-			if err := s.RecordBaseTimes(ctx, 1, 100, map[string]int64{"README.md": 101}); err != nil {
+			if err := s.RecordBaseTimes(ctx, 1, 100, 0, map[string]int64{"README.md": 101}); err != nil {
 				t.Fatal(err)
 			}
 			if node, _, err := s.LookupNode(ctx, 1, "README.md"); err != nil || node.RaisedMtime != 101 {

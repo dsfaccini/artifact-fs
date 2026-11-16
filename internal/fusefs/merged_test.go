@@ -36,7 +36,7 @@ func (f *fakeSnapshot) RaisedMtimes(context.Context, int64) (map[string]int64, e
 	return nil, nil
 }
 
-func (f *fakeSnapshot) RecordBaseTimes(context.Context, int64, int64, map[string]int64) error {
+func (f *fakeSnapshot) RecordBaseTimes(context.Context, int64, int64, int64, map[string]int64) error {
 	return nil
 }
 

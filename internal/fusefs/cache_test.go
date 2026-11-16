@@ -588,7 +588,8 @@ func (f *cacheFixture) fileTimes(parent fuseops.InodeID, name string) [2]int64 {
 // second past the mtime it reported, also when both commits share a second.
 // Git compares stat data in whole seconds, so a change that keeps the size
 // would otherwise leave the stat data Git's index holds. A file whose blob
-// the switch keeps keeps its mtime, until a later commit passes it.
+// the switch keeps keeps its mtime, until a later commit passes it, and a
+// path whose type the switch changes drops a raised mtime.
 func TestSwitchRaisesTheMtimeOfEachFileWhoseBlobItChanges(t *testing.T) {
 	const second = 1_700_000_000
 	keep := baseFile("keep.txt", "keep", 0o100644)
@@ -613,6 +614,8 @@ func TestSwitchRaisesTheMtimeOfEachFileWhoseBlobItChanges(t *testing.T) {
 	kept := []model.BaseNode{baseFile("f.txt", "aaaa", 0o100644), baseFile("keep.txt", "kept", 0o100644)}
 	f.switchAt(second, kept...)
 	want("a change to keep.txt alone", second+3, second+1)
+	f.switchAt(second, kept[0], model.BaseNode{Path: "keep.txt", Type: "symlink", Mode: 0o120000, ObjectOID: "link", SizeState: "known", SizeBytes: 4})
+	want("keep.txt retyped", second+3, second)
 	f.switchAt(second+10, kept...)
 	want("a later commit", second+10, second+10)
 }

@@ -574,10 +574,12 @@ while its content changes. Two effects follow:
   file reads its blob, which a blobless clone may fetch.
 
 The snapshot database records the raised mtimes of each generation, so a
-daemon restart keeps them, also a restart that serves a HEAD that moved while
-no daemon ran. That restart raises nothing when the snapshot no longer holds
-the generation the mount served last, or when a version that recorded no
-raised mtimes served it.
+daemon restart keeps them, also when it cannot read which generation the mount
+served last. A restart that serves a HEAD that moved while no daemon ran raises
+from that generation. It raises nothing when the snapshot no longer holds the
+generation, when the restart cannot read which one it was, or when a version
+that recorded no raised mtimes served it. Each file the move changed then
+reports the new commit's time, which can be an mtime the file reported before.
 
 Two rarer cases still leave a change's stat data as Git's index holds it. A
 file that a HEAD change removes, and a later one in the same second adds back
