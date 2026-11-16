@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1452,7 +1453,9 @@ func TestActivationKeepsTheServedHEADOfAReconcileDuringItsPreparation(t *testing
 
 // An activation that keeps the generation the mount serves can keep one below
 // its prune bound, the generations before the preparation's own. The prune
-// keeps it, so the mount still serves HEAD's files.
+// keeps it, so the mount still serves HEAD's files. The kept generation's
+// files take their times from HEAD's commit, also when the resolver had
+// switched to another generation that an activation then failed to activate.
 func TestActivationKeepsTheGenerationItServesThroughItsPrune(t *testing.T) {
 	t.Parallel()
 	t.Run("a superseded preparation published past it", func(t *testing.T) {
@@ -1462,9 +1465,13 @@ func TestActivationKeepsTheGenerationItServesThroughItsPrune(t *testing.T) {
 		var supersede atomic.Bool
 		var first string
 		r = newServedAsyncRepo(t, func(svc *Service) {
-			// A newer request supersedes the preparation once it published,
-			// and the remote returns to the commit the mount serves.
-			svc.readyRecorded = func() {
+			// The superseded activation's switch retires the generation the
+			// mount serves, and the retention window does not keep it.
+			svc.generationRetention = time.Nanosecond
+			// A newer request supersedes the preparation as its activation
+			// reads the commit time it switches the resolver with, and the
+			// remote returns to the commit the mount serves.
+			svc.git = &commitTimestampGit{GitStore: svc.git, before: func() {
 				if !supersede.CompareAndSwap(true, false) {
 					return
 				}
@@ -1479,18 +1486,27 @@ func TestActivationKeepsTheGenerationItServesThroughItsPrune(t *testing.T) {
 				}
 				svc.resetRunningPrepareState(repo)
 				runCmd(t, "git", "-C", r.remote, "reset", "-q", "--hard", first)
-			}
+			}}
 		}, nil)
 		first = strings.TrimSpace(runCmdOutput(t, "git", "-C", r.remote, "rev-parse", "HEAD"))
 
-		commitFile(t, r.remote, "README.md", "two\n")
+		// The late commit's time differs from the first's.
+		if err := os.WriteFile(filepath.Join(r.remote, "README.md"), []byte("two\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runCmd(t, "git", "-C", r.remote, "add", "README.md")
+		late := exec.Command("git", "-C", r.remote, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "late")
+		late.Env = append(os.Environ(), "GIT_AUTHOR_DATE=1600000000 +0000", "GIT_COMMITTER_DATE=1600000000 +0000")
+		if out, err := late.CombinedOutput(); err != nil {
+			t.Fatalf("commit to the remote: %v\n%s", err, out)
+		}
 		supersede.Store(true)
 		if err := r.requestPrepare(ctx, "late"); err != nil {
 			t.Fatal(err)
 		}
 		r.svc.prepareWorkers.Wait()
 		if supersede.Load() {
-			t.Fatal("the late preparation never recorded ready")
+			t.Fatal("the late preparation never activated")
 		}
 		// The next sync starts the newer request's preparation.
 		if err := r.svc.syncRepos(ctx); err != nil {
@@ -1576,10 +1592,13 @@ func (g *bootstrapGit) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo
 }
 
 // requireServesHEADFiles fails t unless r's mount serves the README.md of
-// r's HEAD.
+// r's HEAD, with the times of HEAD's commit.
 func requireServesHEADFiles(t *testing.T, r *servedAsyncRepo) {
 	t.Helper()
 	gen := r.rt.resolver.Generation()
+	if got, want := r.rt.resolver.CommitTime(), strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", r.cfg.GitDir, "log", "-1", "--format=%ct", "HEAD")); strconv.FormatInt(got, 10) != want {
+		t.Errorf("commit time at generation %d, which the resolver serves, = %d, want HEAD's %s", gen, got, want)
+	}
 	readme, err := r.rt.resolver.ResolvePath("README.md")
 	if err != nil {
 		t.Fatalf("README.md at generation %d, which the resolver serves: %v", gen, err)

@@ -596,9 +596,9 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 		oid, ref, err := s.git.ResolveHEAD(ctx, cfg)
 		keep = err == nil && oid == served.oid && ref == served.ref
 	}
-	switchTo := gen
+	switchTo, switchOID := gen, headOID
 	if keep {
-		switchTo = served.gen
+		switchTo, switchOID = served.gen, served.oid
 	}
 	// The clean-index bootstrap matches the index with gen, so it runs only
 	// when the mount serves gen.
@@ -607,15 +607,14 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 			return err
 		}
 	}
-	commitTime := rt.resolver.CommitTime()
+	commitTime := int64(0)
+	if ts, err := s.git.CommitTimestamp(ctx, cfg, switchOID); err == nil {
+		commitTime = ts
+	} else {
+		s.logger.Warn("commit timestamp unavailable", "repo", cfg.Name, "error", err)
+	}
 	if !keep {
 		served = servedHead{oid: headOID, ref: headRef, gen: gen}
-		commitTime = 0
-		if ts, err := s.git.CommitTimestamp(ctx, cfg, headOID); err == nil {
-			commitTime = ts
-		} else {
-			s.logger.Warn("commit timestamp unavailable", "repo", cfg.Name, "error", err)
-		}
 	}
 	// The gate opens in the s.mu hold that checks the request, so a newer
 	// request's reset lands before the check or after the open.
