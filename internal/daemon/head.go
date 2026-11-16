@@ -85,7 +85,7 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 	} else if ctx.Err() == nil {
 		s.logger.Warn("commit timestamp unavailable", "repo", cfg.Name, "error", timestampErr)
 	}
-	if err := s.switchGeneration(ctx, rt, gen, commitTime); err != nil {
+	if err := s.switchGeneration(ctx, rt, gen, commitTime, nil); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -105,10 +105,19 @@ func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 	return nil
 }
 
-// switchGeneration switches rt's resolver to gen, then tells the kernel to
-// drop what it caches that the switch changed. It records when the previous
-// generation retired.
-func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, commitTime int64) error {
+// switchGeneration switches rt's resolver to gen, runs activate when it is
+// not nil, then tells the kernel to drop what it caches that the switch
+// changed. It records when the previous generation retired, and returns
+// activate's error.
+//
+// The kernel can hold a directory's lock while a lookup there waits at rt's
+// gate, and an entry invalidation waits for that lock. So the pass starts
+// only while the gate holds no ops, and a Reset of the gate holds ops only
+// once the pass ends. While the gate holds ops, switchGeneration returns
+// before the pass, and one of rt's workers sends it once the gate opens or
+// fails. A stop of rt cancels it. An activation opens the gate in activate,
+// so its pass follows at once.
+func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, commitTime int64, activate func() error) error {
 	sw, err := rt.resolver.SwitchGeneration(ctx, gen, commitTime)
 	if err != nil {
 		return err
@@ -118,6 +127,28 @@ func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, co
 		rt.retired = append(rt.retired, retiredGeneration{gen: sw.Replaced, at: time.Now()})
 		rt.retiredMu.Unlock()
 	}
+	if activate != nil {
+		err = activate()
+	}
+	if !rt.gate.StartPass() {
+		rt.workers.Go(func() {
+			runHook(s.passDeferred)
+			if rt.gate.WaitPass(rt.ctx) != nil {
+				return
+			}
+			defer rt.gate.EndPass()
+			s.sendSwitch(rt.ctx, rt, sw)
+		})
+		return err
+	}
+	defer rt.gate.EndPass()
+	s.sendSwitch(ctx, rt, sw)
+	return err
+}
+
+// sendSwitch sends the kernel the invalidations sw needs, then logs sw's
+// paths for the fsmonitor hook.
+func (s *Service) sendSwitch(ctx context.Context, rt *repoRuntime, sw fusefs.Switch) {
 	s.mu.Lock()
 	mfs := rt.mfs
 	serving := rt.mount == mountServing
@@ -139,7 +170,6 @@ func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, co
 	if serving && mfs.Backend() == fusefs.BackendFSKit {
 		s.logSwitchedAfterCacheTTL(rt, name, sw.Changed)
 	}
-	return nil
 }
 
 // logSwitchedAfterCacheTTL logs switched once more after fusefs.CacheTTL,

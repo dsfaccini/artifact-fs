@@ -1544,7 +1544,7 @@ func (f *headReconcileFixture) switchToNext() {
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	if err := f.svc.switchGeneration(f.ctx, f.rt, gen, 0); err != nil {
+	if err := f.svc.switchGeneration(f.ctx, f.rt, gen, 0, nil); err != nil {
 		f.t.Fatal(err)
 	}
 }
@@ -1644,14 +1644,14 @@ func TestConcurrentSwitchesRetireTheGenerationsTheyReplaced(t *testing.T) {
 	pause := &pausingListing{SnapshotStore: f.rt.resolver.Snapshot, gen: gens[0], paused: make(chan struct{}), resume: make(chan struct{})}
 	f.rt.resolver.Snapshot = pause
 	first := make(chan error, 1)
-	go func() { first <- f.svc.switchGeneration(f.ctx, f.rt, gens[0], 0) }()
+	go func() { first <- f.svc.switchGeneration(f.ctx, f.rt, gens[0], 0, nil) }()
 	select {
 	case <-pause.paused:
 	case err := <-first:
 		t.Fatalf("switch to %d returned before it listed the generation: %v", gens[0], err)
 	}
 	second := make(chan error, 1)
-	go func() { second <- f.svc.switchGeneration(f.ctx, f.rt, gens[1], 0) }()
+	go func() { second <- f.svc.switchGeneration(f.ctx, f.rt, gens[1], 0, nil) }()
 	waitForSwitchBehindAnother(t.Name())
 	close(pause.resume)
 	for _, done := range []chan error{first, second} {

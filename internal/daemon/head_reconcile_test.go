@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -889,42 +888,98 @@ func TestHeadReconcileServesReadsMatchingReportedSize(t *testing.T) {
 	}
 }
 
-// invalidatingMount records the generation the resolver serves each time the
-// daemon asks the mount to invalidate the kernel's caches.
+// invalidatingMount records, each time the daemon asks the mount to
+// invalidate the kernel's caches, the generation the resolver serves and
+// whether an op would wait at gate. The kernel can hold a directory's lock
+// while a lookup there waits at the gate, and its entry invalidation waits
+// for that lock, so an invalidation sent then blocks until the lookup ends.
+// during, when not nil, runs first.
 type invalidatingMount struct {
 	*fakeMountedFS
 	resolver *fusefs.Resolver
-	gens     chan int64
+	gate     *fusefs.ReadyGate
+	during   func()
+	passes   chan switchPass
+}
+
+type switchPass struct {
+	gen  int64
+	held bool
 }
 
 func (m *invalidatingMount) InvalidateChanged() error {
-	m.gens <- m.resolver.Generation()
+	if m.during != nil {
+		m.during()
+	}
+	m.passes <- switchPass{gen: m.resolver.Generation(), held: holdsOps(m.gate)}
 	return nil
+}
+
+// holdsOps reports whether an op that reaches gate now would wait.
+func holdsOps(gate *fusefs.ReadyGate) bool {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return errors.Is(gate.Wait(ctx), context.Canceled)
+}
+
+func newInvalidatingMount(resolver *fusefs.Resolver, gate *fusefs.ReadyGate) *invalidatingMount {
+	return &invalidatingMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, resolver: resolver, gate: gate, passes: make(chan switchPass, 4)}
 }
 
 func TestHeadReconcileInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 	t.Parallel()
 	f := newHeadReconcileFixture(t)
-	mount := &invalidatingMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, resolver: f.rt.resolver, gens: make(chan int64, 1)}
+	mount := newInvalidatingMount(f.rt.resolver, nil)
 	f.svc.mu.Lock()
 	f.rt.mfs, f.rt.mount = mount, mountServing
 	f.svc.mu.Unlock()
 
 	f.updateMain(f.nextOID)
 	f.signal()
-	if gen := <-mount.gens; gen != f.oldGen+1 {
-		t.Fatalf("mount invalidated while the resolver served generation %d, want the new generation %d", gen, f.oldGen+1)
+	if pass := <-mount.passes; pass.gen != f.oldGen+1 {
+		t.Fatalf("mount invalidated while the resolver served generation %d, want the new generation %d", pass.gen, f.oldGen+1)
 	}
 }
 
-// A prepare of an async repo can land after the repo's first preparation made
-// it ready: Controller.Prepare reads the repo as preparing, and BeginPrepare
-// checks only the config. The kernel then caches entries from the open gate,
-// and the late preparation moves HEAD to the remote's new tip. Its activation
-// must invalidate the kernel's caches once the resolver serves the new
-// generation, before it opens the gate.
-func TestLateAsyncPrepareInvalidatesKernelCacheAfterSwitch(t *testing.T) {
+// A HEAD reconcile can switch while the gate holds ops: an async repo's
+// preparation moves the branch, and the watcher sees it before the
+// preparation opens the gate. The reconcile's pass then waits for the gate.
+func TestHeadReconcileInvalidatesOnlyOnceTheGateOpens(t *testing.T) {
 	t.Parallel()
+	f := newIdleHeadReconcileFixture(t, time.Millisecond)
+	gate := fusefs.NewReadyGate(false)
+	mount := newInvalidatingMount(f.rt.resolver, gate)
+	f.svc.mu.Lock()
+	f.rt.gate, f.rt.mfs, f.rt.mount = gate, mount, mountServing
+	f.svc.mu.Unlock()
+
+	f.updateMain(f.nextOID)
+	if err := f.svc.reconcileHEAD(f.ctx, f.rt); err != nil {
+		t.Fatal(err)
+	}
+	gate.MarkReady()
+	if pass := <-mount.passes; pass.held || pass.gen != f.oldGen+1 {
+		t.Fatalf("mount invalidated at generation %d, with ops held at the gate: %v; want generation %d with the gate open", pass.gen, pass.held, f.oldGen+1)
+	}
+}
+
+// servedAsyncRepo is an async repo of a local remote that a daemon prepared
+// once and serves through an invalidatingMount. Its HEAD watcher never polls.
+type servedAsyncRepo struct {
+	svc    *Service
+	cfg    model.RepoConfig
+	remote string
+	rt     *repoRuntime
+	gate   *fusefs.ReadyGate
+	// passes receives every pass after the first preparation's.
+	passes chan switchPass
+}
+
+// newServedAsyncRepo builds a servedAsyncRepo. setup, when not nil, sets the
+// daemon's hooks before the repo registers. The mount runs during, when not
+// nil, at the start of every pass.
+func newServedAsyncRepo(t *testing.T, setup func(*Service), during func()) *servedAsyncRepo {
+	t.Helper()
 	ctx := t.Context()
 	tmp := t.TempDir()
 	remote := filepath.Join(tmp, "remote")
@@ -935,10 +990,16 @@ func TestLateAsyncPrepareInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = svc.Close() }()
-	gens := make(chan int64, 1)
-	svc.mount = func(_, _ context.Context, _ model.RepoPaths, engine *fusefs.Engine, _ *fusefs.ReadyGate, _ *slog.Logger, _ func(string) string) (fusefs.MountedFS, error) {
-		return &invalidatingMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, resolver: engine.Resolver, gens: gens}, nil
+	t.Cleanup(func() { _ = svc.Close() })
+	passes := make(chan switchPass, 4)
+	svc.headPollTicks = make(chan time.Time)
+	svc.mount = func(_, _ context.Context, _ model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, _ *slog.Logger, _ func(string) string) (fusefs.MountedFS, error) {
+		mount := newInvalidatingMount(engine.Resolver, gate)
+		mount.passes, mount.during = passes, during
+		return mount, nil
+	}
+	if setup != nil {
+		setup(svc)
 	}
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{Name: "repo"}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + remote, Branch: "main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Hour}, Enabled: true}
 	if err := svc.ctl().AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
@@ -956,46 +1017,373 @@ func TestLateAsyncPrepareInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 	if ready.PrepareState != model.PrepareStateReady || rt == nil {
 		t.Fatalf("after the first preparation: prepare state %q, runtime %v; want ready and running", ready.PrepareState, rt)
 	}
-	svc.mu.Lock()
-	firstGen, gate := rt.head.gen, rt.gate
-	svc.mu.Unlock()
 	select {
-	case <-gens:
+	case <-passes:
 	default:
 	}
+	svc.mu.Lock()
+	gate := rt.gate
+	svc.mu.Unlock()
+	return &servedAsyncRepo{svc: svc, cfg: ready, remote: remote, rt: rt, gate: gate, passes: passes}
+}
 
-	next := commitFile(t, remote, "README.md", "two\n")
-	if err := svc.registry.BeginPrepare(ctx, ready, model.PrepareStatePreparing, "late"); err != nil {
-		t.Fatal(err)
+// requestPrepare requests a preparation of r's repo, as `artifact-fs prepare`
+// does, and runs the sync its nudge wakes.
+func (r *servedAsyncRepo) requestPrepare(ctx context.Context, request string) error {
+	if err := r.svc.registry.BeginPrepare(ctx, r.cfg, model.PrepareStatePreparing, request); err != nil {
+		return err
 	}
+	return r.svc.syncRepos(ctx)
+}
+
+// commitTimestampGit runs before ahead of each CommitTimestamp.
+type commitTimestampGit struct {
+	model.GitStore
+	before func()
+}
+
+func (g *commitTimestampGit) CommitTimestamp(ctx context.Context, repo model.RepoConfig, oid string) (int64, error) {
+	g.before()
+	return g.GitStore.CommitTimestamp(ctx, repo, oid)
+}
+
+// A prepare request can reset the gate while a switch pass runs, here a HEAD
+// reconcile's. The reset holds ops only once the pass ends: a lookup it held
+// could block the pass's entry invalidations. The end of the request's
+// preparation during the pass replaces the reset.
+func TestGateResetDuringASwitchPassTakesEffectWhenThePassEnds(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		// end is how the request's preparation ends during the pass. With
+		// none, it waits before its activation until the test saw the gate.
+		end model.PrepareState
+	}{
+		{name: "reset"},
+		{name: "reset then ready", end: model.PrepareStateReady},
+		{name: "reset then failed", end: model.PrepareStateFailed},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			var r *servedAsyncRepo
+			var armed, requested atomic.Bool
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			r = newServedAsyncRepo(t, func(svc *Service) {
+				svc.readyRecorded = func() {
+					if tt.end == "" && requested.Load() {
+						<-release
+					}
+				}
+			}, func() {
+				if !armed.CompareAndSwap(true, false) {
+					return
+				}
+				requested.Store(true)
+				if err := r.requestPrepare(ctx, "next"); err != nil {
+					t.Errorf("prepare request during the pass: %v", err)
+					return
+				}
+				switch tt.end {
+				case model.PrepareStateReady:
+					// The activation's pass follows its open of the gate.
+					<-r.passes
+				case model.PrepareStateFailed:
+					for {
+						st, err := r.svc.ctl().Status(ctx, r.cfg.Name)
+						if err != nil {
+							t.Errorf("status during the pass: %v", err)
+							return
+						}
+						if st.State == string(model.PrepareStateFailed) {
+							return
+						}
+						time.Sleep(time.Millisecond)
+					}
+				}
+			})
+			defer releaseOnce.Do(func() { close(release) })
+
+			next := commitFile(t, r.remote, "README.md", "two\n")
+			runCmd(t, "git", "--git-dir", r.cfg.GitDir, "fetch", "-q", "origin", "main")
+			runCmd(t, "git", "--git-dir", r.cfg.GitDir, "update-ref", "HEAD", next)
+			if tt.end == model.PrepareStateFailed {
+				if err := os.RemoveAll(r.remote); err != nil {
+					t.Fatal(err)
+				}
+			}
+			armed.Store(true)
+			if err := r.svc.reconcileHEAD(ctx, r.rt); err != nil {
+				t.Fatal(err)
+			}
+			if armed.Load() {
+				t.Fatal("the HEAD reconcile sent no pass")
+			}
+			if pass := <-r.passes; pass.held {
+				t.Fatalf("HEAD reconcile invalidated at generation %d with ops held at the gate, want the reset to hold them only once the pass ends", pass.gen)
+			}
+			canceled, cancel := context.WithCancel(ctx)
+			cancel()
+			err := r.gate.Wait(canceled)
+			switch tt.end {
+			case "":
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("op at the gate after the pass = %v, want it held for the request's preparation", err)
+				}
+			case model.PrepareStateReady:
+				if err != nil {
+					t.Fatalf("op at the gate after the pass = %v, want it through: the preparation ended ready during the pass", err)
+				}
+			case model.PrepareStateFailed:
+				if err == nil || errors.Is(err, context.Canceled) {
+					t.Fatalf("op at the gate after the pass = %v, want the failure of the preparation that ended during the pass", err)
+				}
+			}
+			releaseOnce.Do(func() { close(release) })
+			r.svc.prepareWorkers.Wait()
+		})
+	}
+}
+
+// A prepare of an async repo can land after the repo's first preparation made
+// it ready: Controller.Prepare reads the repo as preparing, and BeginPrepare
+// checks only the config. The kernel then caches entries from the open gate,
+// and the late preparation moves HEAD to the remote's new tip. Its activation
+// must invalidate the kernel's caches once the resolver serves the new
+// generation, and only once it opened the gate: a lookup the gate held would
+// block the invalidations until the lookup ended.
+func TestLateAsyncPrepareInvalidatesKernelCacheAfterSwitch(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	var r *servedAsyncRepo
+	// statesAtPass receives, during each pass of the late preparation, the
+	// state status reports.
+	var late atomic.Bool
+	statesAtPass := make(chan string, 4)
+	r = newServedAsyncRepo(t, func(svc *Service) {
+		// A pass that waits for the gate waits here also until status no
+		// longer reports the late preparation, so it cannot beat the
+		// activation's record.
+		svc.passDeferred = func() {
+			for late.Load() {
+				if st, err := svc.ctl().Status(ctx, r.cfg.Name); err != nil || st.State != string(model.PrepareStatePreparing) {
+					return
+				}
+			}
+		}
+	}, func() {
+		if !late.Load() {
+			return
+		}
+		// Any record during the pass, here the refresh loop's after a fetch,
+		// reports what the runtime holds then.
+		start := time.Now()
+		r.rt.refresh <- time.Millisecond
+		defer func() { r.rt.refresh <- time.Hour }()
+		for {
+			rec, _, err := r.svc.registry.GetRuntime(ctx, r.cfg.ID)
+			if err != nil {
+				t.Errorf("runtime record during the pass: %v", err)
+				statesAtPass <- ""
+				return
+			}
+			if rec.LastFetchAt.After(start) {
+				statesAtPass <- rec.State
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	})
+	r.svc.mu.Lock()
+	firstGen := r.rt.head.gen
+	r.svc.mu.Unlock()
+
+	next := commitFile(t, r.remote, "README.md", "two\n")
+	late.Store(true)
 	// reconcileHEAD runs under headMu, so only the activation can switch the
-	// resolver until the gate opens. The activation's prune waits for headMu.
-	rt.headMu.Lock()
-	if err := svc.syncRepos(ctx); err != nil {
-		rt.headMu.Unlock()
+	// resolver. The activation's prune waits for headMu.
+	r.rt.headMu.Lock()
+	if err := r.requestPrepare(ctx, "late"); err != nil {
+		r.rt.headMu.Unlock()
 		t.Fatal(err)
 	}
-	gateErr := gate.Wait(ctx)
-	var invalidated []int64
-	select {
-	case gen := <-gens:
-		invalidated = append(invalidated, gen)
-	default:
+	pass := <-r.passes
+	r.rt.headMu.Unlock()
+	if err := r.gate.Wait(ctx); err != nil {
+		t.Fatalf("gate after the late preparation = %v, want open", err)
 	}
-	rt.headMu.Unlock()
-	if gateErr != nil {
-		t.Fatalf("gate after the late preparation = %v, want open", gateErr)
-	}
-	svc.prepareWorkers.Wait()
+	r.svc.prepareWorkers.Wait()
 
-	svc.mu.Lock()
-	served := rt.head
-	svc.mu.Unlock()
-	if runningRuntime(svc, ready.ID) != rt || served.oid != next || served.gen == firstGen {
+	r.svc.mu.Lock()
+	served := r.rt.head
+	r.svc.mu.Unlock()
+	if runningRuntime(r.svc, r.cfg.ID) != r.rt || served.oid != next || served.gen == firstGen {
 		t.Fatalf("after the late preparation the runtime serves %s at generation %d, want the same runtime serving %s at a generation after %d", served.oid, served.gen, next, firstGen)
 	}
-	if want := []int64{served.gen}; !slices.Equal(invalidated, want) {
-		t.Fatalf("mount invalidated at generations %v before the gate opened, want %v, the generation the activation switched to", invalidated, want)
+	if pass.held || pass.gen != served.gen {
+		t.Fatalf("mount invalidated at generation %d, with ops held at the gate: %v; want generation %d, the generation the activation switched to, with the gate open", pass.gen, pass.held, served.gen)
+	}
+	// Once status no longer reports the preparation, the kernel holds nothing
+	// the switch changed.
+	if state := <-statesAtPass; state != string(model.PrepareStatePreparing) {
+		t.Fatalf("status during the activation's pass = %q, want %q: the activation records the end of the preparation only after the pass", state, model.PrepareStatePreparing)
+	}
+}
+
+// A newer prepare request can supersede an activation once its resolver
+// switched: drivePrepare resets the runtime for the request before it cancels
+// the preparation the request replaces. The superseded activation leaves the
+// gate shut, so its pass waits for the newer preparation to open it. Sent at
+// once, the pass would wait for a lookup the gate holds, which waits for the
+// newer preparation, which waits for the repo's prepare lock that the
+// superseded one holds.
+func TestSupersededActivationSendsItsPassOnlyOnceTheGateOpens(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	var r *servedAsyncRepo
+	var supersede atomic.Bool
+	r = newServedAsyncRepo(t, func(svc *Service) {
+		svc.git = &commitTimestampGit{GitStore: svc.git, before: func() {
+			if !supersede.CompareAndSwap(true, false) {
+				return
+			}
+			if err := svc.registry.BeginPrepare(ctx, r.cfg, model.PrepareStatePreparing, "newer"); err != nil {
+				t.Errorf("newer prepare request: %v", err)
+				return
+			}
+			repo, err := svc.registry.GetRepo(ctx, r.cfg.Name)
+			if err != nil {
+				t.Errorf("read the newer request: %v", err)
+				return
+			}
+			svc.resetRunningPrepareState(repo)
+		}}
+	}, nil)
+
+	commitFile(t, r.remote, "README.md", "two\n")
+	supersede.Store(true)
+	if err := r.requestPrepare(ctx, "late"); err != nil {
+		t.Fatal(err)
+	}
+	r.svc.prepareWorkers.Wait()
+	if supersede.Load() {
+		t.Fatal("the late preparation never activated")
+	}
+	if !holdsOps(r.gate) {
+		t.Fatal("gate after the superseded activation is open, want it held for the newer request")
+	}
+	// The next sync starts the newer request's preparation, which opens the
+	// gate.
+	if err := r.svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if pass := <-r.passes; pass.held {
+			t.Fatalf("mount invalidated at generation %d with ops held at the gate, want every pass with the gate open", pass.gen)
+		}
+	}
+	r.svc.prepareWorkers.Wait()
+}
+
+// A HEAD reconcile can switch further during an activation's pass: the
+// gate is open, and HEAD moves again. The activation then keeps the served
+// HEAD the reconcile recorded, which the resolver serves, so status reports
+// the commit and generation the mount serves.
+func TestActivationKeepsTheServedHEADOfAReconcileDuringItsPass(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	var r *servedAsyncRepo
+	var armed atomic.Bool
+	r = newServedAsyncRepo(t, nil, func() {
+		if !armed.CompareAndSwap(true, false) {
+			return
+		}
+		prev, err := exec.Command("git", "--git-dir", r.cfg.GitDir, "rev-parse", "HEAD~1").Output()
+		if err != nil {
+			t.Errorf("resolve HEAD~1 during the pass: %v", err)
+			return
+		}
+		if out, err := exec.Command("git", "--git-dir", r.cfg.GitDir, "update-ref", "HEAD", strings.TrimSpace(string(prev))).CombinedOutput(); err != nil {
+			t.Errorf("move HEAD during the pass: %v\n%s", err, out)
+			return
+		}
+		if err := r.svc.reconcileHEAD(ctx, r.rt); err != nil {
+			t.Errorf("HEAD reconcile during the pass: %v", err)
+		}
+	})
+
+	commitFile(t, r.remote, "README.md", "two\n")
+	armed.Store(true)
+	if err := r.requestPrepare(ctx, "late"); err != nil {
+		t.Fatal(err)
+	}
+	r.svc.prepareWorkers.Wait()
+	if armed.Load() {
+		t.Fatal("the late activation sent no pass")
+	}
+	head := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", r.cfg.GitDir, "rev-parse", "HEAD"))
+	rec, _, err := r.svc.registry.GetRuntime(ctx, r.cfg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gen := r.rt.resolver.Generation(); rec.ServedCommit != head || rec.ServedGeneration != gen {
+		t.Fatalf("status after the activation serves %s at generation %d; want HEAD %s at generation %d, which the resolver serves", rec.ServedCommit, rec.ServedGeneration, head, gen)
+	}
+}
+
+// A newer prepare request can land as an activation opens the gate. The
+// activation opens it in the s.mu hold that checks its request, so the
+// request's reset lands before the check, which supersedes the activation,
+// or after the open. A reset between the two would find the gate shut, and
+// the open would then let ops through while the newer preparation runs. The
+// request starts once the activation opened the gate, and lands once the
+// activation releases s.mu.
+func TestPrepareRequestAsAnActivationOpensTheGateHoldsOps(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	var r *servedAsyncRepo
+	var late, newer atomic.Bool
+	requested := make(chan struct{})
+	heldAtReady := make(chan bool, 1)
+	request := func() {
+		defer close(requested)
+		if err := r.requestPrepare(ctx, "newer"); err != nil {
+			t.Errorf("newer prepare request: %v", err)
+		}
+	}
+	r = newServedAsyncRepo(t, func(svc *Service) {
+		svc.gateOpened = func() {
+			if !late.CompareAndSwap(true, false) {
+				return
+			}
+			newer.Store(true)
+			if svc.mu.TryLock() {
+				svc.mu.Unlock()
+				t.Error("the activation opened the gate outside the s.mu hold that checked its request")
+			}
+			if holdsOps(r.gate) {
+				t.Error("the gate holds ops once the activation opened it")
+			}
+			go request()
+		}
+		svc.readyRecorded = func() {
+			if newer.Load() {
+				heldAtReady <- holdsOps(r.gate)
+			}
+		}
+	}, nil)
+
+	commitFile(t, r.remote, "README.md", "two\n")
+	late.Store(true)
+	if err := r.requestPrepare(ctx, "late"); err != nil {
+		t.Fatal(err)
+	}
+	held := <-heldAtReady
+	<-requested
+	r.svc.prepareWorkers.Wait()
+	if !held {
+		t.Fatal("gate during the newer request's preparation is open, want it held until that preparation activates")
 	}
 }
 
