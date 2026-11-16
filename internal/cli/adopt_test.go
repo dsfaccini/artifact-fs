@@ -5,6 +5,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 )
 
 func TestAdoptGitDirRejectsAcquisitionFlags(t *testing.T) {
@@ -15,7 +17,7 @@ func TestAdoptGitDirRejectsAcquisitionFlags(t *testing.T) {
 		{"--async"}, {"--prepared-gitdir"}, {"--refresh", "30s"},
 	} {
 		t.Run(flag[0], func(t *testing.T) {
-			t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+			t.Setenv("ARTIFACT_FS_ROOT", gittest.StateRoot(t))
 			args := append([]string{"add-repo", "--name", "repo", "--adopt-gitdir", "--git-dir", "/unused"}, flag...)
 			var stdout, stderr bytes.Buffer
 			if code := Run(context.Background(), args, &stdout, &stderr); code == 0 {

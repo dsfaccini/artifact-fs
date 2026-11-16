@@ -18,6 +18,7 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
 	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -96,7 +97,7 @@ func newHeadReconcileFixtureWithBackoff(t *testing.T, backoff time.Duration) *he
 // no worker yet.
 func newIdleHeadReconcileFixture(t *testing.T, backoff time.Duration) *headReconcileFixture {
 	t.Helper()
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	workDir := filepath.Join(root, "work")
 	runCmd(t, "git", "init", "--initial-branch", "main", workDir)
 	readme := filepath.Join(workDir, "README.md")

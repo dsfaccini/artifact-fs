@@ -59,7 +59,7 @@ func TestVerifiedSourceStatusAndRefreshPolicy(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc, err := New(ctx, gittest.StateRoot(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ type bootstrapFixture struct {
 func newBootstrapFixture(t *testing.T) *bootstrapFixture {
 	t.Helper()
 	ctx := context.Background()
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	repoPath := filepath.Join(root, "worktree")
 	runCmd(t, "git", "init", "--initial-branch", "main", repoPath)
 	if err := os.WriteFile(filepath.Join(repoPath, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
@@ -515,7 +515,7 @@ func TestJoinRuntimeMountIsNotCanceledWithWorkers(t *testing.T) {
 func newHookService(t *testing.T, mountPath string) (*Service, model.RepoConfig) {
 	t.Helper()
 	ctx := t.Context()
-	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc, err := New(ctx, gittest.StateRoot(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

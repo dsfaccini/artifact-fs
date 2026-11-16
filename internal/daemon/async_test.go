@@ -27,7 +27,7 @@ import (
 func TestAddRepoAsyncRegistersWithoutClone(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -262,7 +262,7 @@ func TestSupersededPrepareDoesNotMutateExistingClone(t *testing.T) {
 func TestRepoPrepareLockSerializesServices(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	first, err := NewController(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -321,7 +321,7 @@ func TestRepoPrepareLockSerializesServices(t *testing.T) {
 func TestAddRepoAsyncRejectsInlineCredentials(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc, err := New(ctx, gittest.StateRoot(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +351,7 @@ func TestAddRepoAsyncRejectsInlineCredentials(t *testing.T) {
 func TestPrepareAsyncRejectsPersistedInlineCredentialsBeforeClone(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -492,7 +492,7 @@ func TestPrepareAsyncExistingCloneRejectsCredentialedRemoteBeforeSetURL(t *testi
 func TestAddRepoPreparedGitDirValidation(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc, err := New(ctx, gittest.StateRoot(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -520,7 +520,7 @@ func TestAddRepoPreparedGitDirValidation(t *testing.T) {
 func TestSyncReposSkipsResetWhilePrepareWorkerInFlight(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc, err := New(ctx, gittest.StateRoot(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -576,7 +576,7 @@ func TestSyncReposSkipsResetWhilePrepareWorkerInFlight(t *testing.T) {
 func TestDrivePrepareSkipsStalePreparingSnapshot(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc, err := New(ctx, gittest.StateRoot(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -641,7 +641,7 @@ func TestDrivePrepareSkipsStalePreparingSnapshot(t *testing.T) {
 func TestPrepareAsyncFailurePersistsRedactedError(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc, err := New(ctx, gittest.StateRoot(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -707,7 +707,7 @@ func TestStartPrepareWorkerTimesOutAndPersistsFailed(t *testing.T) {
 	t.Setenv("AFS_CLONE_STARTED", cloneStarted)
 
 	var logs bytes.Buffer
-	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewJSONHandler(&logs, nil)))
+	svc, err := New(ctx, gittest.StateRoot(t), slog.New(slog.NewJSONHandler(&logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

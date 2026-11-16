@@ -11,6 +11,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -47,7 +48,7 @@ func shortTempDir(t *testing.T) string {
 func TestNewRefusesASecondDaemonOnOneRoot(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	first, err := New(ctx, root, discardLogger())
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +87,7 @@ func TestNewRefusesASecondDaemonOnOneRoot(t *testing.T) {
 func TestStatusTrustsTheRecordOnlyWhileADaemonRuns(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	root := t.TempDir()
+	root := gittest.StateRoot(t)
 	ctl, err := NewController(ctx, root, discardLogger())
 	if err != nil {
 		t.Fatal(err)
@@ -233,7 +234,7 @@ func heldDaemonLock(t *testing.T, ctl *Controller) {
 func newRegisteredController(t *testing.T) *Controller {
 	t.Helper()
 	ctx := context.Background()
-	ctl, err := NewController(ctx, t.TempDir(), discardLogger())
+	ctl, err := NewController(ctx, gittest.StateRoot(t), discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}

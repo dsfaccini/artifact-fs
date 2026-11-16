@@ -60,6 +60,20 @@ func PrivateTempDir(t testing.TB) string {
 	return dir
 }
 
+// StateRoot returns t.TempDir() narrowed to 0700, which only the current user
+// can write, as artifact-fs requires of a state root. A t.TempDir() follows the
+// umask, so under umask 002 the group can write it, and the daemon refuses it.
+// Under /tmp on Linux the state root gets the FSMonitor hook script; a test
+// that expects the hook link uses PrivateTempDir.
+func StateRoot(t testing.TB) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 // PartialCloneRemote commits files on branch main of a bare repository that
 // serves partial clones, and returns its URL. A blobless clone of it holds no
 // blobs, so every read of one fetches from it.
