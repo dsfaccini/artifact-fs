@@ -2,14 +2,18 @@ package slimtree
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/daemon"
@@ -17,6 +21,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
+	"github.com/cloudflare/artifact-fs/internal/slimtree/doctor"
 )
 
 func TestDefaultBackendByPlatform(t *testing.T) {
@@ -44,13 +49,13 @@ func TestDefaultBackendByPlatform(t *testing.T) {
 				{backend: "nope", refusal: `unknown backend "nope": use apfsclone or artifactfs`},
 			} {
 				var stderr bytes.Buffer
-				code := run(t.Context(), tc.goos, []string{"--backend", c.backend}, io.Discard, &stderr)
+				code := run(t.Context(), tc.goos, doctor.Probe{}, []string{"--backend", c.backend}, io.Discard, &stderr)
 				if c.runs != (code == 0) || !c.runs && !strings.Contains(stderr.String(), c.refusal) {
 					t.Fatalf("--backend %s on %s: exit %d, stderr %q, want runs %v", c.backend, tc.goos, code, stderr.String(), c.runs)
 				}
 			}
 			var stdout bytes.Buffer
-			if code := run(t.Context(), tc.goos, []string{"--help"}, &stdout, io.Discard); code != 0 || !strings.Contains(stdout.String(), tc.usage) || !strings.Contains(stdout.String(), fmt.Sprintf("(default: %q)", tc.want)) {
+			if code := run(t.Context(), tc.goos, doctor.Probe{}, []string{"--help"}, &stdout, io.Discard); code != 0 || !strings.Contains(stdout.String(), tc.usage) || !strings.Contains(stdout.String(), fmt.Sprintf("(default: %q)", tc.want)) {
 				t.Fatalf("--help on %s: exit %d, stdout %q, want %q and the default", tc.goos, code, stdout.String(), tc.usage)
 			}
 		})
@@ -203,5 +208,55 @@ func TestHomeResolvesItsEnvironment(t *testing.T) {
 	t.Setenv("SLIMTREE_HOME", "slimtree")
 	if got, err := Home(); err == nil {
 		t.Fatalf("Home() with a relative SLIMTREE_HOME = %q, want an error", got)
+	}
+}
+
+type modeInfo struct {
+	fs.FileInfo
+	mode fs.FileMode
+}
+
+func (m modeInfo) Mode() fs.FileMode { return m.mode }
+func (m modeInfo) Sys() any          { return &syscall.Stat_t{} }
+
+// doctor prints its report, as JSON with --json, and exits 1 when a check
+// fails.
+func TestDoctorExitsOneOnAFailedCheck(t *testing.T) {
+	t.Setenv("SLIMTREE_HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+	probe := doctor.Probe{
+		LookPath: func(file string) (string, error) { return "/usr/bin/" + file, nil },
+		Stat: func(path string) (fs.FileInfo, error) {
+			if path == "/dev/fuse" {
+				return modeInfo{mode: fs.ModeDevice | fs.ModeCharDevice}, nil
+			}
+			return modeInfo{mode: fs.ModeSetuid | 0o755}, nil
+		},
+		ReadWrite: func(string) error { return errors.New("permission denied") },
+		ReadFile: func(path string) ([]byte, error) {
+			if path == "/proc/self/status" {
+				return []byte("CapBnd:\t000001ffffffffff\n"), nil
+			}
+			return []byte("ID=debian\n"), nil
+		},
+		Output: func(string, ...string) (string, error) { return "git version 2.47.0\n", nil },
+		EUID:   1000,
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run(t.Context(), "linux", probe, []string{"doctor", "--json"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "doctor: a check failed") {
+		t.Fatalf("doctor --json with an unwritable /dev/fuse: exit %d, stderr %q, want 1", code, stderr.String())
+	}
+	var report doctor.Report
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || report.OK || len(report.Checks) != 4 || report.Checks[1].Fix != "sudo chmod 0666 /dev/fuse" {
+		t.Fatalf("doctor --json = %s (%v), want a failed report with the chmod fix", stdout.String(), err)
+	}
+	stdout.Reset()
+	if code := run(t.Context(), "linux", probe, []string{"doctor"}, &stdout, io.Discard); code != 1 || !strings.Contains(stdout.String(), "fail  dev-fuse") || !strings.Contains(stdout.String(), "      fix: sudo chmod 0666 /dev/fuse\n") {
+		t.Fatalf("doctor: exit %d, stdout %q, want the failure and its fix", code, stdout.String())
+	}
+	probe.ReadWrite = func(string) error { return nil }
+	stdout.Reset()
+	if code := run(t.Context(), "linux", probe, []string{"doctor", "--json"}, &stdout, io.Discard); code != 0 {
+		t.Fatalf("doctor --json on a healthy machine: exit %d, stdout %s", code, stdout.String())
 	}
 }
