@@ -7,7 +7,7 @@ import (
 	"syscall"
 )
 
-// testHookWhileOpen, when set, runs in Write while the file is open for
+// testHookWhileOpen, when set, runs in open once the file is open for
 // writing.
 var testHookWhileOpen func()
 
@@ -20,16 +20,23 @@ var testHookWhileOpen func()
 func Write(path string, data []byte, perm fs.FileMode) error {
 	syscall.ForkLock.RLock()
 	defer syscall.ForkLock.RUnlock()
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	f, err := open(path, perm)
 	if err != nil {
 		return err
 	}
 	_, err = f.Write(data)
-	if testHookWhileOpen != nil {
-		testHookWhileOpen()
-	}
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
 	return err
+}
+
+// open opens path for writing, then runs testHookWhileOpen, so the hook sees
+// every lock Write holds from the open on.
+func open(path string, perm fs.FileMode) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err == nil && testHookWhileOpen != nil {
+		testHookWhileOpen()
+	}
+	return f, err
 }
