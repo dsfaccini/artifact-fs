@@ -255,15 +255,16 @@ func TestDoctorExitsOneOnAFailedCheck(t *testing.T) {
 			}
 			return []byte("ID=debian\n"), nil
 		},
-		Output: func(string, ...string) (string, error) { return "git version 2.47.0\n", nil },
-		EUID:   1000,
+		Output:   func(string, ...string) (string, error) { return "git version 2.47.0\n", nil },
+		EUID:     1000,
+		MountIDs: func() (bool, error) { return true, nil },
 	}
 	var stdout, stderr bytes.Buffer
 	if code := run(t.Context(), "linux", probe, []string{"doctor", "--json"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "doctor: a check failed") {
 		t.Fatalf("doctor --json with an unwritable /dev/fuse: exit %d, stderr %q, want 1", code, stderr.String())
 	}
 	var report doctor.Report
-	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || report.OK || len(report.Checks) != 6 || report.Checks[2].Fix != "sudo chmod 0666 /dev/fuse" {
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || report.OK || len(report.Checks) != 7 || report.Checks[2].Fix != "sudo chmod 0666 /dev/fuse" {
 		t.Fatalf("doctor --json = %s (%v), want a failed report with the chmod fix", stdout.String(), err)
 	}
 	stdout.Reset()
@@ -342,8 +343,9 @@ func healthyLinux() doctor.Probe {
 			}
 			return nil, os.ErrNotExist
 		},
-		Output: func(string, ...string) (string, error) { return "git version 2.47.0\n", nil },
-		EUID:   1000,
+		Output:   func(string, ...string) (string, error) { return "git version 2.47.0\n", nil },
+		EUID:     1000,
+		MountIDs: func() (bool, error) { return true, nil },
 	}
 }
 
@@ -373,6 +375,7 @@ func TestFirstRunSummaryPrintsOnce(t *testing.T) {
 			"ok    dev-fuse       /dev/fuse\n" +
 			"ok    cap-sys-admin  CapBnd holds CAP_SYS_ADMIN\n" +
 			"ok    apparmor       no AppArmor profile\n" +
+			"ok    mount-id       unique mount IDs\n" +
 			"ok    git            git version 2.47.0\n"},
 		{goos: "darwin", probe: darwin, want: "slimtree's first run: what --backend apfsclone needs here (slimtree doctor checks again)\n" +
 			"ok    xcode-select   /Library/Developer/CommandLineTools\n" +
@@ -422,7 +425,7 @@ func TestFirstRunSkipsHelpVersionAndDoctor(t *testing.T) {
 		}
 		if args[len(args)-1] == "--json" {
 			var report doctor.Report
-			if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || len(report.Checks) != 6 {
+			if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || len(report.Checks) != 7 {
 				t.Errorf("doctor --json stdout = %s (%v), want one report", stdout.String(), err)
 			}
 		}

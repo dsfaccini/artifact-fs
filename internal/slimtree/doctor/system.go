@@ -32,6 +32,7 @@ func System() Probe {
 		OSVersion:      osVersion,
 		FSKitAvailable: fuse.FSKitAvailable,
 		APFS:           apfs,
+		MountIDs:       mountIDs,
 	}
 }
 
