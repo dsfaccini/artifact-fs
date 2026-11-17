@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/slimtree/doctor"
+	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 	"github.com/cloudflare/artifact-fs/internal/version"
 )
 
@@ -44,10 +45,12 @@ var markerCreated func(*os.File)
 // writeFirstRunMarker writes the marker to a temporary file and renames it
 // into place, so a failed write, as on a full disk, leaves no empty marker
 // that would hide the summary from the next run.
-func writeFirstRunMarker(home string) error {
-	if err := os.MkdirAll(home, 0o700); err != nil {
+func writeFirstRunMarker(dir string) error {
+	h, err := state.Open(dir)
+	if err != nil {
 		return err
 	}
+	home := h.Dir()
 	f, err := os.CreateTemp(home, "."+firstRunMarker+"-*")
 	if err != nil {
 		return err
@@ -56,6 +59,9 @@ func writeFirstRunMarker(home string) error {
 		markerCreated(f)
 	}
 	_, err = fmt.Fprintf(f, "slimtree %s\n%s\n", version.String(), time.Now().UTC().Format(time.RFC3339))
+	if err == nil {
+		err = f.Sync()
+	}
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}

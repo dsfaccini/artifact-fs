@@ -2,6 +2,7 @@ package slimtree
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,10 +12,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
@@ -22,6 +26,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/doctor"
+	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 )
 
 func TestDefaultBackendByPlatform(t *testing.T) {
@@ -273,13 +278,14 @@ func TestDoctorExitsOneOnAFailedCheck(t *testing.T) {
 
 // homeAfterFirstRun points SLIMTREE_HOME at a home whose first-run summary
 // has been shown.
-func homeAfterFirstRun(t *testing.T) {
+func homeAfterFirstRun(t *testing.T) string {
 	t.Helper()
-	home := t.TempDir()
+	home := gittest.StateRoot(t)
 	if err := os.WriteFile(filepath.Join(home, firstRunMarker), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("SLIMTREE_HOME", home)
+	return home
 }
 
 func requireNoFirstRunMarker(t *testing.T, home string) {
@@ -400,7 +406,7 @@ func TestFirstRunSurvivesAnUnwritableHome(t *testing.T) {
 	t.Setenv("SLIMTREE_HOME", filepath.Join(file, "home"))
 	for range 2 {
 		var stderr bytes.Buffer
-		if code := run(t.Context(), "linux", healthyLinux(), nil, io.Discard, &stderr); code != 0 || !strings.HasPrefix(stderr.String(), "slimtree's first run: ") || !strings.Contains(stderr.String(), "\nslimtree: cannot record the first run, so the next run prints this summary again: mkdir "+file+": not a directory\n") {
+		if code := run(t.Context(), "linux", healthyLinux(), nil, io.Discard, &stderr); code != 0 || !strings.HasPrefix(stderr.String(), "slimtree's first run: ") || !strings.Contains(stderr.String(), "\nslimtree: cannot record the first run, so the next run prints this summary again: lstat "+file+"/home: not a directory\n") {
 			t.Fatalf("run with an unwritable home: exit %d, stderr %q, want 0, the summary and why no marker was written", code, stderr.String())
 		}
 	}
@@ -409,7 +415,7 @@ func TestFirstRunSurvivesAnUnwritableHome(t *testing.T) {
 // A write that fails after the marker's create, as on a full disk, leaves no
 // marker, so the next run prints the summary again, as the failure says.
 func TestFirstRunMarkerWriteFailureLeavesNoMarker(t *testing.T) {
-	home := t.TempDir()
+	home := filepath.Join(t.TempDir(), "home")
 	t.Setenv("SLIMTREE_HOME", home)
 	markerCreated = func(f *os.File) {
 		if err := f.Close(); err != nil {
@@ -421,8 +427,8 @@ func TestFirstRunMarkerWriteFailureLeavesNoMarker(t *testing.T) {
 	if code := run(t.Context(), "linux", healthyLinux(), nil, io.Discard, &stderr); code != 0 || !strings.Contains(stderr.String(), "\nslimtree: cannot record the first run, so the next run prints this summary again: ") {
 		t.Fatalf("run whose marker write fails: exit %d, stderr %q, want 0 and why no marker was written", code, stderr.String())
 	}
-	if entries, err := os.ReadDir(home); err != nil || len(entries) != 0 {
-		t.Fatalf("after the failed write, %s holds %v (%v), want nothing", home, entries, err)
+	if entries, err := os.ReadDir(home); err != nil || len(entries) != 1 || entries[0].Name() != "w" {
+		t.Fatalf("after the failed write, %s holds %v (%v), want only the records directory", home, entries, err)
 	}
 	markerCreated = nil
 	stderr.Reset()
@@ -431,5 +437,203 @@ func TestFirstRunMarkerWriteFailureLeavesNoMarker(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, firstRunMarker)); err != nil {
 		t.Fatalf("next run wrote no marker: %v", err)
+	}
+}
+
+// gitIn runs git in dir and returns its output.
+func gitIn(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), "git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com"}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
+}
+
+// repoWithWorktrees makes a repository with a commit and a linked worktree
+// on a new branch for each name, and returns its canonical common dir and
+// worktree paths.
+func repoWithWorktrees(t *testing.T, names ...string) (string, []string) {
+	t.Helper()
+	base, err := state.Canonical(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	main := filepath.Join(base, "main")
+	gitIn(t, base, "init", "-q", "-b", "main", main)
+	gitIn(t, main, "commit", "-q", "--allow-empty", "-m", "base")
+	paths := make([]string, len(names))
+	for i, name := range names {
+		paths[i] = filepath.Join(base, name)
+		gitIn(t, main, "worktree", "add", "-q", "-b", name, paths[i])
+	}
+	return filepath.Join(main, ".git"), paths
+}
+
+// list reports each record's state from git's worktree list: ok for an
+// apfsclone worktree git lists, stopped for an artifactfs one, and missing
+// for one whose directory or repository is gone.
+func TestListReportsEachRecordsState(t *testing.T) {
+	homeDir := homeAfterFirstRun(t)
+	home, err := state.Open(homeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, paths := repoWithWorktrees(t, "kept", "gone", "served")
+	other, otherPaths := repoWithWorktrees(t, "elsewhere")
+	if err := os.RemoveAll(paths[1]); err != nil {
+		t.Fatal(err)
+	}
+	created := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	vanishedRepo := filepath.Join(filepath.Dir(other), "vanished", ".git")
+	for _, r := range []state.Record{
+		{Backend: "apfsclone", Path: paths[0], CommonDir: repo, Branch: "kept", Created: created},
+		{Backend: "apfsclone", Path: paths[1], CommonDir: repo, Branch: "gone", Created: created},
+		{Backend: "artifactfs", Path: paths[2], CommonDir: repo, Branch: "served", Created: created},
+		{Backend: "apfsclone", Path: otherPaths[0], CommonDir: other, Branch: "elsewhere", Created: created},
+		{Backend: "apfsclone", Path: filepath.Join(filepath.Dir(vanishedRepo), "wt"), CommonDir: vanishedRepo, Branch: "wt", Created: created},
+	} {
+		if err := home.Write(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The worktree moved to another branch after it was made.
+	gitIn(t, paths[0], "switch", "-q", "-c", "moved")
+	stray := filepath.Join(home.Dir(), "w", "stray")
+	if err := os.WriteFile(stray, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := run(t.Context(), "linux", doctor.Probe{}, []string{"list", "--json"}, &stdout, &stderr); code != 0 || stderr.String() != "slimtree: skipping "+stray+", which holds no readable record: open "+stray+"/worktree.json: not a directory\n" {
+		t.Fatalf("list --json: exit %d, stderr %q, want 0 and the stray entry skipped", code, stderr.String())
+	}
+	var got struct {
+		Version   int
+		Worktrees []struct{ Name, Path, Backend, State, Branch, Repo string }
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("list --json = %s: %v", stdout.String(), err)
+	}
+	type row struct{ Name, Path, Backend, State, Branch, Repo string }
+	want := []row{
+		{"kept", paths[0], "apfsclone", "ok", "moved", repo},
+		// git still reads the branch from the worktree's admin directory.
+		{"gone", paths[1], "apfsclone", "missing", "gone", repo},
+		{"served", paths[2], "artifactfs", "stopped", "served", repo},
+		{"elsewhere", otherPaths[0], "apfsclone", "ok", "elsewhere", other},
+		{"wt", filepath.Join(filepath.Dir(vanishedRepo), "wt"), "apfsclone", "missing", "", vanishedRepo},
+	}
+	var rows []row
+	for _, w := range got.Worktrees {
+		rows = append(rows, row(w))
+	}
+	slices.SortFunc(want, func(a, b row) int { return strings.Compare(a.Path, b.Path) })
+	if got.Version != 1 || !reflect.DeepEqual(rows, want) {
+		t.Fatalf("list --json = version %d, %+v\nwant version 1, %+v", got.Version, rows, want)
+	}
+
+	// --repo keeps the worktrees of the repository that holds the current
+	// directory.
+	t.Chdir(paths[2])
+	stdout.Reset()
+	if code := run(t.Context(), "linux", doctor.Probe{}, []string{"list", "--repo"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("list --repo: exit %d, stderr %q", code, stderr.String())
+	}
+	wantText := "NAME    STATE    BACKEND     BRANCH  PATH\n" +
+		"gone    missing  apfsclone   gone    " + paths[1] + "\n" +
+		"kept    ok       apfsclone   moved   " + paths[0] + "\n" +
+		"served  stopped  artifactfs  served  " + paths[2] + "\n"
+	if stdout.String() != wantText {
+		t.Fatalf("list --repo =\n%s\nwant\n%s", stdout.String(), wantText)
+	}
+}
+
+// A usage error writes the error once to stderr and nothing to stdout, where
+// --json output goes.
+func TestUsageErrorLeavesStdoutEmpty(t *testing.T) {
+	homeAfterFirstRun(t)
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"list", "--json", "--bogus"}, "flag provided but not defined: -bogus\n"},
+		{[]string{"--backend", "nope", "list", "--json"}, `invalid value "nope" for flag -backend: unknown backend "nope": use apfsclone or artifactfs` + "\n"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := run(t.Context(), "linux", doctor.Probe{}, tc.args, &stdout, &stderr); code != 1 || stdout.Len() != 0 || stderr.String() != tc.want {
+			t.Errorf("%q: exit %d, stdout %q, stderr %q; want 1, no stdout, stderr %q", tc.args, code, stdout.String(), stderr.String(), tc.want)
+		}
+	}
+}
+
+// git stats each unlocked worktree's .git, so a hung mount can hang git
+// worktree list. list stops git once worktreeListTimeout passes, and reports
+// the repository's worktrees as unknown.
+func TestListReportsUnknownWhenGitHangs(t *testing.T) {
+	homeDir := homeAfterFirstRun(t)
+	home, err := state.Open(homeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := home.Write(state.Record{Backend: "artifactfs", Path: "/work/hung", CommonDir: "/src/repo/.git"}); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "listing")
+	if err := os.WriteFile(filepath.Join(bin, "git"), fmt.Appendf(nil, "#!/bin/sh\n: > '%s'\nexec sleep 60\n", marker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ctx, cancel := gittest.ExpireOnFile(t.Context(), marker)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	if code := run(ctx, "linux", doctor.Probe{}, []string{"list", "--json"}, &stdout, &stderr); code != 0 || stderr.String() != "slimtree: git worktree list did not finish within 10s in /src/repo/.git, so its worktrees are unknown\n" {
+		t.Fatalf("list with a hung git: exit %d, stderr %q", code, stderr.String())
+	}
+	var got struct {
+		Worktrees []struct{ State, Reason string }
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil || len(got.Worktrees) != 1 || got.Worktrees[0].State != "unknown" || got.Worktrees[0].Reason != "git worktree list did not finish within 10s" {
+		t.Fatalf("list --json with a hung git = %s (%v), want the worktree unknown", stdout.String(), err)
+	}
+}
+
+// A canceled list, as on Ctrl-C, fails with the context's error instead of
+// reporting the worktrees missing.
+func TestListFailsWhenCanceled(t *testing.T) {
+	homeDir := homeAfterFirstRun(t)
+	home, err := state.Open(homeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := home.Write(state.Record{Backend: "apfsclone", Path: "/work/a", CommonDir: "/src/repo/.git"}); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "listing")
+	if err := os.WriteFile(filepath.Join(bin, "git"), fmt.Appendf(nil, "#!/bin/sh\n: > '%s'\nexec sleep 60\n", marker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() {
+		for {
+			if _, err := os.Stat(marker); err == nil {
+				cancel()
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}()
+	var stdout, stderr bytes.Buffer
+	if code := run(ctx, "linux", doctor.Probe{}, []string{"list", "--json"}, &stdout, &stderr); code != 1 || stdout.Len() != 0 || stderr.String() != "context canceled\n" {
+		t.Fatalf("canceled list: exit %d, stdout %q, stderr %q; want 1 and the context's error", code, stdout.String(), stderr.String())
 	}
 }

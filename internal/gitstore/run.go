@@ -27,7 +27,7 @@ func runGitDiscardOutputWithEnv(ctx context.Context, gitDir string, extraEnv []s
 
 func runGitInput(ctx context.Context, gitDir string, extraEnv []string, input []byte, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
-	configureCancelableCommand(cmd)
+	ConfigureCancelableCommand(cmd)
 	return runInputCommand(ctx, cmd, gitDir, extraEnv, input)
 }
 
@@ -39,7 +39,7 @@ func (s *Store) runLazyFetchGitInput(ctx context.Context, gitDir string, input [
 		return "", err
 	}
 	cmd := exec.CommandContext(ctx, "git", args...)
-	configureCancelableCommand(cmd)
+	ConfigureCancelableCommand(cmd)
 	configureCommandSession(cmd)
 	return runInputCommand(ctx, cmd, gitDir, env, input)
 }
@@ -84,14 +84,14 @@ func (s *Store) runNetworkGit(ctx context.Context, gitDir string, extraEnv []str
 		return "", err
 	}
 	cmd := exec.CommandContext(ctx, "git", args...)
-	configureCancelableCommand(cmd)
+	ConfigureCancelableCommand(cmd)
 	configureCommandSession(cmd)
 	return runGitCommand(ctx, cmd, gitDir, append(env, extraEnv...), true)
 }
 
 func runGitWithEnvCapture(ctx context.Context, gitDir string, extraEnv []string, captureOutput bool, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
-	configureCancelableCommand(cmd)
+	ConfigureCancelableCommand(cmd)
 	return runGitCommand(ctx, cmd, gitDir, extraEnv, captureOutput)
 }
 
@@ -157,7 +157,10 @@ func isCancellationSignal(msg string) bool {
 	return strings.EqualFold(msg, "signal: terminated") || strings.EqualFold(msg, "signal: killed")
 }
 
-func configureCancelableCommand(cmd *exec.Cmd) {
+// ConfigureCancelableCommand makes cmd stop as every git command of this
+// package stops when its context ends: its process group gets SIGTERM, then
+// SIGKILL after gitCommandWaitDelay, through terminateCommandProcessGroup.
+func ConfigureCancelableCommand(cmd *exec.Cmd) {
 	configureCommandProcessGroup(cmd)
 	cmd.Cancel = func() error { return terminateCommandProcessGroup(cmd) }
 	cmd.WaitDelay = gitCommandWaitDelay

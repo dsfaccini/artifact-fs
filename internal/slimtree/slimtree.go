@@ -13,6 +13,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/cli"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/doctor"
+	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 	"github.com/cloudflare/artifact-fs/internal/version"
 	ucli "github.com/urfave/cli/v3"
 )
@@ -77,7 +78,45 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 					return printDoctor(stdout, doctor.Run(probe, goos, c.String("backend"), dir), c.Bool("json"))
 				},
 			},
+			{
+				Name:  "list",
+				Usage: "list the worktrees slimtree made; reads only its records and git's worktree list",
+				Flags: []ucli.Flag{
+					&ucli.BoolFlag{Name: "repo", Usage: "only the worktrees of the repository that holds the current directory"},
+					&ucli.BoolFlag{Name: "json", Usage: "print the list as JSON"},
+				},
+				// list needs no doctor checks: it changes nothing and runs
+				// only git commands that read.
+				Action: func(ctx context.Context, c *ucli.Command) error {
+					dir, err := Home()
+					if err != nil {
+						return err
+					}
+					home, err := state.Open(dir)
+					if err != nil {
+						return err
+					}
+					repo := ""
+					if c.Bool("repo") {
+						if repo, err = commonDir(ctx); err != nil {
+							return err
+						}
+					}
+					l, err := listWorktrees(ctx, home, repo, func(err error) { fmt.Fprintln(stderr, "slimtree:", err) })
+					if err != nil {
+						return err
+					}
+					return printListing(stdout, l, c.Bool("json"))
+				},
+			},
 		},
+	}
+	// A usage error goes to stderr once, as run prints it, and never puts
+	// the help on stdout, where --json output goes.
+	onUsageError := func(_ context.Context, _ *ucli.Command, err error, _ bool) error { return err }
+	app.OnUsageError = onUsageError
+	for _, c := range app.Commands {
+		c.OnUsageError = onUsageError
 	}
 	if err := app.Run(ctx, append([]string{"slimtree"}, args...)); err != nil {
 		fmt.Fprintln(stderr, err)
