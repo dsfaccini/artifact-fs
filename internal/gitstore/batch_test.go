@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -160,7 +161,7 @@ func TestFetchMissingBlobsLogsEveryFailureButACancel(t *testing.T) {
 			script := "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = fetch ]; then\n" +
 				"    if [ " + tt.mode + " = fail ]; then echo 'fatal: remote refused' >&2; exit 128; fi\n" +
 				"    : > " + marker + "; exec sleep 60\n  fi\ndone\nexec " + realGit + " \"$@\"\n"
-			if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+			if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -216,7 +217,7 @@ func failedFetchMissingBlobs(t *testing.T, stderrScript string) (string, error) 
 		"*\" cat-file \"*) while read -r oid; do echo \"$oid missing\"; done ;;\n" +
 		"*\" config \"*) printf 'remote.origin.promisor\\ntrue\\000' ;;\n" +
 		"*\" fetch \"*) " + stderrScript + "; exit 128 ;;\nesac\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(fakeGit), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(fakeGit), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -649,7 +650,7 @@ func batchStderrLogs(t *testing.T, stderrScript string) string {
 		t.Fatal(err)
 	}
 	fakeGit := "#!/bin/sh\n" + stderrScript + "\nwhile read -r oid; do echo \"$oid missing\"; done\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(fakeGit), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(fakeGit), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -674,7 +675,7 @@ func TestBlobToCacheRemovesDstAfterAFailedWrite(t *testing.T) {
 	// cat-file announces 10 bytes and sends 3, a cut-short stream a local
 	// repository cannot produce.
 	fakeGit := "#!/bin/sh\nread -r oid\necho \"$oid blob 10\"\nprintf abc\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(fakeGit), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(fakeGit), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))

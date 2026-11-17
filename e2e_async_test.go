@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/daemon"
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -162,7 +163,7 @@ for arg in "$@"; do
 done
 exec "$AFS_REAL_GIT" "$@"
 `
-	if err := os.WriteFile(wrapperPath, []byte(script), 0o755); err != nil {
+	if err := execfile.Write(wrapperPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_REAL_GIT", realGit)

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
@@ -106,7 +107,7 @@ func TestSSHWrapperLivesUnderTheStateRoot(t *testing.T) {
 	runCmd(t, "git", "init", "--initial-branch", "main", remote)
 	commitFile(t, remote, "README.md", "main\n")
 	bin, shared := filepath.Join(tmp, "bin"), filepath.Join(tmp, "shared")
-	if err := errors.Join(os.Mkdir(bin, 0o700), os.WriteFile(filepath.Join(bin, "ssh"), []byte("#!/bin/sh\nexit 255\n"), 0o700), os.Mkdir(shared, 0o777), os.Chmod(shared, 0o777)); err != nil {
+	if err := errors.Join(os.Mkdir(bin, 0o700), execfile.Write(filepath.Join(bin, "ssh"), []byte("#!/bin/sh\nexit 255\n"), 0o700), os.Mkdir(shared, 0o777), os.Chmod(shared, 0o777)); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -164,7 +165,7 @@ func TestNewEmptiesTheDaemonTempDir(t *testing.T) {
 	daemonTemp := filepath.Join(root, "config", "tmp", "daemon")
 	cliEntry := filepath.Join(root, "config", "tmp", "artifact-fs-ssh-cli")
 	for _, dir := range []string{filepath.Join(daemonTemp, "artifact-fs-ssh-left"), cliEntry} {
-		if err := errors.Join(os.MkdirAll(dir, 0o700), os.WriteFile(filepath.Join(dir, "ssh"), []byte("#!/bin/sh\n"), 0o700)); err != nil {
+		if err := errors.Join(os.MkdirAll(dir, 0o700), execfile.Write(filepath.Join(dir, "ssh"), []byte("#!/bin/sh\n"), 0o700)); err != nil {
 			t.Fatal(err)
 		}
 	}

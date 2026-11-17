@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"golang.org/x/sys/unix"
@@ -234,7 +235,7 @@ func TestCloneKeepsAnIncludedCoreSSHCommand(t *testing.T) {
 	t.Setenv(sshSessionReportEnv, filepath.Join(tmp, "plain-ssh"))
 	runs := filepath.Join(tmp, "deploy-ssh-runs")
 	deploySSH := filepath.Join(tmp, "deploy-ssh")
-	if err := os.WriteFile(deploySSH, []byte("#!/bin/sh\necho \"$*\" >> '"+runs+"'\nexit 1\n"), 0o755); err != nil {
+	if err := execfile.Write(deploySSH, []byte("#!/bin/sh\necho \"$*\" >> '"+runs+"'\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	include := filepath.Join(tmp, "deploy.inc")
@@ -310,7 +311,7 @@ func TestSSHWrapperIsReusedOnlyWhilePrivate(t *testing.T) {
 	plant := func(t *testing.T) string {
 		t.Helper()
 		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		if err := execfile.Write(filepath.Join(dir, "ssh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 			t.Fatal(err)
 		}
 		return dir
@@ -568,7 +569,7 @@ func TestRunGitCancellationKillsDescendants(t *testing.T) {
 	// The child marks git started only once its sleep runs, so the cancel cannot race the fork.
 	// The child and its sleep ignore SIGTERM, so only the SIGKILL that follows it ends them.
 	script := "#!/bin/sh\n(trap '' TERM; exec 3>\"$AFS_CHILD_FIFO\"; sleep 60 & : > \"$AFS_GIT_STARTED\"; wait; : > \"$AFS_CHILD_FINISHED\") &\nwait\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -659,7 +660,7 @@ func assertEscapedGitCancellationIsBounded(t *testing.T, call func(context.Conte
 	marker := filepath.Join(tmp, "escaped")
 	finished := filepath.Join(tmp, "escaped-finished")
 	script := "#!/bin/sh\n\"$AFS_TEST_BINARY\" -test.run '^TestRunGitEscapedDescriptorHelper$' &\nwait\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -837,7 +838,7 @@ func TestCanceledRunGitErrorOmitsCancellationSignal(t *testing.T) {
 	blocked := filepath.Join(tmp, "blocked")
 	hook := filepath.Join(tmp, "hook")
 	script := "#!/bin/sh\nif [ ! -e \"$AFS_BLOCKED\" ]; then\n  : > \"$AFS_BLOCKED\"\n  sleep 60\nfi\nexit 1\n"
-	if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
+	if err := execfile.Write(hook, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	run(t, "git", "-C", repo, "config", "core.fsmonitor", hook)
@@ -887,7 +888,7 @@ func TestCanceledLazyFetchLeavesNoMaintenanceLock(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(gitDir, "hooks"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(gitDir, "hooks", "pre-auto-gc"), []byte(hook), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(gitDir, "hooks", "pre-auto-gc"), []byte(hook), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_BLOCKED", blocked)

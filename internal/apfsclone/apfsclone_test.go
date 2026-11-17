@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"golang.org/x/sys/unix"
 )
 
@@ -45,7 +46,7 @@ func write(t *testing.T, path, content string, mode os.FileMode) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte(content), mode); err != nil {
+	if err := execfile.Write(path, []byte(content), mode); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(path, mode); err != nil {

@@ -16,6 +16,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/meta"
@@ -122,7 +123,7 @@ func TestSyncRegistrationIsNotMountedWhilePreparing(t *testing.T) {
 	started := filepath.Join(tmp, "git-started")
 	release := filepath.Join(tmp, "git-release")
 	gitScript := "#!/bin/sh\n: > \"$AFS_GIT_STARTED\"\nwhile [ ! -f \"$AFS_GIT_RELEASE\" ]; do sleep 0.01; done\nprintf '%s\\n' 'clone failed' >&2\nexit 1\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(gitScript), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(gitScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_GIT_STARTED", started)
@@ -425,7 +426,7 @@ func TestPrepareAsyncExistingCloneRejectsCredentialedRemoteBeforeSetURL(t *testi
 		t.Fatal(err)
 	}
 	marker := filepath.Join(tmp, "set-url-invoked")
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\ncase \"$*\" in *\"remote set-url\"*) : > \"$GIT_SET_URL_MARKER\";; esac\nexec \"$AFS_REAL_GIT\" \"$@\"\n"), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte("#!/bin/sh\ncase \"$*\" in *\"remote set-url\"*) : > \"$GIT_SET_URL_MARKER\";; esac\nexec \"$AFS_REAL_GIT\" \"$@\"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_REAL_GIT", realGit)
@@ -700,7 +701,7 @@ func TestStartPrepareWorkerTimesOutAndPersistsFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	cloneStarted := filepath.Join(t.TempDir(), "clone-started")
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(markCloneStartScript), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(markCloneStartScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -765,7 +766,7 @@ func TestMountRepoPreparationTimesOutAndReleasesLock(t *testing.T) {
 	gitStarted := filepath.Join(tmp, "git-started")
 	gitFinished := filepath.Join(tmp, "git-finished")
 	// The git call finishes only if the prepare deadline fails to kill it.
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\n: > \"$AFS_GIT_STARTED\"\nsleep 60\n: > \"$AFS_GIT_FINISHED\"\nexit 1\n"), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte("#!/bin/sh\n: > \"$AFS_GIT_STARTED\"\nsleep 60\n: > \"$AFS_GIT_FINISHED\"\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -826,7 +827,7 @@ func TestAddRepoSyncFailureIsLoggedAndPersisted(t *testing.T) {
 	}
 	gitPath := filepath.Join(bin, "git")
 	gitScript := "#!/bin/sh\nprintf '%s\\n' 'fatal: Authentication failed for https://credential-user:super-secret@example.com/org/repo.git; HTTP 401' >&2\nexit 1\n"
-	if err := os.WriteFile(gitPath, []byte(gitScript), 0o755); err != nil {
+	if err := execfile.Write(gitPath, []byte(gitScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -891,7 +892,7 @@ func TestAddRepoSyncTimeoutIsLoggedAndPersisted(t *testing.T) {
 		t.Fatal(err)
 	}
 	cloneStarted := filepath.Join(tmp, "clone-started")
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(markCloneStartScript), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(markCloneStartScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -933,7 +934,7 @@ func TestAddRepoSyncCancellationIsLoggedAndPersisted(t *testing.T) {
 	}
 	started := filepath.Join(tmp, "git-started")
 	gitScript := "#!/bin/sh\n: > \"$AFS_GIT_STARTED\"\nexec sleep 10\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(gitScript), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(gitScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_GIT_STARTED", started)
@@ -995,7 +996,7 @@ func TestAddRepoSyncBuildTreeCancellationIsPersisted(t *testing.T) {
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" = 'ls-tree' ]; then : > \"$AFS_GIT_STARTED\"; exec sleep 10; fi\n" +
 		"exec \"$AFS_REAL_GIT\" \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_REAL_GIT", realGit)
@@ -1041,7 +1042,7 @@ func TestSyncPrepareRetryPersistsCurrentFailure(t *testing.T) {
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nprintf '%s\\n' 'new retry failure' >&2\nexit 1\n"), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte("#!/bin/sh\nprintf '%s\\n' 'new retry failure' >&2\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1076,7 +1077,7 @@ func TestPrepareAsyncReportsRemoteConfigurationPhase(t *testing.T) {
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nprintf '%s\\n' 'remote setup failed' >&2\nexit 1\n"), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte("#!/bin/sh\nprintf '%s\\n' 'remote setup failed' >&2\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1119,7 +1120,7 @@ func TestAddRepoSyncFailureDoesNotOverwriteNewerConfig(t *testing.T) {
 	started := filepath.Join(tmp, "git-started")
 	release := filepath.Join(tmp, "git-release")
 	gitScript := "#!/bin/sh\n: > \"$AFS_GIT_STARTED\"\nwhile [ ! -f \"$AFS_GIT_RELEASE\" ]; do sleep 0.01; done\nprintf '%s\\n' 'fatal: Authentication failed; HTTP 401' >&2\nexit 1\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(gitScript), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(gitScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_GIT_STARTED", started)
@@ -1403,7 +1404,7 @@ func TestPrepareAsyncFreshCloneSkipsSecondFetchForBranchFetchRef(t *testing.T) {
 	}
 	logPath := filepath.Join(t.TempDir(), "git.log")
 	fakeGit := filepath.Join(bin, "git")
-	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_COMMAND_LOG\"\nexec \"$AFS_REAL_GIT\" \"$@\"\n"), 0o755); err != nil {
+	if err := execfile.Write(fakeGit, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_COMMAND_LOG\"\nexec \"$AFS_REAL_GIT\" \"$@\"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_REAL_GIT", realGit)

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -180,7 +181,7 @@ func TestFSMonitorHookScriptQuotesArgs(t *testing.T) {
 	pwned := filepath.Join(tmp, "pwned")
 	hookPath := filepath.Join(tmp, "artifact-fs-fsmonitor")
 	script := fsmonitorHookScript(tmp, "/bin/false", "repo$(touch "+pwned+")")
-	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+	if err := execfile.Write(hookPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write hook: %v", err)
 	}
 	_ = exec.Command("sh", hookPath).Run()
@@ -211,7 +212,7 @@ func TestEnsureIndexInitializedPreservesStagedEntries(t *testing.T) {
 	// A hook that ran would discard the staged entries.
 	dir := t.TempDir()
 	fsmonitorCalled, fsmonitorHook := filepath.Join(dir, "fsmonitor-called"), filepath.Join(dir, "fsmonitor")
-	if err := os.WriteFile(fsmonitorHook, []byte("#!/bin/sh\n: > '"+fsmonitorCalled+"'\ngit read-tree HEAD\nprintf 'token\\n'\n"), 0o755); err != nil {
+	if err := execfile.Write(fsmonitorHook, []byte("#!/bin/sh\n: > '"+fsmonitorCalled+"'\ngit read-tree HEAD\nprintf 'token\\n'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	run(t, "git", "-C", repo, "config", "core.fsmonitor", fsmonitorHook)
@@ -300,13 +301,13 @@ func TestBootstrapCleanIndexForFSMonitorMarksSnapshotEntriesWithoutReadingBlobs(
 	}
 
 	hook := filepath.Join(t.TempDir(), "fsmonitor")
-	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
+	if err := execfile.Write(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	run(t, "git", "-C", repo, "config", "core.fsmonitor", hook)
 	postIndexChange := filepath.Join(gitDir, "hooks", "post-index-change")
 	postIndexChangeCalled := filepath.Join(t.TempDir(), "post-index-change-called")
-	if err := os.WriteFile(postIndexChange, []byte("#!/bin/sh\nprintf called > \"$AFS_POST_INDEX_CHANGE\"\n"), 0o755); err != nil {
+	if err := execfile.Write(postIndexChange, []byte("#!/bin/sh\nprintf called > \"$AFS_POST_INDEX_CHANGE\"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_POST_INDEX_CHANGE", postIndexChangeCalled)
@@ -317,7 +318,7 @@ func TestBootstrapCleanIndexForFSMonitorMarksSnapshotEntriesWithoutReadingBlobs(
 	bin := t.TempDir()
 	logPath := filepath.Join(bin, "git.log")
 	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AFS_GIT_LOG\"\nif [ \"$1\" = cat-file ]; then exit 88; fi\nexec \"$AFS_REAL_GIT\" \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_GIT_LOG", logPath)
@@ -465,7 +466,7 @@ func TestBootstrapCleanIndexForFSMonitorLeavesCRLFNormalizingPathsToGit(t *testi
 
 	run(t, "git", "-C", repo, "read-tree", "HEAD")
 	hook := filepath.Join(t.TempDir(), "fsmonitor")
-	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
+	if err := execfile.Write(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	run(t, "git", "-C", repo, "config", "core.fsmonitor", hook)
@@ -499,7 +500,7 @@ func TestBootstrapCleanIndexForFSMonitorMarksItsHookQuery(t *testing.T) {
 	run(t, "git", "-C", repo, "read-tree", "HEAD")
 	dir := t.TempDir()
 	marker, hook := filepath.Join(dir, "marker"), filepath.Join(dir, "fsmonitor")
-	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf '%s' \"$"+FSMonitorBootstrapEnv+"\" > '"+marker+"'\nprintf 'token\\0/\\0'\n"), 0o755); err != nil {
+	if err := execfile.Write(hook, []byte("#!/bin/sh\nprintf '%s' \"$"+FSMonitorBootstrapEnv+"\" > '"+marker+"'\nprintf 'token\\0/\\0'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	run(t, "git", "-C", repo, "config", "core.fsmonitor", hook)
@@ -533,7 +534,7 @@ func TestBootstrapCleanIndexForFSMonitorKeepsItsWorktreeInTheStoreTempDir(t *tes
 	}
 	sharedListing, privateListing, hook := filepath.Join(dir, "shared-listing"), filepath.Join(dir, "private-listing"), filepath.Join(dir, "fsmonitor")
 	// The hook runs while the bootstrap's private worktree exists.
-	if err := os.WriteFile(hook, []byte("#!/bin/sh\nls -A \"$TMPDIR\" > '"+sharedListing+"'\nls -A '"+private+"' > '"+privateListing+"'\nprintf 'token\\0/\\0'\n"), 0o755); err != nil {
+	if err := execfile.Write(hook, []byte("#!/bin/sh\nls -A \"$TMPDIR\" > '"+sharedListing+"'\nls -A '"+private+"' > '"+privateListing+"'\nprintf 'token\\0/\\0'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	run(t, "git", "-C", repo, "config", "core.fsmonitor", hook)
@@ -853,7 +854,7 @@ func TestEnsureIndexInitializedPreservesAlternateIndex(t *testing.T) {
 	fsmonitorCalled := filepath.Join(t.TempDir(), "fsmonitor-called")
 	fsmonitorHook := filepath.Join(t.TempDir(), "fsmonitor")
 	script := "#!/bin/sh\n: > \"$AFS_FSMONITOR_CALLED\"\ngit read-tree HEAD\nprintf 'token\\n'\n"
-	if err := os.WriteFile(fsmonitorHook, []byte(script), 0o755); err != nil {
+	if err := execfile.Write(fsmonitorHook, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_FSMONITOR_CALLED", fsmonitorCalled)

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 )
 
 var errStoreClosed = errors.New("git store closed")
@@ -249,7 +250,7 @@ func (s *Store) batchModeSSH() (string, error) {
 		s.testHookSSHWrapperDirMade(created)
 	}
 	wrapper := filepath.Join(created, "ssh")
-	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nexec "+shellScriptQuote(ssh)+" -o BatchMode=yes \"$@\"\n"), 0o700); err != nil {
+	if err := execfile.Write(wrapper, []byte("#!/bin/sh\nexec "+shellScriptQuote(ssh)+" -o BatchMode=yes \"$@\"\n"), 0o700); err != nil {
 		_ = os.RemoveAll(created)
 		return "", fmt.Errorf("create SSH wrapper: %w", err)
 	}

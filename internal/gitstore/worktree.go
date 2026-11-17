@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
 
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -298,39 +298,27 @@ func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfi
 	return nil
 }
 
-// replaceExecutable writes script to a new file beside path, then renames it
-// over path. Linux refuses to exec a file that is open for writing, so
-// rewriting the hook in place would fail a Git that runs it meanwhile, and Git
-// would then rescan the worktree.
+// replaceExecutable writes script to a new file in a new directory beside
+// path, then renames it over path. Linux refuses to exec a file that is open
+// for writing, so rewriting the hook in place would fail a Git that runs it
+// meanwhile, and Git would then rescan the worktree.
 func (s *Store) replaceExecutable(path, script string) error {
-	// A fork in another goroutine while the new file is open for writing
-	// would hand the child its write descriptor until the child execs
-	// (golang/go#22315), and the rename would install that file as the hook.
-	syscall.ForkLock.RLock()
-	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
+	tmp, err := os.MkdirTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
 	if err != nil {
-		syscall.ForkLock.RUnlock()
 		return err
 	}
-	tmp := f.Name()
-	_, err = f.WriteString(script)
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
+	defer os.RemoveAll(tmp)
+	staged := filepath.Join(tmp, filepath.Base(path))
+	if err := execfile.Write(staged, []byte(script), 0o755); err != nil {
+		return err
 	}
-	syscall.ForkLock.RUnlock()
-	if err == nil {
-		err = os.Chmod(tmp, 0o755)
+	if err := os.Chmod(staged, 0o755); err != nil {
+		return err
 	}
-	if err == nil && s.testHookBeforeHookRename != nil {
-		s.testHookBeforeHookRename(path, tmp)
+	if s.testHookBeforeHookRename != nil {
+		s.testHookBeforeHookRename(path, staged)
 	}
-	if err == nil {
-		err = os.Rename(tmp, path)
-	}
-	if err != nil {
-		_ = os.Remove(tmp)
-	}
-	return err
+	return os.Rename(staged, path)
 }
 
 // replaceLink makes a symlink to target in a new directory beside path, then
