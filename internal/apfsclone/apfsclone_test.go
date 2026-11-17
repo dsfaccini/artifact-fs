@@ -3,6 +3,7 @@ package apfsclone
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"maps"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -22,6 +24,12 @@ import (
 // trimmed stdout.
 func run(t *testing.T, dir string, args ...string) string {
 	t.Helper()
+	return strings.TrimSpace(output(t, dir, args...))
+}
+
+// output runs git as run does, and returns its stdout whole.
+func output(t *testing.T, dir string, args ...string) string {
+	t.Helper()
 	cmd := exec.CommandContext(t.Context(), "git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com"}, args...)...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -29,7 +37,7 @@ func run(t *testing.T, dir string, args ...string) string {
 	if err != nil {
 		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, stderr.Bytes())
 	}
-	return strings.TrimSpace(string(out))
+	return string(out)
 }
 
 func write(t *testing.T, path, content string, mode os.FileMode) {
@@ -147,7 +155,7 @@ func (f fixture) state(t *testing.T) string {
 func trackedTree(t *testing.T, worktree string) map[string]string {
 	t.Helper()
 	tree := map[string]string{}
-	for name := range strings.SplitSeq(run(t, worktree, "ls-files", "-z"), "\x00") {
+	for name := range strings.SplitSeq(output(t, worktree, "ls-files", "-z"), "\x00") {
 		if name == "" {
 			continue
 		}
@@ -383,8 +391,8 @@ func TestAddRewritesACloneWithoutItsExecutableBit(t *testing.T) {
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 // TestAddRegistersHoldingALockItReleasesBeforePostCheckout probes the lock
-// from inside git worktree add, through a fake git first on PATH, and from
-// the post-checkout hook. It is serial: it sets PATH.
+// from inside git worktree add and read-tree, through a fake git first on
+// PATH, and from the post-checkout hook. It is serial: it sets PATH.
 func TestAddRegistersHoldingALockItReleasesBeforePostCheckout(t *testing.T) {
 	f := newFixture(t, nil, nil)
 	probe, err := os.Executable()
@@ -397,7 +405,7 @@ func TestAddRegistersHoldingALockItReleasesBeforePostCheckout(t *testing.T) {
 	}
 	dir := t.TempDir()
 	log := filepath.Join(dir, "lock.log")
-	write(t, filepath.Join(dir, "bin/git"), "#!/bin/sh\ncase \" $* \" in *\" worktree add \"*) "+shellQuote(probe)+" add ;; esac\n"+
+	write(t, filepath.Join(dir, "bin/git"), "#!/bin/sh\ncase \" $* \" in *\" worktree add \"*) "+shellQuote(probe)+" add ;; *\" read-tree \"*) "+shellQuote(probe)+" read-tree ;; esac\n"+
 		"exec "+shellQuote(realGit)+" \"$@\"\n", 0o755)
 	write(t, filepath.Join(f.base, ".git/hooks/post-checkout"), "#!/bin/sh\n"+shellQuote(probe)+" hook\n", 0o755)
 	t.Setenv("PATH", filepath.Join(dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -405,7 +413,7 @@ func TestAddRegistersHoldingALockItReleasesBeforePostCheckout(t *testing.T) {
 	t.Setenv(lockProbeLogEnv, log)
 
 	f.add(t, "locked", newRecorder(filepath.Join(f.worktrees, "locked")).Clone)
-	if got, want := strings.Split(strings.TrimSpace(read(t, log)), "\n"), []string{"add held", "hook free"}; !slices.Equal(got, want) {
+	if got, want := strings.Split(strings.TrimSpace(read(t, log)), "\n"), []string{"add held", "read-tree held", "hook free"}; !slices.Equal(got, want) {
 		t.Fatalf("lock probes = %q, want %q", got, want)
 	}
 }
@@ -414,7 +422,7 @@ func TestAddRunsPostCheckoutAsGitWorktreeAddDoes(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, nil, nil)
 	log := filepath.Join(t.TempDir(), "post-checkout.log")
-	write(t, filepath.Join(f.base, ".git/hooks/post-checkout"), "#!/bin/sh\necho \"$(pwd -P) $*\" >> "+shellQuote(log)+"\n", 0o755)
+	write(t, filepath.Join(f.base, ".git/hooks/post-checkout"), "#!/bin/sh\necho \"$(pwd -P) $(ps -o pgid= -p $$ | tr -d ' ') $*\" >> "+shellQuote(log)+"\n", 0o755)
 	plain := f.addPlain(t, "plain")
 	clone, _ := f.add(t, "clone", newRecorder(filepath.Join(f.worktrees, "clone")).Clone)
 
@@ -425,7 +433,9 @@ func TestAddRunsPostCheckoutAsGitWorktreeAddDoes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want = append(want, resolved+" "+strings.Repeat("0", len(head))+" "+head+" 1")
+		// git worktree add runs the hook in its caller's process group, where
+		// the hook can read the terminal.
+		want = append(want, resolved+" "+strconv.Itoa(unix.Getpgrp())+" "+strings.Repeat("0", len(head))+" "+head+" 1")
 	}
 	if got := strings.Split(strings.TrimSpace(read(t, log)), "\n"); !slices.Equal(got, want) {
 		t.Fatalf("post-checkout ran with %q, want %q", got, want)
@@ -467,5 +477,66 @@ func TestPreflightRefusesWhatCannotClone(t *testing.T) {
 				t.Errorf("base state = %q, want %q", got, before)
 			}
 		})
+	}
+}
+
+// TestAddFailsWhenARewriteStillDiffers uses a clean filter that does not
+// round-trip, so refresh calls README.md changed however often Git writes it.
+// PR 7's gate refuses a filter attribute before Add creates anything, so it
+// must keep this check covered another way, such as a seam that skips the
+// rewrite.
+func TestAddFailsWhenARewriteStillDiffers(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, func(upstream string) {
+		write(t, filepath.Join(upstream, ".gitattributes"), "README.md filter=x\n", 0o644)
+		run(t, upstream, "add", ".gitattributes")
+		run(t, upstream, "commit", "-qm", "filter")
+	}, nil)
+	run(t, f.base, "config", "filter.x.clean", "tr a b")
+	path := filepath.Join(f.worktrees, "clone")
+	_, err := Add(t.Context(), Options{Base: f.base, Path: path, Commit: "upstream/main",
+		AddArgs: []string{"-b", "feat/clone"}, Clone: newRecorder(path).Clone})
+	var incomplete *IncompleteError
+	if !errors.As(err, &incomplete) || incomplete.Path != path || !strings.Contains(err.Error(), "still differ from the index") {
+		t.Fatalf("Add = %v, want an IncompleteError for %s saying files still differ", err, path)
+	}
+}
+
+// TestPreflightProbesUnderANameNoOtherAddUses leaves a file at the name a
+// probe of this process could take, as a concurrent Add's probe would.
+func TestPreflightProbesUnderANameNoOtherAddUses(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil, nil)
+	other := filepath.Join(f.worktrees, ".apfsclone-probe-"+strconv.Itoa(os.Getpid()))
+	write(t, other, "another probe\n", 0o644)
+	f.add(t, "clone", newRecorder(filepath.Join(f.worktrees, "clone")).Clone)
+	if got := read(t, other); got != "another probe\n" {
+		t.Errorf("the other probe holds %q", got)
+	}
+	probes, err := filepath.Glob(filepath.Join(f.worktrees, ".apfsclone-probe-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(probes, []string{other}) {
+		t.Errorf("probes left: %q, want only the other one", probes)
+	}
+}
+
+// TestGitBoundsTheStderrItQuotes makes checkout-index report thousands of
+// paths that are not in the index.
+func TestGitBoundsTheStderrItQuotes(t *testing.T) {
+	t.Parallel()
+	repo := t.TempDir()
+	run(t, repo, "init", "-q")
+	var paths strings.Builder
+	for i := range 2000 {
+		fmt.Fprintf(&paths, "missing-%04d.txt\x00", i)
+	}
+	_, err := git(t.Context(), repo, []byte(paths.String()), "checkout-index", "-z", "--stdin")
+	if err == nil {
+		t.Fatal("checkout-index of missing paths succeeded")
+	}
+	if !strings.Contains(err.Error(), "missing-0000.txt") || !strings.HasSuffix(err.Error(), "[git stderr truncated]") || len(err.Error()) > 17<<10 {
+		t.Fatalf("error of %d bytes, want the first paths, a truncation label, and at most 17 KiB: %.200s", len(err.Error()), err)
 	}
 }

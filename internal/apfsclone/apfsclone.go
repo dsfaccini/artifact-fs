@@ -29,6 +29,7 @@ package apfsclone
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -36,7 +37,6 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 
@@ -160,10 +160,12 @@ func Add(ctx context.Context, o Options) (Result, error) {
 	if err != nil {
 		return Result{}, &IncompleteError{dest, err}
 	}
-	// The lock is released, so the hook can make a worktree.
+	// The lock is released, so the hook can make a worktree. The hook runs in
+	// this process's group, as git worktree add runs it, so it can read the
+	// terminal. A background group would stop it at the first read.
 	hook := exec.CommandContext(ctx, "git", "-C", dest, "hook", "run", "--ignore-missing", "post-checkout", "--",
 		strings.Repeat("0", len(head)), head, "1")
-	gitstore.ConfigureCancelableCommand(hook)
+	hook.Cancel = func() error { return hook.Process.Signal(syscall.SIGTERM) }
 	hook.Stdout, hook.Stderr = o.Stdout, o.Stderr
 	if err := hook.Run(); err != nil {
 		return result, fmt.Errorf("the post-checkout hook in %s failed: %w", dest, err)
@@ -259,7 +261,7 @@ func preflight(clone Clonefile, base, dest string, baseHead tree) error {
 	if source == "" {
 		return nil
 	}
-	probe := filepath.Join(parent, ".apfsclone-probe-"+strconv.Itoa(os.Getpid()))
+	probe := filepath.Join(parent, ".apfsclone-probe-"+rand.Text())
 	err := clone(source, probe)
 	switch {
 	case err == nil:
@@ -442,7 +444,7 @@ func checkoutIndex(ctx context.Context, worktree string, paths []string) error {
 	return err
 }
 
-// configureGit makes cmd, a git that Add runs other than the hook, stop as
+// configureGit makes cmd, a git that Add runs other than the hook's, stop as
 // gitstore's commands stop, and start it in its own session with prompts off.
 // A partial-clone base makes git fetch missing objects. Without a terminal, a
 // prompt fails instead of stopping git.
@@ -459,8 +461,8 @@ func git(ctx context.Context, dir string, stdin []byte, args ...string) ([]byte,
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	stderr := gitstore.NewBoundedStderr()
+	cmd.Stderr = stderr
 	out, err := cmd.Output()
 	if err != nil {
 		name := args[0]
