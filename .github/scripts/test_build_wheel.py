@@ -88,13 +88,13 @@ class WheelTest(unittest.TestCase):
         for target, platform, tags in [
             (
                 "linux-amd64",
-                "manylinux_2_17_x86_64.manylinux2014_x86_64.musllinux_1_1_x86_64",
-                ["manylinux_2_17_x86_64", "manylinux2014_x86_64", "musllinux_1_1_x86_64"],
+                "manylinux2014_x86_64.manylinux_2_17_x86_64.musllinux_1_1_x86_64",
+                ["manylinux2014_x86_64", "manylinux_2_17_x86_64", "musllinux_1_1_x86_64"],
             ),
             (
                 "linux-arm64",
-                "manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64",
-                ["manylinux_2_17_aarch64", "manylinux2014_aarch64", "musllinux_1_1_aarch64"],
+                "manylinux2014_aarch64.manylinux_2_17_aarch64.musllinux_1_1_aarch64",
+                ["manylinux2014_aarch64", "manylinux_2_17_aarch64", "musllinux_1_1_aarch64"],
             ),
             ("darwin-arm64", "macosx_13_0_arm64", ["macosx_13_0_arm64"]),
         ]:
@@ -134,7 +134,7 @@ class WheelTest(unittest.TestCase):
                 "Metadata-Version: 2.4\n"
                 "Name: slimtree\n"
                 "Version: 0.1.0a1\n"
-                f"Summary: {build_wheel.SUMMARY}\n"
+                "Summary: Disk-light git worktrees from APFS clones\n"
                 "License-Expression: Apache-2.0\n"
                 "License-File: LICENSE\n"
                 "License-File: THIRD_PARTY_LICENSES\n"

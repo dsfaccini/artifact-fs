@@ -32,7 +32,7 @@ PLATFORMS = {
     "darwin-arm64": ("macosx_13_0_arm64",),
 }
 
-SUMMARY = "Disk-light git worktrees from an APFS clone or an artifact-fs mount"
+SUMMARY = "Disk-light git worktrees from APFS clones"
 SOURCE = "https://github.com/dsfaccini/artifact-fs"
 
 
@@ -66,7 +66,8 @@ def metadata(version, licenses, readme):
 
 def wheel(binary, target, version, licenses, readme, out):
     """Write the wheel of binary for target into out and return its path."""
-    tags = PLATFORMS[target]
+    # A compressed tag set is sorted.
+    tags = sorted(PLATFORMS[target])
     dist = f"slimtree-{version}"
     info = f"{dist}.dist-info"
     files = [(f"{dist}.data/scripts/slimtree", binary.read_bytes(), 0o755)]

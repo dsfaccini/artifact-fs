@@ -82,6 +82,13 @@ EOF
 	;;
 Linux)
 	# artifactfs, Linux's default backend, is not in this release.
+	python3 - "$work/doctor.json" <<'EOF'
+import json, sys
+report = json.load(open(sys.argv[1]))
+backend = report["checks"][0]
+assert not report["ok"] and backend["id"] == "backend" and backend["status"] == "fail", report
+assert backend["detail"] == "artifactfs worktrees are not in this release yet", backend
+EOF
 	for backend in "" artifactfs; do
 		status=0
 		"$slimtree" ${backend:+--backend "$backend"} new feat 2>"$work/new.err" || status=$?

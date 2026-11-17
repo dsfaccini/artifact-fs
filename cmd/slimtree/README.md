@@ -16,7 +16,7 @@ change in any release before 1.0.
 | `slimtree new <branch>` | Makes a worktree from APFS clones | Not in this release yet |
 | `slimtree rm <worktree>` | Removes a worktree slimtree made | Not in this release yet |
 | `slimtree list` | Lists the worktrees slimtree made | Lists the worktrees slimtree made |
-| `slimtree doctor` | Checks what slimtree needs | Checks what slimtree needs |
+| `slimtree doctor` | Checks what slimtree needs | Checks the FUSE setup, and reports that artifactfs worktrees are not in this release yet |
 
 Release builds are tested on macOS 26, Ubuntu 24.04 and Alpine Linux. On Linux,
 `slimtree new` will make worktrees served from an
