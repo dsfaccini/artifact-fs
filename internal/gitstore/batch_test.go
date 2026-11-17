@@ -312,7 +312,7 @@ func TestPromisorRemoteFollowsLazyFetchOrder(t *testing.T) {
 			if err := f.Close(); err != nil {
 				t.Fatal(err)
 			}
-			got, err := promisorRemote(context.Background(), gitDir)
+			got, err := New(nil).promisorRemote(context.Background(), gitDir)
 			if err != nil {
 				t.Fatalf("promisorRemote: %v", err)
 			}

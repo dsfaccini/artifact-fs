@@ -40,7 +40,7 @@ func TestConfigureStatusOptimizationDoesNotWriteIndex(t *testing.T) {
 	if _, err := os.Stat(indexLock); err != nil {
 		t.Fatalf("daemon changed caller-owned index lock: %v", err)
 	}
-	if _, err := runGit(ctx, gitDir, "config", "--unset", "core.fsmonitor"); err != nil {
+	if _, err := New(nil).runGit(ctx, gitDir, "config", "--unset", "core.fsmonitor"); err != nil {
 		t.Fatalf("disable test fsmonitor hook: %v", err)
 	}
 	if err := os.Remove(indexLock); err != nil {
@@ -65,7 +65,7 @@ func TestReconfiguringTheFSMonitorHookLeavesTheOpenHookWhole(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if _, err := runGit(context.Background(), gitDir, "config", "--unset", "core.fsmonitor"); err != nil {
+		if _, err := New(nil).runGit(context.Background(), gitDir, "config", "--unset", "core.fsmonitor"); err != nil {
 			t.Errorf("disable test fsmonitor hook: %v", err)
 		}
 	})
@@ -125,7 +125,7 @@ func TestReconfiguringTheFSMonitorHookLinkLeavesALink(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if _, err := runGit(context.Background(), gitDir, "config", "--unset", "core.fsmonitor"); err != nil {
+		if _, err := New(nil).runGit(context.Background(), gitDir, "config", "--unset", "core.fsmonitor"); err != nil {
 			t.Errorf("disable test fsmonitor hook: %v", err)
 		}
 	})

@@ -533,7 +533,7 @@ func TestPrepareFetchedBranchRefusesPreparedGitDirRewind(t *testing.T) {
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: preparedGitDir}, RepoSpec: model.RepoSpec{Branch: "master", PreparedGitDir: true}}
 	store := New(nil)
 	ctx := t.Context()
-	localOID, err := runGit(ctx, preparedGitDir, "rev-parse", "refs/heads/master")
+	localOID, err := New(nil).runGit(ctx, preparedGitDir, "rev-parse", "refs/heads/master")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,7 +549,7 @@ func TestPrepareFetchedBranchRefusesPreparedGitDirRewind(t *testing.T) {
 	if strings.Contains(err.Error(), localOID) {
 		t.Fatalf("error leaked commit details: %v", err)
 	}
-	afterOID, err := runGit(ctx, preparedGitDir, "rev-parse", "refs/heads/master")
+	afterOID, err := New(nil).runGit(ctx, preparedGitDir, "rev-parse", "refs/heads/master")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -579,7 +579,7 @@ func TestZeroOIDForGitDirMatchesObjectFormat(t *testing.T) {
 
 			gitDir := filepath.Join(repo, ".git")
 			ctx := t.Context()
-			zero, err := zeroOIDForGitDir(ctx, gitDir)
+			zero, err := New(nil).zeroOIDForGitDir(ctx, gitDir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -590,11 +590,11 @@ func TestZeroOIDForGitDirMatchesObjectFormat(t *testing.T) {
 			if len(zero) != wantLength || strings.Trim(zero, "0") != "" {
 				t.Fatalf("zero OID = %q, want %d zeros", zero, wantLength)
 			}
-			head, err := runGit(ctx, gitDir, "rev-parse", "HEAD")
+			head, err := New(nil).runGit(ctx, gitDir, "rev-parse", "HEAD")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := runGit(ctx, gitDir, "update-ref", "refs/heads/prepared", head, zero); err != nil {
+			if _, err := New(nil).runGit(ctx, gitDir, "update-ref", "refs/heads/prepared", head, zero); err != nil {
 				t.Fatalf("create prepared branch with zero OID: %v", err)
 			}
 		})
@@ -734,7 +734,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	if inside := strings.TrimSpace(runOutput(t, "git", "-C", mountedWorktree, "rev-parse", "--is-inside-work-tree")); inside != "true" {
 		t.Fatalf("mounted Git directory reported is-inside-work-tree = %q, want true", inside)
 	}
-	configuredWorktree, err := runGit(ctx, gitDir, "config", "--path", "core.worktree")
+	configuredWorktree, err := New(nil).runGit(ctx, gitDir, "config", "--path", "core.worktree")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -750,7 +750,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 		t.Fatalf("core.worktree = %q, want %q", resolvedWorktree, wantWorktree)
 	}
 
-	count, err := runGit(ctx, gitDir, "rev-list", "--count", "HEAD")
+	count, err := New(nil).runGit(ctx, gitDir, "rev-list", "--count", "HEAD")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -760,7 +760,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(gitDir, "shallow")); err != nil {
 		t.Fatalf("snapshot clone is not shallow: %v", err)
 	}
-	fetchRef, err := runGit(ctx, gitDir, "config", "--get-all", "remote.origin.fetch")
+	fetchRef, err := New(nil).runGit(ctx, gitDir, "config", "--get-all", "remote.origin.fetch")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -770,7 +770,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	}
 	// The generated hook targets os.Executable, which is the test runner here.
 	// Disable it before fetch so newer Git versions do not recurse into tests.
-	if _, err := runGit(ctx, gitDir, "config", "--unset", "core.fsmonitor"); err != nil {
+	if _, err := New(nil).runGit(ctx, gitDir, "config", "--unset", "core.fsmonitor"); err != nil {
 		t.Fatalf("disable test fsmonitor hook: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(work, "NEW.md"), []byte("new\n"), 0o644); err != nil {
@@ -783,21 +783,21 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	if err := New(nil).FetchNonInteractive(ctx, cfg); err != nil {
 		t.Fatalf("verified source refresh: %v", err)
 	}
-	count, err = runGit(ctx, gitDir, "rev-list", "--count", "HEAD")
+	count, err = New(nil).runGit(ctx, gitDir, "rev-list", "--count", "HEAD")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if count != "1" {
 		t.Fatalf("snapshot history count after refresh = %q, want 1", count)
 	}
-	trackingTip, err := runGit(ctx, gitDir, "rev-parse", verifiedSourceTrackingRef)
+	trackingTip, err := New(nil).runGit(ctx, gitDir, "rev-parse", verifiedSourceTrackingRef)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if trackingTip != advancedTip {
 		t.Fatalf("tracking ref = %q, want advanced source %q", trackingTip, advancedTip)
 	}
-	trackingCount, err := runGit(ctx, gitDir, "rev-list", "--count", verifiedSourceTrackingRef)
+	trackingCount, err := New(nil).runGit(ctx, gitDir, "rev-list", "--count", verifiedSourceTrackingRef)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -805,7 +805,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 		t.Fatalf("tracking history count after refresh = %q, want 1", trackingCount)
 	}
 	for _, ref := range []string{"refs/remotes/origin/side", "refs/remotes/origin/main"} {
-		if _, err := runGit(ctx, gitDir, "show-ref", "--verify", ref); err == nil {
+		if _, err := New(nil).runGit(ctx, gitDir, "show-ref", "--verify", ref); err == nil {
 			t.Fatalf("verified source refresh fetched %s; the source lands only in %s", ref, verifiedSourceTrackingRef)
 		}
 	}
@@ -824,7 +824,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	if _, err := New(nil).PrepareSource(ctx, cfg, requirement); err != nil {
 		t.Fatalf("PrepareSource fallback: %v", err)
 	}
-	fallbackCount, err := runGit(ctx, fallbackDir, "rev-list", "--count", "HEAD")
+	fallbackCount, err := New(nil).runGit(ctx, fallbackDir, "rev-list", "--count", "HEAD")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -920,14 +920,14 @@ func TestPrepareSourceSupportsSHA256Remote(t *testing.T) {
 	if prepared.Commit != tip || !prepared.Verified || !prepared.Acquired {
 		t.Fatalf("prepared source = %+v", prepared)
 	}
-	format, err := runGit(ctx, gitDir, "rev-parse", "--show-object-format")
+	format, err := New(nil).runGit(ctx, gitDir, "rev-parse", "--show-object-format")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if format != "sha256" {
 		t.Fatalf("object format = %q, want sha256", format)
 	}
-	head, err := runGit(ctx, gitDir, "rev-parse", "HEAD")
+	head, err := New(nil).runGit(ctx, gitDir, "rev-parse", "HEAD")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1030,7 +1030,7 @@ func TestPrepareSourceReacquiresMissingOrCorruptReceiptGitDir(t *testing.T) {
 			if !prepared.Verified || !prepared.Acquired || prepared.Commit != tip {
 				t.Fatalf("prepared source = %+v", prepared)
 			}
-			head, err := runGit(ctx, gitDir, "rev-parse", "HEAD")
+			head, err := New(nil).runGit(ctx, gitDir, "rev-parse", "HEAD")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1092,14 +1092,14 @@ func TestPrepareSourceReceiptPreservesIndexAndRestoresHEAD(t *testing.T) {
 	if err := os.WriteFile(stagedPath, []byte("staged\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	stagedOID, err := runGit(ctx, gitDir, "hash-object", "-w", stagedPath)
+	stagedOID, err := New(nil).runGit(ctx, gitDir, "hash-object", "-w", stagedPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runGit(ctx, gitDir, "update-index", "--add", "--cacheinfo", "100644", stagedOID, "README.md"); err != nil {
+	if _, err := New(nil).runGit(ctx, gitDir, "update-index", "--add", "--cacheinfo", "100644", stagedOID, "README.md"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runGit(ctx, gitDir, "update-ref", "--no-deref", "HEAD", requiredCommit+"^"); err != nil {
+	if _, err := New(nil).runGit(ctx, gitDir, "update-ref", "--no-deref", "HEAD", requiredCommit+"^"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1112,14 +1112,14 @@ func TestPrepareSourceReceiptPreservesIndexAndRestoresHEAD(t *testing.T) {
 	if prepared.Acquired {
 		t.Fatal("receipt reuse unexpectedly performed remote acquisition")
 	}
-	head, err := runGit(ctx, gitDir, "rev-parse", "HEAD")
+	head, err := New(nil).runGit(ctx, gitDir, "rev-parse", "HEAD")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if head != requiredCommit {
 		t.Fatalf("HEAD = %q, want required commit %q", head, requiredCommit)
 	}
-	staged, err := runGit(ctx, gitDir, "diff", "--cached", "--name-only", "HEAD")
+	staged, err := New(nil).runGit(ctx, gitDir, "diff", "--cached", "--name-only", "HEAD")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1187,21 +1187,21 @@ func TestCloneBloblessUsesExactCanonicalTag(t *testing.T) {
 			if err := New(nil).CloneBlobless(ctx, cfg); err != nil {
 				t.Fatalf("CloneBlobless: %v", err)
 			}
-			head, err := runGit(ctx, gitDir, "rev-parse", "HEAD")
+			head, err := New(nil).runGit(ctx, gitDir, "rev-parse", "HEAD")
 			if err != nil {
 				t.Fatal(err)
 			}
 			if head != tagCommit {
 				t.Fatalf("HEAD = %q, want tag commit %q; same-named branch is %q", head, tagCommit, branchCommit)
 			}
-			format, err := runGit(ctx, gitDir, "rev-parse", "--show-object-format")
+			format, err := New(nil).runGit(ctx, gitDir, "rev-parse", "--show-object-format")
 			if err != nil {
 				t.Fatal(err)
 			}
 			if format != objectFormat {
 				t.Fatalf("object format = %q, want %q", format, objectFormat)
 			}
-			fetchRef, err := runGit(ctx, gitDir, "config", "--get-all", "remote.origin.fetch")
+			fetchRef, err := New(nil).runGit(ctx, gitDir, "config", "--get-all", "remote.origin.fetch")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1739,7 +1739,7 @@ func TestFetchRefAmbientFullRefPreparesDetachedHEAD(t *testing.T) {
 	if err := store.FetchRefAmbient(ctx, cfg, "refs/pull/10/head"); err != nil {
 		t.Fatalf("FetchRefAmbient: %v", err)
 	}
-	if _, err := runGit(ctx, preparedGitDir, "rev-parse", "--verify", fetchedFullRefRemoteTrackingRef+"^{commit}"); err != nil {
+	if _, err := New(nil).runGit(ctx, preparedGitDir, "rev-parse", "--verify", fetchedFullRefRemoteTrackingRef+"^{commit}"); err != nil {
 		t.Fatalf("expected fetched full ref at safe remote-tracking ref: %v", err)
 	}
 	if err := store.PrepareFetchedBranch(ctx, cfg, "refs/pull/10/head"); err != nil {

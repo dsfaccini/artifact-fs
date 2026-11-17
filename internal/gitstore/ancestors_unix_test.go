@@ -168,8 +168,8 @@ func TestFSMonitorHookIsTheLinkOnlyUnderPrivateAncestors(t *testing.T) {
 			if err := New(nil).ConfigureFSMonitorHook(t.Context(), cfg, stateRoot); err != nil {
 				t.Fatal(err)
 			}
-			hook, err := runGit(t.Context(), gitDir, "config", "--get", "core.fsmonitor")
-			if _, unsetErr := runGit(context.Background(), gitDir, "config", "--unset", "core.fsmonitor"); unsetErr != nil {
+			hook, err := New(nil).runGit(t.Context(), gitDir, "config", "--get", "core.fsmonitor")
+			if _, unsetErr := New(nil).runGit(context.Background(), gitDir, "config", "--unset", "core.fsmonitor"); unsetErr != nil {
 				t.Fatalf("disable test fsmonitor hook: %v", unsetErr)
 			}
 			if err != nil {

@@ -16,8 +16,10 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/execfile"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"golang.org/x/sys/unix"
 )
 
@@ -506,6 +508,99 @@ func TestAddRunsPostCheckoutAsGitWorktreeAddDoes(t *testing.T) {
 	}
 	if got := strings.Split(strings.TrimSpace(read(t, log)), "\n"); !slices.Equal(got, want) {
 		t.Fatalf("post-checkout ran with %q, want %q", got, want)
+	}
+}
+
+// A process that holds a git's stdout and stderr after the git exits cannot
+// fail Add, PostCheckout or Git, whether the caller passes a file for that
+// output, as a CLI passes its own, or another writer, as tests do. The stderr
+// writer gets the post-checkout hook's output, which git hook run sends to
+// stderr. It is serial: it sets PATH.
+func TestGitsSucceedWhileAnotherProcessHoldsTheirOutput(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		writers func(t *testing.T) (stdout, stderr io.Writer, read func(io.Writer) string)
+	}{
+		{name: "files", writers: func(t *testing.T) (io.Writer, io.Writer, func(io.Writer) string) {
+			dir := t.TempDir()
+			open := func(name string) *os.File {
+				f, err := os.Create(filepath.Join(dir, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { f.Close() })
+				return f
+			}
+			return open("stdout"), open("stderr"), func(w io.Writer) string { return read(t, w.(*os.File).Name()) }
+		}},
+		{name: "buffers", writers: func(*testing.T) (io.Writer, io.Writer, func(io.Writer) string) {
+			return &bytes.Buffer{}, &bytes.Buffer{}, func(w io.Writer) string { return w.(*bytes.Buffer).String() }
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t, nil, nil)
+			write(t, filepath.Join(f.base, ".git/hooks/post-checkout"), "#!/bin/sh\necho hook stdout\necho hook stderr >&2\n", 0o755)
+			want := trackedTree(t, f.addPlain(t, "plain"))
+			path := os.Getenv("PATH")
+			_, holderExited := gittest.HoldGitOutput(t)
+			stdout, stderr, contents := tt.writers(t)
+			held := filepath.Join(f.worktrees, "held")
+			result, err := Add(t.Context(), Options{Base: f.base, Path: held, Commit: "upstream/main",
+				AddArgs: []string{"-q", "-b", "feat/held"}, Clone: newRecorder(held).Clone, Stdout: stdout, Stderr: stderr})
+			if err == nil {
+				err = PostCheckout(t.Context(), held, result.Head, stdout, stderr)
+			}
+			if err != nil {
+				t.Fatalf("Add: %v\n%s", err, contents(stderr))
+			}
+			head, err := Git(t.Context(), held, "rev-parse", "HEAD")
+			if err != nil || strings.TrimSpace(string(head)) != result.Head {
+				t.Fatalf("Git rev-parse HEAD = %q, %v; want %s", head, err, result.Head)
+			}
+			if _, statErr := os.Stat(holderExited); statErr == nil {
+				t.Error("Add, PostCheckout or Git returned only after a holder of a git's output exited")
+			}
+			if out, errOut := contents(stdout), contents(stderr); out != "" || errOut != "hook stdout\nhook stderr\n" {
+				t.Fatalf("stdout %q and stderr %q, want nothing and the post-checkout hook's lines", out, errOut)
+			}
+			t.Setenv("PATH", path)
+			if got := trackedTree(t, held); !maps.Equal(got, want) {
+				t.Fatalf("tree after Add = %q\nplain tree = %q", got, want)
+			}
+		})
+	}
+}
+
+// PostCheckout hands the hook a caller's *os.File as it is, as a CLI passes
+// its terminal, so the hook's output reaches the file while the hook runs. A
+// copy made once the hook exits would hide a prompt from the user until then.
+func TestPostCheckoutHandsTheHookTheCallersFile(t *testing.T) {
+	t.Parallel()
+	repo := t.TempDir()
+	run(t, repo, "init", "-q")
+	dir := t.TempDir()
+	proceed := filepath.Join(dir, "proceed")
+	// The hook waits at most a minute for the test to see its line.
+	write(t, filepath.Join(repo, ".git/hooks/post-checkout"), "#!/bin/sh\necho hook running >&2\ni=0\nwhile [ ! -e "+shellQuote(proceed)+" ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done\n", 0o755)
+	stderr, err := os.Create(filepath.Join(dir, "stderr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stderr.Close()
+	done := make(chan error, 1)
+	go func() { done <- PostCheckout(t.Context(), repo, strings.Repeat("0", 40), io.Discard, stderr) }()
+	for !strings.Contains(read(t, stderr.Name()), "hook running") {
+		select {
+		case err := <-done:
+			t.Fatalf("PostCheckout returned (%v) before the hook's line reached the caller's file", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if err := os.WriteFile(proceed, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("PostCheckout: %v", err)
 	}
 }
 

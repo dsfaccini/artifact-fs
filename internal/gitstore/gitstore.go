@@ -24,8 +24,9 @@ type Store struct {
 	gitRetryDelays []time.Duration
 	// rollbackContext makes the context of one rollback. Tests replace it.
 	rollbackContext func(context.Context) (context.Context, context.CancelFunc)
-	// tempDir holds the SSH wrapper's directory and the bootstrap's private
-	// worktree; "" means the system temp directory.
+	// tempDir holds the SSH wrapper's directory, the bootstrap's private
+	// worktree and each git's stream files; "" means the system temp
+	// directory.
 	tempDir string
 	// sshWrapperDir holds the wrapper batchModeSSH writes; Close removes it.
 	sshWrapperDir string
@@ -81,8 +82,9 @@ func (s *Store) Close() {
 }
 
 // SetTempDir sets the directory under which the Store makes the SSH wrapper
-// that Git runs, and the hooks directory Git reads during the fsmonitor
-// bootstrap, which the Store keeps empty. Call it before the Store runs Git.
+// that Git runs, the hooks directory Git reads during the fsmonitor
+// bootstrap, which the Store keeps empty, and the files that hold each git's
+// stdin, stdout and stderr. Call it before the Store runs Git.
 func (s *Store) SetTempDir(dir string) {
 	s.tempDir = dir
 }
@@ -111,16 +113,16 @@ func (s *Store) SetBatchPoolSize(n int) {
 // daemon's check after each reconcile, servesHEAD, serves HEAD again once
 // the switching stops.
 func (s *Store) ResolveHEAD(ctx context.Context, repo model.RepoConfig) (oid string, ref string, err error) {
-	ref = headRef(ctx, repo)
+	ref = s.headRef(ctx, repo)
 	for {
 		if s.testHookBetweenHEADReads != nil {
 			s.testHookBetweenHEADReads()
 		}
-		oid, err = runGit(ctx, repo.GitDir, "rev-parse", "HEAD")
+		oid, err = s.runGit(ctx, repo.GitDir, "rev-parse", "HEAD")
 		if err != nil {
 			return "", "", err
 		}
-		after := headRef(ctx, repo)
+		after := s.headRef(ctx, repo)
 		if after == ref {
 			return strings.TrimSpace(oid), ref, nil
 		}
@@ -129,8 +131,8 @@ func (s *Store) ResolveHEAD(ctx context.Context, repo model.RepoConfig) (oid str
 }
 
 // headRef returns HEAD's short ref, or DETACHED when HEAD names no ref.
-func headRef(ctx context.Context, repo model.RepoConfig) string {
-	ref, err := runGit(ctx, repo.GitDir, "symbolic-ref", "-q", "--short", "HEAD")
+func (s *Store) headRef(ctx context.Context, repo model.RepoConfig) string {
+	ref, err := s.runGit(ctx, repo.GitDir, "symbolic-ref", "-q", "--short", "HEAD")
 	if err != nil {
 		return "DETACHED"
 	}
@@ -139,7 +141,7 @@ func headRef(ctx context.Context, repo model.RepoConfig) string {
 
 // CommitTimestamp returns the committer timestamp of the given commit OID.
 func (s *Store) CommitTimestamp(ctx context.Context, repo model.RepoConfig, oid string) (int64, error) {
-	out, err := runGit(ctx, repo.GitDir, "show", "-s", "--format=%ct", oid)
+	out, err := s.runGit(ctx, repo.GitDir, "show", "-s", "--format=%ct", oid)
 	if err != nil {
 		return 0, err
 	}
@@ -157,7 +159,7 @@ func (s *Store) ComputeAheadBehind(ctx context.Context, repo model.RepoConfig) (
 	if err != nil {
 		return 0, 0, false, err
 	}
-	if _, err := runGit(ctx, repo.GitDir, "rev-parse", "--verify", "--quiet", tracking+"^{commit}"); err != nil {
+	if _, err := s.runGit(ctx, repo.GitDir, "rev-parse", "--verify", "--quiet", tracking+"^{commit}"); err != nil {
 		if exitErr, ok := errors.AsType[*gitCommandError](err); ok && exitErr.exitCode == 1 {
 			return 0, 0, false, nil
 		}
@@ -168,14 +170,14 @@ func (s *Store) ComputeAheadBehind(ctx context.Context, repo model.RepoConfig) (
 	// from HEAD. Without a common ancestor, its counts would read as a
 	// divergence, so it reports 0/0.
 	if repo.RequiredCommit != "" && repo.HistoryDepth > 0 {
-		if _, err := runGit(ctx, repo.GitDir, "merge-base", "HEAD", tracking); err != nil {
+		if _, err := s.runGit(ctx, repo.GitDir, "merge-base", "HEAD", tracking); err != nil {
 			if exitErr, ok := errors.AsType[*gitCommandError](err); ok && exitErr.exitCode == 1 {
 				return 0, 0, false, nil
 			}
 			return 0, 0, false, err
 		}
 	}
-	out, err := runGit(ctx, repo.GitDir, "rev-list", "--left-right", "--count", "HEAD..."+tracking)
+	out, err := s.runGit(ctx, repo.GitDir, "rev-list", "--left-right", "--count", "HEAD..."+tracking)
 	if err != nil {
 		return 0, 0, false, err
 	}
