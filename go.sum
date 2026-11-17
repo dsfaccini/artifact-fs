@@ -1,5 +1,5 @@
-github.com/dsfaccini/fuse v0.0.0-20261114214500-7ded3da20bc1 h1:BSoaDsiWkpL0enPl/CCfxfz0NHSd9nTBLsZwtF45JRI=
-github.com/dsfaccini/fuse v0.0.0-20261114214500-7ded3da20bc1/go.mod h1:ZifyKF8rwmCxklHYIVnocdzA7myY30/EZYjB2dRmJz0=
+github.com/dsfaccini/fuse v0.0.0-20261117000249-050965920a17 h1:4/yN3NczmH+MqmdzvvJySH85z+tuUiiNy8YoN0wCNH4=
+github.com/dsfaccini/fuse v0.0.0-20261117000249-050965920a17/go.mod h1:ZifyKF8rwmCxklHYIVnocdzA7myY30/EZYjB2dRmJz0=
 github.com/dustin/go-humanize v1.1.0 h1:dbKTrvD0klcbBV/h4AWJdMuZogJACoMlvWIWZ5b2xWg=
 github.com/dustin/go-humanize v1.1.0/go.mod h1:hc1CvRkJMsgxqjmjMQF3QNRAZBwY8AXBAzKYoSX9sFI=
 github.com/ebitengine/purego v0.11.2 h1:WWiTx8rD8zYdOwSj8O/NiNbsOvSAgJMTlyV1XlbUSeU=
