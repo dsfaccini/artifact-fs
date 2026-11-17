@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -25,32 +27,54 @@ func (f fakeInfo) ModTime() time.Time { return time.Time{} }
 func (f fakeInfo) IsDir() bool        { return false }
 func (f fakeInfo) Sys() any           { return &syscall.Stat_t{Uid: f.uid} }
 
-// fullCaps is the capability mask of a process with every capability.
-const fullCaps = "000001ffffffffff"
+const (
+	// fullCaps is the capability mask of a process with every capability.
+	fullCaps = "000001ffffffffff"
+	noCaps   = "0000000000000000"
+	// dockerCaps is Docker's default bounding set, which lacks CAP_SYS_ADMIN.
+	dockerCaps = "00000000a80425fb"
+	ubuntu     = "ID=ubuntu\nID_LIKE=debian\n"
+)
 
-// linuxFiles serves an Ubuntu os-release and a /proc/self/status whose
-// bounding and effective sets are caps.
-func linuxFiles(caps string) func(string) ([]byte, error) {
+// procStatus is a /proc/self/status with the given capability sets and
+// NoNewPrivs.
+func procStatus(capEff, capBnd, noNewPrivs string) string {
+	return "Name:\tslimtree\nCapEff:\t" + capEff + "\nCapBnd:\t" + capBnd + "\nNoNewPrivs:\t" + noNewPrivs + "\n"
+}
+
+// linuxFiles serves osRelease as /etc/os-release and status as
+// /proc/self/status. Every other file is missing.
+func linuxFiles(osRelease, status string) func(string) ([]byte, error) {
 	return func(path string) ([]byte, error) {
-		if path == "/proc/self/status" {
-			return []byte("Name:\tslimtree\nCapEff:\t" + caps + "\nCapBnd:\t" + caps + "\n"), nil
+		switch path {
+		case "/etc/os-release":
+			return []byte(osRelease), nil
+		case "/proc/self/status":
+			return []byte(status), nil
 		}
-		return []byte("ID=ubuntu\nID_LIKE=debian\n"), nil
+		return nil, os.ErrNotExist
 	}
 }
 
-// healthyLinux is a Linux machine where every check passes.
+// fuseStat stats /dev/fuse as a character device and every other path as a
+// file with mode, owned by uid.
+func fuseStat(mode fs.FileMode, uid uint32) func(string) (fs.FileInfo, error) {
+	return func(path string) (fs.FileInfo, error) {
+		if path == "/dev/fuse" {
+			return fakeInfo{mode: fs.ModeDevice | fs.ModeCharDevice | 0o666}, nil
+		}
+		return fakeInfo{mode: mode, uid: uid}, nil
+	}
+}
+
+// healthyLinux is an Ubuntu machine where every check passes for a user who
+// mounts through the setuid fusermount3.
 func healthyLinux() Probe {
 	return Probe{
-		LookPath: func(file string) (string, error) { return "/usr/bin/" + file, nil },
-		Stat: func(path string) (fs.FileInfo, error) {
-			if path == "/dev/fuse" {
-				return fakeInfo{mode: fs.ModeDevice | fs.ModeCharDevice | 0o666}, nil
-			}
-			return fakeInfo{mode: fs.ModeSetuid | 0o755}, nil
-		},
+		LookPath:  func(file string) (string, error) { return "/usr/bin/" + file, nil },
+		Stat:      fuseStat(fs.ModeSetuid|0o755, 0),
 		ReadWrite: func(string) error { return nil },
-		ReadFile:  linuxFiles(fullCaps),
+		ReadFile:  linuxFiles(ubuntu, procStatus(noCaps, fullCaps, "0")),
 		Output:    func(string, ...string) (string, error) { return "git version 2.45.0\n", nil },
 		EUID:      1000,
 	}
@@ -95,7 +119,7 @@ func TestChecksByPlatformAndBackend(t *testing.T) {
 		want          map[string]Status
 		reminders     int
 	}{
-		{goos: "linux", backend: "artifactfs", probe: healthyLinux(), want: map[string]Status{"fusermount3": StatusOK, "dev-fuse": StatusOK, "cap-sys-admin": StatusOK, "git": StatusOK}},
+		{goos: "linux", backend: "artifactfs", probe: healthyLinux(), want: map[string]Status{"fusermount": StatusOK, "dev-fuse": StatusOK, "cap-sys-admin": StatusOK, "git": StatusOK}},
 		{goos: "darwin", backend: "apfsclone", probe: healthyDarwin(), want: map[string]Status{"xcode-select": StatusOK, "git": StatusOK, "apfs": StatusOK}},
 		{goos: "darwin", backend: "artifactfs", probe: healthyDarwin(), want: map[string]Status{"xcode-select": StatusOK, "git": StatusOK, "macos-version": StatusOK, "macfuse-fskit": StatusOK}, reminders: 2},
 	} {
@@ -106,19 +130,63 @@ func TestChecksByPlatformAndBackend(t *testing.T) {
 	}
 }
 
+// Without fusermount, the fix installs fuse3 with the package manager that
+// os-release names, read from /usr/lib/os-release when /etc/os-release is
+// missing.
 func TestInstallCommandFromOSRelease(t *testing.T) {
-	for _, tc := range []struct{ osRelease, want string }{
-		{"ID=ubuntu\nID_LIKE=debian\n", "sudo apt-get install -y fuse3"},
-		{"ID=linuxmint\nID_LIKE=\"ubuntu debian\"\n", "sudo apt-get install -y fuse3"},
-		{"ID=fedora\n", "sudo dnf install -y fuse3"},
-		{"ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n", "sudo dnf install -y fuse3"},
-		{"ID=arch\n", "sudo pacman -S --needed fuse3"},
-		{"ID=alpine\n", "sudo apk add fuse3"},
-		{"ID=\"opensuse-tumbleweed\"\nID_LIKE=\"opensuse suse\"\n", "sudo zypper install -y fuse3"},
-		{"ID=nixos\n", "install fuse3 with your distribution's package manager"},
+	const aptNote = " (this can remove FUSE 2's fuse package, which conflicts with fuse3 on Ubuntu 26.04)"
+	for _, tc := range []struct{ etc, usrLib, want string }{
+		{etc: ubuntu, want: "sudo apt-get update && sudo apt-get install -y fuse3" + aptNote},
+		{etc: "ID=linuxmint\nID_LIKE=\"ubuntu debian\"\n", want: "sudo apt-get update && sudo apt-get install -y fuse3" + aptNote},
+		{etc: "ID=fedora\n", want: "sudo dnf install -y fuse3"},
+		{etc: "ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n", want: "sudo dnf install -y fuse3"},
+		{etc: "ID=arch\n", want: "sudo pacman -S --needed fuse3"},
+		{etc: "ID=alpine\n", want: "sudo apk add fuse3"},
+		{etc: "ID=\"opensuse-tumbleweed\"\nID_LIKE=\"opensuse suse\"\n", want: "sudo zypper install -y fuse3"},
+		{etc: "ID=nixos\n", want: "install fuse3 with your distribution's package manager"},
+		{usrLib: "ID=fedora\n", want: "sudo dnf install -y fuse3"},
 	} {
-		if got := installCommand(parseOSRelease(tc.osRelease), "fuse3"); got != tc.want {
-			t.Errorf("installCommand(%q) = %q, want %q", tc.osRelease, got, tc.want)
+		p := healthyLinux()
+		p.LookPath = func(file string) (string, error) {
+			if strings.HasPrefix(file, "fusermount") {
+				return "", errors.New("not found")
+			}
+			return "/usr/bin/" + file, nil
+		}
+		p.ReadFile = func(path string) ([]byte, error) {
+			files := map[string]string{"/etc/os-release": tc.etc, "/usr/lib/os-release": tc.usrLib, "/proc/self/status": procStatus(noCaps, fullCaps, "0")}
+			if files[path] == "" {
+				return nil, os.ErrNotExist
+			}
+			return []byte(files[path]), nil
+		}
+		if got := result(t, Run(p, "linux", "artifactfs", "/work"), "fusermount"); got.Status != StatusFail || got.Fix != tc.want {
+			t.Errorf("fusermount check with /etc/os-release %q and /usr/lib/os-release %q = %+v, want a failure with fix %q", tc.etc, tc.usrLib, got, tc.want)
+		}
+	}
+}
+
+// An old git's fix upgrades it: through the git-core PPA on Ubuntu and its
+// derivatives, and elsewhere with the package manager's upgrade, which stops
+// at the newest git the release ships.
+func TestGitUpgradeFixPerDistribution(t *testing.T) {
+	const ppa = "sudo add-apt-repository -y ppa:git-core/ppa && sudo apt-get update && sudo apt-get install -y git"
+	const stays = "; if git stays older than 2.45, your release ships no newer git"
+	for _, tc := range []struct{ osRelease, want string }{
+		{ubuntu, ppa},
+		{"ID=linuxmint\nID_LIKE=\"ubuntu debian\"\n", ppa},
+		{"ID=debian\n", "sudo apt-get update && sudo apt-get install -y --only-upgrade git" + stays},
+		{"ID=fedora\n", "sudo dnf upgrade -y git" + stays},
+		{"ID=arch\n", "sudo pacman -Syu git" + stays},
+		{"ID=alpine\n", "sudo apk add -U --upgrade git" + stays},
+		{"ID=\"opensuse-leap\"\nID_LIKE=\"suse opensuse\"\n", "sudo zypper update -y git" + stays},
+		{"ID=nixos\n", "upgrade git to 2.45 or later with your distribution's package manager"},
+	} {
+		p := healthyLinux()
+		p.ReadFile = linuxFiles(tc.osRelease, procStatus(noCaps, fullCaps, "0"))
+		p.Output = func(string, ...string) (string, error) { return "git version 2.39.5\n", nil }
+		if got := result(t, Run(p, "linux", "artifactfs", "/work"), "git"); got.Status != StatusWarn || got.Fix != tc.want {
+			t.Errorf("old git on %q = %+v, want a warning with fix %q", tc.osRelease, got, tc.want)
 		}
 	}
 }
@@ -127,19 +195,18 @@ func TestGitVersionFloor(t *testing.T) {
 	for _, tc := range []struct {
 		out  string
 		want Status
-		fix  string
 	}{
-		{"git version 2.45.0\n", StatusOK, ""},
-		{"git version 2.54.0 (Apple Git-157)\n", StatusOK, ""},
-		{"git version 3.0\n", StatusOK, ""},
-		{"git version 2.43.0\n", StatusWarn, "sudo add-apt-repository -y ppa:git-core/ppa && sudo apt-get update && sudo apt-get install -y git"},
-		{"git version 2.9.5\n", StatusWarn, "sudo add-apt-repository -y ppa:git-core/ppa && sudo apt-get update && sudo apt-get install -y git"},
-		{"not git\n", StatusWarn, "sudo add-apt-repository -y ppa:git-core/ppa && sudo apt-get update && sudo apt-get install -y git"},
+		{"git version 2.45.0\n", StatusOK},
+		{"git version 2.54.0 (Apple Git-157)\n", StatusOK},
+		{"git version 3.0\n", StatusOK},
+		{"git version 2.43.0\n", StatusWarn},
+		{"git version 2.9.5\n", StatusWarn},
+		{"not git\n", StatusWarn},
 	} {
 		p := healthyLinux()
 		p.Output = func(string, ...string) (string, error) { return tc.out, nil }
-		if got := result(t, Run(p, "linux", "artifactfs", "/work"), "git"); got.Status != tc.want || got.Fix != tc.fix && tc.want != StatusOK {
-			t.Errorf("git check for %q = %+v, want %s with fix %q", tc.out, got, tc.want, tc.fix)
+		if got := result(t, Run(p, "linux", "artifactfs", "/work"), "git"); got.Status != tc.want {
+			t.Errorf("git check for %q = %+v, want %s", tc.out, got, tc.want)
 		}
 	}
 	p := healthyLinux()
@@ -149,65 +216,74 @@ func TestGitVersionFloor(t *testing.T) {
 		}
 		return "/usr/bin/" + file, nil
 	}
-	if got := result(t, Run(p, "linux", "artifactfs", "/work"), "git"); got.Status != StatusFail || got.Fix != "sudo apt-get install -y git" {
+	if got := result(t, Run(p, "linux", "artifactfs", "/work"), "git"); got.Status != StatusFail || got.Fix != "sudo apt-get update && sudo apt-get install -y git" {
 		t.Errorf("git check without git = %+v, want a failure with the install command", got)
 	}
 }
 
+// The fuse library runs fusermount3, else fusermount, only when its own
+// mount(2) fails, which it does unless CapEff holds CAP_SYS_ADMIN. Root runs
+// fusermount with CapBnd's capabilities, so it needs no setuid bit.
 func TestFusermountNeedsSetuidUnlessRoot(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		mode  fs.FileMode
-		found bool
+		found []string
 		euid  int
+		caps  string
 		want  Status
 		fix   string
 	}{
-		{name: "setuid", mode: fs.ModeSetuid | 0o755, found: true, euid: 1000, want: StatusOK},
-		{name: "not setuid", mode: 0o755, found: true, euid: 1000, want: StatusFail, fix: "sudo chmod u+s /usr/bin/fusermount3"},
-		{name: "not setuid as root", mode: 0o755, found: true, euid: 0, want: StatusWarn, fix: "sudo chmod u+s /usr/bin/fusermount3"},
-		{name: "missing", euid: 1000, want: StatusFail, fix: "sudo apt-get install -y fuse3"},
-		{name: "missing as root", euid: 0, want: StatusWarn, fix: "sudo apt-get install -y fuse3"},
+		{name: "setuid", mode: fs.ModeSetuid | 0o755, found: []string{"fusermount3"}, euid: 1000, caps: noCaps, want: StatusOK},
+		{name: "FUSE 2's fusermount", mode: fs.ModeSetuid | 0o755, found: []string{"fusermount"}, euid: 1000, caps: noCaps, want: StatusOK},
+		{name: "not setuid", mode: 0o755, found: []string{"fusermount3"}, euid: 1000, caps: noCaps, want: StatusFail, fix: "sudo chmod u+s /usr/bin/fusermount3"},
+		{name: "missing", euid: 1000, caps: noCaps, want: StatusFail, fix: "sudo apt-get update && sudo apt-get install -y fuse3 (this can remove FUSE 2's fuse package, which conflicts with fuse3 on Ubuntu 26.04)"},
+		{name: "not setuid as root", mode: 0o755, found: []string{"fusermount3"}, euid: 0, caps: noCaps, want: StatusOK},
+		{name: "missing as root", euid: 0, caps: fullCaps, want: StatusWarn, fix: "apt-get update && apt-get install -y fuse3 (this can remove FUSE 2's fuse package, which conflicts with fuse3 on Ubuntu 26.04)"},
+		{name: "missing as root without CapEff", euid: 0, caps: noCaps, want: StatusFail, fix: "apt-get update && apt-get install -y fuse3 (this can remove FUSE 2's fuse package, which conflicts with fuse3 on Ubuntu 26.04)"},
 	} {
 		p := healthyLinux()
 		p.EUID = tc.euid
+		p.ReadFile = linuxFiles(ubuntu, procStatus(tc.caps, fullCaps, "0"))
 		p.LookPath = func(file string) (string, error) {
-			if file == "fusermount3" && !tc.found {
+			if strings.HasPrefix(file, "fusermount") && !slices.Contains(tc.found, file) {
 				return "", errors.New("not found")
 			}
 			return "/usr/bin/" + file, nil
 		}
-		p.Stat = func(path string) (fs.FileInfo, error) {
-			if path == "/dev/fuse" {
-				return fakeInfo{mode: fs.ModeDevice | fs.ModeCharDevice | 0o666}, nil
-			}
-			return fakeInfo{mode: tc.mode}, nil
-		}
+		p.Stat = fuseStat(tc.mode, 0)
 		r := Run(p, "linux", "artifactfs", "/work")
-		if got := result(t, r, "fusermount3"); got.Status != tc.want || got.Fix != tc.fix && tc.want != StatusOK {
-			t.Errorf("%s: fusermount3 check = %+v, want %s with fix %q", tc.name, got, tc.want, tc.fix)
+		if got := result(t, r, "fusermount"); got.Status != tc.want || got.Fix != tc.fix {
+			t.Errorf("%s: fusermount check = %+v, want %s with fix %q", tc.name, got, tc.want, tc.fix)
 		}
 		if r.OK != (tc.want != StatusFail) {
-			t.Errorf("%s: report ok = %v with fusermount3 %s", tc.name, r.OK, tc.want)
+			t.Errorf("%s: report ok = %v with fusermount %s", tc.name, r.OK, tc.want)
 		}
 	}
 }
 
 func TestDevFuseFixes(t *testing.T) {
-	p := healthyLinux()
-	p.Stat = func(path string) (fs.FileInfo, error) {
-		if path == "/dev/fuse" {
-			return nil, os.ErrNotExist
+	for _, tc := range []struct {
+		name string
+		stat func(string) (fs.FileInfo, error)
+	}{
+		{name: "missing", stat: func(string) (fs.FileInfo, error) { return nil, os.ErrNotExist }},
+		{name: "a regular file", stat: func(string) (fs.FileInfo, error) { return fakeInfo{mode: 0o666}, nil }},
+	} {
+		p := healthyLinux()
+		p.Stat = tc.stat
+		if got := result(t, Run(p, "linux", "artifactfs", "/work"), "dev-fuse"); got.Status != StatusFail || !strings.HasPrefix(got.Fix, "sudo modprobe fuse") {
+			t.Errorf("dev-fuse with /dev/fuse %s = %+v, want the modprobe fix", tc.name, got)
 		}
-		return fakeInfo{mode: fs.ModeSetuid | 0o755}, nil
 	}
-	if got := result(t, Run(p, "linux", "artifactfs", "/work"), "dev-fuse"); got.Status != StatusFail || !strings.HasPrefix(got.Fix, "sudo modprobe fuse") {
-		t.Errorf("dev-fuse without /dev/fuse = %+v, want the modprobe fix", got)
-	}
-	p = healthyLinux()
+	p := healthyLinux()
 	p.ReadWrite = func(string) error { return os.ErrPermission }
 	if got := result(t, Run(p, "linux", "artifactfs", "/work"), "dev-fuse"); got.Status != StatusFail || got.Fix != "sudo chmod 0666 /dev/fuse" {
 		t.Errorf("dev-fuse not writable = %+v, want the chmod fix", got)
+	}
+	p.EUID = 0
+	if got := result(t, Run(p, "linux", "artifactfs", "/work"), "dev-fuse"); got.Fix != "chmod 0666 /dev/fuse" {
+		t.Errorf("dev-fuse not writable for root = %+v, want the chmod fix without sudo", got)
 	}
 }
 
@@ -238,29 +314,85 @@ func TestDarwinChecksReportTheirCause(t *testing.T) {
 	if got := result(t, Run(p, "darwin", "artifactfs", "/work"), "macfuse-fskit"); got.Status != StatusFail || got.Detail != fskitErr.Error() {
 		t.Errorf("FSKit unavailable = %+v, want FSKitAvailable's error verbatim", got)
 	}
+}
 
-	p = healthyDarwin()
-	p.APFS = func(dir string) error { return errors.New(dir + " is on hfs, not APFS") }
-	if got := result(t, Run(p, "darwin", "apfsclone", "/work"), "apfs"); got.Status != StatusFail || got.Detail != "/work is on hfs, not APFS" {
-		t.Errorf("an HFS+ directory = %+v, want the APFS failure", got)
+// A directory the probe cannot write, such as the read-only system volume at
+// /, needs another directory, not another file system.
+func TestAPFSFixFitsTheFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want Result
+	}{
+		{name: "not APFS", err: errors.New("/work is on hfs, not APFS"), want: Result{ID: "apfs", Status: StatusFail, Detail: "/work is on hfs, not APFS", Fix: "make the worktree on an APFS volume, or use --backend artifactfs"}},
+		{name: "read-only", err: fmt.Errorf("%w in /: %w", errNotWritable, syscall.EROFS), want: Result{ID: "apfs", Status: StatusFail, Detail: "cannot write a probe file in /: read-only file system", Fix: "use a directory you can write, on the APFS volume that will hold the worktree"}},
+	} {
+		p := healthyDarwin()
+		p.APFS = func(string) error { return tc.err }
+		if got := result(t, Run(p, "darwin", "apfsclone", "/work"), "apfs"); got != tc.want {
+			t.Errorf("%s: apfs = %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Without a directory, the APFS check writes no probe file.
+func TestAPFSSkipsWithoutADirectory(t *testing.T) {
+	p := healthyDarwin()
+	p.APFS = func(dir string) error {
+		t.Errorf("APFS probed %q", dir)
+		return nil
+	}
+	r := Run(p, "darwin", "apfsclone", "")
+	if got := result(t, r, "apfs"); got.Status != StatusSkip || !r.OK {
+		t.Errorf("apfs without a directory = %+v, report ok %v; want a skip", got, r.OK)
 	}
 }
 
 func TestRequireNamesEachFailedCheck(t *testing.T) {
+	mount := Needs{Mount: true, Dir: "/work"}
 	p := healthyLinux()
-	if err := Require(p, "linux", "artifactfs", "new", "/work"); err != nil {
+	if err := Require(p, "linux", "artifactfs", "new", mount); err != nil {
 		t.Fatalf("Require on a healthy machine: %v", err)
 	}
 	// A git below the floor only warns.
 	p.Output = func(string, ...string) (string, error) { return "git version 2.43.0\n", nil }
-	if err := Require(p, "linux", "artifactfs", "new", "/work"); err != nil {
+	if err := Require(p, "linux", "artifactfs", "new", mount); err != nil {
 		t.Fatalf("Require with an old git: %v, want only a warning", err)
 	}
 	p.ReadWrite = func(string) error { return os.ErrPermission }
-	err := Require(p, "linux", "artifactfs", "new", "/work")
+	err := Require(p, "linux", "artifactfs", "new", mount)
 	want := "slimtree new --backend artifactfs needs:\n  dev-fuse: /dev/fuse is not readable and writable: permission denied; fix: sudo chmod 0666 /dev/fuse"
 	if err == nil || err.Error() != want {
 		t.Fatalf("Require with an unwritable /dev/fuse = %v, want %q", err, want)
+	}
+}
+
+// A command that mounts nothing, such as prune, runs where no mount can, and
+// one without a directory never probes APFS.
+func TestRequireRunsOnlyTheChecksItsCommandNeeds(t *testing.T) {
+	p := healthyLinux()
+	p.ReadWrite = func(string) error { return os.ErrPermission }
+	if err := Require(p, "linux", "artifactfs", "prune", Needs{}); err != nil {
+		t.Errorf("Require without a mount on a machine that cannot mount: %v", err)
+	}
+	p.LookPath = func(string) (string, error) { return "", errors.New("not found") }
+	if err := Require(p, "linux", "artifactfs", "prune", Needs{}); err == nil || !strings.Contains(err.Error(), "\n  git: git is not on PATH;") {
+		t.Errorf("Require without a mount or git = %v, want the git failure", err)
+	}
+
+	d := healthyDarwin()
+	probed := ""
+	d.APFS = func(dir string) error {
+		probed = dir
+		return fmt.Errorf("%w in %s: %w", errNotWritable, dir, syscall.EROFS)
+	}
+	if err := Require(d, "darwin", "apfsclone", "rm", Needs{}); err != nil || probed != "" {
+		t.Errorf("Require without a directory = %v, probed %q; want no probe", err, probed)
+	}
+	err := Require(d, "darwin", "apfsclone", "new", Needs{Dir: "/"})
+	want := "slimtree new --backend apfsclone needs:\n  apfs: cannot write a probe file in /: read-only file system; fix: use a directory you can write, on the APFS volume that will hold the worktree"
+	if err == nil || err.Error() != want || probed != "/" {
+		t.Errorf("Require in / = %v, probed %q; want %q", err, probed, want)
 	}
 }
 
@@ -274,69 +406,85 @@ func TestReportJSONShape(t *testing.T) {
 	if err := json.Compact(&data, out.Bytes()); err != nil {
 		t.Fatal(err)
 	}
-	want := `{"os":"linux","backend":"artifactfs","ok":true,"checks":[` +
-		`{"id":"fusermount3","status":"ok","detail":"/usr/bin/fusermount3"},` +
+	want := `{"version":1,"os":"linux","backend":"artifactfs","ok":true,"checks":[` +
+		`{"id":"fusermount","status":"ok","detail":"/usr/bin/fusermount3"},` +
 		`{"id":"dev-fuse","status":"ok","detail":"/dev/fuse"},` +
 		`{"id":"cap-sys-admin","status":"ok","detail":"CapBnd holds CAP_SYS_ADMIN"},` +
-		`{"id":"git","status":"warn","detail":"git version 2.43.0 is older than 2.45","fix":"sudo add-apt-repository -y ppa:git-core/ppa && sudo apt-get update && sudo apt-get install -y git"}]}`
+		`{"id":"git","status":"warn","detail":"git version 2.43.0 is older than 2.45","fix":"sudo add-apt-repository -y ppa:git-core/ppa && sudo apt-get update && sudo apt-get install -y git"}],` +
+		`"reminders":[]}`
 	if data.String() != want {
 		t.Fatalf("report JSON =\n%s\nwant\n%s", data.String(), want)
 	}
 }
 
 // A container without --cap-add SYS_ADMIN cannot mount, whether or not it has
-// /dev/fuse. Docker's default bounding set is a80425fb.
+// /dev/fuse, and NoNewPrivs keeps fusermount3 from gaining the capability.
 func TestCapSysAdminGatesEveryMount(t *testing.T) {
+	const containerFix = "in a container, run it with --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined"
 	for _, tc := range []struct {
-		name   string
-		euid   int
-		capBnd string
-		capEff string
-		want   Status
+		name           string
+		euid           int
+		capEff, capBnd string
+		noNewPrivs     string
+		want           Status
+		fix            string
 	}{
-		{name: "full bounding set", euid: 1000, capBnd: fullCaps, capEff: "0", want: StatusOK},
-		{name: "docker default", euid: 1000, capBnd: "00000000a80425fb", capEff: "0", want: StatusFail},
-		{name: "root without it", euid: 0, capBnd: fullCaps, capEff: "00000000a80425fb", want: StatusFail},
-		{name: "root with it", euid: 0, capBnd: "00000000a80425fb", capEff: fullCaps, want: StatusOK},
+		{name: "full bounding set", euid: 1000, capEff: noCaps, capBnd: fullCaps, noNewPrivs: "0", want: StatusOK},
+		{name: "docker default", euid: 1000, capEff: noCaps, capBnd: dockerCaps, noNewPrivs: "0", want: StatusFail, fix: containerFix},
+		{name: "docker default with SYS_ADMIN", euid: 1000, capEff: noCaps, capBnd: "00000000a82425fb", noNewPrivs: "0", want: StatusOK},
+		{name: "no new privileges", euid: 1000, capEff: noCaps, capBnd: fullCaps, noNewPrivs: "1", want: StatusFail, fix: noNewPrivsFix},
+		{name: "root with it", euid: 0, capEff: fullCaps, capBnd: dockerCaps, noNewPrivs: "1", want: StatusOK},
+		{name: "root regains it through fusermount3", euid: 0, capEff: dockerCaps, capBnd: fullCaps, noNewPrivs: "0", want: StatusOK},
+		{name: "root without it", euid: 0, capEff: dockerCaps, capBnd: dockerCaps, noNewPrivs: "0", want: StatusFail, fix: containerFix},
+		{name: "root with no new privileges", euid: 0, capEff: dockerCaps, capBnd: fullCaps, noNewPrivs: "1", want: StatusFail, fix: noNewPrivsFix},
 	} {
 		p := healthyLinux()
 		p.EUID = tc.euid
-		p.ReadFile = func(path string) ([]byte, error) {
-			if path == "/proc/self/status" {
-				return []byte("CapEff:\t" + tc.capEff + "\nCapBnd:\t" + tc.capBnd + "\n"), nil
-			}
-			return []byte("ID=ubuntu\n"), nil
-		}
+		p.ReadFile = linuxFiles(ubuntu, procStatus(tc.capEff, tc.capBnd, tc.noNewPrivs))
 		r := Run(p, "linux", "artifactfs", "/work")
 		got := result(t, r, "cap-sys-admin")
-		if got.Status != tc.want || r.OK != (tc.want == StatusOK) {
-			t.Errorf("%s: cap-sys-admin = %+v, report ok %v, want %s", tc.name, got, r.OK, tc.want)
-		}
-		if tc.want == StatusFail && got.Fix != "in a container, run it with --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined" {
-			t.Errorf("%s: fix = %q, want the container flags", tc.name, got.Fix)
+		if got.Status != tc.want || got.Fix != tc.fix || r.OK != (tc.want == StatusOK) {
+			t.Errorf("%s: cap-sys-admin = %+v, report ok %v, want %s with fix %q", tc.name, got, r.OK, tc.want, tc.fix)
 		}
 	}
 }
 
-// Homebrew's fusermount3 can come first on PATH. Setuid but not root's, it
-// cannot mount.
+// A setuid fusermount3 that root does not own, such as Homebrew's, runs as
+// its owner and cannot mount.
 func TestFusermountMustBeRootOwned(t *testing.T) {
-	p := healthyLinux()
-	p.LookPath = func(file string) (string, error) {
-		if file == "fusermount3" {
-			return "/home/linuxbrew/.linuxbrew/bin/fusermount3", nil
+	const brew = "/home/linuxbrew/.linuxbrew/bin/fusermount3"
+	for _, tc := range []struct {
+		name   string
+		path   string
+		distro bool
+		want   Result
+	}{
+		{name: "Homebrew's over the distribution's", path: brew, distro: true, want: Result{Detail: brew + " is not owned by root, so it cannot mount, and it shadows /usr/bin/fusermount3", Fix: "brew unlink libfuse"}},
+		{name: "Homebrew's alone", path: brew, want: Result{Detail: brew + " is not owned by root, so it cannot mount", Fix: "sudo apt-get update && sudo apt-get install -y fuse3 (this can remove FUSE 2's fuse package, which conflicts with fuse3 on Ubuntu 26.04), then brew unlink libfuse"}},
+		{name: "another over the distribution's", path: "/opt/fuse/bin/fusermount3", distro: true, want: Result{Detail: "/opt/fuse/bin/fusermount3 is not owned by root, so it cannot mount, and it shadows /usr/bin/fusermount3", Fix: "put /usr/bin before /opt/fuse/bin on PATH"}},
+		{name: "the distribution's", path: "/usr/bin/fusermount3", distro: true, want: Result{Detail: "/usr/bin/fusermount3 is not owned by root, so it cannot mount", Fix: "sudo chown root:root /usr/bin/fusermount3 && sudo chmod u+s /usr/bin/fusermount3"}},
+	} {
+		p := healthyLinux()
+		p.LookPath = func(file string) (string, error) {
+			if file == "fusermount3" {
+				return tc.path, nil
+			}
+			return "/usr/bin/" + file, nil
 		}
-		return "/usr/bin/" + file, nil
-	}
-	p.Stat = func(path string) (fs.FileInfo, error) {
-		if path == "/dev/fuse" {
-			return fakeInfo{mode: fs.ModeDevice | fs.ModeCharDevice | 0o666}, nil
+		p.Stat = func(path string) (fs.FileInfo, error) {
+			switch {
+			case path == "/dev/fuse":
+				return fakeInfo{mode: fs.ModeDevice | fs.ModeCharDevice | 0o666}, nil
+			case path == tc.path:
+				return fakeInfo{mode: fs.ModeSetuid | 0o755, uid: 1000}, nil
+			case path == "/usr/bin/fusermount3" && tc.distro:
+				return fakeInfo{mode: fs.ModeSetuid | 0o755}, nil
+			}
+			return nil, os.ErrNotExist
 		}
-		return fakeInfo{mode: fs.ModeSetuid | 0o755, uid: 1000}, nil
-	}
-	got := result(t, Run(p, "linux", "artifactfs", "/work"), "fusermount3")
-	want := Result{ID: "fusermount3", Status: StatusFail, Detail: "/home/linuxbrew/.linuxbrew/bin/fusermount3 is not owned by root and shadows the distribution's /usr/bin/fusermount3", Fix: "put /usr/bin before /home/linuxbrew/.linuxbrew/bin on PATH, or sudo apt-get install -y fuse3"}
-	if got != want {
-		t.Fatalf("a setuid fusermount3 owned by uid 1000 = %+v, want %+v", got, want)
+		tc.want.ID, tc.want.Status = "fusermount", StatusFail
+		if got := result(t, Run(p, "linux", "artifactfs", "/work"), "fusermount"); got != tc.want {
+			t.Errorf("%s: fusermount = %+v, want %+v", tc.name, got, tc.want)
+		}
 	}
 }
