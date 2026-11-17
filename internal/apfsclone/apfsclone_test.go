@@ -159,13 +159,17 @@ func (f fixture) addPlain(t *testing.T, name string) string {
 	return path
 }
 
-// add makes the worktree name with Add, cloning with clone.
+// add makes the worktree name with Add, cloning with clone, then runs its
+// post-checkout hook with PostCheckout, as git worktree add does.
 func (f fixture) add(t *testing.T, name string, clone Clonefile) (string, Result) {
 	t.Helper()
 	path := filepath.Join(f.worktrees, name)
 	var stderr bytes.Buffer
 	result, err := Add(t.Context(), Options{Base: f.base, Path: path, Commit: "upstream/main",
 		AddArgs: []string{"-q", "-b", "feat/" + name}, Clone: clone, Stderr: &stderr})
+	if err == nil {
+		err = PostCheckout(t.Context(), path, result.Head, io.Discard, &stderr)
+	}
 	if err != nil {
 		t.Fatalf("Add: %v\n%s", err, stderr.Bytes())
 	}
@@ -305,7 +309,7 @@ func TestAddMatchesGitWorktreeAdd(t *testing.T) {
 	if want := []string{".gitignore", "Makefile", "README.md", "bin/run.sh", "data/blob.bin", "hidden.txt"}; !slices.Equal(rec.cloned, want) {
 		t.Fatalf("cloned %q, want %q", rec.cloned, want)
 	}
-	if want := (Result{Cloned: 5, Written: 4}); result != want {
+	if want := (Result{Head: strings.TrimSpace(run(t, f.upstream, "rev-parse", "main")), Cloned: 5, Written: 4}); result != want {
 		t.Fatalf("Add returned %+v, want %+v", result, want)
 	}
 	if got := run(t, clone, "status", "--porcelain", "--untracked-files=no"); got != "" {

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,9 @@ import (
 
 // recordsDir holds one directory per worktree, named by its ID.
 const recordsDir = "w"
+
+// archivesDir holds what rm keeps of each worktree it removed, by ID and time.
+const archivesDir = "archives"
 
 // recordFile is the record inside a worktree's directory.
 const recordFile = "worktree.json"
@@ -98,6 +102,32 @@ func (h *Home) Write(r Record) error {
 	return writeFile(dir, recordFile, append(data, '\n'))
 }
 
+// Remove removes the record of the worktree at path, with its directory.
+func (h *Home) Remove(path string) error {
+	return os.RemoveAll(filepath.Join(h.dir, recordsDir, ID(path)))
+}
+
+// Archive writes a copy of r to archives/<ID>/<ns>/worktree.json, ns being
+// the time in nanoseconds, and returns the recovery ref that belongs to that
+// archive: refs/slimtree/archive/<ID>/<ns>/HEAD. Write the copy before the
+// ref, so the copy names the repository of every ref a removal leaves.
+func (h *Home) Archive(r Record) (string, error) {
+	r.Version = recordVersion
+	data, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	id, ns := ID(r.Path), strconv.FormatInt(time.Now().UnixNano(), 10)
+	dir := filepath.Join(h.dir, archivesDir, id, ns)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	if err := writeFile(dir, recordFile, append(data, '\n')); err != nil {
+		return "", err
+	}
+	return "refs/slimtree/archive/" + id + "/" + ns + "/HEAD", nil
+}
+
 // Records returns every record, sorted by path. It skips an entry of w/
 // that holds no readable record, such as a stray file or a record a crash
 // left empty, and passes each skip's cause to skipped when it is not nil.
@@ -133,7 +163,10 @@ func (h *Home) Records(skipped func(error)) ([]Record, error) {
 
 // Resolve returns the record of the worktree arg names. An arg that holds a
 // path separator, or is . or .., is a path. Any other arg is a worktree's
-// name, and then a path below the current directory.
+// name, and then a path below the current directory. Resolve refuses a name
+// while ./name exists and is not that worktree, so a command never acts on
+// another worktree than the directory the user sees. It checks ./name only,
+// no path deeper below.
 func (h *Home) Resolve(arg string) (Record, error) {
 	records, err := h.Records(nil)
 	if err != nil {
@@ -148,6 +181,9 @@ func (h *Home) Resolve(arg string) (Record, error) {
 		}
 		switch len(named) {
 		case 1:
+			if _, err := os.Lstat(arg); err == nil && !sameCanonical(arg, named[0].Path) {
+				return Record{}, fmt.Errorf("%s names the worktree %s and also ./%s; name the one you mean by its path", arg, named[0].Path, arg)
+			}
 			return named[0], nil
 		case 0:
 		default:
@@ -167,7 +203,37 @@ func (h *Home) Resolve(arg string) (Record, error) {
 			return r, nil
 		}
 	}
+	// A case-insensitive volume, the Mac's default, names one directory in
+	// many spellings.
+	for _, r := range records {
+		if SamePath(r.Path, path) {
+			return r, nil
+		}
+	}
 	return Record{}, fmt.Errorf("slimtree made no worktree %s", arg)
+}
+
+// SamePath reports whether a and b name one file: the same string, or two
+// existing paths os.SameFile matches, as two spellings of a directory on a
+// case-insensitive volume are. It follows no symlink, so a symlink at a
+// worktree's path never matches the directory it points at.
+func SamePath(a, b string) bool {
+	if a == b {
+		return true
+	}
+	ia, err := os.Lstat(a)
+	if err != nil {
+		return false
+	}
+	ib, err := os.Lstat(b)
+	return err == nil && os.SameFile(ia, ib)
+}
+
+// sameCanonical reports whether path, with its symlinks resolved, is the
+// record path want.
+func sameCanonical(path, want string) bool {
+	c, err := Canonical(path)
+	return err == nil && SamePath(c, want)
 }
 
 // Canonical returns path absolute, with the symlinks of its longest existing

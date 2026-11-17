@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 )
 
 // Home returns slimtree's home directory: $SLIMTREE_HOME, else
@@ -25,4 +27,13 @@ func Home() (string, error) {
 		return "", err
 	}
 	return filepath.Join(userHome, ".local", "share", "slimtree"), nil
+}
+
+// openHome opens the home Home names.
+func openHome() (*state.Home, error) {
+	dir, err := Home()
+	if err != nil {
+		return nil, err
+	}
+	return state.Open(dir)
 }
