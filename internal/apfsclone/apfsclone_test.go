@@ -160,13 +160,17 @@ func (f fixture) addPlain(t *testing.T, name string) string {
 	return path
 }
 
-// add makes the worktree name with Add, cloning with clone.
+// add makes the worktree name with Add, cloning with clone, then runs its
+// post-checkout hook with PostCheckout, as git worktree add does.
 func (f fixture) add(t *testing.T, name string, clone Clonefile) (string, Result) {
 	t.Helper()
 	path := filepath.Join(f.worktrees, name)
 	var stderr bytes.Buffer
 	result, err := Add(t.Context(), Options{Base: f.base, Path: path, Commit: "upstream/main",
 		AddArgs: []string{"-q", "-b", "feat/" + name}, Clone: clone, Stderr: &stderr})
+	if err == nil {
+		err = PostCheckout(t.Context(), path, result.Head, io.Discard, &stderr)
+	}
 	if err != nil {
 		t.Fatalf("Add: %v\n%s", err, stderr.Bytes())
 	}
@@ -306,7 +310,7 @@ func TestAddMatchesGitWorktreeAdd(t *testing.T) {
 	if want := []string{".gitignore", "Makefile", "README.md", "bin/run.sh", "data/blob.bin", "hidden.txt"}; !slices.Equal(rec.cloned, want) {
 		t.Fatalf("cloned %q, want %q", rec.cloned, want)
 	}
-	if want := (Result{Cloned: 5, Written: 4}); result != want {
+	if want := (Result{Head: strings.TrimSpace(run(t, f.upstream, "rev-parse", "main")), Cloned: 5, Written: 4}); result != want {
 		t.Fatalf("Add returned %+v, want %+v", result, want)
 	}
 	if got := run(t, clone, "status", "--porcelain", "--untracked-files=no"); got != "" {
@@ -507,11 +511,11 @@ func TestAddRunsPostCheckoutAsGitWorktreeAddDoes(t *testing.T) {
 }
 
 // A process that holds a git's stdout and stderr after the git exits cannot
-// fail Add, whether its caller passes a file for that output, as a CLI passes
-// its own, or another writer, as tests do. The stderr writer gets the
-// post-checkout hook's output, which git hook run sends to stderr. It is
-// serial: it sets PATH.
-func TestAddSucceedsWhileAnotherProcessHoldsGitsOutput(t *testing.T) {
+// fail Add, PostCheckout or Git, whether the caller passes a file for that
+// output, as a CLI passes its own, or another writer, as tests do. The stderr
+// writer gets the post-checkout hook's output, which git hook run sends to
+// stderr. It is serial: it sets PATH.
+func TestGitsSucceedWhileAnotherProcessHoldsTheirOutput(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
 		writers func(t *testing.T) (stdout, stderr io.Writer, read func(io.Writer) string)
@@ -540,16 +544,23 @@ func TestAddSucceedsWhileAnotherProcessHoldsGitsOutput(t *testing.T) {
 			_, holderExited := gittest.HoldGitOutput(t)
 			stdout, stderr, contents := tt.writers(t)
 			held := filepath.Join(f.worktrees, "held")
-			_, err := Add(t.Context(), Options{Base: f.base, Path: held, Commit: "upstream/main",
+			result, err := Add(t.Context(), Options{Base: f.base, Path: held, Commit: "upstream/main",
 				AddArgs: []string{"-q", "-b", "feat/held"}, Clone: newRecorder(held).Clone, Stdout: stdout, Stderr: stderr})
-			if _, statErr := os.Stat(holderExited); statErr == nil {
-				t.Error("Add returned only after a holder of a git's output exited")
+			if err == nil {
+				err = PostCheckout(t.Context(), held, result.Head, stdout, stderr)
 			}
 			if err != nil {
 				t.Fatalf("Add: %v\n%s", err, contents(stderr))
 			}
+			head, err := Git(t.Context(), held, "rev-parse", "HEAD")
+			if err != nil || strings.TrimSpace(string(head)) != result.Head {
+				t.Fatalf("Git rev-parse HEAD = %q, %v; want %s", head, err, result.Head)
+			}
+			if _, statErr := os.Stat(holderExited); statErr == nil {
+				t.Error("Add, PostCheckout or Git returned only after a holder of a git's output exited")
+			}
 			if out, errOut := contents(stdout), contents(stderr); out != "" || errOut != "hook stdout\nhook stderr\n" {
-				t.Fatalf("Add's stdout %q and stderr %q, want nothing and the post-checkout hook's lines", out, errOut)
+				t.Fatalf("stdout %q and stderr %q, want nothing and the post-checkout hook's lines", out, errOut)
 			}
 			t.Setenv("PATH", path)
 			if got := trackedTree(t, held); !maps.Equal(got, want) {

@@ -13,6 +13,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/apfsclone"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 )
@@ -115,6 +116,7 @@ func listWorktrees(ctx context.Context, home *state.Home, repo string, warn func
 
 // gitWorktree is one worktree that git worktree list reports.
 type gitWorktree struct {
+	head     string
 	branch   string
 	prunable bool
 }
@@ -171,6 +173,10 @@ func worktreeList(ctx context.Context, commonDir string) (map[string]gitWorktree
 		case "worktree":
 			path = filepath.Clean(value)
 			worktrees[path] = gitWorktree{}
+		case "HEAD":
+			w := worktrees[path]
+			w.head = value
+			worktrees[path] = w
 		case "branch":
 			w := worktrees[path]
 			w.branch = strings.TrimPrefix(value, "refs/heads/")
@@ -185,11 +191,11 @@ func worktreeList(ctx context.Context, commonDir string) (map[string]gitWorktree
 }
 
 // commonDir returns the canonical common git dir of the repository that holds
-// the current directory.
-func commonDir(ctx context.Context) (string, error) {
-	out, err := exec.CommandContext(ctx, "git", "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+// the current directory. need names what needs it, for the error.
+func commonDir(ctx context.Context, need string) (string, error) {
+	out, err := apfsclone.Git(ctx, ".", "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
-		return "", fmt.Errorf("--repo needs a git repository: git rev-parse: %w", err)
+		return "", fmt.Errorf("%s needs a git repository: %w", need, err)
 	}
 	return state.Canonical(strings.TrimSpace(string(out)))
 }

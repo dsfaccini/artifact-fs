@@ -13,7 +13,6 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/cli"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/doctor"
-	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 	"github.com/cloudflare/artifact-fs/internal/version"
 	ucli "github.com/urfave/cli/v3"
 )
@@ -88,17 +87,13 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 				// list needs no doctor checks: it changes nothing and runs
 				// only git commands that read.
 				Action: func(ctx context.Context, c *ucli.Command) error {
-					dir, err := Home()
-					if err != nil {
-						return err
-					}
-					home, err := state.Open(dir)
+					home, err := openHome()
 					if err != nil {
 						return err
 					}
 					repo := ""
 					if c.Bool("repo") {
-						if repo, err = commonDir(ctx); err != nil {
+						if repo, err = commonDir(ctx, "--repo"); err != nil {
 							return err
 						}
 					}
@@ -107,6 +102,48 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 						return err
 					}
 					return printListing(stdout, l, c.Bool("json"))
+				},
+			},
+			{
+				Name:      "new",
+				Usage:     "make a worktree on a branch: the branch that exists, or a new one at --from, else at HEAD",
+				ArgsUsage: "<branch>",
+				Flags: []ucli.Flag{
+					&ucli.StringFlag{Name: "from", Usage: "make the new branch at this commit-ish, resolved in the current directory"},
+					&ucli.BoolFlag{Name: "track", Usage: "make the new branch track --from, which must name a branch"},
+					&ucli.StringFlag{Name: "path", Usage: "the worktree's path (default: <base>-<the branch's last segment>, next to the base worktree)"},
+				},
+				Action: func(ctx context.Context, c *ucli.Command) error {
+					if c.Args().Len() != 1 {
+						return errors.New("slimtree new takes one branch")
+					}
+					if b := c.String("backend"); b != string(apfsClone) {
+						return fmt.Errorf("slimtree new cannot make %s worktrees yet", b)
+					}
+					if err := doctor.Require(probe, goos, string(apfsClone), "new", doctor.Needs{}); err != nil {
+						return err
+					}
+					home, err := openHome()
+					if err != nil {
+						return err
+					}
+					return newWorktree(ctx, home, newOptions{branch: c.Args().First(), from: c.String("from"), track: c.Bool("track"), path: c.String("path")}, stdout, stderr)
+				},
+			},
+			{
+				Name:      "rm",
+				Usage:     "remove a worktree slimtree made, with its ignored files, as git worktree remove does; a recovery ref keeps its HEAD, and its branch stays",
+				ArgsUsage: "<worktree>",
+				Flags:     []ucli.Flag{&ucli.BoolFlag{Name: "force", Usage: "discard the changes git status lists, or drop a worktree whose directory is gone"}},
+				Action: func(ctx context.Context, c *ucli.Command) error {
+					if c.Args().Len() != 1 {
+						return errors.New("slimtree rm takes one worktree, by name or path")
+					}
+					home, err := openHome()
+					if err != nil {
+						return err
+					}
+					return removeWorktree(ctx, home, probe, goos, c.Args().First(), c.Bool("force"), stdout)
 				},
 			},
 		},
