@@ -10,5 +10,6 @@ import (
 
 func TestFSMonitorHookSkipsRaceExitSleep(t *testing.T) {
 	link, _, _ := registerHookedRepo(t)
-	gittest.RequireHookSkipsRaceExitSleep(t, hookedWorktree(t, link))
+	work, _ := hookedWorktree(t, link)
+	gittest.RequireHookSkipsRaceExitSleep(t, work)
 }
