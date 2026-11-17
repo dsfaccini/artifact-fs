@@ -9,65 +9,72 @@ import (
 	"strings"
 )
 
-// A release build sets Version and Commit with
+// A release build sets Version, Tag and Commit with
 //
-//	-ldflags "-X github.com/cloudflare/artifact-fs/internal/version.Version=X.Y.Z -X github.com/cloudflare/artifact-fs/internal/version.Commit=<sha>"
+//	-ldflags "-X github.com/cloudflare/artifact-fs/internal/version.Version=X.Y.Z -X github.com/cloudflare/artifact-fs/internal/version.Tag=vX.Y.Z -X github.com/cloudflare/artifact-fs/internal/version.Commit=<sha>"
 //
 // The linker silently skips -X for a variable that does not exist or whose
-// initializer is not a constant, so keep both uninitialized.
+// initializer is not a constant, so keep all three uninitialized.
 var (
-	// Version is the release version. A leading v is dropped.
+	// Version is the release version, in the form the package index publishes,
+	// such as 0.1.0rc1. A leading v is dropped.
 	Version string
+	// Tag is the git tag of the release, such as v0.1.0-rc.1. It defaults to v
+	// followed by Version.
+	Tag string
 	// Commit is the commit the release was built from.
 	Commit string
 )
+
+const commitLength = 12
 
 // Go stamps a build of an untagged commit with a pseudo-version, which ends in
 // the commit's 14-digit time and 12-digit hash.
 var pseudoVersion = regexp.MustCompile(`\d{14}-[0-9a-f]{12}$`)
 
-// String describes the build as "X.Y.Z (vX.Y.Z, <commit>, <go version>,
-// <os>/<arch>)". Without -ldflags it reads what Go stamped: a go install of a
-// release tag reports that tag, and any other build reports
+// String describes the build as "<version> (<tag>, <commit>, <go version>,
+// <os>/<arch>)". Without -ldflags it reads what Go stamped: a go build from a
+// clean checkout at a release tag reports that tag, and any other build reports
 // "dev (untagged, ...)". The commit falls back to the stamped VCS revision,
 // with -dirty for modified sources, then to "unknown".
 func String() string {
 	info, _ := debug.ReadBuildInfo()
-	v, commit := resolve(Version, Commit, info)
-	tag := "untagged"
-	if v != "dev" {
-		tag = "v" + v
-	}
+	v, tag, commit := resolve(Version, Tag, Commit, info)
 	return fmt.Sprintf("%s (%s, %s, %s, %s/%s)", v, tag, commit, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 }
 
-func resolve(stampedVersion, stampedCommit string, info *debug.BuildInfo) (string, string) {
+func resolve(stampedVersion, stampedTag, stampedCommit string, info *debug.BuildInfo) (string, string, string) {
 	v := strings.TrimPrefix(stampedVersion, "v")
-	commit := stampedCommit
+	tag := stampedTag
+	if v != "" && tag == "" {
+		tag = "v" + v
+	}
+	commit := shortCommit(stampedCommit)
 	if info != nil {
 		if v == "" {
-			v = releaseVersion(info.Main.Version)
+			tag = releaseTag(info.Main.Version)
+			v = strings.TrimPrefix(tag, "v")
 		}
 		if commit == "" {
 			commit = vcsCommit(info.Settings)
 		}
 	}
 	if v == "" {
-		v = "dev"
+		v, tag = "dev", "untagged"
 	}
 	if commit == "" {
 		commit = "unknown"
 	}
-	return v, commit
+	return v, tag, commit
 }
 
-// releaseVersion returns the version of a module version that names a release
-// tag, and "" for a pseudo-version, a modified checkout or no version.
-func releaseVersion(moduleVersion string) string {
+// releaseTag returns a module version that names a release tag, and "" for a
+// pseudo-version, a modified checkout or no version.
+func releaseTag(moduleVersion string) string {
 	if moduleVersion == "" || moduleVersion == "(devel)" || strings.Contains(moduleVersion, "+") || pseudoVersion.MatchString(moduleVersion) {
 		return ""
 	}
-	return strings.TrimPrefix(moduleVersion, "v")
+	return moduleVersion
 }
 
 func vcsCommit(settings []debug.BuildSetting) string {
@@ -75,16 +82,20 @@ func vcsCommit(settings []debug.BuildSetting) string {
 	for _, s := range settings {
 		switch s.Key {
 		case "vcs.revision":
-			revision = s.Value
+			revision = shortCommit(s.Value)
 		case "vcs.modified":
 			modified = s.Value
 		}
-	}
-	if len(revision) > 12 {
-		revision = revision[:12]
 	}
 	if revision != "" && modified == "true" {
 		revision += "-dirty"
 	}
 	return revision
+}
+
+func shortCommit(commit string) string {
+	if len(commit) > commitLength {
+		return commit[:commitLength]
+	}
+	return commit
 }
