@@ -117,17 +117,56 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 					if c.Args().Len() != 1 {
 						return errors.New("slimtree new takes one branch")
 					}
-					if b := c.String("backend"); b != string(apfsClone) {
-						return fmt.Errorf("slimtree new cannot make %s worktrees yet", b)
-					}
-					if err := doctor.Require(probe, goos, string(apfsClone), "new", doctor.Needs{}); err != nil {
+					b := backend(c.String("backend"))
+					if err := doctor.Require(probe, goos, string(b), "new", doctor.Needs{Mount: b == artifactFS}); err != nil {
 						return err
 					}
 					home, err := openHome()
 					if err != nil {
 						return err
 					}
-					return newWorktree(ctx, home, newOptions{branch: c.Args().First(), from: c.String("from"), track: c.Bool("track"), path: c.String("path")}, stdout, stderr)
+					return newWorktree(ctx, home, newOptions{branch: c.Args().First(), from: c.String("from"), track: c.Bool("track"), path: c.String("path"), backend: b, goos: goos}, stdout, stderr)
+				},
+			},
+			{
+				Name:      "stop",
+				Usage:     "stop the daemon of an artifactfs worktree and unmount it; its changes stay for resume",
+				ArgsUsage: "<worktree>",
+				Action: func(ctx context.Context, c *ucli.Command) error {
+					if c.Args().Len() != 1 {
+						return errors.New("slimtree stop takes one worktree, by name or path")
+					}
+					if err := doctor.Require(probe, goos, string(artifactFS), "stop", doctor.Needs{Mount: true}); err != nil {
+						return err
+					}
+					home, err := openHome()
+					if err != nil {
+						return err
+					}
+					return stopWorktree(ctx, home, c.Args().First(), stdout)
+				},
+			},
+			{
+				Name:      "resume",
+				Usage:     "mount an artifactfs worktree again, as after stop or a reboot",
+				ArgsUsage: "<worktree>",
+				Flags:     []ucli.Flag{&ucli.BoolFlag{Name: "all", Usage: "resume every artifactfs worktree slimtree made"}},
+				Action: func(ctx context.Context, c *ucli.Command) error {
+					all := c.Bool("all")
+					if all && c.Args().Len() != 0 || !all && c.Args().Len() != 1 {
+						return errors.New("slimtree resume takes one worktree, by name or path, or --all")
+					}
+					if err := doctor.Require(probe, goos, string(artifactFS), "resume", doctor.Needs{Mount: true}); err != nil {
+						return err
+					}
+					home, err := openHome()
+					if err != nil {
+						return err
+					}
+					if !all {
+						return resumeWorktree(ctx, home, c.Args().First(), goos, stdout, stderr)
+					}
+					return resumeAll(ctx, home, goos, stdout, stderr)
 				},
 			},
 			{

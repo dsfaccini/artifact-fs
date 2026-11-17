@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -15,12 +16,14 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/apfsclone"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
+	"github.com/cloudflare/artifact-fs/internal/slimtree/mounts"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 )
 
 // Worktree states that list reports.
 const (
 	stateOK      = "ok"
+	stateMounted = "mounted"
 	stateStopped = "stopped"
 	stateMissing = "missing"
 	// stateUnknown marks a worktree whose repository git did not list in
@@ -64,7 +67,10 @@ type listing struct {
 // repository whose common dir is repo, or of every repository when repo is
 // "". It reads records and git's worktree list, and stats nothing itself.
 // git stats each unlocked worktree's .git, and skips a locked one, so each
-// repository's list is bounded by worktreeListTimeout. It passes each record
+// repository's list is bounded by worktreeListTimeout. For an artifactfs
+// worktree, which slimtree locks, it reads the gitfile in the record
+// directory, the process table and the mount table, none of which reaches
+// the mount. It passes each record
 // it skips, and each repository git did not list in time, to warn.
 func listWorktrees(ctx context.Context, home *state.Home, repo string, warn func(error)) (listing, error) {
 	records, err := home.Records(warn)
@@ -101,10 +107,8 @@ func listWorktrees(ctx context.Context, home *state.Home, repo string, warn func
 		// records is missing.
 		case !ok || gw.prunable:
 			w.State = stateMissing
-		// Without a reader of the mount table, list cannot tell a mounted
-		// artifactfs worktree from a stopped one.
 		case r.Backend == string(artifactFS):
-			w.State = stateStopped
+			w.State, w.Reason = artifactFSState(home, r)
 		default:
 			w.State = stateOK
 		}
@@ -112,6 +116,31 @@ func listWorktrees(ctx context.Context, home *state.Home, repo string, warn func
 		out.Worktrees = append(out.Worktrees, w)
 	}
 	return out, nil
+}
+
+// artifactFSState returns the state of r, an artifactfs worktree that git
+// lists, and the reason for an unknown state. Without the gitfile in its
+// record directory, git cannot remove the worktree. It is mounted while its
+// recorded daemon runs and its recorded mount is at its path.
+func artifactFSState(home *state.Home, r state.Record) (string, string) {
+	if _, err := os.Lstat(filepath.Join(home.RecordDir(r.Path), gitfileName)); err != nil {
+		return stateMissing, ""
+	}
+	alive, err := daemonAlive(r)
+	if err != nil {
+		return stateUnknown, err.Error()
+	}
+	if !alive {
+		return stateStopped, ""
+	}
+	id, err := mounts.Identify(r.Path)
+	switch {
+	case err != nil:
+		return stateUnknown, err.Error()
+	case id == "" || string(id) != r.MountIdentity:
+		return stateUnknown, "its daemon runs, and its mount is not at " + r.Path
+	}
+	return stateMounted, ""
 }
 
 // gitWorktree is one worktree that git worktree list reports.
