@@ -54,8 +54,15 @@ const (
 )
 
 // mountRetry backs off the mounts of one repo. request is the mount request
-// the failed attempt carried out: a new request mounts at once.
+// the failed attempt carried out, and configVersion the registration it
+// mounted: a new request or a new registration mounts at once.
 type mountRetry struct {
 	*retrier
-	request string
+	request, configVersion string
+}
+
+// carriesOut reports whether r backs off the mounts of cfg's registration
+// and mount request.
+func (r *mountRetry) carriesOut(cfg model.RepoConfig) bool {
+	return r != nil && r.request == cfg.MountRequest && r.configVersion == cfg.ConfigVersion
 }

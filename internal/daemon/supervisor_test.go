@@ -904,3 +904,36 @@ func TestSupersededMountCheckMountsTheRepoAtTheNextSync(t *testing.T) {
 		}
 	}
 }
+
+// A remove-repo of b lands after a sync pass listed b and before the pass
+// reaches b, so b's mount check fails and backs off b's mounts. A new
+// registration of b is a new config, so the next sync mounts it at once.
+func TestReRegisteredRepoMountsWithNoBackoffAtTheNextSync(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	svc, ctl, repo := newUnmountedSyncRepos(t, "a", "b")
+	var removed atomic.Bool
+	svc.mount = func(mctx, opCtx context.Context, p model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
+		if p.Name == "a" && removed.CompareAndSwap(false, true) {
+			if err := ctl.RemoveRepo(ctx, "b"); err != nil {
+				t.Errorf("remove-repo b: %v", err)
+			}
+		}
+		return fakeMount(mctx, opCtx, p, engine, gate, logger, redact)
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if rec := runtimeRecord(t, svc, "b"); rec.LastErrorPhase != phaseMount || !rec.NextRetryAt.After(time.Now()) {
+		t.Fatalf("b's repo_runtime after the pass that b's removal failed = %+v, want a mount failure with a later next attempt", rec)
+	}
+	if err := ctl.AddRepoWithOptions(ctx, repo("b"), AddRepoOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if rec := runtimeRecord(t, svc, "b"); rec.State != repoStateMounted || rec.LastError != "" {
+		t.Fatalf("the re-registered b's repo_runtime after the next sync = %+v, want it mounted with no failure", rec)
+	}
+}
