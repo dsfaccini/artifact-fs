@@ -19,8 +19,16 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/logging"
 	"github.com/cloudflare/artifact-fs/internal/model"
+	"github.com/cloudflare/artifact-fs/internal/version"
 	ucli "github.com/urfave/cli/v3"
 )
+
+// urfave's default prints "<name> version <version>".
+func init() {
+	ucli.VersionPrinter = func(cmd *ucli.Command) {
+		fmt.Fprintf(cmd.Root().Writer, "%s %s\n", cmd.Root().Name, cmd.Root().Version)
+	}
+}
 
 // Main runs artifact-fs with the arguments the process received, its program
 // name first. Git runs the FSMonitor hook link with the hook protocol version
@@ -59,6 +67,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	app := &ucli.Command{
 		Name:      "artifact-fs",
 		Usage:     "Git-backed FUSE filesystem with persistent writable overlay",
+		Version:   version.String(),
 		Writer:    stdout,
 		ErrWriter: stderr,
 	}
