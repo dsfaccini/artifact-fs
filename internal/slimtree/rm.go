@@ -35,7 +35,7 @@ func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, g
 		return err
 	}
 	if r.Backend != string(apfsClone) {
-		return fmt.Errorf("slimtree rm cannot remove the %s worktree %s yet", r.Backend, r.Path)
+		return notInThisRelease("slimtree rm "+r.Path, r.Backend)
 	}
 	if err := doctor.Require(probe, goos, r.Backend, "rm", doctor.Needs{}); err != nil {
 		return err

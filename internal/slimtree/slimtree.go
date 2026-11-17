@@ -118,7 +118,7 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 						return errors.New("slimtree new takes one branch")
 					}
 					if b := c.String("backend"); b != string(apfsClone) {
-						return fmt.Errorf("slimtree new cannot make %s worktrees yet", b)
+						return notInThisRelease("slimtree new", b)
 					}
 					if err := doctor.Require(probe, goos, string(apfsClone), "new", doctor.Needs{}); err != nil {
 						return err

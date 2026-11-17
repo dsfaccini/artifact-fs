@@ -40,3 +40,9 @@ func backendUsage(goos string) string {
 	}
 	return "how to make worktrees: artifactfs (apfsclone needs macOS)"
 }
+
+// notInThisRelease refuses cmd on a worktree of backend b, which this release
+// cannot make or remove.
+func notInThisRelease(cmd, b string) error {
+	return fmt.Errorf("%s: %s worktrees are not in this release yet; this release makes and removes only apfsclone worktrees, on macOS", cmd, b)
+}
