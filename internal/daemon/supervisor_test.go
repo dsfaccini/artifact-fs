@@ -642,7 +642,10 @@ type lockedMountCheck struct {
 	release func()
 }
 
-func startLockedMountCheck(t *testing.T, step string) *lockedMountCheck {
+// newUnmountedSyncRepos registers the sync repos names, which share one
+// remote, with a daemon that has not synced. ctl stands in for a CLI process,
+// with its own git store, and repo returns the config each name registers.
+func newUnmountedSyncRepos(t *testing.T, names ...string) (svc *Service, ctl *Controller, repo func(string) model.RepoConfig) {
 	t.Helper()
 	ctx := t.Context()
 	tmp := t.TempDir()
@@ -655,19 +658,47 @@ func startLockedMountCheck(t *testing.T, step string) *lockedMountCheck {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = svc.Close() })
-	repo := func(name string) model.RepoConfig {
+	repo = func(name string) model.RepoConfig {
 		return model.RepoConfig{RepoPaths: model.RepoPaths{Name: name}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Hour}, Enabled: true}
 	}
-	for _, name := range []string{"a", "b", "c"} {
+	for _, name := range names {
 		if err := svc.ctl().AddRepoWithOptions(ctx, repo(name), AddRepoOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ctl, err := NewController(ctx, root, discardLogger())
+	ctl, err = NewController(ctx, root, discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ctl.Close() })
+	return svc, ctl, repo
+}
+
+// runCLIStep runs step, one of lockedMountCheckSteps, on b through ctl. arm
+// runs right before the call that takes b's prepare lock.
+func runCLIStep(ctx context.Context, ctl *Controller, repo func(string) model.RepoConfig, step string, arm func()) error {
+	switch step {
+	case "fetch command":
+		arm()
+		return ctl.FetchNow(ctx, "b")
+	case "cli prepare":
+		arm()
+		_, err := ctl.Prepare(ctx, "b")
+		return err
+	case "re-registering sync add-repo":
+		if err := ctl.RemoveRepo(ctx, "b"); err != nil {
+			return err
+		}
+		arm()
+		return ctl.AddRepoWithOptions(ctx, repo("b"), AddRepoOptions{})
+	}
+	return fmt.Errorf("unknown step %q", step)
+}
+
+func startLockedMountCheck(t *testing.T, step string) *lockedMountCheck {
+	t.Helper()
+	ctx := t.Context()
+	svc, ctl, repo := newUnmountedSyncRepos(t, "a", "b", "c")
 	cliGit := &pausingCLIGit{GitStore: ctl.git, held: make(chan struct{}), release: make(chan struct{})}
 	ctl.git = cliGit
 	m := &lockedMountCheck{svc: svc, passed: make(chan struct{}), stepped: make(chan struct{}), waited: make(chan struct{}, 1), release: sync.OnceFunc(func() { close(cliGit.release) })}
@@ -686,20 +717,7 @@ func startLockedMountCheck(t *testing.T, step string) *lockedMountCheck {
 			stepping.Store(true)
 			go func() {
 				defer close(m.stepped)
-				switch step {
-				case "fetch command":
-					cliGit.armed.Store(true)
-					m.stepErr = ctl.FetchNow(ctx, "b")
-				case "cli prepare":
-					cliGit.armed.Store(true)
-					_, m.stepErr = ctl.Prepare(ctx, "b")
-				case "re-registering sync add-repo":
-					if m.stepErr = ctl.RemoveRepo(ctx, "b"); m.stepErr != nil {
-						return
-					}
-					cliGit.armed.Store(true)
-					m.stepErr = ctl.AddRepoWithOptions(ctx, repo("b"), AddRepoOptions{})
-				}
+				m.stepErr = runCLIStep(ctx, ctl, repo, step, func() { cliGit.armed.Store(true) })
 			}()
 			select {
 			case <-cliGit.held:
@@ -723,10 +741,11 @@ func startLockedMountCheck(t *testing.T, step string) *lockedMountCheck {
 	return m
 }
 
-// record returns the repo_runtime record of the repo name, which must exist.
-func (m *lockedMountCheck) record(t *testing.T, name string) model.RepoRuntimeRecord {
+// runtimeRecord returns the repo_runtime record of the repo name, which must
+// exist.
+func runtimeRecord(t *testing.T, svc *Service, name string) model.RepoRuntimeRecord {
 	t.Helper()
-	rec, ok, err := m.svc.registry.GetRuntime(t.Context(), model.RepoID(name))
+	rec, ok, err := svc.registry.GetRuntime(t.Context(), model.RepoID(name))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -753,7 +772,7 @@ func TestMountCheckSkipsARepoWhosePrepareLockIsHeld(t *testing.T) {
 			if m.passErr != nil {
 				t.Fatal(m.passErr)
 			}
-			if rec := m.record(t, "c"); rec.State != repoStateMounted {
+			if rec := runtimeRecord(t, m.svc, "c"); rec.State != repoStateMounted {
 				t.Fatalf("c's repo_runtime after the pass = %+v, want it mounted", rec)
 			}
 		})
@@ -784,13 +803,53 @@ func TestSkippedMountCheckMountsTheRepoAtTheNextSync(t *testing.T) {
 			if m.passErr != nil {
 				t.Fatal(m.passErr)
 			}
-			if rec := m.record(t, "b"); rec.LastError != "" {
+			if rec := runtimeRecord(t, m.svc, "b"); rec.LastError != "" {
 				t.Fatalf("b's repo_runtime after the pass records the failure %q in phase %q, want none", rec.LastError, rec.LastErrorPhase)
 			}
 			if err := m.svc.syncRepos(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			if rec := m.record(t, "b"); rec.State != repoStateMounted || rec.LastError != "" {
+			if rec := runtimeRecord(t, m.svc, "b"); rec.State != repoStateMounted || rec.LastError != "" {
+				t.Fatalf("b's repo_runtime after the next sync = %+v, want it mounted with no failure", rec)
+			}
+		})
+	}
+}
+
+// A CLI preparation or a re-registration that starts and ends after a sync
+// pass listed b, and before the pass reaches b, supersedes the config or the
+// prepare request the pass listed. The mount check skips b, records no
+// failure and backs off nothing, and the next sync, which lists b anew,
+// mounts b.
+func TestSupersededMountCheckMountsTheRepoAtTheNextSync(t *testing.T) {
+	t.Parallel()
+	for _, step := range []string{"cli prepare", "re-registering sync add-repo"} {
+		t.Run(step, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			svc, ctl, repo := newUnmountedSyncRepos(t, "a", "b")
+			var stepped atomic.Bool
+			svc.mount = func(mctx, opCtx context.Context, p model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
+				if p.Name == "a" && stepped.CompareAndSwap(false, true) {
+					if err := runCLIStep(ctx, ctl, repo, step, func() {}); err != nil {
+						t.Errorf("the %s: %v", step, err)
+					}
+				}
+				return fakeMount(mctx, opCtx, p, engine, gate, logger, redact)
+			}
+			if err := svc.syncRepos(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if !stepped.Load() {
+				t.Fatalf("the pass never mounted a, so the %s never ran", step)
+			}
+			if rec := runtimeRecord(t, svc, "b"); rec.LastError != "" || !rec.NextRetryAt.IsZero() {
+				t.Fatalf("b's repo_runtime after the pass records the failure %q in phase %q with its next attempt at %v, want none", rec.LastError, rec.LastErrorPhase, rec.NextRetryAt)
+			}
+			if err := svc.syncRepos(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if rec := runtimeRecord(t, svc, "b"); rec.State != repoStateMounted || rec.LastError != "" {
 				t.Fatalf("b's repo_runtime after the next sync = %+v, want it mounted with no failure", rec)
 			}
 		})
