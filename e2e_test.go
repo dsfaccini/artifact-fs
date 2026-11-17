@@ -129,19 +129,30 @@ func writeTestFile(t *testing.T, dir, name, content string) {
 // renameEINTRRetries counts the renames renameInMount retried after EINTR.
 var renameEINTRRetries atomic.Int64
 
+// mountEINTRBound bounds the retries of renameInMount and openatInMount. A
+// mount that answers EINTR to every try then fails the test, instead of
+// spinning until the test binary's timeout, whose panic skips every unmount
+// cleanup.
+const mountEINTRBound = time.Minute
+
 // renameInMount renames oldPath to newPath through the mount with
-// unix.Rename, and retries while the rename returns EINTR, as os.Rename does.
-// The mount answers an op that a signal interrupted while it waited for a
-// blob to hydrate with EINTR, and changes nothing. The test process serves
-// the mount, so its threads take signals, such as the runtime's preemption
-// signal or SIGCHLD from the daemon's git, while they wait in an op.
+// unix.Rename, and retries while the rename returns EINTR, as os.Rename does,
+// for at most mountEINTRBound. The mount answers an op that a signal
+// interrupted while it waited for a blob to hydrate with EINTR, and changes
+// nothing. The test process serves the mount, so its threads take signals,
+// such as the runtime's preemption signal or SIGCHLD from the daemon's git,
+// while they wait in an op.
 func renameInMount(oldPath, newPath string) error {
+	deadline := time.Now().Add(mountEINTRBound)
 	for {
 		err := unix.Rename(oldPath, newPath)
 		if err != unix.EINTR {
 			return err
 		}
 		renameEINTRRetries.Add(1)
+		if time.Now().After(deadline) {
+			return fmt.Errorf("rename %s: every try for %v returned %w", oldPath, mountEINTRBound, err)
+		}
 	}
 }
 
@@ -149,10 +160,14 @@ func renameInMount(oldPath, newPath string) error {
 // unix.Openat, and retries while the open returns EINTR, as renameInMount
 // does. An open hydrates the file's blob.
 func openatInMount(dirFD int, path string, flags int, mode uint32) (int, error) {
+	deadline := time.Now().Add(mountEINTRBound)
 	for {
 		fd, err := unix.Openat(dirFD, path, flags, mode)
 		if err != unix.EINTR {
 			return fd, err
+		}
+		if time.Now().After(deadline) {
+			return fd, fmt.Errorf("openat %s: every try for %v returned %w", path, mountEINTRBound, err)
 		}
 	}
 }

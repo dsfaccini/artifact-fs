@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -34,7 +35,17 @@ func TestE2ERenameRetriesAnInterruptedHydration(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o644) })
-	run(t, "", "git", "--git-dir", filepath.Join(repo.root, "repos", repoName, "git"), "config", "remote.origin.uploadpack", uploadPack)
+	// The mount serves before the daemon writes its status optimization
+	// config into the same git config, and git fails a config write that
+	// finds config.lock held. So the write retries while git reports that.
+	gitDir := filepath.Join(repo.root, "repos", repoName, "git")
+	waitForCondition(t, 60*time.Second, "a write of remote.origin.uploadpack", func() (bool, string) {
+		out, err := exec.Command("git", "--git-dir", gitDir, "config", "remote.origin.uploadpack", uploadPack).CombinedOutput()
+		if err != nil && !strings.Contains(string(out), "could not lock config file") {
+			t.Fatalf("git config remote.origin.uploadpack: %v\n%s", err, out)
+		}
+		return err == nil, string(out)
+	})
 
 	source := filepath.Join(repo.mountPath, "packages", "wrangler")
 	destination := filepath.Join(repo.mountPath, "packages", "wrangler-pending")
