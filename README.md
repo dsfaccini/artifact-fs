@@ -1,3 +1,10 @@
+> [!NOTE]
+> This repository is a fork of [cloudflare/artifact-fs](https://github.com/cloudflare/artifact-fs).
+
+**Pass [this link](https://github.com/dsfaccini/davids-ai-toolset/tree/main/skills/disk-light-worktrees) to your agent, and each fresh worktree takes about 88% less disk.**
+
+<sub>A fresh pydantic-ai worktree took about 43 MiB through artifact-fs, against about 371 MiB for `git worktree add`. That counts the checkout, its git dir and its virtualenv's private bytes, median of three runs on a 16-core Linux box with ext4, and leaves out the shared blob cache, which every worktree reuses.</sub>
+
 <p align="center">
   <img src="artifact-fs.png" alt="ArtifactFS" width="720">
 </p>
