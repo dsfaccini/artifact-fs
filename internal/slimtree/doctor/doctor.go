@@ -4,8 +4,10 @@
 package doctor
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"regexp"
 	"slices"
@@ -40,6 +42,15 @@ type Report struct {
 	OK        bool     `json:"ok"`
 	Checks    []Result `json:"checks"`
 	Reminders []string `json:"reminders,omitempty"`
+}
+
+// WriteJSON writes r as indented JSON and leaves &, < and > unescaped, so a
+// fix reads as the command to run.
+func (r Report) WriteJSON(w io.Writer) error {
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	return enc.Encode(r)
 }
 
 // Probe reads the machine. System returns the real one; tests inject each

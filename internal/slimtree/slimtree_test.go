@@ -2,8 +2,11 @@ package slimtree
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -204,5 +207,49 @@ func TestHomeResolvesItsEnvironment(t *testing.T) {
 	t.Setenv("SLIMTREE_HOME", "slimtree")
 	if got, err := Home(); err == nil {
 		t.Fatalf("Home() with a relative SLIMTREE_HOME = %q, want an error", got)
+	}
+}
+
+type modeInfo struct {
+	fs.FileInfo
+	mode fs.FileMode
+}
+
+func (m modeInfo) Mode() fs.FileMode { return m.mode }
+
+// doctor prints its report, as JSON with --json, and exits 1 when a check
+// fails.
+func TestDoctorExitsOneOnAFailedCheck(t *testing.T) {
+	t.Setenv("SLIMTREE_HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+	probe := doctor.Probe{
+		LookPath: func(file string) (string, error) { return "/usr/bin/" + file, nil },
+		Stat: func(path string) (fs.FileInfo, error) {
+			if path == "/dev/fuse" {
+				return modeInfo{mode: fs.ModeDevice | fs.ModeCharDevice}, nil
+			}
+			return modeInfo{mode: fs.ModeSetuid | 0o755}, nil
+		},
+		ReadWrite: func(string) error { return errors.New("permission denied") },
+		ReadFile:  func(string) ([]byte, error) { return []byte("ID=debian\n"), nil },
+		Output:    func(string, ...string) (string, error) { return "git version 2.47.0\n", nil },
+		EUID:      1000,
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run(t.Context(), "linux", probe, []string{"doctor", "--json"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "doctor: a check failed") {
+		t.Fatalf("doctor --json with an unwritable /dev/fuse: exit %d, stderr %q, want 1", code, stderr.String())
+	}
+	var report doctor.Report
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || report.OK || len(report.Checks) != 3 || report.Checks[1].Fix != "sudo chmod 0666 /dev/fuse" {
+		t.Fatalf("doctor --json = %s (%v), want a failed report with the chmod fix", stdout.String(), err)
+	}
+	stdout.Reset()
+	if code := run(t.Context(), "linux", probe, []string{"doctor"}, &stdout, io.Discard); code != 1 || !strings.Contains(stdout.String(), "fail  dev-fuse") || !strings.Contains(stdout.String(), "      fix: sudo chmod 0666 /dev/fuse\n") {
+		t.Fatalf("doctor: exit %d, stdout %q, want the failure and its fix", code, stdout.String())
+	}
+	probe.ReadWrite = func(string) error { return nil }
+	stdout.Reset()
+	if code := run(t.Context(), "linux", probe, []string{"doctor", "--json"}, &stdout, io.Discard); code != 0 {
+		t.Fatalf("doctor --json on a healthy machine: exit %d, stdout %s", code, stdout.String())
 	}
 }

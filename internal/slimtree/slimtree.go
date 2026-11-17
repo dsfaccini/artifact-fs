@@ -4,7 +4,6 @@ package slimtree
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -83,9 +82,7 @@ var errDoctorFailed = errors.New("doctor: a check failed")
 
 func printDoctor(w io.Writer, r doctor.Report, asJSON bool) error {
 	if asJSON {
-		enc := json.NewEncoder(w)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(r); err != nil {
+		if err := r.WriteJSON(w); err != nil {
 			return err
 		}
 	} else {
