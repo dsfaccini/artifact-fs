@@ -446,7 +446,9 @@ func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''
 
 // TestAddRegistersHoldingALockItReleasesBeforePostCheckout probes the lock
 // from inside git worktree add and read-tree, through a fake git first on
-// PATH, and from the post-checkout hook. It is serial: it sets PATH.
+// PATH, and from the post-checkout hook. The fake skips the read-tree of the
+// attribute check, which reads into a temporary index before the lock exists.
+// It is serial: it sets PATH.
 func TestAddRegistersHoldingALockItReleasesBeforePostCheckout(t *testing.T) {
 	f := newFixture(t, nil, nil)
 	probe, err := os.Executable()
@@ -459,7 +461,7 @@ func TestAddRegistersHoldingALockItReleasesBeforePostCheckout(t *testing.T) {
 	}
 	dir := t.TempDir()
 	log := filepath.Join(dir, "lock.log")
-	write(t, filepath.Join(dir, "bin/git"), "#!/bin/sh\ncase \" $* \" in *\" worktree add \"*) "+shellQuote(probe)+" add ;; *\" read-tree HEAD \"*) "+shellQuote(probe)+" read-tree ;; esac\n"+
+	write(t, filepath.Join(dir, "bin/git"), "#!/bin/sh\ncase \" $* \" in *\" worktree add \"*) "+shellQuote(probe)+" add ;; *\" read-tree \"*) [ -n \"$GIT_INDEX_FILE\" ] || "+shellQuote(probe)+" read-tree ;; esac\n"+
 		"exec "+shellQuote(realGit)+" \"$@\"\n", 0o755)
 	write(t, filepath.Join(f.base, ".git/hooks/post-checkout"), "#!/bin/sh\n"+shellQuote(probe)+" hook\n", 0o755)
 	t.Setenv("PATH", filepath.Join(dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -547,13 +549,13 @@ func TestAddFailsWhenARewriteStillDiffers(t *testing.T) {
 				write(t, filepath.Join(path, filepath.FromSlash(p)), "edited after the rewrite\n", 0o644)
 			}
 		}})
-	// hidden.txt is the clone that does not match its blob.
-	if !slices.Equal(rewritten, []string{"hidden.txt"}) {
-		t.Fatalf("Add rewrote %q, want hidden.txt", rewritten)
-	}
 	var incomplete *IncompleteError
 	if !errors.As(err, &incomplete) || incomplete.Path != path || !strings.Contains(err.Error(), "still differ from the index") {
 		t.Fatalf("Add = %v, want an IncompleteError for %s saying files still differ", err, path)
+	}
+	// hidden.txt is the clone that does not match its blob.
+	if !slices.Equal(rewritten, []string{"hidden.txt"}) {
+		t.Fatalf("Add rewrote %q, want hidden.txt", rewritten)
 	}
 }
 
@@ -682,9 +684,35 @@ func TestAddRechecksTheAttributesOfACommitThatMoved(t *testing.T) {
 	_, err := Add(t.Context(), Options{Base: f.base, Path: path, Commit: "upstream/main",
 		AddArgs: []string{"-b", "feat/clone"}, Clone: rec.Clone,
 		beforeRegister: func() { run(t, f.base, "fetch", "-q", "upstream") }})
+	var incomplete *IncompleteError
+	want := "changed.txt has the attribute eol=lf, which converts it on checkout"
+	if !errors.As(err, &incomplete) || incomplete.Path != path || !strings.Contains(err.Error(), want) {
+		t.Fatalf("Add = %v, want an IncompleteError for %s saying %q", err, path, want)
+	}
 	if got, want := run(t, path, "rev-parse", "HEAD"), run(t, f.upstream, "rev-parse", "main"); got != want {
 		t.Fatalf("the worktree's HEAD is %s, want the fetched %s", got, want)
 	}
+	if len(rec.cloned) > 0 {
+		t.Errorf("Add cloned %q after the recheck refused", rec.cloned)
+	}
+}
+
+// TestAddChecksTheCommitItReadIntoTheIndex fetches a commit with an attribute
+// that converts changed.txt between Add's checks and git worktree add. Once
+// Add has filled the new worktree's index with that commit, it moves the new
+// branch back to the checked commit, so HEAD no longer names the commit in
+// the index.
+func TestAddChecksTheCommitItReadIntoTheIndex(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil, nil)
+	checked := run(t, f.base, "rev-parse", "upstream/main")
+	f.commitUpstream(t, map[string]string{".gitattributes": "changed.txt eol=lf\n"})
+	path := filepath.Join(f.worktrees, "clone")
+	rec := newRecorder(path)
+	_, err := Add(t.Context(), Options{Base: f.base, Path: path, Commit: "upstream/main",
+		AddArgs: []string{"-b", "feat/clone"}, Clone: rec.Clone,
+		beforeRegister: func() { run(t, f.base, "fetch", "-q", "upstream") },
+		afterRegister:  func() { run(t, f.base, "update-ref", "refs/heads/feat/clone", checked) }})
 	var incomplete *IncompleteError
 	want := "changed.txt has the attribute eol=lf, which converts it on checkout"
 	if !errors.As(err, &incomplete) || incomplete.Path != path || !strings.Contains(err.Error(), want) {
@@ -692,6 +720,38 @@ func TestAddRechecksTheAttributesOfACommitThatMoved(t *testing.T) {
 	}
 	if len(rec.cloned) > 0 {
 		t.Errorf("Add cloned %q after the recheck refused", rec.cloned)
+	}
+}
+
+// TestAddFillsTheWorktreeFromTheCommitInItsIndex fetches a commit that
+// removes Makefile between Add's checks and git worktree add. Once Add has
+// filled the new worktree's index with that commit, it moves the new branch
+// back to the checked commit, which has Makefile.
+func TestAddFillsTheWorktreeFromTheCommitInItsIndex(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil, nil)
+	checked := run(t, f.base, "rev-parse", "upstream/main")
+	run(t, f.upstream, "rm", "-q", "Makefile")
+	run(t, f.upstream, "commit", "-qm", "remove Makefile")
+	path := filepath.Join(f.worktrees, "clone")
+	rec := newRecorder(path)
+	var stderr bytes.Buffer
+	_, err := Add(t.Context(), Options{Base: f.base, Path: path, Commit: "upstream/main",
+		AddArgs: []string{"-b", "feat/clone"}, Clone: rec.Clone, Stderr: &stderr,
+		beforeRegister: func() { run(t, f.base, "fetch", "-q", "upstream") },
+		afterRegister:  func() { run(t, f.base, "update-ref", "refs/heads/feat/clone", checked) }})
+	if err != nil {
+		t.Fatalf("Add: %v\n%s", err, stderr.Bytes())
+	}
+	if slices.Contains(rec.cloned, "Makefile") {
+		t.Errorf("Add cloned Makefile, which the index does not hold: cloned %q", rec.cloned)
+	}
+	if _, err := os.Lstat(filepath.Join(path, "Makefile")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("Makefile in the worktree: %v", err)
+	}
+	plain := f.addPlain(t, "plain")
+	if got, want := trackedTree(t, path), trackedTree(t, plain); !maps.Equal(got, want) {
+		t.Errorf("clone's tree = %q\nplain tree = %q", got, want)
 	}
 }
 

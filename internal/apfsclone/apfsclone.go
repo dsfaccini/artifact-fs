@@ -1,8 +1,8 @@
 // Package apfsclone makes a Git worktree whose files are APFS clones of a base
 // worktree's files.
 //
-// Add runs git worktree add --no-checkout, fills the index with read-tree
-// HEAD, then writes the files:
+// Add runs git worktree add --no-checkout, resolves the new worktree's HEAD
+// once and fills the index with that commit, then writes the files:
 //
 //   - A tracked path is cloned from the base when it is a regular file (mode
 //     100644 or 100755), the base's HEAD has the same mode and blob there, and
@@ -86,11 +86,13 @@ type Options struct {
 	// post-checkout hook.
 	Stdout, Stderr io.Writer
 
-	// beforeRegister and afterRewrite are test hooks that production code
-	// leaves nil. beforeRegister runs after Add's checks, before git worktree
-	// add. afterRewrite runs after Add rewrites from Git the files that differ
-	// from the index, with their paths.
+	// beforeRegister, afterRegister and afterRewrite are test hooks that
+	// production code leaves nil. beforeRegister runs after Add's checks,
+	// before git worktree add. afterRegister runs once the new worktree's
+	// index is filled. afterRewrite runs after Add rewrites from Git the files
+	// that differ from the index, with their paths.
 	beforeRegister func()
+	afterRegister  func()
 	afterRewrite   func(paths []string)
 }
 
@@ -151,7 +153,7 @@ func Add(ctx context.Context, o Options) (Result, error) {
 	refuse := func(err error) error {
 		return fmt.Errorf("apfsclone cannot clone %s into %s: %w", base, dest, err)
 	}
-	baseHead, err := treeEntries(ctx, base)
+	baseHead, err := treeEntries(ctx, base, "HEAD")
 	if err != nil {
 		return Result{}, refuse(err)
 	}
@@ -182,21 +184,23 @@ func Add(ctx context.Context, o Options) (Result, error) {
 	if o.beforeRegister != nil {
 		o.beforeRegister()
 	}
-	if err := register(ctx, o, base, dest, filepath.Join(commonDir, RegistrationLock)); err != nil {
+	// head is the commit in the new worktree's index. Add checks, fills and
+	// reports it, never HEAD again, so another process that moves the new
+	// branch cannot pair one commit's checks with another commit's index.
+	head, err := register(ctx, o, base, dest, filepath.Join(commonDir, RegistrationLock))
+	if err != nil {
 		return Result{}, err
 	}
-	out, err = git(ctx, dest, nil, "rev-parse", "HEAD")
-	if err != nil {
-		return Result{}, &IncompleteError{dest, err}
+	if o.afterRegister != nil {
+		o.afterRegister()
 	}
-	head := strings.TrimSpace(string(out))
 	// A fetch can move o.Commit after the check.
 	if head != commit {
 		if err := refuseConvertingAttributes(ctx, dest, head); err != nil {
 			return Result{}, &IncompleteError{dest, err}
 		}
 	}
-	result, err := populate(ctx, clone, base, dest, baseHead, dirty, o.afterRewrite)
+	result, err := populate(ctx, clone, base, dest, head, baseHead, dirty, o.afterRewrite)
 	if err != nil {
 		return Result{}, &IncompleteError{dest, err}
 	}
@@ -214,12 +218,14 @@ func Add(ctx context.Context, o Options) (Result, error) {
 	return result, nil
 }
 
-// register runs git worktree add --no-checkout and read-tree HEAD holding the
-// flock on lockPath. A failed read-tree returns an IncompleteError.
-func register(ctx context.Context, o Options, base, dest, lockPath string) error {
+// register runs git worktree add --no-checkout, resolves the new worktree's
+// HEAD and reads that commit into its index, holding the flock on lockPath.
+// It returns the commit. A failure after git worktree add returns an
+// IncompleteError.
+func register(ctx context.Context, o Options, base, dest, lockPath string) (string, error) {
 	unlock, err := lockFile(ctx, lockPath)
 	if err != nil {
-		return fmt.Errorf("apfsclone cannot clone %s into %s: %w", base, dest, err)
+		return "", fmt.Errorf("apfsclone cannot clone %s into %s: %w", base, dest, err)
 	}
 	defer unlock()
 	args := append([]string{"-C", base, "worktree", "add", "--no-checkout"}, o.AddArgs...)
@@ -227,12 +233,17 @@ func register(ctx context.Context, o Options, base, dest, lockPath string) error
 	configureGit(add)
 	add.Stdout, add.Stderr = o.Stdout, o.Stderr
 	if err := add.Run(); err != nil {
-		return fmt.Errorf("git worktree add %s: %w", dest, err)
+		return "", fmt.Errorf("git worktree add %s: %w", dest, err)
 	}
-	if _, err := git(ctx, dest, nil, "read-tree", "HEAD"); err != nil {
-		return &IncompleteError{dest, err}
+	out, err := git(ctx, dest, nil, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return "", &IncompleteError{dest, err}
 	}
-	return nil
+	head := strings.TrimSpace(string(out))
+	if _, err := git(ctx, dest, nil, "read-tree", head); err != nil {
+		return "", &IncompleteError{dest, err}
+	}
+	return head, nil
 }
 
 // lockFile takes an exclusive flock on path, which it creates when missing.
@@ -315,11 +326,12 @@ func preflight(clone Clonefile, base, dest string, baseHead tree) error {
 	return fmt.Errorf("cloning %s into %s failed: %w", source, parent, err)
 }
 
-// populate writes dest's files, cloning from base the paths that baseHead and
-// dirty show to match, and rewrites from Git each clone that does not match
-// its entry. afterRewrite, when not nil, runs after that rewrite.
-func populate(ctx context.Context, clone Clonefile, base, dest string, baseHead tree, dirty map[string]bool, afterRewrite func([]string)) (Result, error) {
-	target, err := treeEntries(ctx, dest)
+// populate writes dest's files from head, the commit in its index, cloning
+// from base the paths that baseHead and dirty show to match, and rewrites
+// from Git each clone that does not match its entry. afterRewrite, when not
+// nil, runs after that rewrite.
+func populate(ctx context.Context, clone Clonefile, base, dest, head string, baseHead tree, dirty map[string]bool, afterRewrite func([]string)) (Result, error) {
+	target, err := treeEntries(ctx, dest, head)
 	if err != nil {
 		return Result{}, err
 	}
@@ -420,7 +432,8 @@ var convertingAttributes = map[string]bool{"filter": true, "ident": true, "worki
 // refuseConvertingAttributes refuses a commit with a path whose attributes
 // convert it on checkout. It runs check-attr --cached on a temporary index of
 // the commit, so it leaves repo's index alone. It accepts -text, which turns
-// end-of-line conversion off.
+// end-of-line conversion off. It needs lazy fetch: under GIT_NO_LAZY_FETCH,
+// check-attr --cached skips a .gitattributes whose blob is missing.
 func refuseConvertingAttributes(ctx context.Context, repo, commit string) error {
 	scratch, err := os.MkdirTemp("", "apfsclone-")
 	if err != nil {
@@ -502,9 +515,9 @@ func exists(p string) bool {
 	return err == nil
 }
 
-// treeEntries reads the tree of HEAD in repo.
-func treeEntries(ctx context.Context, repo string) (tree, error) {
-	out, err := git(ctx, repo, nil, "ls-tree", "-r", "-z", "--full-tree", "HEAD")
+// treeEntries reads the tree of commit in repo.
+func treeEntries(ctx context.Context, repo, commit string) (tree, error) {
+	out, err := git(ctx, repo, nil, "ls-tree", "-r", "-z", "--full-tree", commit)
 	if err != nil {
 		return tree{}, err
 	}
