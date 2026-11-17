@@ -1,6 +1,7 @@
 package gitstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -42,5 +43,17 @@ func TestTerminateCommandProcessGroupReportsExitedProcess(t *testing.T) {
 	}
 	if err := terminateCommandProcessGroup(cmd); !errors.Is(err, os.ErrProcessDone) {
 		t.Fatalf("terminate exited process error = %v, want os.ErrProcessDone", err)
+	}
+}
+
+// One writer set as both stdout and stderr gets the two streams in the order
+// the command wrote them, as the one pipe os/exec gives such a writer did.
+func TestRunWithFilesKeepsTheOrderOfOneWriterForBothStreams(t *testing.T) {
+	t.Parallel()
+	var out bytes.Buffer
+	cmd := exec.Command("sh", "-c", "echo 1; echo 2 >&2; echo 3")
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := RunWithFiles(cmd, t.TempDir(), nil, nil); err != nil || out.String() != "1\n2\n3\n" {
+		t.Fatalf("RunWithFiles = %v, output %q; want nil and %q", err, out.String(), "1\n2\n3\n")
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
@@ -567,6 +568,39 @@ func TestGitsSucceedWhileAnotherProcessHoldsTheirOutput(t *testing.T) {
 				t.Fatalf("tree after Add = %q\nplain tree = %q", got, want)
 			}
 		})
+	}
+}
+
+// PostCheckout hands the hook a caller's *os.File as it is, as a CLI passes
+// its terminal, so the hook's output reaches the file while the hook runs. A
+// copy made once the hook exits would hide a prompt from the user until then.
+func TestPostCheckoutHandsTheHookTheCallersFile(t *testing.T) {
+	t.Parallel()
+	repo := t.TempDir()
+	run(t, repo, "init", "-q")
+	dir := t.TempDir()
+	proceed := filepath.Join(dir, "proceed")
+	// The hook waits at most a minute for the test to see its line.
+	write(t, filepath.Join(repo, ".git/hooks/post-checkout"), "#!/bin/sh\necho hook running >&2\ni=0\nwhile [ ! -e "+shellQuote(proceed)+" ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done\n", 0o755)
+	stderr, err := os.Create(filepath.Join(dir, "stderr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stderr.Close()
+	done := make(chan error, 1)
+	go func() { done <- PostCheckout(t.Context(), repo, strings.Repeat("0", 40), io.Discard, stderr) }()
+	for !strings.Contains(read(t, stderr.Name()), "hook running") {
+		select {
+		case err := <-done:
+			t.Fatalf("PostCheckout returned (%v) before the hook's line reached the caller's file", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if err := os.WriteFile(proceed, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("PostCheckout: %v", err)
 	}
 }
 

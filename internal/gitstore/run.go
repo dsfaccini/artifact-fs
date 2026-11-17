@@ -69,8 +69,9 @@ func (s *Store) runInputCommand(ctx context.Context, cmd *exec.Cmd, gitDir strin
 // pipe, for each standard stream that is not an *os.File. cmd reads input as
 // its stdin when input is not nil. A writer the caller set as cmd.Stdout or
 // cmd.Stderr gets what cmd wrote there once cmd exits, whatever its exit
-// status. An *os.File stays as the caller set it, so a hook can still reach
-// the terminal. When readStdout is not nil, it replaces cmd.Stdout and gets
+// status. One writer set as both gets one file, as os/exec gives it one pipe,
+// so the two streams keep their order. An *os.File stays as the caller set
+// it, so a hook can still reach the terminal. When readStdout is not nil, it replaces cmd.Stdout and gets
 // the stdout file only once cmd exits 0: a git that failed, as on a full
 // disk, can leave its last line cut. Each file is unlinked in dir, or in the
 // system temp directory when dir is "", before cmd starts.
@@ -126,6 +127,7 @@ func RunWithFiles(cmd *exec.Cmd, dir string, input []byte, readStdout func(io.Re
 	}
 	var stdoutFile *os.File
 	var err error
+	callerStdout := cmd.Stdout
 	if readStdout != nil {
 		if stdoutFile, err = unlinked(); err != nil {
 			return err
@@ -134,7 +136,9 @@ func RunWithFiles(cmd *exec.Cmd, dir string, input []byte, readStdout func(io.Re
 	} else if cmd.Stdout, err = toFile(cmd.Stdout); err != nil {
 		return err
 	}
-	if cmd.Stderr, err = toFile(cmd.Stderr); err != nil {
+	if readStdout == nil && sameWriter(cmd.Stderr, callerStdout) {
+		cmd.Stderr = cmd.Stdout
+	} else if cmd.Stderr, err = toFile(cmd.Stderr); err != nil {
 		return err
 	}
 	runErr := cmd.Run()
@@ -149,6 +153,14 @@ func RunWithFiles(cmd *exec.Cmd, dir string, input []byte, readStdout func(io.Re
 		readErr = errors.Join(readErr, readWritten(stdoutFile, readStdout))
 	}
 	return errors.Join(runErr, readErr)
+}
+
+// sameWriter reports whether a and b are one writer, as os/exec checks
+// before it gives stdout and stderr one pipe. Writers of a type that cannot
+// be compared are never one writer.
+func sameWriter(a, b io.Writer) (same bool) {
+	defer func() { _ = recover() }()
+	return a != nil && a == b
 }
 
 // readWritten passes read what f holds. It reads at offsets: a process that
