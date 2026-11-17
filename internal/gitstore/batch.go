@@ -477,7 +477,7 @@ func newBatchCatFile(gitDir string, lazyFetchEnv func() ([]string, error), logge
 	cmd.Stderr = stderr
 	configureCommandSession(cmd)
 	// A lazy fetch's descendant can keep the stderr pipe open after a kill.
-	cmd.WaitDelay = gitCommandWaitDelay
+	cmd.WaitDelay = GitCommandWaitDelay
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

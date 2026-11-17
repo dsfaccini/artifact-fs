@@ -169,6 +169,7 @@ func Add(ctx context.Context, o Options) (Result, error) {
 	hook := exec.CommandContext(ctx, "git", "-C", dest, "hook", "run", "--ignore-missing", "post-checkout", "--",
 		strings.Repeat("0", len(head)), head, "1")
 	hook.Cancel = func() error { return hook.Process.Signal(syscall.SIGTERM) }
+	hook.WaitDelay = gitstore.GitCommandWaitDelay
 	hook.Stdout, hook.Stderr = o.Stdout, o.Stderr
 	if err := hook.Run(); err != nil {
 		return result, fmt.Errorf("the post-checkout hook in %s failed: %w", dest, err)

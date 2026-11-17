@@ -1564,7 +1564,7 @@ func TestFetchStartsBeforeAndEndsAfterItsRemoteLookup(t *testing.T) {
 	// The fetch waits until the lookup runs, then marks its start only while
 	// the lookup still runs. The lookup expires the context once the fetch's
 	// git is reaped, so the cancel cannot reach the fetch. The lookup and its
-	// sleep ignore SIGTERM, so only the SIGKILL gitCommandWaitDelay after the
+	// sleep ignore SIGTERM, so only the SIGKILL GitCommandWaitDelay after the
 	// cancel ends them. The loop and sleep bounds limit how long the lookup
 	// outlives a timeout panic.
 	script := "#!/bin/sh\n" +
