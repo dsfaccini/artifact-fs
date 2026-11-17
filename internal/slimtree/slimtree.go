@@ -56,6 +56,14 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 				Validator: func(b string) error { return checkBackend(goos, backend(b)) },
 			},
 		},
+		// urfave runs Before only for a command's action, never for --help
+		// or --version. doctor prints the full report, and help is help.
+		Before: func(ctx context.Context, c *ucli.Command) (context.Context, error) {
+			if sub := c.Command(c.Args().First()); sub == nil || sub.Name != "doctor" && sub.Name != "help" {
+				firstRun(stderr, probe, goos, c.String("backend"))
+			}
+			return ctx, nil
+		},
 		Commands: []*ucli.Command{
 			{
 				Name:  "doctor",
@@ -86,18 +94,23 @@ func printDoctor(w io.Writer, r doctor.Report, asJSON bool) error {
 			return err
 		}
 	} else {
-		for _, c := range r.Checks {
-			fmt.Fprintf(w, "%-4s  %-13s  %s\n", c.Status, c.ID, c.Detail)
-			if c.Status != doctor.StatusOK && c.Fix != "" {
-				fmt.Fprintf(w, "      fix: %s\n", c.Fix)
-			}
-		}
-		for _, m := range r.Reminders {
-			fmt.Fprintf(w, "reminder: %s\n", m)
-		}
+		writeChecks(w, r)
 	}
 	if !r.OK {
 		return errDoctorFailed
 	}
 	return nil
+}
+
+// writeChecks writes r's checks, their fixes and its reminders as text.
+func writeChecks(w io.Writer, r doctor.Report) {
+	for _, c := range r.Checks {
+		fmt.Fprintf(w, "%-4s  %-13s  %s\n", c.Status, c.ID, c.Detail)
+		if c.Status != doctor.StatusOK && c.Fix != "" {
+			fmt.Fprintf(w, "      fix: %s\n", c.Fix)
+		}
+	}
+	for _, m := range r.Reminders {
+		fmt.Fprintf(w, "reminder: %s\n", m)
+	}
 }
