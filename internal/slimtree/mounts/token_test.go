@@ -5,8 +5,10 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"runtime"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestSignalReachesOnlyTheProcessItsStartTokenNames(t *testing.T) {
@@ -54,5 +56,41 @@ func TestSignalReachesOnlyTheProcessItsStartTokenNames(t *testing.T) {
 	}
 	if err := Signal(pid, token, syscall.SIGKILL); !errors.Is(err, ErrGone) {
 		t.Fatalf("Signal of a reaped child = %v; want ErrGone", err)
+	}
+}
+
+// A child that exited and was not reaped is a zombie: gone for Signal,
+// whatever StartToken answers. A stop loop in a container whose PID 1 never
+// reaps otherwise waits forever.
+func TestSignalTreatsAZombieAsGone(t *testing.T) {
+	t.Parallel()
+	cat := exec.Command("/bin/cat")
+	stdin, err := cat.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	start(t, cat)
+	pid := cat.Process.Pid
+	token, err := StartToken(pid)
+	if err != nil || token == "" {
+		t.Fatalf("StartToken = %q, %v", token, err)
+	}
+	if err := stdin.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for !zombie(t, pid) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := Signal(pid, token, 0); !errors.Is(err, ErrGone) {
+		t.Fatalf("Signal 0 of a zombie = %v; want ErrGone", err)
+	}
+	// Linux answers for a zombie, so a launcher can record the token of a
+	// child that already exited. macOS answers nothing.
+	want := token
+	if runtime.GOOS == "darwin" {
+		want = ""
+	}
+	if got, err := StartToken(pid); err != nil || got != want {
+		t.Fatalf("StartToken of a zombie = %q, %v; want %q", got, err, want)
 	}
 }

@@ -403,14 +403,15 @@ func ownerUID(info fs.FileInfo) (uint32, bool) {
 // checkMountID reads which mount IDs the kernel gives. slimtree unmounts a
 // mount only when its identity, which holds its ID, matches the one slimtree
 // recorded. Linux 6.8 gives IDs no later mount reuses. Linux 5.8 to 6.7 give
-// reusable ones, which the device and the source must back up.
+// reusable ones, with which a new mount of the same worktree most likely
+// gets its old mount's identity.
 func checkMountID(p Probe, _ string, _ []Result) Result {
 	unique, err := p.MountIDs()
 	switch {
 	case err != nil:
 		return Result{Status: StatusFail, Detail: err.Error(), Fix: "upgrade to Linux 6.8 or later"}
 	case !unique:
-		return Result{Status: StatusWarn, Detail: "Linux before 6.8 reuses mount IDs, so slimtree tells a mount from a later one at its path by its ID, device and source", Fix: "upgrade to Linux 6.8 or later"}
+		return Result{Status: StatusWarn, Detail: "Linux before 6.8 reuses mount IDs, so a new mount of a worktree most likely gets the identity of the worktree's old mount, and slimtree can stop the new mount in its place", Fix: "upgrade to Linux 6.8 or later"}
 	}
 	return Result{Status: StatusOK, Detail: "unique mount IDs"}
 }

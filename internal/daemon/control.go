@@ -70,7 +70,8 @@ func acquireDaemonLock(root string) (*os.File, error) {
 // Running reports whether a daemon holds root's daemon lock, and the pid the
 // holder wrote into the lock file, 0 before it wrote one. For an instant
 // after a daemon takes the lock, the file still holds the pid of the daemon
-// before it. So match the pid with a start token before you signal it.
+// before it. So before you signal the pid, match it with the start token
+// recorded when that daemon started, never with one read from the pid now.
 func Running(root string) (pid int, running bool, err error) {
 	f, err := os.Open(daemonLockPath(root))
 	if errors.Is(err, os.ErrNotExist) {

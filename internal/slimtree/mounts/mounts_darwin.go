@@ -134,8 +134,8 @@ func Holders(ctx context.Context, path string, key Key, ignore int) ([]Holder, e
 // start_sec:start_usec, which fork sets and exec keeps. kern.proc.pid reads
 // the p_start that proc_pidinfo's PROC_PIDTBSDINFO reads, and answers for
 // another user's process too. It reads no argv. A pid and its token name one
-// process. For a child of this process, only its wait status tells that it
-// exited.
+// process. Signal with signal 0 tells whether the process runs. Tell that a
+// child of this process exited only from its wait status.
 func StartToken(pid int) (string, error) {
 	procs, err := unix.SysctlKinfoProcSlice("kern.proc.pid", pid)
 	if err != nil {
@@ -149,7 +149,8 @@ func StartToken(pid int) (string, error) {
 }
 
 // Signal sends sig to the process pid names while its start token is token,
-// and returns ErrGone otherwise. macOS has no pidfd: a process that took pid
+// and returns ErrGone otherwise, also for a zombie, which has no token. With
+// signal 0 it only tells whether the process runs. macOS has no pidfd: a process that took pid
 // between the token read and the kill would need the PID space to wrap in
 // that instant.
 func Signal(pid int, token string, sig syscall.Signal) error {
@@ -172,7 +173,7 @@ func Signal(pid int, token string, sig syscall.Signal) error {
 }
 
 // unmountPath unmounts path with umount(8).
-func unmountPath(ctx context.Context, path string) error {
+func unmountPath(ctx context.Context, path string, _ Identity, _ func(string) (Identity, error)) error {
 	_, err := run(ctx, "/sbin/umount", path)
 	return err
 }

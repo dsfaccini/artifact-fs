@@ -9,6 +9,7 @@ import (
 	"slices"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // start starts cmd and stops it, and its process group when it leads one, at
@@ -89,6 +90,7 @@ func TestHoldersNamesEachProcessOnTheMountExceptTheIgnoredOneAndItsDescendants(t
 		if holders, err = Holders(t.Context(), root, key, 0); err != nil {
 			t.Fatal(err)
 		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	pids := holderPIDs(holders)
 	for _, pid := range []int{daemon.Process.Pid, inCwd.Process.Pid, withFile.Process.Pid, mapper.Process.Pid} {

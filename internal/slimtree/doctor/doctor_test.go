@@ -158,7 +158,7 @@ func TestMountIDCheck(t *testing.T) {
 		want   Result
 	}{
 		{unique: true, want: Result{Status: StatusOK, Detail: "unique mount IDs"}},
-		{want: Result{Status: StatusWarn, Detail: "Linux before 6.8 reuses mount IDs, so slimtree tells a mount from a later one at its path by its ID, device and source", Fix: "upgrade to Linux 6.8 or later"}},
+		{want: Result{Status: StatusWarn, Detail: "Linux before 6.8 reuses mount IDs, so a new mount of a worktree most likely gets the identity of the worktree's old mount, and slimtree can stop the new mount in its place", Fix: "upgrade to Linux 6.8 or later"}},
 		{err: errors.New("statx returned no mount ID: slimtree needs Linux 5.8 or later"), want: Result{Status: StatusFail, Detail: "statx returned no mount ID: slimtree needs Linux 5.8 or later", Fix: "upgrade to Linux 6.8 or later"}},
 	} {
 		p := healthyLinux()

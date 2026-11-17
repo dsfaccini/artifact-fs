@@ -34,8 +34,11 @@ func TestUnmountTriesALazyUnmountAndChecksTheMountWent(t *testing.T) {
 		// stays keeps the mount after a fake that exits 0.
 		stays   bool
 		mounted Identity
-		wantLog string
-		wantErr string
+		// afterFailedU, when set, is what is mounted once a normal unmount
+		// ran and failed.
+		afterFailedU *Identity
+		wantLog      string
+		wantErr      string
 	}{
 		{name: "normal", program: "fusermount3", mounted: "id", wantLog: "-u " + point},
 		{name: "lazy after a failed normal unmount", program: "fusermount3", exits: map[string]string{"-u": "1"}, mounted: "id", wantLog: "-u " + point + "\n-uz " + point},
@@ -44,6 +47,8 @@ func TestUnmountTriesALazyUnmountAndChecksTheMountWent(t *testing.T) {
 		{name: "another mount", program: "fusermount3", mounted: "other", wantErr: ErrOtherMount.Error()},
 		{name: "nothing mounted", program: "fusermount3", mounted: ""},
 		{name: "fusermount without fusermount3", program: "fusermount", mounted: "id", wantLog: "-u " + point},
+		{name: "gone after a failed normal unmount", program: "fusermount3", exits: map[string]string{"-u": "1"}, mounted: "id", afterFailedU: new(Identity), wantLog: "-u " + point},
+		{name: "another mount after a failed normal unmount", program: "fusermount3", exits: map[string]string{"-u": "1"}, mounted: "id", afterFailedU: new(Identity("other")), wantLog: "-u " + point, wantErr: ErrOtherMount.Error()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bin := t.TempDir()
@@ -62,6 +67,9 @@ func TestUnmountTriesALazyUnmountAndChecksTheMountWent(t *testing.T) {
 				}
 				if _, err := os.Stat(filepath.Join(bin, "gone")); err == nil && !tc.stays {
 					return "", nil
+				}
+				if log, _ := os.ReadFile(filepath.Join(bin, "log")); len(log) > 0 && tc.afterFailedU != nil {
+					return *tc.afterFailedU, nil
 				}
 				return tc.mounted, nil
 			}

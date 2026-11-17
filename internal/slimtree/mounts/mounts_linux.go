@@ -44,9 +44,8 @@ func mountID(path string) (uint64, bool, error) {
 }
 
 // UniqueMountIDs reports whether the kernel gives each mount an ID that no
-// later mount reuses, as Linux 6.8 and later do. Before 6.8, Identify tells a
-// mount from a later one at the same path by a reusable ID, the device and
-// the source. It fails before Linux 5.8, which reports no mount ID.
+// later mount reuses, as Linux 6.8 and later do. It fails before Linux 5.8,
+// which reports no mount ID.
 func UniqueMountIDs() (bool, error) {
 	_, unique, err := mountID("/")
 	return unique, err
@@ -75,7 +74,11 @@ func readMountinfo() ([]mountinfoEntry, error) {
 // Identify returns the identity of the artifact-fs mount at path, or "" when
 // nothing is mounted at path. It fails with ErrUnrelatedMount for any other
 // mount there. The identity holds the boot ID, the mount's ID, and the
-// mountinfo ID, device and source.
+// mountinfo ID, device and source. From Linux 6.8 the mount's ID is unique.
+// Before 6.8 it is the mountinfo ID, and both that ID and FUSE's device
+// number reuse the lowest free number, while the source is
+// artifact-fs:<repo>. So a later mount of the same repo at the same path
+// most likely gets the same identity.
 func Identify(path string) (Identity, error) {
 	point, err := mountPoint(path)
 	if err != nil {
@@ -242,46 +245,58 @@ func readStat(pid int) ([]string, error) {
 // no process has pid. The token is the boot ID and field 22 of
 // /proc/<pid>/stat, the start time in clock ticks since boot, which fork
 // sets and exec keeps. It reads no argv: right after exec, Linux shows an
-// empty cmdline until the new argv is in place. It answers for a zombie too.
-// A pid and its token name one process; two processes can share a token.
-// For a child of this process, only its wait status tells that it exited.
+// empty cmdline until the new argv is in place. It answers for a zombie too,
+// so a launcher can record the token of a child that already exited. A
+// matching token therefore does not mean that the process runs: Signal with
+// signal 0 tells that. A pid and its token name one process; two processes
+// can share a token. Tell that a child of this process exited only from its
+// wait status.
 func StartToken(pid int) (string, error) {
+	token, _, err := startTokenState(pid)
+	return token, err
+}
+
+// startTokenState returns StartToken's answer and whether the process has
+// exited: a zombie, or dead.
+func startTokenState(pid int) (string, bool, error) {
 	fields, err := readStat(pid)
 	if absent(err) {
-		return "", nil
+		return "", false, nil
 	}
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	boot, err := bootID()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return boot + ":" + fields[19], nil
+	return boot + ":" + fields[19], fields[0] == "Z" || fields[0] == "X", nil
 }
 
-// Signal sends sig to the process pid names while its start token is token,
-// and returns ErrGone otherwise. It opens a pidfd before it reads the token.
-// A process that held pid since before the open and still holds it is the
-// one the pidfd names, so no other process can take the signal.
+// Signal sends sig to the process pid names while its start token is token
+// and it has not exited, and returns ErrGone otherwise, also for a zombie.
+// With signal 0 it only tells whether the process runs. It opens a pidfd
+// before it reads the token. A process that held pid since before the open
+// and still holds it is the one the pidfd names, so no other process can
+// take the signal. The open fails for a pid no process leader holds, such as
+// a thread's ID, so the token decides then too.
 func Signal(pid int, token string, sig syscall.Signal) error {
 	if token == "" {
 		return errors.New("signal: no start token")
 	}
-	fd, err := unix.PidfdOpen(pid, 0)
-	if errors.Is(err, unix.ESRCH) {
-		return ErrGone
+	fd, openErr := unix.PidfdOpen(pid, 0)
+	if openErr == nil {
+		defer unix.Close(fd)
 	}
-	if err != nil {
-		return os.NewSyscallError("pidfd_open", err)
-	}
-	defer unix.Close(fd)
-	got, err := StartToken(pid)
+	got, exited, err := startTokenState(pid)
 	if err != nil {
 		return err
 	}
-	if got != token {
+	if got != token || exited {
 		return ErrGone
+	}
+	if openErr != nil {
+		return os.NewSyscallError("pidfd_open", openErr)
 	}
 	if err := unix.PidfdSendSignal(fd, sig, nil, 0); errors.Is(err, unix.ESRCH) {
 		return ErrGone
@@ -291,11 +306,13 @@ func Signal(pid int, token string, sig syscall.Signal) error {
 	return nil
 }
 
-// unmountPath unmounts path with fusermount3, else fusermount, which the
-// fuse library falls back to. A daemon that died leaves a mount the kernel
-// no longer serves, which a normal unmount can fail to take. A lazy unmount
-// then detaches it.
-func unmountPath(ctx context.Context, path string) error {
+// unmountPath unmounts the mount at path, whose identity is id, with
+// fusermount3, else fusermount, which the fuse library falls back to. A
+// daemon that died leaves a mount the kernel no longer serves, which a
+// normal unmount can fail to take. A lazy unmount then detaches it, but only
+// while identify still finds id at path: the normal unmount can fail
+// because the mount already went, and another mount can take the path.
+func unmountPath(ctx context.Context, path string, id Identity, identify func(string) (Identity, error)) error {
 	prog, err := exec.LookPath("fusermount3")
 	if err != nil {
 		if prog, err = exec.LookPath("fusermount"); err != nil {
@@ -305,6 +322,15 @@ func unmountPath(ctx context.Context, path string) error {
 	_, err = run(ctx, prog, "-u", path)
 	if err == nil {
 		return nil
+	}
+	got, idErr := identify(path)
+	switch {
+	case idErr != nil:
+		return fmt.Errorf("unmount %s: %w; then: %w", path, err, idErr)
+	case got == "":
+		return nil
+	case got != id:
+		return fmt.Errorf("unmount %s: %w", path, ErrOtherMount)
 	}
 	if _, lazyErr := run(ctx, prog, "-uz", path); lazyErr != nil {
 		return fmt.Errorf("unmount %s: %w; lazy unmount: %w", path, err, lazyErr)

@@ -74,7 +74,7 @@ func Unmount(ctx context.Context, path string, id Identity) error {
 	if got != id {
 		return fmt.Errorf("unmount %s: %w", point, ErrOtherMount)
 	}
-	if err := unmountPath(ctx, point); err != nil {
+	if err := unmountPath(ctx, point, id, identify); err != nil {
 		return err
 	}
 	if got, err = identify(point); err != nil {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -69,5 +70,24 @@ func TestRunStopsTheCommandsProcessGroupWhenItsContextEnds(t *testing.T) {
 			t.Fatalf("sleeper in the command's process group ended with %q, %v; want term", data, err)
 		}
 		return
+	}
+}
+
+// A command in an uninterruptible kernel wait outlives SIGKILL, and its wait
+// never returns. No process can be put in one without a mount, so the hook
+// holds the wait instead. Serial: it sets waitHook.
+func TestRunStopsWaitingForACommandThatOutlivesItsStop(t *testing.T) {
+	release := make(chan struct{})
+	waitHook = func() { <-release }
+	t.Cleanup(func() {
+		close(release)
+		waitHook = nil
+	})
+	dir := t.TempDir()
+	ctx, cancel := gittest.ExpireOnFile(t.Context(), filepath.Join(dir, "started"))
+	defer cancel()
+	_, err := run(ctx, os.Args[0], helper, "hang", dir)
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "had not exited "+stopGrace.String()+" after it was stopped") || !strings.Contains(err.Error(), os.Args[0]) {
+		t.Fatalf("run = %v; want the deadline, naming the command that has not exited", err)
 	}
 }
