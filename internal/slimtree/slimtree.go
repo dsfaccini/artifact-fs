@@ -4,12 +4,16 @@ package slimtree
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"runtime"
 
 	"github.com/cloudflare/artifact-fs/internal/cli"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
+	"github.com/cloudflare/artifact-fs/internal/slimtree/doctor"
 	"github.com/cloudflare/artifact-fs/internal/version"
 	ucli "github.com/urfave/cli/v3"
 )
@@ -32,12 +36,13 @@ func Main(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer
 			return cli.Run(ctx, args[2:], stdout, stderr)
 		}
 	}
-	return run(ctx, runtime.GOOS, args[1:], stdout, stderr)
+	return run(ctx, runtime.GOOS, doctor.System(), args[1:], stdout, stderr)
 }
 
-// run runs slimtree's own commands as they run on goos. The cli package sets
-// the urfave version printer, which prints "slimtree <version.String()>".
-func run(ctx context.Context, goos string, args []string, stdout io.Writer, stderr io.Writer) int {
+// run runs slimtree's own commands as they run on goos, reading the machine
+// through probe. The cli package sets the urfave version printer, which
+// prints "slimtree <version.String()>".
+func run(ctx context.Context, goos string, probe doctor.Probe, args []string, stdout io.Writer, stderr io.Writer) int {
 	app := &ucli.Command{
 		Name:      "slimtree",
 		Usage:     "disk-light git worktrees from an APFS clone or an artifact-fs mount",
@@ -52,10 +57,50 @@ func run(ctx context.Context, goos string, args []string, stdout io.Writer, stde
 				Validator: func(b string) error { return checkBackend(goos, backend(b)) },
 			},
 		},
+		Commands: []*ucli.Command{
+			{
+				Name:  "doctor",
+				Usage: "check what the backend needs in the current directory; installs nothing",
+				Flags: []ucli.Flag{&ucli.BoolFlag{Name: "json", Usage: "print the report as JSON"}},
+				Action: func(_ context.Context, c *ucli.Command) error {
+					dir, err := os.Getwd()
+					if err != nil {
+						return err
+					}
+					return printDoctor(stdout, doctor.Run(probe, goos, c.String("backend"), dir), c.Bool("json"))
+				},
+			},
+		},
 	}
 	if err := app.Run(ctx, append([]string{"slimtree"}, args...)); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
 	return 0
+}
+
+var errDoctorFailed = errors.New("doctor: a check failed")
+
+func printDoctor(w io.Writer, r doctor.Report, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(r); err != nil {
+			return err
+		}
+	} else {
+		for _, c := range r.Checks {
+			fmt.Fprintf(w, "%-4s  %-13s  %s\n", c.Status, c.ID, c.Detail)
+			if c.Status != doctor.StatusOK && c.Fix != "" {
+				fmt.Fprintf(w, "      fix: %s\n", c.Fix)
+			}
+		}
+		for _, m := range r.Reminders {
+			fmt.Fprintf(w, "reminder: %s\n", m)
+		}
+	}
+	if !r.OK {
+		return errDoctorFailed
+	}
+	return nil
 }

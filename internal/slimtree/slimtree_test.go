@@ -17,6 +17,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
+	"github.com/cloudflare/artifact-fs/internal/slimtree/doctor"
 )
 
 func TestDefaultBackendByPlatform(t *testing.T) {
@@ -44,13 +45,13 @@ func TestDefaultBackendByPlatform(t *testing.T) {
 				{backend: "nope", refusal: `unknown backend "nope": use apfsclone or artifactfs`},
 			} {
 				var stderr bytes.Buffer
-				code := run(t.Context(), tc.goos, []string{"--backend", c.backend}, io.Discard, &stderr)
+				code := run(t.Context(), tc.goos, doctor.Probe{}, []string{"--backend", c.backend}, io.Discard, &stderr)
 				if c.runs != (code == 0) || !c.runs && !strings.Contains(stderr.String(), c.refusal) {
 					t.Fatalf("--backend %s on %s: exit %d, stderr %q, want runs %v", c.backend, tc.goos, code, stderr.String(), c.runs)
 				}
 			}
 			var stdout bytes.Buffer
-			if code := run(t.Context(), tc.goos, []string{"--help"}, &stdout, io.Discard); code != 0 || !strings.Contains(stdout.String(), tc.usage) || !strings.Contains(stdout.String(), fmt.Sprintf("(default: %q)", tc.want)) {
+			if code := run(t.Context(), tc.goos, doctor.Probe{}, []string{"--help"}, &stdout, io.Discard); code != 0 || !strings.Contains(stdout.String(), tc.usage) || !strings.Contains(stdout.String(), fmt.Sprintf("(default: %q)", tc.want)) {
 				t.Fatalf("--help on %s: exit %d, stdout %q, want %q and the default", tc.goos, code, stdout.String(), tc.usage)
 			}
 		})
