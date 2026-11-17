@@ -276,17 +276,26 @@ func TestNewStartsWhereGitWorktreeAddStarts(t *testing.T) {
 		}
 	}
 
+	// In a detached worktree, HEAD names no branch to track. git worktree
+	// add, which runs in the base, would track the base's branch.
+	detached := filepath.Join(filepath.Dir(main), "detached")
+	gitIn(t, main, "worktree", "add", "-q", "--detach", detached, "topic")
 	for _, tc := range []struct {
+		dir  string
 		args []string
 		want string
 	}{
-		{[]string{"new", "topic", "--from", "main"}, "the branch topic exists; drop --from to check it out\n"},
-		{[]string{"new", "lone", "--track"}, "--track needs --from, the branch to track\n"},
+		{here, []string{"new", "topic", "--from", "main"}, "the branch topic exists; drop --from to check it out\n"},
+		{here, []string{"new", "lone", "--track"}, "--track needs --from, the branch to track\n"},
+		{detached, []string{"new", "lone", "--from", "HEAD", "--track"}, "--track needs --from to name a branch, and HEAD names none\n"},
+		{detached, []string{"new", "lone", "--from", "@", "--track"}, "--track needs --from to name a branch, and @ names none\n"},
 	} {
+		t.Chdir(tc.dir)
 		if code, stdout, stderr := slimtree(t.Context(), tc.args...); code != 1 || stdout != "" || stderr != tc.want {
 			t.Errorf("%s: exit %d, stdout %q, stderr %q; want 1 and %q", strings.Join(tc.args, " "), code, stdout, stderr, tc.want)
 		}
 	}
+	gitFindsNothing(t, main, "rev-parse", "--verify", "--quiet", "refs/heads/lone")
 }
 
 // A new that fails removes the worktree and the branch it made, and keeps a
@@ -327,8 +336,10 @@ func TestNewRollsBackWhatItMade(t *testing.T) {
 	gitFindsNothing(t, main, "config", "--get-regexp", `^branch\.feat\.`)
 
 	// git worktree add makes the branch, then refuses a directory that holds
-	// files.
+	// files. The rollback keeps the config new did not write.
 	cloneWith(t, nil)
+	gitIn(t, main, "config", "branch.made.pushRemote", "origin")
+	gitIn(t, main, "config", "branch.autoSetupRebase", "always")
 	for _, tc := range []struct {
 		args []string
 		// kept is the branch that must still point at topic.
@@ -348,7 +359,9 @@ func TestNewRollsBackWhatItMade(t *testing.T) {
 		}
 		if tc.gone != "" {
 			gitFindsNothing(t, main, "rev-parse", "--verify", "--quiet", "refs/heads/"+tc.gone)
-			gitFindsNothing(t, main, "config", "--get-regexp", `^branch\.`+tc.gone+`\.`)
+			if got := gitIn(t, main, "config", "--get-regexp", `^branch\.`+tc.gone+`\.`); got != "branch."+tc.gone+".pushremote origin\n" {
+				t.Fatalf("branch.%s config = %q, want pushremote alone", tc.gone, got)
+			}
 		}
 		if tc.kept != "" {
 			if got := gitIn(t, main, "rev-parse", tc.kept); got != topic {
@@ -435,6 +448,8 @@ func TestRmRefusesAWorktreeWithChanges(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(path, "notes.txt"), []byte("notes\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// git worktree remove would hide the file too, then delete it.
+	gitIn(t, main, "config", "status.showUntrackedFiles", "no")
 	want := "git status lists changes in " + path + "; commit them, or discard them with slimtree rm --force\n"
 	if code, stdout, stderr := slimtree(t.Context(), "rm", path); code != 1 || stdout != "" || stderr != want {
 		t.Fatalf("rm of a worktree with changes: exit %d, stdout %q, stderr %q; want 1 and %q", code, stdout, stderr, want)
@@ -499,6 +514,19 @@ func TestRmForceDropsAGoneWorktree(t *testing.T) {
 	if list := gitIn(t, main, "worktree", "list", "--porcelain"); !strings.Contains(list, "worktree "+path+"\n") {
 		t.Fatalf("a refused rm removed git's registration of %s:\n%s", path, list)
 	}
+	// A Ctrl-C once rm listed the worktrees fails the command, which changes
+	// nothing.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	goneListed = cancel
+	code, stdout, stderr := slimtree(ctx, "rm", "--force", path)
+	goneListed = nil
+	if code != 1 || stdout != "" || stderr != "context canceled\n" {
+		t.Fatalf("a canceled rm --force: exit %d, stdout %q, stderr %q; want 1 and context canceled", code, stdout, stderr)
+	}
+	if list := gitIn(t, main, "worktree", "list", "--porcelain"); !strings.Contains(list, "worktree "+path+"\n") || len(records(t)) != 1 {
+		t.Fatalf("a canceled rm --force removed the registration or the record:\n%s", list)
+	}
 	if code, stdout, stderr := slimtree(t.Context(), "rm", "--force", path); code != 0 || !strings.HasSuffix(stdout, " keeps its HEAD "+head+"\n") {
 		t.Fatalf("rm --force of a gone worktree: exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
@@ -506,4 +534,155 @@ func TestRmForceDropsAGoneWorktree(t *testing.T) {
 	if got := gitIn(t, main, "for-each-ref", "--format=%(objectname)", "refs/slimtree/"); got != head+"\n" {
 		t.Fatalf("recovery refs point at %q, want %s", got, head)
 	}
+}
+
+// A rollback keeps a branch that moved after new made it, and says so.
+func TestNewRollbackKeepsABranchThatMoved(t *testing.T) {
+	homeAfterFirstRun(t)
+	main := newRepo(t)
+	topic, moved := gitIn(t, main, "rev-parse", "topic"), gitIn(t, main, "rev-parse", "main")
+	path := filepath.Join(filepath.Dir(main), "main-feat")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	cloneWith(t, func(src, dst string) error {
+		if strings.HasPrefix(dst, path+string(filepath.Separator)) && ctx.Err() == nil {
+			gitIn(t, main, "update-ref", "refs/heads/feat", strings.TrimSpace(moved))
+			cancel()
+		}
+		return copyClone(src, dst)
+	})
+	want := "slimtree kept the branch feat, which it made at " + strings.TrimSpace(topic) + " and which now points at " + strings.TrimSpace(moved) + "\n"
+	if code, stdout, stderr := slimtree(ctx, "new", "feat", "--from", "topic"); code != 1 || stdout != "" || !strings.HasSuffix(stderr, want) {
+		t.Fatalf("new: exit %d, stdout %q, stderr %q; want 1 and %q", code, stdout, stderr, want)
+	}
+	requireNoWorktree(t, main, path)
+	if got := gitIn(t, main, "rev-parse", "feat"); got != moved {
+		t.Fatalf("feat points at %s, want %s", got, moved)
+	}
+}
+
+// new refuses a base that is not a worktree of the current repository, or
+// that slimtree.base names by a relative path, and creates nothing.
+func TestNewRefusesABaseOutsideTheRepository(t *testing.T) {
+	homeAfterFirstRun(t)
+	cloneWith(t, nil)
+	main := newRepo(t)
+	other := filepath.Join(filepath.Dir(main), "other")
+	gitIn(t, filepath.Dir(main), "init", "-q", "-b", "main", other)
+	gitIn(t, other, "commit", "-q", "--allow-empty", "-m", "other")
+	otherWorktrees := gitIn(t, other, "worktree", "list", "--porcelain")
+	for _, tc := range []struct{ base, want string }{
+		{"../other", "slimtree.base ../other is not an absolute path\n"},
+		{other, "the base " + other + " is not the top directory of a worktree of " + filepath.Join(main, ".git") + "; set git config slimtree.base to one\n"},
+	} {
+		gitIn(t, main, "config", "slimtree.base", tc.base)
+		if code, stdout, stderr := slimtree(t.Context(), "new", "feat"); code != 1 || stdout != "" || stderr != tc.want {
+			t.Errorf("new with slimtree.base %s: exit %d, stdout %q, stderr %q; want 1 and %q", tc.base, code, stdout, stderr, tc.want)
+		}
+	}
+	gitFindsNothing(t, main, "rev-parse", "--verify", "--quiet", "refs/heads/feat")
+	gitFindsNothing(t, other, "rev-parse", "--verify", "--quiet", "refs/heads/feat")
+	if got := gitIn(t, other, "worktree", "list", "--porcelain"); got != otherWorktrees {
+		t.Fatalf("other's worktrees = %q, want %q", got, otherWorktrees)
+	}
+	if got := records(t); len(got) != 0 {
+		t.Fatalf("records = %+v, want none", got)
+	}
+}
+
+// new runs the post-checkout hook holding no lock, so a hook can run
+// slimtree, and a long hook stalls no other command.
+func TestNewRunsPostCheckoutHoldingNoLock(t *testing.T) {
+	homeDir := homeAfterFirstRun(t)
+	cloneWith(t, nil)
+	main := newRepo(t)
+	probe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := execfile.Write(filepath.Join(main, ".git", "hooks", "post-checkout"), []byte("#!/bin/sh\nexec '"+probe+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(lockProbeEnv, filepath.Join(homeDir, "lock"))
+	if code, _, stderr := slimtree(t.Context(), "new", "feat"); code != 0 || !strings.Contains(stderr, "\nlock free\n") {
+		t.Fatalf("new: exit %d, stderr %q; want 0 and the hook's lock free", code, stderr)
+	}
+}
+
+// A Ctrl-C can land after git worktree add registered the worktree, before
+// Go reaped git, which then reports a failure. The rollback still removes
+// the worktree, also when a git worktree add that was killed left it locked
+// as initializing. A fake git runs the real git worktree add, locks the
+// worktree, then exits as a git that SIGINT stopped.
+func TestNewRollsBackAWorktreeGitRegisteredBeforeItFailed(t *testing.T) {
+	homeAfterFirstRun(t)
+	cloneWith(t, nil)
+	main := newRepo(t)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte("#!/bin/sh\nif [ \"$3 $4\" = \"worktree add\" ]; then\n"+
+		"  '"+realGit+"' \"$@\" || exit\n"+
+		"  eval \"dest=\\${$(($# - 1))}\"\n"+
+		"  '"+realGit+"' -C \"$2\" worktree lock --reason initializing \"$dest\" || exit\n"+
+		"  exit 130\nfi\nexec '"+realGit+"' \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	path := filepath.Join(filepath.Dir(main), "main-feat")
+	if code, stdout, stderr := slimtree(t.Context(), "new", "feat", "--from", "topic"); code != 1 || stdout != "" || !strings.Contains(stderr, "exit status 130") {
+		t.Fatalf("new: exit %d, stdout %q, stderr %q; want 1 and git's exit status 130", code, stdout, stderr)
+	}
+	requireNoWorktree(t, main, path)
+	gitFindsNothing(t, main, "rev-parse", "--verify", "--quiet", "refs/heads/feat")
+}
+
+// new refuses a path at which git registers a worktree, which a rollback
+// would otherwise remove.
+func TestNewRefusesAPathGitRegisters(t *testing.T) {
+	homeAfterFirstRun(t)
+	cloneWith(t, nil)
+	main := newRepo(t)
+	path := filepath.Join(filepath.Dir(main), "main-feat")
+	gitIn(t, main, "worktree", "add", "-q", "-b", "other", path)
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+	want := "git already registers a worktree at " + path + "\n"
+	if code, stdout, stderr := slimtree(t.Context(), "new", "feat", "--from", "topic"); code != 1 || stdout != "" || stderr != want {
+		t.Fatalf("new: exit %d, stdout %q, stderr %q; want 1 and %q", code, stdout, stderr, want)
+	}
+	if list := gitIn(t, main, "worktree", "list", "--porcelain"); !strings.Contains(list, "worktree "+path+"\n") {
+		t.Fatalf("git no longer registers %s:\n%s", path, list)
+	}
+	gitFindsNothing(t, main, "rev-parse", "--verify", "--quiet", "refs/heads/feat")
+}
+
+// On a case-insensitive volume, the Mac's default, new and rm accept a path
+// spelled in another case than the directory's: in slimtree.base, the
+// current directory, --path and rm's argument.
+func TestNewAndRmAcceptAnotherSpelling(t *testing.T) {
+	homeAfterFirstRun(t)
+	cloneWith(t, nil)
+	main := newRepo(t)
+	upper := filepath.Join(filepath.Dir(main), "MAIN")
+	if _, err := os.Stat(upper); err != nil {
+		t.Skipf("the volume is case-sensitive: %v", err)
+	}
+	work := filepath.Join(filepath.Dir(main), "work")
+	if err := os.Mkdir(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, main, "config", "slimtree.base", upper)
+	t.Chdir(upper)
+	path := filepath.Join(filepath.Dir(main), "WORK", "feat")
+	if code, stdout, stderr := slimtree(t.Context(), "new", "feat", "--path", path); code != 0 || stdout != path+"\n" {
+		t.Fatalf("new: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if code, stdout, stderr := slimtree(t.Context(), "rm", filepath.Join(work, "feat")); code != 0 {
+		t.Fatalf("rm: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	requireNoWorktree(t, main, path)
 }

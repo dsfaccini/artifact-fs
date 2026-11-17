@@ -132,7 +132,7 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 			},
 			{
 				Name:      "rm",
-				Usage:     "remove a worktree slimtree made; a recovery ref keeps its HEAD, and its branch stays",
+				Usage:     "remove a worktree slimtree made, with its ignored files, as git worktree remove does; a recovery ref keeps its HEAD, and its branch stays",
 				ArgsUsage: "<worktree>",
 				Flags:     []ucli.Flag{&ucli.BoolFlag{Name: "force", Usage: "discard the changes git status lists, or drop a worktree whose directory is gone"}},
 				Action: func(ctx context.Context, c *ucli.Command) error {

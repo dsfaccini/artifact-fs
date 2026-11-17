@@ -36,133 +36,180 @@ type newOptions struct {
 }
 
 // newWorktree makes an apfsclone worktree on o.branch, cloned from the base
-// worktree, and writes its record. It checks out o.branch when it exists, and
-// otherwise makes it at o.from, else at HEAD. It resolves o.from and HEAD in
-// the current directory, as git worktree add does. It removes the worktree
-// and the branch it made when it fails, except when only the post-checkout
-// hook failed, which leaves a complete worktree, as git worktree add does. It
-// prints the worktree's path to stdout.
+// worktree, writes its record, and prints its path to stdout. It then runs
+// the post-checkout hook, holding no lock, so the hook can run slimtree and a
+// long hook stalls no other command. A failed hook leaves the worktree and its
+// record, as git worktree add keeps its worktree.
 func newWorktree(ctx context.Context, home *state.Home, o newOptions, stdout, stderr io.Writer) error {
+	dest, head, err := makeWorktree(ctx, home, o, stdout, stderr)
+	if err != nil {
+		return err
+	}
+	return apfsclone.PostCheckout(ctx, dest, head, stderr, stderr)
+}
+
+// makeWorktree makes the worktree and its record for newWorktree, holding the
+// global lock, and returns its path and the commit it checks out. It checks
+// out o.branch when it exists, and otherwise makes it at o.from, else at
+// HEAD. It resolves o.from and HEAD in the current directory, as git worktree
+// add does. When it fails, it removes what it made.
+func makeWorktree(ctx context.Context, home *state.Home, o newOptions, stdout, stderr io.Writer) (string, string, error) {
 	if o.track && o.from == "" {
-		return errors.New("--track needs --from, the branch to track")
+		return "", "", errors.New("--track needs --from, the branch to track")
 	}
 	out, err := apfsclone.Git(ctx, ".", "check-ref-format", "--branch", o.branch)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	// check-ref-format expands @{-1}.
 	if strings.TrimSpace(string(out)) != o.branch {
-		return fmt.Errorf("%s is not a branch name", o.branch)
+		return "", "", fmt.Errorf("%s is not a branch name", o.branch)
 	}
 	repo, err := commonDir(ctx, "slimtree new")
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	base, err := baseWorktree(ctx, repo)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	dest := filepath.Join(filepath.Dir(base), filepath.Base(base)+"-"+path.Base(o.branch))
 	if o.path != "" {
 		if dest, err = state.Canonical(o.path); err != nil {
-			return err
+			return "", "", err
 		}
 	}
 	lock, err := home.Lock(ctx, dest)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	defer lock.Unlock()
 
 	existing, err := refCommit(ctx, ".", "refs/heads/"+o.branch)
 	if err != nil {
-		return err
+		return "", "", err
 	}
-	// start is the commit a new branch starts at, and "" for a branch that
-	// exists.
-	var start string
+	rb := rollback{repo: repo, base: base, dest: dest, branch: o.branch}
 	commit, addArgs := o.branch, []string(nil)
 	switch {
 	case existing != "" && o.from != "":
-		return fmt.Errorf("the branch %s exists; drop --from to check it out", o.branch)
+		return "", "", fmt.Errorf("the branch %s exists; drop --from to check it out", o.branch)
 	case existing != "":
 	default:
 		from := o.from
 		if from == "" {
 			from = "HEAD"
 		}
-		if start, err = refCommit(ctx, ".", from+"^{commit}"); err != nil {
-			return err
+		if rb.start, err = refCommit(ctx, ".", from+"^{commit}"); err != nil {
+			return "", "", err
 		}
-		if start == "" {
-			return fmt.Errorf("%s names no commit", from)
+		if rb.start == "" {
+			return "", "", fmt.Errorf("%s names no commit", from)
 		}
-		commit, addArgs = start, []string{"-b", o.branch}
+		commit, addArgs = rb.start, []string{"-b", o.branch}
 		if o.track {
 			// git worktree add resolves its start in the base, where
 			// @{upstream} and @{-1} can name another branch.
 			out, err := apfsclone.Git(ctx, ".", "rev-parse", "--symbolic-full-name", o.from)
 			if err != nil {
-				return err
+				return "", "", err
 			}
-			if commit = strings.TrimSpace(string(out)); commit == "" {
-				return fmt.Errorf("--track needs --from to name a branch, and %s names none", o.from)
+			commit = strings.TrimSpace(string(out))
+			if !strings.HasPrefix(commit, "refs/heads/") && !strings.HasPrefix(commit, "refs/remotes/") {
+				return "", "", fmt.Errorf("--track needs --from to name a branch, and %s names none", o.from)
 			}
 			addArgs = []string{"--track", "-b", o.branch}
+			if rb.unset, err = absentKeys(ctx, base, "branch."+o.branch, trackingKeys); err != nil {
+				return "", "", err
+			}
 		}
 	}
-
-	rb := rollback{base: base, dest: dest, branch: o.branch, start: start, track: o.track}
+	// A rollback removes the worktree git registers at dest, which must then
+	// be the one new made.
+	listed, err := worktreeList(ctx, repo)
+	if err != nil {
+		return "", "", err
+	}
+	if _, ok := listed[dest]; ok {
+		return "", "", fmt.Errorf("git already registers a worktree at %s", dest)
+	}
 	// git worktree add makes the directories above dest that are missing.
 	for dir := filepath.Dir(dest); !exists(dir); dir = filepath.Dir(dir) {
 		rb.missing = dir
 	}
+
 	result, err := apfsclone.Add(ctx, apfsclone.Options{Base: base, Path: dest, Commit: commit, AddArgs: addArgs,
 		Clone: cloneFile, Stdout: stderr, Stderr: stderr})
-	var hook *apfsclone.HookError
-	var incomplete *apfsclone.IncompleteError
-	rb.registered = errors.As(err, &incomplete)
-	if err == nil || errors.As(err, &hook) {
-		rb.registered = true
+	if err == nil {
 		r := state.Record{Backend: string(apfsClone), Path: dest, CommonDir: repo, Branch: o.branch,
 			Created: time.Now().UTC(), SlimtreeVersion: version.String()}
-		recordErr := home.Write(r)
-		if recordErr == nil {
+		if err = home.Write(r); err == nil {
 			fmt.Fprintf(stderr, "slimtree: cloned %d files from %s, wrote %d from Git\n", result.Cloned, base, result.Written)
 			fmt.Fprintln(stdout, dest)
-			return err
+			return dest, result.Head, nil
 		}
-		err = errors.Join(err, fmt.Errorf("writing the record of %s: %w", dest, recordErr))
+		err = fmt.Errorf("writing the record of %s: %w", dest, err)
 	}
 	if rollbackErr := rb.run(ctx); rollbackErr != nil {
-		return errors.Join(err, rollbackErr)
+		return "", "", errors.Join(err, rollbackErr)
 	}
-	return err
+	return "", "", err
 }
 
-// rollback is what a failed new made.
+// trackingKeys are the keys of a branch's config section that git branch
+// --track can write.
+var trackingKeys = []string{"remote", "merge", "rebase"}
+
+// absentKeys returns those of keys that the config section section in dir
+// does not set.
+func absentKeys(ctx context.Context, dir, section string, keys []string) ([]string, error) {
+	var absent []string
+	for _, k := range keys {
+		_, err := apfsclone.Git(ctx, dir, "config", "--get", section+"."+k)
+		var exit *exec.ExitError
+		switch {
+		case errors.As(err, &exit) && exit.ExitCode() == 1:
+			absent = append(absent, k)
+		case err != nil:
+			return nil, err
+		}
+	}
+	return absent, nil
+}
+
+// rollback is what a failed new can have made.
 type rollback struct {
-	base, dest string
-	// registered is set once git worktree add has registered dest.
-	registered bool
+	// repo is the repository's common dir, and base its base worktree.
+	repo, base, dest string
 	// missing is the highest directory above dest that did not exist, or "".
 	missing string
+	branch  string
 	// start is the commit new made branch at, or "" for a branch that
-	// existed. track is set when new made branch track another.
-	branch, start string
-	track         bool
+	// existed.
+	start string
+	// unset are the keys of branch's config section that were not set before
+	// new made branch track another.
+	unset []string
 }
 
-// run removes what a failed new made: the worktree, the directories above it
-// that git worktree add made, and the branch, when it still points at
-// rb.start, with its tracking config. It outlives ctx's cancellation, for at
-// most rollbackTimeout.
+// run removes what a failed new made: the worktree when git registers it,
+// the directories above it that git worktree add made, and the branch while
+// it still points at rb.start, with the tracking config new wrote. It
+// outlives ctx's cancellation, for at most rollbackTimeout.
 func (rb rollback) run(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
 	defer cancel()
-	if rb.registered {
-		if _, err := apfsclone.Git(ctx, rb.base, "worktree", "remove", "--force", rb.dest); err != nil {
-			return fmt.Errorf("slimtree left the incomplete worktree %s; remove it with git worktree remove --force %s, and the branch %s with git branch -D %s: %w", rb.dest, rb.dest, rb.branch, rb.branch, err)
+	// Whether git registered dest decides, not Add's error: a Ctrl-C can land
+	// after git worktree add registered it, before Go reaped git.
+	listed, err := worktreeList(ctx, rb.repo)
+	if err != nil {
+		return fmt.Errorf("slimtree cannot tell whether git registered %s, so it left it and the branch %s: %w", rb.dest, rb.branch, err)
+	}
+	if _, ok := listed[rb.dest]; ok {
+		// git worktree add locks its worktree as initializing until it ends,
+		// so one that was stopped leaves the lock.
+		if _, err := apfsclone.Git(ctx, rb.base, "worktree", "remove", "--force", "--force", rb.dest); err != nil {
+			return fmt.Errorf("slimtree left the incomplete worktree %s; remove it with git worktree remove --force --force %s, and the branch %s with git branch -D %s: %w", rb.dest, rb.dest, rb.branch, rb.branch, err)
 		}
 	}
 	for dir := filepath.Dir(rb.dest); rb.missing != ""; dir = filepath.Dir(dir) {
@@ -190,11 +237,15 @@ func (rb rollback) run(ctx context.Context) error {
 	if _, err := apfsclone.Git(ctx, rb.base, "update-ref", "-d", ref, rb.start); err != nil {
 		return err
 	}
-	if !rb.track {
-		return nil
+	for _, k := range rb.unset {
+		_, err := apfsclone.Git(ctx, rb.base, "config", "--unset-all", "branch."+rb.branch+"."+k)
+		// git config exits 5 for a key it does not set.
+		var exit *exec.ExitError
+		if err != nil && !(errors.As(err, &exit) && exit.ExitCode() == 5) {
+			return err
+		}
 	}
-	_, err = apfsclone.Git(ctx, rb.base, "config", "--remove-section", "branch."+rb.branch)
-	return err
+	return nil
 }
 
 // exists reports whether path exists.
@@ -229,16 +280,10 @@ func baseWorktree(ctx context.Context, repo string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("the base %s: %w", base, err)
 	}
-	if common, top, ok := strings.Cut(strings.TrimSpace(string(out)), "\n"); ok && canonicalIs(common, repo) && canonicalIs(top, base) {
+	if common, top, ok := strings.Cut(strings.TrimSpace(string(out)), "\n"); ok && state.SamePath(common, repo) && state.SamePath(top, base) {
 		return base, nil
 	}
 	return "", fmt.Errorf("the base %s is not the top directory of a worktree of %s; set git config slimtree.base to one", base, repo)
-}
-
-// canonicalIs reports whether path, made canonical, is want.
-func canonicalIs(path, want string) bool {
-	c, err := state.Canonical(path)
-	return err == nil && c == want
 }
 
 // refCommit returns the object ID that rev in dir names, or "" when it names

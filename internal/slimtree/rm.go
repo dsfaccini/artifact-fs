@@ -14,11 +14,16 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 )
 
-// removeWorktree removes the apfsclone worktree arg names, and its record.
-// Without force, it refuses a worktree in which git status lists anything,
-// and a worktree whose directory is gone, which can be on a volume that is
-// not mounted. It first writes the worktree's HEAD to a recovery ref in the
-// repository, and never deletes a branch.
+// goneListed, when set, runs once rm has listed the worktrees of a gone
+// worktree's repository. Tests use it to cancel the command there.
+var goneListed func()
+
+// removeWorktree removes the apfsclone worktree arg names, with its ignored
+// files, as git worktree remove does, and its record. Without force, it
+// refuses a worktree in which git status lists a change or an untracked file,
+// whatever the config hides, and a worktree whose directory is gone, which
+// can be on a volume that is not mounted. It first writes the worktree's HEAD
+// to a recovery ref in the repository, and never deletes a branch.
 func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, goos, arg string, force bool, stdout io.Writer) error {
 	lock, err := home.Lock(ctx, "")
 	if err != nil {
@@ -43,7 +48,13 @@ func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, g
 			return fmt.Errorf("%s is gone; if its volume is not mounted, mount it and rerun. slimtree rm --force removes git's registration of it and its record", r.Path)
 		}
 		listed, err := worktreeList(ctx, r.CommonDir)
-		if errors.Is(err, errWorktreeListTimeout) || ctx.Err() != nil {
+		if goneListed != nil {
+			goneListed()
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if errors.Is(err, errWorktreeListTimeout) {
 			return err
 		}
 		// A repository git cannot read holds no registration.
@@ -58,11 +69,13 @@ func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, g
 		if err != nil {
 			return fmt.Errorf("slimtree removes nothing at %s, which is not a worktree of %s: %w", r.Path, r.CommonDir, err)
 		}
-		if len(lines) != 3 || !canonicalIs(lines[0], r.CommonDir) || !canonicalIs(lines[1], r.Path) {
+		if len(lines) != 3 || !state.SamePath(lines[0], r.CommonDir) || !state.SamePath(lines[1], r.Path) {
 			return fmt.Errorf("slimtree removes nothing at %s, which is not a worktree of %s", r.Path, r.CommonDir)
 		}
 		head = lines[2]
-		status, err := apfsclone.Git(ctx, r.Path, "status", "--porcelain")
+		// git worktree remove hides what the config hides, such as untracked
+		// files under status.showUntrackedFiles=no, and then deletes them.
+		status, err := apfsclone.Git(ctx, r.Path, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none")
 		if err != nil {
 			return err
 		}

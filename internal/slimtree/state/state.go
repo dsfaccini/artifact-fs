@@ -164,9 +164,9 @@ func (h *Home) Records(skipped func(error)) ([]Record, error) {
 // Resolve returns the record of the worktree arg names. An arg that holds a
 // path separator, or is . or .., is a path. Any other arg is a worktree's
 // name, and then a path below the current directory. Resolve refuses a name
-// that also names an existing path below the current directory other than
-// that worktree, so a command never acts on another worktree than the
-// directory the user sees.
+// while ./name exists and is not that worktree, so a command never acts on
+// another worktree than the directory the user sees. It checks ./name only,
+// no path deeper below.
 func (h *Home) Resolve(arg string) (Record, error) {
 	records, err := h.Records(nil)
 	if err != nil {
@@ -181,10 +181,8 @@ func (h *Home) Resolve(arg string) (Record, error) {
 		}
 		switch len(named) {
 		case 1:
-			if _, err := os.Lstat(arg); err == nil {
-				if here, err := Canonical(arg); err != nil || here != named[0].Path {
-					return Record{}, fmt.Errorf("%s names the worktree %s and also ./%s; name the one you mean by its path", arg, named[0].Path, arg)
-				}
+			if _, err := os.Lstat(arg); err == nil && !SamePath(arg, named[0].Path) {
+				return Record{}, fmt.Errorf("%s names the worktree %s and also ./%s; name the one you mean by its path", arg, named[0].Path, arg)
 			}
 			return named[0], nil
 		case 0:
@@ -205,7 +203,29 @@ func (h *Home) Resolve(arg string) (Record, error) {
 			return r, nil
 		}
 	}
+	// A case-insensitive volume, the Mac's default, names one directory in
+	// many spellings.
+	for _, r := range records {
+		if SamePath(r.Path, path) {
+			return r, nil
+		}
+	}
 	return Record{}, fmt.Errorf("slimtree made no worktree %s", arg)
+}
+
+// SamePath reports whether a and b name one file: the same string, or two
+// existing paths os.SameFile matches, as two spellings of a directory on a
+// case-insensitive volume are.
+func SamePath(a, b string) bool {
+	if a == b {
+		return true
+	}
+	ia, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	ib, err := os.Stat(b)
+	return err == nil && os.SameFile(ia, ib)
 }
 
 // Canonical returns path absolute, with the symlinks of its longest existing

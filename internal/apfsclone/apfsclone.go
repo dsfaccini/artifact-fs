@@ -82,8 +82,7 @@ type Options struct {
 	AddArgs []string
 	// Clone clones one file. nil uses clonefile(2), which only macOS has.
 	Clone Clonefile
-	// Stdout and Stderr receive the output of git worktree add and of the
-	// post-checkout hook.
+	// Stdout and Stderr receive the output of git worktree add.
 	Stdout, Stderr io.Writer
 
 	// beforeRegister, afterRegister and afterRewrite are test hooks that
@@ -96,8 +95,10 @@ type Options struct {
 	afterRewrite   func(paths []string)
 }
 
-// Result counts the files of a worktree that Add made.
+// Result describes a worktree that Add made.
 type Result struct {
+	// Head is the commit in the worktree's index, which PostCheckout takes.
+	Head string
 	// Cloned counts the files that are clones of the base's files.
 	Cloned int
 	// Written counts the entries that Git wrote.
@@ -117,19 +118,6 @@ func (e *IncompleteError) Error() string {
 
 func (e *IncompleteError) Unwrap() error { return e.Err }
 
-// A HookError is a failure of the post-checkout hook. The worktree is
-// complete, and git worktree add keeps it too when its hook fails.
-type HookError struct {
-	Path string
-	Err  error
-}
-
-func (e *HookError) Error() string {
-	return fmt.Sprintf("the post-checkout hook in %s failed: %v", e.Path, e.Err)
-}
-
-func (e *HookError) Unwrap() error { return e.Err }
-
 // entry is a tree entry's mode and object ID.
 type entry struct{ mode, oid string }
 
@@ -145,12 +133,8 @@ type tree struct {
 // commit, a checkout that converts files, and a base and a worktree parent
 // that are not on one APFS volume. When the new worktree's HEAD is another
 // commit than the one Add checked, it checks that commit's attributes too.
-// After the worktree is filled it runs the post-checkout hook with the
-// arguments git worktree add passes it, and returns the hook's failure as a
-// HookError. It runs the hook through git hook run, which also runs the hooks
-// that config defines. Unlike git worktree add, which unsets GIT_DIR and
-// GIT_WORK_TREE for its hook, git hook run exports GIT_DIR, the new
-// worktree's git dir.
+// Add does not run the post-checkout hook, which git worktree add runs once
+// the worktree is filled. Run it with PostCheckout.
 func Add(ctx context.Context, o Options) (Result, error) {
 	clone := o.Clone
 	if clone == nil {
@@ -218,18 +202,27 @@ func Add(ctx context.Context, o Options) (Result, error) {
 	if err != nil {
 		return Result{}, &IncompleteError{dest, err}
 	}
-	// The lock is released, so the hook can make a worktree. The hook runs in
-	// this process's group, as git worktree add runs it, so it can read the
-	// terminal. A background group would stop it at the first read.
-	hook := exec.CommandContext(ctx, "git", "-C", dest, "hook", "run", "--ignore-missing", "post-checkout", "--",
+	result.Head = head
+	return result, nil
+}
+
+// PostCheckout runs the post-checkout hook of the worktree at path, which Add
+// filled with head, with the arguments git worktree add passes it. It runs
+// the hook through git hook run, which also runs the hooks that config
+// defines. Unlike git worktree add, which unsets GIT_DIR and GIT_WORK_TREE for
+// its hook, git hook run exports GIT_DIR, the new worktree's git dir. The
+// hook runs in this process's group, as git worktree add runs it, so it can
+// read the terminal. A background group would stop it at the first read.
+func PostCheckout(ctx context.Context, path, head string, stdout, stderr io.Writer) error {
+	hook := exec.CommandContext(ctx, "git", "-C", path, "hook", "run", "--ignore-missing", "post-checkout", "--",
 		strings.Repeat("0", len(head)), head, "1")
 	hook.Cancel = func() error { return hook.Process.Signal(syscall.SIGTERM) }
 	hook.WaitDelay = gitstore.GitCommandWaitDelay
-	hook.Stdout, hook.Stderr = o.Stdout, o.Stderr
+	hook.Stdout, hook.Stderr = stdout, stderr
 	if err := hook.Run(); err != nil {
-		return result, &HookError{dest, err}
+		return fmt.Errorf("the post-checkout hook in %s failed: %w", path, err)
 	}
-	return result, nil
+	return nil
 }
 
 // register runs git worktree add --no-checkout, resolves the new worktree's
@@ -597,7 +590,7 @@ func checkoutIndex(ctx context.Context, worktree string, paths []string) error {
 	return err
 }
 
-// configureGit makes cmd, a git that Add runs other than the hook's, stop as
+// configureGit makes cmd, a git that Add runs, stop as
 // gitstore's commands stop, and start it in its own session with prompts off.
 // A partial-clone base makes git fetch missing objects. Without a terminal, a
 // prompt fails instead of stopping git.
