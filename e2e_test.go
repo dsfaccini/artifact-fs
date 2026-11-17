@@ -130,9 +130,31 @@ func writeTestFile(t *testing.T, dir, name, content string) {
 var renameEINTRRetries atomic.Int64
 
 // renameInMount renames oldPath to newPath through the mount with
-// unix.Rename.
+// unix.Rename, and retries while the rename returns EINTR, as os.Rename does.
+// The mount answers an op that a signal interrupted while it waited for a
+// blob to hydrate with EINTR, and changes nothing. The test process serves
+// the mount, so its threads take signals, such as the runtime's preemption
+// signal or SIGCHLD from the daemon's git, while they wait in an op.
 func renameInMount(oldPath, newPath string) error {
-	return unix.Rename(oldPath, newPath)
+	for {
+		err := unix.Rename(oldPath, newPath)
+		if err != unix.EINTR {
+			return err
+		}
+		renameEINTRRetries.Add(1)
+	}
+}
+
+// openatInMount opens path below dirFD, a directory of the mount, with
+// unix.Openat, and retries while the open returns EINTR, as renameInMount
+// does. An open hydrates the file's blob.
+func openatInMount(dirFD int, path string, flags int, mode uint32) (int, error) {
+	for {
+		fd, err := unix.Openat(dirFD, path, flags, mode)
+		if err != unix.EINTR {
+			return fd, err
+		}
+	}
 }
 
 func run(t *testing.T, dir string, name string, args ...string) string {
@@ -410,7 +432,7 @@ func TestE2EFilesystemDirectoryRenamePersistsAcrossRestart(t *testing.T) {
 	repo := newMountedE2ERepo(t)
 
 	renamedRoot := filepath.Join(repo.mountPath, "packages", "wrangler-pending")
-	if err := unix.Rename(filepath.Join(repo.mountPath, "packages", "wrangler"), renamedRoot); err != nil {
+	if err := renameInMount(filepath.Join(repo.mountPath, "packages", "wrangler"), renamedRoot); err != nil {
 		t.Fatal(err)
 	}
 	trackedDestination := filepath.Join(repo.mountPath, "packages", "miniflare")
@@ -424,7 +446,7 @@ func TestE2EFilesystemDirectoryRenamePersistsAcrossRestart(t *testing.T) {
 	if err := writeMountFile(filepath.Join(replacementSource, "nested", "incoming.txt"), []byte("incoming\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Rename(replacementSource, trackedDestination); err != nil {
+	if err := renameInMount(replacementSource, trackedDestination); err != nil {
 		t.Fatal(err)
 	}
 
@@ -844,7 +866,7 @@ func testE2EFilesystemDirectoryRenameConcurrentAccess(t *testing.T, repo *mounte
 		if time.Now().After(deadline) {
 			break
 		}
-		if renameErr = unix.Rename(current, next); renameErr != nil {
+		if renameErr = renameInMount(current, next); renameErr != nil {
 			break
 		}
 		current, next = next, current
@@ -989,7 +1011,7 @@ func testE2ECLIDirectoryMove(t *testing.T, repo *mountedE2ERepo) {
 	// An openat through the moved directory descriptor is the test's
 	// subject, so the test process opens the file, and closes it before the
 	// next fork (e2e_files_test.go).
-	childFD, err := unix.Openat(dirFD, "payload.bin", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	childFD, err := openatInMount(dirFD, "payload.bin", unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		t.Fatalf("openat through moved directory descriptor: %v", err)
 	}
@@ -1020,7 +1042,7 @@ func testE2ECLIDirectoryMove(t *testing.T, repo *mountedE2ERepo) {
 	}
 
 	crossParent := filepath.Join(sibling, "nested")
-	if err := unix.Rename(filepath.Join(moved, "nested"), crossParent); err != nil {
+	if err := renameInMount(filepath.Join(moved, "nested"), crossParent); err != nil {
 		t.Fatalf("cross-parent directory rename: %v", err)
 	}
 	assertPathMissing(t, filepath.Join(moved, "nested"))
@@ -1060,7 +1082,7 @@ func testE2ERecursiveCopyMoveAndReplace(t *testing.T, repo *mountedE2ERepo) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Rename(copiedMoved, emptyDestination); err != nil {
+	if err := renameInMount(copiedMoved, emptyDestination); err != nil {
 		sourceEntries, sourceReadErr := os.ReadDir(copiedMoved)
 		destinationEntries, destinationReadErr := os.ReadDir(emptyDestination)
 		t.Fatalf(
@@ -1134,7 +1156,7 @@ func assertReplacedDirectoryHandleMatchesNative(t *testing.T, mountedHandle *os.
 	if nativeChildFD >= 0 {
 		_ = unix.Close(nativeChildFD)
 	}
-	mountedChildFD, mountedOpenErr := unix.Openat(int(mountedHandle.Fd()), incomingChild, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	mountedChildFD, mountedOpenErr := openatInMount(int(mountedHandle.Fd()), incomingChild, unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if mountedChildFD >= 0 {
 		_ = unix.Close(mountedChildFD)
 	}
@@ -1167,7 +1189,7 @@ func testE2EReplaceVisibleEmptyTrackedDirectory(t *testing.T, repo *mountedE2ERe
 	if err := writeMountFile(filepath.Join(source, "nested", "incoming.txt"), []byte("incoming\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Rename(source, destination); err != nil {
+	if err := renameInMount(source, destination); err != nil {
 		t.Fatal(err)
 	}
 	assertPathMissing(t, source)
@@ -1213,7 +1235,7 @@ func testE2ERejectNonemptyDirectoryReplacement(t *testing.T, repo *mountedE2ERep
 	if err := writeMountFile(filepath.Join(rejectedDestination, "destination.txt"), []byte("destination\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Rename(rejectedSource, rejectedDestination); !errors.Is(err, unix.ENOTEMPTY) {
+	if err := renameInMount(rejectedSource, rejectedDestination); !errors.Is(err, unix.ENOTEMPTY) {
 		t.Fatalf("rename over nonempty destination error = %v, want ENOTEMPTY", err)
 	}
 	if got := readFileStr(t, filepath.Join(rejectedSource, "source.txt")); got != "source\n" {
