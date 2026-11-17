@@ -117,6 +117,19 @@ func (e *IncompleteError) Error() string {
 
 func (e *IncompleteError) Unwrap() error { return e.Err }
 
+// A HookError is a failure of the post-checkout hook. The worktree is
+// complete, and git worktree add keeps it too when its hook fails.
+type HookError struct {
+	Path string
+	Err  error
+}
+
+func (e *HookError) Error() string {
+	return fmt.Sprintf("the post-checkout hook in %s failed: %v", e.Path, e.Err)
+}
+
+func (e *HookError) Unwrap() error { return e.Err }
+
 // entry is a tree entry's mode and object ID.
 type entry struct{ mode, oid string }
 
@@ -133,10 +146,11 @@ type tree struct {
 // that are not on one APFS volume. When the new worktree's HEAD is another
 // commit than the one Add checked, it checks that commit's attributes too.
 // After the worktree is filled it runs the post-checkout hook with the
-// arguments git worktree add passes it, and returns the hook's failure. It
-// runs the hook through git hook run, which also runs the hooks that config
-// defines. Unlike git worktree add, which unsets GIT_DIR and GIT_WORK_TREE
-// for its hook, git hook run exports GIT_DIR, the new worktree's git dir.
+// arguments git worktree add passes it, and returns the hook's failure as a
+// HookError. It runs the hook through git hook run, which also runs the hooks
+// that config defines. Unlike git worktree add, which unsets GIT_DIR and
+// GIT_WORK_TREE for its hook, git hook run exports GIT_DIR, the new
+// worktree's git dir.
 func Add(ctx context.Context, o Options) (Result, error) {
 	clone := o.Clone
 	if clone == nil {
@@ -213,7 +227,7 @@ func Add(ctx context.Context, o Options) (Result, error) {
 	hook.WaitDelay = gitstore.GitCommandWaitDelay
 	hook.Stdout, hook.Stderr = o.Stdout, o.Stderr
 	if err := hook.Run(); err != nil {
-		return result, fmt.Errorf("the post-checkout hook in %s failed: %w", dest, err)
+		return result, &HookError{dest, err}
 	}
 	return result, nil
 }
@@ -591,6 +605,12 @@ func configureGit(cmd *exec.Cmd) {
 	gitstore.ConfigureCancelableCommand(cmd)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS=", "SSH_ASKPASS_REQUIRE=never")
+}
+
+// Git runs git -C dir with args as Add runs its git commands, and returns its
+// stdout. Its error quotes git's stderr, bounded and redacted.
+func Git(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	return git(ctx, dir, nil, args...)
 }
 
 // git runs git -C dir with args and stdin, and returns its stdout.
