@@ -116,6 +116,21 @@ const (
 	gitErrorTruncatedLabel = "[git stderr truncated]"
 )
 
+// BoundedStderr collects a git command's stderr for an error message, bounded
+// as this package's commands bound theirs.
+type BoundedStderr struct{ b boundedGitError }
+
+// NewBoundedStderr returns a BoundedStderr that keeps the first 16 KiB.
+func NewBoundedStderr() *BoundedStderr {
+	return &BoundedStderr{b: boundedGitError{limit: maxGitErrorBytes}}
+}
+
+func (s *BoundedStderr) Write(p []byte) (int, error) { return s.b.Write(p) }
+
+// String returns the kept stderr. A cut stderr drops the token the cut split,
+// which redaction would not recognize, and ends with a truncation label.
+func (s *BoundedStderr) String() string { return s.b.String() }
+
 type boundedGitError struct {
 	buf          bytes.Buffer
 	limit        int

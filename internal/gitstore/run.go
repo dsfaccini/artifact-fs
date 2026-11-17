@@ -159,9 +159,9 @@ func isCancellationSignal(msg string) bool {
 
 // ConfigureCancelableCommand makes cmd stop as every git command of this
 // package stops when its context ends: its process group gets SIGTERM, then
-// SIGKILL after gitCommandWaitDelay, through terminateCommandProcessGroup.
+// SIGKILL after GitCommandWaitDelay, through terminateCommandProcessGroup.
 func ConfigureCancelableCommand(cmd *exec.Cmd) {
 	configureCommandProcessGroup(cmd)
 	cmd.Cancel = func() error { return terminateCommandProcessGroup(cmd) }
-	cmd.WaitDelay = gitCommandWaitDelay
+	cmd.WaitDelay = GitCommandWaitDelay
 }

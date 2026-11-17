@@ -443,7 +443,7 @@ func (s *Store) fetchRef(ctx context.Context, repo model.RepoConfig, ref string,
 // the lookup, so a failure that comes first still redacts against origin and
 // keeps its cause. When ctx ends while the lookup still runs, it reports the
 // remotes incomplete. The returned stop cancels the lookup and returns once
-// its git has exited, at most about gitCommandWaitDelay later, so no git the
+// its git has exited, at most about GitCommandWaitDelay later, so no git the
 // operation started outlives it.
 func (s *Store) startRemotesForLogging(ctx context.Context, repo model.RepoConfig) (func() ([]string, bool), func()) {
 	type lookupResult struct {
@@ -674,10 +674,10 @@ func refOIDOrZero(ctx context.Context, gitDir string, refName string) (string, e
 const defaultRollbackTimeout = 20 * time.Second
 
 // RollbackBound bounds how long PrepareFetchedBranch runs once its context
-// ends: the git command the cancel stops exits within gitCommandWaitDelay,
-// then the rollback ends at its deadline, plus gitCommandWaitDelay for the git
+// ends: the git command the cancel stops exits within GitCommandWaitDelay,
+// then the rollback ends at its deadline, plus GitCommandWaitDelay for the git
 // command that deadline stops. The daemon's drain must outlast it.
-const RollbackBound = defaultRollbackTimeout + 2*gitCommandWaitDelay
+const RollbackBound = defaultRollbackTimeout + 2*GitCommandWaitDelay
 
 // defaultRollbackContext is the context of one rollback: it outlives ctx's
 // cancellation and ends after defaultRollbackTimeout.

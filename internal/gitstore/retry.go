@@ -17,7 +17,9 @@ const (
 	GitOperationClone GitOperation = "clone"
 	GitOperationFetch GitOperation = "fetch"
 
-	gitCommandWaitDelay = 250 * time.Millisecond
+	// GitCommandWaitDelay is how long a stopped git gets after SIGTERM, before
+	// SIGKILL and before its Wait stops waiting for its output.
+	GitCommandWaitDelay = 250 * time.Millisecond
 
 	logGitOperationAttemptFailed = "git operation attempt failed"
 	logGitOperationRetrying      = "retrying transient git operation failure"
