@@ -22,7 +22,7 @@ func apfs(dir string) error {
 	}
 	f, err := os.CreateTemp(dir, ".slimtree-probe-")
 	if err != nil {
-		return err
+		return fmt.Errorf("%w in %s: %w", errNotWritable, dir, err)
 	}
 	src := f.Name()
 	defer os.Remove(src)
