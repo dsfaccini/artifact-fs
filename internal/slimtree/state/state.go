@@ -181,7 +181,7 @@ func (h *Home) Resolve(arg string) (Record, error) {
 		}
 		switch len(named) {
 		case 1:
-			if _, err := os.Lstat(arg); err == nil && !SamePath(arg, named[0].Path) {
+			if _, err := os.Lstat(arg); err == nil && !sameCanonical(arg, named[0].Path) {
 				return Record{}, fmt.Errorf("%s names the worktree %s and also ./%s; name the one you mean by its path", arg, named[0].Path, arg)
 			}
 			return named[0], nil
@@ -215,17 +215,25 @@ func (h *Home) Resolve(arg string) (Record, error) {
 
 // SamePath reports whether a and b name one file: the same string, or two
 // existing paths os.SameFile matches, as two spellings of a directory on a
-// case-insensitive volume are.
+// case-insensitive volume are. It follows no symlink, so a symlink at a
+// worktree's path never matches the directory it points at.
 func SamePath(a, b string) bool {
 	if a == b {
 		return true
 	}
-	ia, err := os.Stat(a)
+	ia, err := os.Lstat(a)
 	if err != nil {
 		return false
 	}
-	ib, err := os.Stat(b)
+	ib, err := os.Lstat(b)
 	return err == nil && os.SameFile(ia, ib)
+}
+
+// sameCanonical reports whether path, with its symlinks resolved, is the
+// record path want.
+func sameCanonical(path, want string) bool {
+	c, err := Canonical(path)
+	return err == nil && SamePath(c, want)
 }
 
 // Canonical returns path absolute, with the symlinks of its longest existing

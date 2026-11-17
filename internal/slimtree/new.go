@@ -140,6 +140,8 @@ func makeWorktree(ctx context.Context, home *state.Home, o newOptions, stdout, s
 
 	result, err := apfsclone.Add(ctx, apfsclone.Options{Base: base, Path: dest, Commit: commit, AddArgs: addArgs,
 		Clone: cloneFile, Stdout: stderr, Stderr: stderr})
+	var incomplete *apfsclone.IncompleteError
+	rb.added = err == nil || errors.As(err, &incomplete)
 	if err == nil {
 		r := state.Record{Backend: string(apfsClone), Path: dest, CommonDir: repo, Branch: o.branch,
 			Created: time.Now().UTC(), SlimtreeVersion: version.String()}
@@ -190,12 +192,15 @@ type rollback struct {
 	// unset are the keys of branch's config section that were not set before
 	// new made branch track another.
 	unset []string
+	// added is set when Add reports that its git worktree add registered
+	// dest.
+	added bool
 }
 
-// run removes what a failed new made: the worktree when git registers it,
-// the directories above it that git worktree add made, and the branch while
-// it still points at rb.start, with the tracking config new wrote. It
-// outlives ctx's cancellation, for at most rollbackTimeout.
+// run removes what a failed new made: the worktree new registered, the
+// directories above it that git worktree add made, and the branch while it
+// still points at rb.start, with the tracking config new wrote. It outlives
+// ctx's cancellation, for at most rollbackTimeout.
 func (rb rollback) run(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
 	defer cancel()
@@ -205,7 +210,16 @@ func (rb rollback) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("slimtree cannot tell whether git registered %s, so it left it and the branch %s: %w", rb.dest, rb.branch, err)
 	}
-	if _, ok := listed[rb.dest]; ok {
+	// Another process can register dest after makeWorktree checked it, and
+	// outside the global lock. A registration on another branch is never
+	// new's: new never detaches, and git checks out a branch only once. One on
+	// a branch that existed can be another process's, which git refused to
+	// check out again for new, unless Add reports that it registered dest.
+	switch w, ok := listed[rb.dest]; {
+	case !ok || w.branch != rb.branch:
+	case rb.start == "" && !rb.added:
+		return fmt.Errorf("slimtree kept the worktree %s on %s, which another process can have made; if new made it, remove it with git worktree remove --force --force %s", rb.dest, rb.branch, rb.dest)
+	default:
 		// git worktree add locks its worktree as initializing until it ends,
 		// so one that was stopped leaves the lock.
 		if _, err := apfsclone.Git(ctx, rb.base, "worktree", "remove", "--force", "--force", rb.dest); err != nil {

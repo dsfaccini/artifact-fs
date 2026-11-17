@@ -490,6 +490,18 @@ func TestRmRefusesANameThatAlsoNamesADirectoryHere(t *testing.T) {
 	if got := gitIn(t, path, "status", "--porcelain"); got != "" {
 		t.Fatalf("git status in %s lists %q", path, got)
 	}
+
+	// ./feat that is a symlink to the worktree names the worktree.
+	if err := os.Remove(filepath.Join(main, "feat")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(path, filepath.Join(main, "feat")); err != nil {
+		t.Fatal(err)
+	}
+	if code, stdout, stderr := slimtree(t.Context(), "rm", "feat"); code != 0 {
+		t.Fatalf("rm feat through a symlink to it: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	requireNoWorktree(t, main, path)
 }
 
 // rm refuses a worktree whose directory is gone, which can be on a volume
@@ -685,4 +697,90 @@ func TestNewAndRmAcceptAnotherSpelling(t *testing.T) {
 		t.Fatalf("rm: exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
 	requireNoWorktree(t, main, path)
+}
+
+// Another process can register the worktree's path after new checked it,
+// outside slimtree's lock, as a plain git worktree add or another new's
+// post-checkout hook can. new's git worktree add then fails, and the rollback
+// keeps that worktree and its files: on another branch, and on a branch that
+// existed, since git refused to check it out for new too.
+func TestNewRollbackKeepsAWorktreeAnotherProcessRegistered(t *testing.T) {
+	for _, tc := range []struct {
+		name, branch, foreign string
+		args                  []string
+		want                  string
+	}{
+		{name: "new branch", branch: "feat", foreign: "foreign", args: []string{"new", "feat", "--from", "topic"}, want: "already exists"},
+		{name: "existing branch", branch: "topic", foreign: "topic", args: []string{"new", "topic"}, want: "slimtree kept the worktree "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			homeAfterFirstRun(t)
+			main := newRepo(t)
+			path := filepath.Join(filepath.Dir(main), "main-"+tc.branch)
+			registered := false
+			// Preflight's probe is the first clone, before new's git
+			// worktree add.
+			cloneWith(t, func(src, dst string) error {
+				if !registered {
+					registered = true
+					args := []string{"worktree", "add", "-q", path, tc.foreign}
+					if tc.foreign != tc.branch {
+						args = []string{"worktree", "add", "-q", "-b", tc.foreign, path}
+					}
+					gitIn(t, main, args...)
+					if err := os.WriteFile(filepath.Join(path, "precious.txt"), []byte("precious\n"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return copyClone(src, dst)
+			})
+			if code, stdout, stderr := slimtree(t.Context(), tc.args...); code != 1 || stdout != "" || !strings.Contains(stderr, tc.want) {
+				t.Fatalf("%s: exit %d, stdout %q, stderr %q; want 1 and %q", strings.Join(tc.args, " "), code, stdout, stderr, tc.want)
+			}
+			if got, err := os.ReadFile(filepath.Join(path, "precious.txt")); err != nil || string(got) != "precious\n" {
+				t.Fatalf("precious.txt = %q, %v", got, err)
+			}
+			if got := gitIn(t, path, "symbolic-ref", "HEAD"); got != "refs/heads/"+tc.foreign+"\n" {
+				t.Fatalf("the worktree at %s is on %q, want %s", path, got, tc.foreign)
+			}
+			if tc.foreign != tc.branch {
+				gitFindsNothing(t, main, "rev-parse", "--verify", "--quiet", "refs/heads/"+tc.branch)
+			}
+			if got := records(t); len(got) != 0 {
+				t.Fatalf("records = %+v, want none", got)
+			}
+		})
+	}
+}
+
+// A symlink at a recorded worktree's path never stands for the worktree it
+// points at, so rm removes nothing through it.
+func TestRmRefusesASymlinkToAnotherWorktree(t *testing.T) {
+	homeAfterFirstRun(t)
+	cloneWith(t, nil)
+	main := newRepo(t)
+	path := filepath.Join(filepath.Dir(main), "main-feat")
+	if code, _, stderr := slimtree(t.Context(), "new", "feat"); code != 0 {
+		t.Fatalf("new feat: exit %d, stderr %q", code, stderr)
+	}
+	other := filepath.Join(filepath.Dir(main), "other")
+	gitIn(t, main, "worktree", "add", "-q", "-b", "other", other)
+	gitIn(t, main, "worktree", "remove", "--force", path)
+	if err := os.Symlink(other, path); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ arg, want string }{
+		{path, "slimtree made no worktree " + path + "\n"},
+		{"main-feat", "slimtree removes nothing at " + path + ", which is not a worktree of " + filepath.Join(main, ".git") + "\n"},
+	} {
+		if code, stdout, stderr := slimtree(t.Context(), "rm", tc.arg); code != 1 || stdout != "" || stderr != tc.want {
+			t.Errorf("rm %s: exit %d, stdout %q, stderr %q; want 1 and %q", tc.arg, code, stdout, stderr, tc.want)
+		}
+	}
+	if got := gitIn(t, other, "symbolic-ref", "HEAD"); got != "refs/heads/other\n" {
+		t.Fatalf("the worktree other is on %q", got)
+	}
+	if list := gitIn(t, main, "worktree", "list", "--porcelain"); !strings.Contains(list, "worktree "+other+"\n") {
+		t.Fatalf("git no longer registers %s:\n%s", other, list)
+	}
 }
