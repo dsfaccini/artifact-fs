@@ -114,6 +114,8 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 		return l.Worktrees[0].State
 	}
 
+	// Each new and resume that mounts counts against the FSKit budget.
+	e2eMountsStarted.Add(1)
 	if got := mustSlimtree("--backend", "artifactfs", "new", "--path", wt, "feat"); got != wt+"\n" {
 		t.Fatalf("slimtree new printed %q, want %s", got, wt)
 	}
@@ -186,6 +188,7 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 		t.Fatalf("slimtree list after stop: %s, want stopped", got)
 	}
 
+	e2eMountsStarted.Add(1)
 	if got := mustSlimtree("resume", "--all"); got != "mounted "+wt+"\n" {
 		t.Fatalf("slimtree resume --all printed %q", got)
 	}
@@ -209,6 +212,7 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 	if got := listed(); got != "stopped" {
 		t.Fatalf("slimtree list after the daemon died: %s, want stopped", got)
 	}
+	e2eMountsStarted.Add(1)
 	if got := mustSlimtree("resume", wt); got != "mounted "+wt+"\n" {
 		t.Fatalf("slimtree resume after the daemon died printed %q", got)
 	}
