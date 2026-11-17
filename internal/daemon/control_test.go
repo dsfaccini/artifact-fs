@@ -11,6 +11,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -120,6 +122,49 @@ func TestStatusTrustsTheRecordOnlyWhileADaemonRuns(t *testing.T) {
 	if st.State != repoStateMounted || st.Phase != phaseServe || st.ServedGeneration != 3 || st.CurrentHEADOID != strings.Repeat("a", 40) {
 		t.Fatalf("status with a daemon = %+v, want the recorded mount", st)
 	}
+}
+
+// Running reports the pid the daemon lock's holder wrote, and only while a
+// holder has the flock: the file keeps the pid after the daemon exits.
+func TestRunningNamesTheDaemonLockHolder(t *testing.T) {
+	t.Parallel()
+	root := filepath.Join(t.TempDir(), "root")
+	if err := os.MkdirAll(filepath.Join(root, "config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	running := func(wantPID int, want bool) {
+		t.Helper()
+		pid, ok, err := Running(root)
+		if err != nil || pid != wantPID || ok != want {
+			t.Fatalf("Running = %d, %v, %v; want %d, %v, nil", pid, ok, err, wantPID, want)
+		}
+	}
+	running(0, false)
+	lock, err := acquireDaemonLock(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	running(os.Getpid(), true)
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(daemonLockPath(root)); err != nil || len(data) == 0 {
+		t.Fatalf("lock file after the holder closed it = %q, %v; want the pid it wrote", data, err)
+	}
+	running(0, false)
+	// A daemon between its flock and its pid write.
+	f, err := os.OpenFile(daemonLockPath(root), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	running(0, true)
 }
 
 func TestUnmountAndRemountApplyThroughTheRunningDaemon(t *testing.T) {

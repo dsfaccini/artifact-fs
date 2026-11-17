@@ -24,7 +24,7 @@ func (s *Controller) Status(ctx context.Context, name string) (model.RepoRuntime
 	if err != nil {
 		return model.RepoRuntimeState{}, err
 	}
-	live, err := daemonRunning(s.root)
+	_, live, err := Running(s.root)
 	if err != nil {
 		return model.RepoRuntimeState{}, err
 	}

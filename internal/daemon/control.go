@@ -3,6 +3,7 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -66,25 +67,33 @@ func acquireDaemonLock(root string) (*os.File, error) {
 	return f, nil
 }
 
-// daemonRunning reports whether a daemon holds root's daemon lock.
-func daemonRunning(root string) (bool, error) {
+// Running reports whether a daemon holds root's daemon lock, and the pid the
+// holder wrote into the lock file, 0 before it wrote one. For an instant
+// after a daemon takes the lock, the file still holds the pid of the daemon
+// before it. So match the pid with a start token before you signal it.
+func Running(root string) (pid int, running bool, err error) {
 	f, err := os.Open(daemonLockPath(root))
 	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+		return 0, false, nil
 	}
 	if err != nil {
-		return false, err
+		return 0, false, err
 	}
 	defer f.Close()
 	err = unix.Flock(int(f.Fd()), unix.LOCK_SH|unix.LOCK_NB)
 	if err == nil {
 		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
-		return false, nil
+		return 0, false, nil
 	}
-	if errors.Is(err, unix.EWOULDBLOCK) {
-		return true, nil
+	if !errors.Is(err, unix.EWOULDBLOCK) {
+		return 0, false, err
 	}
-	return false, err
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return 0, false, err
+	}
+	pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+	return pid, true, nil
 }
 
 // listenControl opens the control socket that CLI commands nudge so the

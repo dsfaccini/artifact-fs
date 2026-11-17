@@ -95,6 +95,7 @@ func healthyLinux() Probe {
 		ReadFile:  linuxFiles(ubuntu, procStatus(noCaps, fullCaps, "0")),
 		Output:    func(string, ...string) (string, error) { return "git version 2.45.0\n", nil },
 		EUID:      1000,
+		MountIDs:  func() (bool, error) { return true, nil },
 	}
 }
 
@@ -137,13 +138,35 @@ func TestChecksByPlatformAndBackend(t *testing.T) {
 		want          map[string]Status
 		reminders     int
 	}{
-		{goos: "linux", backend: "artifactfs", probe: healthyLinux(), want: map[string]Status{"fusermount": StatusOK, "dev-fuse": StatusOK, "cap-sys-admin": StatusOK, "apparmor": StatusOK, "git": StatusOK}},
+		{goos: "linux", backend: "artifactfs", probe: healthyLinux(), want: map[string]Status{"fusermount": StatusOK, "dev-fuse": StatusOK, "cap-sys-admin": StatusOK, "apparmor": StatusOK, "mount-id": StatusOK, "git": StatusOK}},
 		{goos: "darwin", backend: "apfsclone", probe: healthyDarwin(), want: map[string]Status{"xcode-select": StatusOK, "git": StatusOK, "apfs": StatusOK}},
 		{goos: "darwin", backend: "artifactfs", probe: healthyDarwin(), want: map[string]Status{"xcode-select": StatusOK, "git": StatusOK, "macos-version": StatusOK, "macfuse-fskit": StatusOK}, reminders: 2},
 	} {
 		r := Run(tc.probe, tc.goos, tc.backend, "/work")
 		if got := statuses(r); !reflect.DeepEqual(got, tc.want) || !r.OK || len(r.Reminders) != tc.reminders {
 			t.Errorf("%s/%s: checks %v, ok %v, %d reminders; want %v, ok, %d reminders", tc.goos, tc.backend, got, r.OK, len(r.Reminders), tc.want, tc.reminders)
+		}
+	}
+}
+
+// mount-id fails before Linux 5.8, which reports no mount ID, and warns
+// before 6.8, whose mount IDs a later mount can reuse.
+func TestMountIDCheck(t *testing.T) {
+	for _, tc := range []struct {
+		unique bool
+		err    error
+		want   Result
+	}{
+		{unique: true, want: Result{Status: StatusOK, Detail: "unique mount IDs"}},
+		{want: Result{Status: StatusWarn, Detail: "Linux before 6.8 reuses mount IDs, so slimtree tells a mount from a later one at its path by its ID, device and source", Fix: "upgrade to Linux 6.8 or later"}},
+		{err: errors.New("statx returned no mount ID: slimtree needs Linux 5.8 or later"), want: Result{Status: StatusFail, Detail: "statx returned no mount ID: slimtree needs Linux 5.8 or later", Fix: "upgrade to Linux 6.8 or later"}},
+	} {
+		p := healthyLinux()
+		p.MountIDs = func() (bool, error) { return tc.unique, tc.err }
+		r := Run(p, "linux", "artifactfs", "")
+		tc.want.ID = "mount-id"
+		if got := result(t, r, "mount-id"); got != tc.want || r.OK != (tc.want.Status != StatusFail) {
+			t.Errorf("mount-id = %+v, report ok %v; want %+v", got, r.OK, tc.want)
 		}
 	}
 }
@@ -448,6 +471,7 @@ func TestReportJSONShape(t *testing.T) {
 		`{"id":"dev-fuse","status":"ok","detail":"/dev/fuse"},` +
 		`{"id":"cap-sys-admin","status":"ok","detail":"CapBnd holds CAP_SYS_ADMIN"},` +
 		`{"id":"apparmor","status":"ok","detail":"no AppArmor profile"},` +
+		`{"id":"mount-id","status":"ok","detail":"unique mount IDs"},` +
 		`{"id":"git","status":"warn","detail":"git version 2.43.0 is older than 2.45","fix":"sudo apt-get update && sudo apt-get install -y software-properties-common && sudo add-apt-repository -y ppa:git-core/ppa && sudo apt-get update && sudo apt-get install -y git"}],` +
 		`"reminders":[]}`
 	if data.String() != want {

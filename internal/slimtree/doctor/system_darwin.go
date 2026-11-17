@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 )
 
 func osVersion() (string, error) { return unix.Sysctl("kern.osproductversion") }
+
+func mountIDs() (bool, error) { return false, errors.New("mount IDs are read only on Linux") }
 
 // apfs checks dir's file system type, then clones a probe file there, because
 // clonefile is what the apfsclone backend needs.
