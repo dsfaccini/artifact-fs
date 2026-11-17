@@ -3,6 +3,7 @@ package daemon
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -141,6 +142,11 @@ func (s *Service) syncRepos(ctx context.Context) error {
 		s.logger.Info("mounting repo", "repo", repo.Name)
 		s.recordPhase(repo, phaseMount)
 		if err := s.mountRepo(ctx, repo); err != nil {
+			// The next sync checks the repo again.
+			if errors.Is(err, errPrepareLockHeld) {
+				s.logger.Info("repo mount deferred while another step holds the repo's prepare lock", "repo", repo.Name)
+				continue
+			}
 			s.logger.Error("repo mount failed", "repo", repo.Name, "error", auth.RedactLogString(err.Error(), repo.RemoteURL))
 			s.recordMountFailure(repo, repoStateUnmounted, err, s.backoffMount(repo))
 		}

@@ -594,3 +594,205 @@ func TestRetriedMountWritesTheStatusConfigOnceThePrepareLockFrees(t *testing.T) 
 		t.Fatalf("core.worktree = %q at the sync after the prepare lock was free, want %q", got, cfg.MountPath)
 	}
 }
+
+// pausingCLIGit pauses the first FetchNonInteractive or ResolveHEAD after it
+// is armed, until release closes. A fetch command runs the one, and a CLI
+// preparation the other, under the repo's prepare lock.
+type pausingCLIGit struct {
+	model.GitStore
+	armed   atomic.Bool
+	held    chan struct{}
+	release chan struct{}
+}
+
+func (g *pausingCLIGit) pause() {
+	if g.armed.CompareAndSwap(true, false) {
+		close(g.held)
+		<-g.release
+	}
+}
+
+func (g *pausingCLIGit) FetchNonInteractive(ctx context.Context, cfg model.RepoConfig) error {
+	g.pause()
+	return g.GitStore.FetchNonInteractive(ctx, cfg)
+}
+
+func (g *pausingCLIGit) ResolveHEAD(ctx context.Context, cfg model.RepoConfig) (string, string, error) {
+	g.pause()
+	return g.GitStore.ResolveHEAD(ctx, cfg)
+}
+
+// lockedMountCheckSteps are the CLI steps that can take a repo's prepare lock
+// after a sync pass listed the repo ready, and before the pass reaches it.
+var lockedMountCheckSteps = []string{"fetch command", "cli prepare", "re-registering sync add-repo"}
+
+// lockedMountCheck is a sync pass over the sync repos a, b and c, which no
+// runtime serves yet, while a CLI step holds b's prepare lock. The step takes
+// the lock from a hook in a's mount, after the pass listed b, and holds it
+// until release. passed closes when the pass returns, with its error in
+// passErr, and stepped when the step returns, with its error in stepErr.
+// waited receives once the daemon finds b's prepare lock held and waits.
+type lockedMountCheck struct {
+	svc     *Service
+	passed  chan struct{}
+	passErr error
+	stepped chan struct{}
+	stepErr error
+	waited  chan struct{}
+	release func()
+}
+
+func startLockedMountCheck(t *testing.T, step string) *lockedMountCheck {
+	t.Helper()
+	ctx := t.Context()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	runCmd(t, "git", "init", "--initial-branch", "main", remote)
+	commitFile(t, remote, "README.md", "main\n")
+	root := filepath.Join(tmp, "artifact-fs")
+	svc, err := New(ctx, root, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+	repo := func(name string) model.RepoConfig {
+		return model.RepoConfig{RepoPaths: model.RepoPaths{Name: name}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main"}, RefreshPolicy: model.RefreshPolicy{RefreshInterval: time.Hour}, Enabled: true}
+	}
+	for _, name := range []string{"a", "b", "c"} {
+		if err := svc.ctl().AddRepoWithOptions(ctx, repo(name), AddRepoOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctl, err := NewController(ctx, root, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ctl.Close() })
+	cliGit := &pausingCLIGit{GitStore: ctl.git, held: make(chan struct{}), release: make(chan struct{})}
+	ctl.git = cliGit
+	m := &lockedMountCheck{svc: svc, passed: make(chan struct{}), stepped: make(chan struct{}), waited: make(chan struct{}, 1), release: sync.OnceFunc(func() { close(cliGit.release) })}
+	svc.lockBusy = func(lockName string) {
+		if lockName != "b.prepare.lock" {
+			return
+		}
+		select {
+		case m.waited <- struct{}{}:
+		default:
+		}
+	}
+	var stepping atomic.Bool
+	svc.mount = func(mctx, opCtx context.Context, p model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
+		if p.Name == "a" {
+			stepping.Store(true)
+			go func() {
+				defer close(m.stepped)
+				switch step {
+				case "fetch command":
+					cliGit.armed.Store(true)
+					m.stepErr = ctl.FetchNow(ctx, "b")
+				case "cli prepare":
+					cliGit.armed.Store(true)
+					_, m.stepErr = ctl.Prepare(ctx, "b")
+				case "re-registering sync add-repo":
+					if m.stepErr = ctl.RemoveRepo(ctx, "b"); m.stepErr != nil {
+						return
+					}
+					cliGit.armed.Store(true)
+					m.stepErr = ctl.AddRepoWithOptions(ctx, repo("b"), AddRepoOptions{})
+				}
+			}()
+			select {
+			case <-cliGit.held:
+			case <-m.stepped:
+				t.Errorf("the %s returned %v before it held b's prepare lock", step, m.stepErr)
+			}
+		}
+		return fakeMount(mctx, opCtx, p, engine, gate, logger, redact)
+	}
+	go func() {
+		m.passErr = svc.syncRepos(ctx)
+		close(m.passed)
+	}()
+	t.Cleanup(func() {
+		m.release()
+		<-m.passed
+		if stepping.Load() {
+			<-m.stepped
+		}
+	})
+	return m
+}
+
+// record returns the repo_runtime record of the repo name, which must exist.
+func (m *lockedMountCheck) record(t *testing.T, name string) model.RepoRuntimeRecord {
+	t.Helper()
+	rec, ok, err := m.svc.registry.GetRuntime(t.Context(), model.RepoID(name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatalf("%s has no repo_runtime record", name)
+	}
+	return rec
+}
+
+// One sync loop serves every repo, and a CLI step can hold a repo's prepare
+// lock for up to the prepare timeout. So the mount check of b skips b while
+// the step holds b's lock, and the pass mounts c.
+func TestMountCheckSkipsARepoWhosePrepareLockIsHeld(t *testing.T) {
+	t.Parallel()
+	for _, step := range lockedMountCheckSteps {
+		t.Run(step, func(t *testing.T) {
+			t.Parallel()
+			m := startLockedMountCheck(t, step)
+			select {
+			case <-m.passed:
+			case <-m.waited:
+				t.Fatalf("the mount check of b waited for b's prepare lock while the %s held it", step)
+			}
+			if m.passErr != nil {
+				t.Fatal(m.passErr)
+			}
+			if rec := m.record(t, "c"); rec.State != repoStateMounted {
+				t.Fatalf("c's repo_runtime after the pass = %+v, want it mounted", rec)
+			}
+		})
+	}
+}
+
+// A skipped mount check records no failure, so nothing backs off b's mount,
+// and the next sync after the step ends mounts b. A CLI preparation or a
+// re-registration changes the prepare request or the config the pass listed,
+// so a mount check that waited for the lock would fail b as superseded.
+func TestSkippedMountCheckMountsTheRepoAtTheNextSync(t *testing.T) {
+	t.Parallel()
+	for _, step := range lockedMountCheckSteps {
+		t.Run(step, func(t *testing.T) {
+			t.Parallel()
+			m := startLockedMountCheck(t, step)
+			// The pass reached b while the step held b's lock.
+			select {
+			case <-m.passed:
+			case <-m.waited:
+			}
+			m.release()
+			<-m.stepped
+			if m.stepErr != nil {
+				t.Fatalf("the %s: %v", step, m.stepErr)
+			}
+			<-m.passed
+			if m.passErr != nil {
+				t.Fatal(m.passErr)
+			}
+			if rec := m.record(t, "b"); rec.LastError != "" {
+				t.Fatalf("b's repo_runtime after the pass records the failure %q in phase %q, want none", rec.LastError, rec.LastErrorPhase)
+			}
+			if err := m.svc.syncRepos(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if rec := m.record(t, "b"); rec.State != repoStateMounted || rec.LastError != "" {
+				t.Fatalf("b's repo_runtime after the next sync = %+v, want it mounted with no failure", rec)
+			}
+		})
+	}
+}

@@ -149,6 +149,27 @@ var (
 				t.Errorf("prepare state after the re-prepare = %q (%s), want ready", cfg.PrepareState, cfg.PrepareError)
 			}
 		},
+		start: func(f *overlapRepo) <-chan error {
+			ended := make(chan error, 1)
+			go func() {
+				ctx := context.Background()
+				if err := f.svc.registry.BeginPrepare(ctx, f.cfg, model.PrepareStatePreparing, "again"); err != nil {
+					ended <- err
+					return
+				}
+				if err := f.svc.syncRepos(ctx); err != nil {
+					ended <- err
+					return
+				}
+				f.svc.prepareWorkers.Wait()
+				cfg, err := f.svc.registry.GetRepo(ctx, f.cfg.Name)
+				if err == nil && cfg.PrepareState != model.PrepareStateReady {
+					err = fmt.Errorf("prepare state %q (%s), want ready", cfg.PrepareState, cfg.PrepareError)
+				}
+				ended <- err
+			}()
+			return ended
+		},
 	}
 	cliPrepareStep = overlapStep{
 		name: "a CLI prepare of a sync repo",
@@ -160,6 +181,14 @@ var (
 			if _, err := f.ctl.Prepare(t.Context(), f.cfg.Name); err != nil {
 				t.Errorf("CLI prepare: %v", err)
 			}
+		},
+		start: func(f *overlapRepo) <-chan error {
+			ended := make(chan error, 1)
+			go func() {
+				_, err := f.ctl.Prepare(context.Background(), f.cfg.Name)
+				ended <- err
+			}()
+			return ended
 		},
 	}
 	refreshStep = overlapStep{
@@ -237,6 +266,8 @@ func TestFetchesWaitWhileAnotherStepHoldsThePrepareLock(t *testing.T) {
 		{holder: asyncPrepareStep, contender: refreshStep, async: true},
 		{holder: asyncPrepareStep, contender: fetchCommandStep, async: true},
 		{holder: cliPrepareStep, contender: refreshStep},
+		{holder: refreshStep, contender: cliPrepareStep},
+		{holder: refreshStep, contender: asyncPrepareStep, async: true},
 		{holder: refreshStep, contender: fetchCommandStep},
 		{holder: fetchCommandStep, contender: refreshStep},
 	} {
