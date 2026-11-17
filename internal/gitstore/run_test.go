@@ -23,7 +23,7 @@ func TestRunGitClassifiesBeforeCredentialRedaction(t *testing.T) {
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	_, err := runGitWithEnv(context.Background(), "", []string{"ARTIFACT_FS_GIT_PASSWORD=0"}, "version")
+	_, err := New(nil).runGitWithEnv(context.Background(), "", []string{"ARTIFACT_FS_GIT_PASSWORD=0"}, "version")
 	_, _, retryable := gitOperationCauses(err)
 	if !retryable {
 		t.Fatalf("redacted command error was not retryable: %v", err)

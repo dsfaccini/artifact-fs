@@ -72,29 +72,14 @@ func (s *Store) streamTreeRecords(ctx context.Context, gitDir string, headOID st
 	// A treeless clone fetches missing trees here.
 	configureCommandSession(cmd)
 	cmd.Env = append(append(os.Environ(), "GIT_DIR="+gitDir), env...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
 	// A lazy fetch's server shapes this stderr, and redaction's cost grows
 	// faster than its length.
 	errBuf := &boundedGitError{limit: maxGitErrorBytes}
-	cmd.Stderr = errBuf
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	stopClose := context.AfterFunc(ctx, func() {
-		_ = stdout.Close()
-	})
-	defer stopClose()
-	readErr := readNullDelimited(stdout, fn)
-	waitErr := cmd.Wait()
-	if readErr != nil {
-		if contextErr := ctx.Err(); contextErr != nil {
-			return errors.Join(readErr, contextErr)
-		}
-		return readErr
-	}
+	var readErr error
+	waitErr := RunWithFiles(cmd, s.tempDir, nil, func(r io.Reader) error {
+		readErr = readNullDelimited(r, fn)
+		return nil
+	}, errBuf)
 	if waitErr != nil {
 		msg := auth.RedactString(strings.TrimSpace(errBuf.String()))
 		if msg == "" {
@@ -108,7 +93,7 @@ func (s *Store) streamTreeRecords(ctx context.Context, gitDir string, headOID st
 		}
 		return errors.New(msg)
 	}
-	return nil
+	return readErr
 }
 
 func readNullDelimited(r io.Reader, fn func(string)) error {
@@ -189,50 +174,19 @@ func (s *Store) batchResolveSizes(ctx context.Context, repo model.RepoConfig, no
 	// minutes. Blobs reported as "missing" keep SizeState="unknown" and get
 	// their size resolved during hydration.
 	cmd.Env = append(os.Environ(), "GIT_DIR="+repo.GitDir, "GIT_NO_LAZY_FETCH=1")
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return err
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
 	errBuf := &bytes.Buffer{}
-	cmd.Stderr = errBuf
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	stopClose := context.AfterFunc(ctx, func() {
-		_ = stdin.Close()
-		_ = stdout.Close()
-	})
-	defer stopClose()
-	writeErrCh := make(chan error, 1)
-	go func() {
-		var writeErr error
-		for _, oid := range oids {
-			if _, writeErr = fmt.Fprintln(stdin, oid); writeErr != nil {
-				break
-			}
+	var scanErr error
+	waitErr := RunWithFiles(cmd, s.tempDir, []byte(strings.Join(oids, "\n")+"\n"), func(r io.Reader) error {
+		// Output format: "<oid> <type> <size>" or "<oid> missing"
+		scan := bufio.NewScanner(r)
+		for scan.Scan() {
+			applyBatchCheckLine(nodes, index, scan.Text())
 		}
-		if closeErr := stdin.Close(); writeErr == nil {
-			writeErr = closeErr
-		}
-		writeErrCh <- writeErr
-	}()
-	// Output format: "<oid> <type> <size>" or "<oid> missing"
-	scan := bufio.NewScanner(stdout)
-	for scan.Scan() {
-		applyBatchCheckLine(nodes, index, scan.Text())
-	}
-	scanErr := scan.Err()
-	writeErr := <-writeErrCh
-	waitErr := cmd.Wait()
+		scanErr = scan.Err()
+		return nil
+	}, errBuf)
 	if contextErr := ctx.Err(); contextErr != nil {
-		return errors.Join(contextErr, writeErr, scanErr)
-	}
-	if writeErr != nil {
-		return writeErr
+		return errors.Join(contextErr, scanErr)
 	}
 	if scanErr != nil {
 		return scanErr

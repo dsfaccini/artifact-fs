@@ -11,7 +11,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -303,6 +305,44 @@ func RequireNoPrompt(t testing.TB, runs string) {
 	if data, err := os.ReadFile(runs); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Git ran SSH_ASKPASS: %q, %v", data, err)
 	}
+}
+
+// HoldGitOutput puts a git first on PATH that leaves a holder of its stdout
+// and stderr behind, then runs the real git, whose path it returns. A git
+// that leaves an ssh ControlPersist master behind holds its stderr the same
+// way, and so does a child that another goroutine forked and that has not
+// exec'd yet (golang/go#22315). Each holder lives a minute and then writes
+// the file at the returned holderExited, so a call that returns while that
+// file is absent did not wait for a holder. When t ends, HoldGitOutput kills
+// each git's process group, which holds the holder when the caller started
+// git in a group of its own. It sets PATH, so t cannot run in parallel.
+func HoldGitOutput(t *testing.T) (realGit, holderExited string) {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	groups := filepath.Join(dir, "groups")
+	holderExited = filepath.Join(dir, "holder-exited")
+	bin := filepath.Join(dir, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\necho $$ >> '" + groups + "'\n(sleep 60; : > '" + holderExited + "') &\nexec '" + realGit + "' \"$@\"\n"
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Cleanup(func() {
+		data, _ := os.ReadFile(groups)
+		for group := range strings.FieldsSeq(string(data)) {
+			if pgid, err := strconv.Atoi(group); err == nil {
+				_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			}
+		}
+	})
+	return realGit, holderExited
 }
 
 // UnauthorizedRemote returns an HTTP remote that answers every request with 401.

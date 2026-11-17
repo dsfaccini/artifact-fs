@@ -45,7 +45,7 @@ func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfi
 	if _, err := os.Stat(path); err == nil {
 		// Validate the effective index without refreshing it. Unlike read-tree,
 		// ls-files does not replace staged state or resolve missing blobs.
-		return runGitDiscardOutputWithEnv(
+		return s.runGitDiscardOutputWithEnv(
 			ctx,
 			repo.GitDir,
 			[]string{"GIT_NO_LAZY_FETCH=1"},
@@ -76,11 +76,11 @@ func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfi
 // redacts all Git output it logs.
 func (s *Store) WarnAdoptedRemoteCredentials(ctx context.Context, repo model.RepoConfig) {
 	names := []string{"origin"}
-	if promisors, err := promisorRemotes(ctx, repo.GitDir); err == nil {
+	if promisors, err := s.promisorRemotes(ctx, repo.GitDir); err == nil {
 		names = append(names, promisors...)
 	}
 	for _, name := range names {
-		if remote, err := runGit(ctx, repo.GitDir, "remote", "get-url", "--", name); err == nil && remoteHasInlineCredentials(remote) {
+		if remote, err := s.runGit(ctx, repo.GitDir, "remote", "get-url", "--", name); err == nil && remoteHasInlineCredentials(remote) {
 			s.logger.WarnContext(ctx, "adopted worktree remote embeds credentials; fetches of missing objects use them", "repo", repo.Name)
 			return
 		}
@@ -97,7 +97,7 @@ func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoCon
 		return err
 	}
 	// The HEAD watcher polls loose refs and packed-refs only.
-	if format, err := runGit(ctx, repo.GitDir, "config", "--get", "extensions.refStorage"); err == nil && format != "files" {
+	if format, err := s.runGit(ctx, repo.GitDir, "config", "--get", "extensions.refStorage"); err == nil && format != "files" {
 		return fmt.Errorf("adoption requires the files ref storage format, not %s", format)
 	} else if err != nil {
 		var exitErr *gitCommandError
@@ -108,7 +108,7 @@ func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoCon
 	if _, err := os.Stat(filepath.Join(repo.GitDir, "index")); err != nil {
 		return fmt.Errorf("adoption requires an initialized index: %w", err)
 	}
-	commonDir, err := runGit(ctx, repo.GitDir, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	commonDir, err := s.runGit(ctx, repo.GitDir, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
 		return err
 	}
@@ -166,7 +166,7 @@ func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoCon
 			// Keep path whitespace across runGit's textual output trimming.
 			args = append(args, "--null", "--get-regexp", "^core\\.worktree$")
 		}
-		value, readErr := runGit(ctx, repo.GitDir, args...)
+		value, readErr := s.runGit(ctx, repo.GitDir, args...)
 		if readErr != nil {
 			var exitErr *gitCommandError
 			if errors.As(readErr, &exitErr) && exitErr.exitCode == 1 {
@@ -183,19 +183,19 @@ func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoCon
 		} else if value != "true" {
 			continue
 		}
-		if _, readErr := runGit(ctx, repo.GitDir, "config", "--file", mainConfig, "--get", key); readErr != nil {
+		if _, readErr := s.runGit(ctx, repo.GitDir, "config", "--file", mainConfig, "--get", key); readErr != nil {
 			var exitErr *gitCommandError
 			if !errors.As(readErr, &exitErr) || exitErr.exitCode != 1 {
 				return readErr
 			}
-			if _, err := runGit(ctx, repo.GitDir, "config", "--file", mainConfig, key, value); err != nil {
+			if _, err := s.runGit(ctx, repo.GitDir, "config", "--file", mainConfig, key, value); err != nil {
 				return err
 			}
 		}
 	}
 	for _, key := range []string{"core.worktree", "core.bare"} {
 		if key == "core.bare" {
-			value, err := runGit(ctx, repo.GitDir, "config", "--file", commonConfig, "--bool", "--get", key)
+			value, err := s.runGit(ctx, repo.GitDir, "config", "--file", commonConfig, "--bool", "--get", key)
 			if err != nil {
 				var exitErr *gitCommandError
 				if errors.As(err, &exitErr) && exitErr.exitCode == 1 {
@@ -207,14 +207,14 @@ func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoCon
 				continue
 			}
 		}
-		if _, err := runGit(ctx, repo.GitDir, "config", "--file", commonConfig, "--unset-all", key); err != nil {
+		if _, err := s.runGit(ctx, repo.GitDir, "config", "--file", commonConfig, "--unset-all", key); err != nil {
 			var exitErr *gitCommandError
 			if !errors.As(err, &exitErr) || exitErr.exitCode != 5 {
 				return err
 			}
 		}
 	}
-	if _, err := runGit(ctx, repo.GitDir, "config", "--file", commonConfig, "extensions.worktreeConfig", "true"); err != nil {
+	if _, err := s.runGit(ctx, repo.GitDir, "config", "--file", commonConfig, "extensions.worktreeConfig", "true"); err != nil {
 		return err
 	}
 	for _, setting := range [][2]string{
@@ -224,7 +224,7 @@ func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoCon
 		{"core.ignorecase", "false"},
 		{"core.symlinks", "true"},
 	} {
-		if _, err := runGit(ctx, repo.GitDir, "config", "--worktree", setting[0], setting[1]); err != nil {
+		if _, err := s.runGit(ctx, repo.GitDir, "config", "--worktree", setting[0], setting[1]); err != nil {
 			return err
 		}
 	}
@@ -241,7 +241,7 @@ func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.Repo
 		}
 		// Verified acquisitions use a standalone Git directory. Pin it only
 		// after FUSE mounts so index refreshes cannot infer the caller's cwd.
-		if _, err := runGit(ctx, repo.GitDir, "config", "core.worktree", repo.MountPath); err != nil {
+		if _, err := s.runGit(ctx, repo.GitDir, "config", "core.worktree", repo.MountPath); err != nil {
 			return err
 		}
 	}
@@ -284,13 +284,13 @@ func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfi
 	} else if err := s.replaceLink(hookPath, exe); err != nil {
 		return err
 	}
-	if _, err := runGit(ctx, repo.GitDir, append(configArgs, "core.fsmonitor", hookPath)...); err != nil {
+	if _, err := s.runGit(ctx, repo.GitDir, append(configArgs, "core.fsmonitor", hookPath)...); err != nil {
 		return err
 	}
-	if _, err := runGit(ctx, repo.GitDir, append(configArgs, "fsmonitor.allowRemote", "true")...); err != nil {
+	if _, err := s.runGit(ctx, repo.GitDir, append(configArgs, "fsmonitor.allowRemote", "true")...); err != nil {
 		return err
 	}
-	if _, err := runGit(ctx, repo.GitDir, append(configArgs, "core.untrackedCache", "true")...); err != nil {
+	if _, err := s.runGit(ctx, repo.GitDir, append(configArgs, "core.untrackedCache", "true")...); err != nil {
 		return err
 	}
 	// Git adds the fsmonitor extension on the next porcelain index read. The
@@ -408,7 +408,7 @@ func (s *Store) ReleaseAdoptedWorktree(ctx context.Context, repo model.RepoConfi
 		// Git matches a value pattern in its locale. Under a UTF-8 locale "."
 		// matches no byte that is not valid UTF-8, which a path can hold, and
 		// the C locale matches each byte.
-		if _, err := runGitWithEnv(ctx, repo.GitDir, []string{"LC_ALL=C"}, "config", "--file", worktreeConfig, "--unset-all", pin[0], pin[1]); err != nil {
+		if _, err := s.runGitWithEnv(ctx, repo.GitDir, []string{"LC_ALL=C"}, "config", "--file", worktreeConfig, "--unset-all", pin[0], pin[1]); err != nil {
 			var exitErr *gitCommandError
 			if !errors.As(err, &exitErr) || exitErr.exitCode != 5 {
 				return err
@@ -495,9 +495,9 @@ func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.
 	}
 	env := []string{"GIT_INDEX_FILE=" + privatePath, "GIT_WORK_TREE=" + privateWorktree, "GIT_NO_LAZY_FETCH=1"}
 	run := func(args ...string) (string, error) {
-		return runGitWithEnv(ctx, repo.GitDir, env, args...)
+		return s.runGitWithEnv(ctx, repo.GitDir, env, args...)
 	}
-	if err := runGitDiscardOutputWithEnv(ctx, repo.GitDir, env, "-c", "core.fsmonitor=false", "ls-files", "--stage", "--", "."); err != nil {
+	if err := s.runGitDiscardOutputWithEnv(ctx, repo.GitDir, env, "-c", "core.fsmonitor=false", "ls-files", "--stage", "--", "."); err != nil {
 		return skip()
 	}
 	if out, err := run("-c", "core.fsmonitor=false", "diff-index", "--cached", "--quiet", "--no-renames", "--ita-visible-in-index", snapshotOID, "--"); err != nil || strings.TrimSpace(out) != "" {
@@ -544,7 +544,7 @@ func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.
 		}
 	}
 	pathInput := []byte(strings.Join(paths, "\x00") + "\x00")
-	attrs, err := runGitInput(ctx, repo.GitDir, env, pathInput, "-c", "core.fsmonitor=false", "check-attr", "--cached", "--all", "-z", "--stdin")
+	attrs, err := s.runGitInput(ctx, repo.GitDir, env, pathInput, "-c", "core.fsmonitor=false", "check-attr", "--cached", "--all", "-z", "--stdin")
 	if err != nil {
 		return skip()
 	}
@@ -581,7 +581,7 @@ func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.
 	if len(validPaths) == 0 {
 		return false, nil
 	}
-	if err := verifyGitAttributesPresent(ctx, repo, env); err != nil {
+	if err := s.verifyGitAttributesPresent(ctx, repo, env); err != nil {
 		return skip()
 	}
 	validInput := []byte(strings.Join(validPaths, "\x00") + "\x00")
@@ -590,7 +590,7 @@ func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.
 	// remove-repo unsets core.untrackedCache, native Git keeps such a cache
 	// and warns on every status that it cannot use it, so this Git drops the
 	// cache. The mount's next status builds it again.
-	if _, err := runGitInput(ctx, repo.GitDir, updateEnv, validInput, "-c", "core.hooksPath="+privateHooks, "-c", "core.untrackedCache=false", "update-index", "--fsmonitor", "--fsmonitor-valid", "-z", "--stdin"); err != nil {
+	if _, err := s.runGitInput(ctx, repo.GitDir, updateEnv, validInput, "-c", "core.hooksPath="+privateHooks, "-c", "core.untrackedCache=false", "update-index", "--fsmonitor", "--fsmonitor-valid", "-z", "--stdin"); err != nil {
 		return skip()
 	}
 	if err := ctx.Err(); err != nil {
@@ -652,8 +652,8 @@ func copyFile(from, to string) error {
 	return closeErr
 }
 
-func verifyGitAttributesPresent(ctx context.Context, repo model.RepoConfig, env []string) error {
-	entries, err := runGitWithEnv(ctx, repo.GitDir, env, "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z", "--", ".")
+func (s *Store) verifyGitAttributesPresent(ctx context.Context, repo model.RepoConfig, env []string) error {
+	entries, err := s.runGitWithEnv(ctx, repo.GitDir, env, "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z", "--", ".")
 	if err != nil {
 		return err
 	}
@@ -666,7 +666,7 @@ func verifyGitAttributesPresent(ctx context.Context, repo model.RepoConfig, env 
 		if len(parts) != 3 || parts[2] != "0" {
 			return errors.New("unmerged .gitattributes entry")
 		}
-		if err := runGitDiscardOutputWithEnv(ctx, repo.GitDir, env, "cat-file", "-e", parts[1]+"^{blob}"); err != nil {
+		if err := s.runGitDiscardOutputWithEnv(ctx, repo.GitDir, env, "cat-file", "-e", parts[1]+"^{blob}"); err != nil {
 			return err
 		}
 	}

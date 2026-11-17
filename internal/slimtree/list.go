@@ -137,8 +137,12 @@ func worktreeList(ctx context.Context, commonDir string) (map[string]gitWorktree
 	}
 	done := make(chan result, 1)
 	go func() {
-		out, err := cmd.Output()
-		done <- result{out, err}
+		var out bytes.Buffer
+		err := gitstore.RunWithFiles(cmd, "", nil, func(r io.Reader) error {
+			_, err := out.ReadFrom(r)
+			return err
+		}, nil)
+		done <- result{out.Bytes(), err}
 	}()
 	var r result
 	select {

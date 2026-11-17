@@ -580,7 +580,7 @@ func TestRunGitCancellationKillsDescendants(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := runGit(ctx, "", "version")
+		_, err := New(nil).runGit(ctx, "", "version")
 		errCh <- err
 	}()
 	for {
@@ -610,7 +610,7 @@ func TestRunGitCancellationKillsDescendants(t *testing.T) {
 
 func TestRunGitCancellationClosesEscapedDescriptorPipes(t *testing.T) {
 	assertEscapedGitCancellationIsBounded(t, func(ctx context.Context) error {
-		_, err := runGit(ctx, "", "version")
+		_, err := New(nil).runGit(ctx, "", "version")
 		return err
 	})
 }
@@ -704,6 +704,64 @@ func assertEscapedGitCancellationIsBounded(t *testing.T, call func(context.Conte
 	}
 	if _, err := os.Stat(finished); err == nil {
 		t.Fatal("Git call waited for the escaped helper to finish")
+	}
+}
+
+// A process that holds a git's stdout and stderr after the git exits neither
+// fails a git that exited 0 nor holds up its call.
+func TestGitSucceedsWhileAnotherProcessHoldsItsOutput(t *testing.T) {
+	files := map[string]string{"a.txt": "a\n", "dir/b.txt": "bb\n"}
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: filepath.Join(t.TempDir(), "repo.git")}, RepoSpec: model.RepoSpec{RemoteURL: gittest.PartialCloneRemote(t, files), Branch: "main"}}
+	store := New(nil)
+	defer store.Close()
+	if err := store.CloneBlobless(t.Context(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	head := strings.TrimSpace(runOutput(t, "git", "--git-dir", cfg.GitDir, "rev-parse", "HEAD"))
+	var blobs []string
+	for _, name := range slices.Sorted(maps.Keys(files)) {
+		blobs = append(blobs, strings.TrimSpace(runOutput(t, "git", "--git-dir", cfg.GitDir, "rev-parse", "HEAD:"+name)))
+	}
+
+	realGit, holderExited := gittest.HoldGitOutput(t)
+	returnedFirst := func(call string) {
+		t.Helper()
+		if _, err := os.Stat(holderExited); err == nil {
+			t.Errorf("%s returned only after a holder of a git's output exited", call)
+		}
+	}
+
+	oid, ref, err := store.ResolveHEAD(t.Context(), cfg)
+	if err != nil || oid != head || ref != "main" {
+		t.Errorf("ResolveHEAD = %q, %q, %v; want %q, %q, nil", oid, ref, err, head, "main")
+	}
+	returnedFirst("ResolveHEAD")
+
+	// The check for missing blobs and the fetch read their stdin.
+	if err := store.FetchMissingBlobs(t.Context(), cfg.RepoPaths, blobs); err != nil {
+		t.Errorf("FetchMissingBlobs: %v", err)
+	}
+	returnedFirst("FetchMissingBlobs")
+	present := runOutput(t, "env", "GIT_NO_LAZY_FETCH=1", realGit, "--git-dir", cfg.GitDir, "cat-file", "--batch-check", "--batch-all-objects")
+	for _, blob := range blobs {
+		if !strings.Contains(present, blob+" blob") {
+			t.Errorf("blob %s missing after FetchMissingBlobs:\n%s", blob, present)
+		}
+	}
+
+	// ls-tree and the size check stream their output.
+	nodes, err := store.BuildTreeIndex(t.Context(), cfg, head)
+	if err != nil {
+		t.Fatalf("BuildTreeIndex: %v", err)
+	}
+	returnedFirst("BuildTreeIndex")
+	got := map[string]string{}
+	for _, n := range nodes {
+		got[n.Path] = fmt.Sprintf("%s %s %d", n.Type, n.SizeState, n.SizeBytes)
+	}
+	want := map[string]string{".": "dir known 0", "a.txt": "file known 2", "dir": "dir unknown 0", "dir/b.txt": "file known 3"}
+	if !maps.Equal(got, want) {
+		t.Errorf("BuildTreeIndex nodes = %v, want %v", got, want)
 	}
 }
 
@@ -847,7 +905,7 @@ func TestCanceledRunGitErrorOmitsCancellationSignal(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := runGit(ctx, gitDir, "read-tree", "-m", "HEAD", "HEAD")
+		_, err := New(nil).runGit(ctx, gitDir, "read-tree", "-m", "HEAD", "HEAD")
 		errCh <- err
 	}()
 	for {

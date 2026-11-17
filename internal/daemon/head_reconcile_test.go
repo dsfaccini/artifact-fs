@@ -1040,6 +1040,31 @@ func (r *servedAsyncRepo) requestPrepare(ctx context.Context, request string) er
 	return r.svc.syncRepos(ctx)
 }
 
+// receiveUnlessPrepareFails returns the next value of ch, the channel of a
+// hook that only a preparation that succeeds reaches. It fails t once the
+// registry records a preparation of r's repo failed, because the hook then
+// never sends.
+func receiveUnlessPrepareFails[T any](t *testing.T, r *servedAsyncRepo, ch <-chan T) T {
+	t.Helper()
+	for {
+		select {
+		case v := <-ch:
+			return v
+		case <-time.After(10 * time.Millisecond):
+		}
+		cfg, err := r.svc.registry.GetRepo(t.Context(), r.cfg.Name)
+		if err != nil || cfg.PrepareState != model.PrepareStateFailed {
+			continue
+		}
+		select {
+		case v := <-ch:
+			return v
+		default:
+			t.Fatalf("preparation %q failed before the awaited step: %s", cfg.PrepareRequest, cfg.PrepareError)
+		}
+	}
+}
+
 // commitTimestampGit runs before ahead of each CommitTimestamp.
 type commitTimestampGit struct {
 	model.GitStore
@@ -1193,7 +1218,7 @@ func TestLateAsyncPrepareInvalidatesKernelCacheAfterSwitch(t *testing.T) {
 	if err := r.requestPrepare(ctx, "late"); err != nil {
 		t.Fatal(err)
 	}
-	pass := <-r.passes
+	pass := receiveUnlessPrepareFails(t, r, r.passes)
 	if err := r.gate.Wait(ctx); err != nil {
 		t.Fatalf("gate after the late preparation = %v, want open", err)
 	}
@@ -1263,7 +1288,7 @@ func TestSupersededActivationSendsItsPassOnlyOnceTheGateOpens(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range 2 {
-		if pass := <-r.passes; pass.held {
+		if pass := receiveUnlessPrepareFails(t, r, r.passes); pass.held {
 			t.Fatalf("mount invalidated at generation %d with ops held at the gate, want every pass with the gate open", pass.gen)
 		}
 	}
@@ -1741,7 +1766,7 @@ func TestPrepareRequestAsAnActivationOpensTheGateHoldsOps(t *testing.T) {
 	if err := r.requestPrepare(ctx, "late"); err != nil {
 		t.Fatal(err)
 	}
-	held := <-heldAtReady
+	held := receiveUnlessPrepareFails(t, r, heldAtReady)
 	<-requested
 	r.svc.prepareWorkers.Wait()
 	if !held {

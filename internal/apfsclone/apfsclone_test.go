@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/execfile"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"golang.org/x/sys/unix"
 )
 
@@ -502,6 +503,35 @@ func TestAddRunsPostCheckoutAsGitWorktreeAddDoes(t *testing.T) {
 	}
 	if got := strings.Split(strings.TrimSpace(read(t, log)), "\n"); !slices.Equal(got, want) {
 		t.Fatalf("post-checkout ran with %q, want %q", got, want)
+	}
+}
+
+// A process that holds a git's stdout and stderr after the git exits cannot
+// fail Add. Its caller passes a file for git's output, as a CLI passes its
+// own stderr, which os/exec hands to git without a pipe. It is serial: it
+// sets PATH.
+func TestAddSucceedsWhileAnotherProcessHoldsGitsOutput(t *testing.T) {
+	f := newFixture(t, nil, nil)
+	want := trackedTree(t, f.addPlain(t, "plain"))
+	path := os.Getenv("PATH")
+	_, holderExited := gittest.HoldGitOutput(t)
+	stderr, err := os.CreateTemp(t.TempDir(), "stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stderr.Close()
+	held := filepath.Join(f.worktrees, "held")
+	_, err = Add(t.Context(), Options{Base: f.base, Path: held, Commit: "upstream/main",
+		AddArgs: []string{"-q", "-b", "feat/held"}, Clone: newRecorder(held).Clone, Stderr: stderr})
+	if _, statErr := os.Stat(holderExited); statErr == nil {
+		t.Error("Add returned only after a holder of a git's output exited")
+	}
+	if err != nil {
+		t.Fatalf("Add: %v\n%s", err, read(t, stderr.Name()))
+	}
+	t.Setenv("PATH", path)
+	if got := trackedTree(t, held); !maps.Equal(got, want) {
+		t.Fatalf("tree after Add = %q\nplain tree = %q", got, want)
 	}
 }
 

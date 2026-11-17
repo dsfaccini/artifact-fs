@@ -569,6 +569,32 @@ func TestUsageErrorLeavesStdoutEmpty(t *testing.T) {
 	}
 }
 
+// A process that holds git worktree list's stdout and stderr after git exits
+// cannot fail list. It is serial: it sets PATH.
+func TestListSucceedsWhileAnotherProcessHoldsGitsOutput(t *testing.T) {
+	homeDir := homeAfterFirstRun(t)
+	home, err := state.Open(homeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, paths := repoWithWorktrees(t, "kept")
+	if err := home.Write(state.Record{Backend: "apfsclone", Path: paths[0], CommonDir: repo, Branch: "kept"}); err != nil {
+		t.Fatal(err)
+	}
+	_, holderExited := gittest.HoldGitOutput(t)
+	var stdout, stderr bytes.Buffer
+	code := run(t.Context(), "linux", doctor.Probe{}, []string{"list", "--json"}, &stdout, &stderr)
+	if _, err := os.Stat(holderExited); err == nil {
+		t.Error("list returned only after a holder of git's output exited")
+	}
+	var got struct {
+		Worktrees []struct{ Name, State, Branch string }
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); code != 0 || stderr.Len() != 0 || err != nil || len(got.Worktrees) != 1 || got.Worktrees[0] != (struct{ Name, State, Branch string }{"kept", "ok", "kept"}) {
+		t.Fatalf("list --json: exit %d, stdout %s, stderr %q; want 0 and kept ok on branch kept", code, stdout.String(), stderr.String())
+	}
+}
+
 // git stats each unlocked worktree's .git, so a hung mount can hang git
 // worktree list. list stops git once worktreeListTimeout passes, and reports
 // the repository's worktrees as unknown.

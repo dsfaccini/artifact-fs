@@ -76,7 +76,7 @@ func assertArtifactWorktreeConfig(t *testing.T, ctx context.Context, gitDir stri
 		"core.ignorecase": "false",
 		"core.symlinks":   "true",
 	} {
-		got, err := runGit(ctx, gitDir, "config", "--local", "--get", key)
+		got, err := New(nil).runGit(ctx, gitDir, "config", "--local", "--get", key)
 		if err != nil {
 			t.Fatalf("read %s: %v", key, err)
 		}

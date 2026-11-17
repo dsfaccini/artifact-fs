@@ -603,12 +603,12 @@ func gitWithEnv(ctx context.Context, dir string, env []string, stdin []byte, arg
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
 	configureGit(cmd)
 	cmd.Env = append(cmd.Env, env...)
-	if stdin != nil {
-		cmd.Stdin = bytes.NewReader(stdin)
-	}
+	var out bytes.Buffer
 	stderr := gitstore.NewBoundedStderr()
-	cmd.Stderr = stderr
-	out, err := cmd.Output()
+	err := gitstore.RunWithFiles(cmd, "", stdin, func(r io.Reader) error {
+		_, err := out.ReadFrom(r)
+		return err
+	}, stderr)
 	if err != nil {
 		name := args[0]
 		if strings.HasPrefix(name, "-") && len(args) > 1 {
@@ -616,5 +616,5 @@ func gitWithEnv(ctx context.Context, dir string, env []string, stdin []byte, arg
 		}
 		return nil, fmt.Errorf("git %s failed: %w: %s", name, err, auth.RedactString(strings.TrimSpace(stderr.String())))
 	}
-	return out, nil
+	return out.Bytes(), nil
 }

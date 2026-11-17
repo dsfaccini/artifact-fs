@@ -12,23 +12,23 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/auth"
 )
 
-func runGit(ctx context.Context, gitDir string, args ...string) (string, error) {
-	return runGitWithEnv(ctx, gitDir, nil, args...)
+func (s *Store) runGit(ctx context.Context, gitDir string, args ...string) (string, error) {
+	return s.runGitWithEnv(ctx, gitDir, nil, args...)
 }
 
-func runGitWithEnv(ctx context.Context, gitDir string, extraEnv []string, args ...string) (string, error) {
-	return runGitWithEnvCapture(ctx, gitDir, extraEnv, true, args...)
+func (s *Store) runGitWithEnv(ctx context.Context, gitDir string, extraEnv []string, args ...string) (string, error) {
+	return s.runGitWithEnvCapture(ctx, gitDir, extraEnv, true, args...)
 }
 
-func runGitDiscardOutputWithEnv(ctx context.Context, gitDir string, extraEnv []string, args ...string) error {
-	_, err := runGitWithEnvCapture(ctx, gitDir, extraEnv, false, args...)
+func (s *Store) runGitDiscardOutputWithEnv(ctx context.Context, gitDir string, extraEnv []string, args ...string) error {
+	_, err := s.runGitWithEnvCapture(ctx, gitDir, extraEnv, false, args...)
 	return err
 }
 
-func runGitInput(ctx context.Context, gitDir string, extraEnv []string, input []byte, args ...string) (string, error) {
+func (s *Store) runGitInput(ctx context.Context, gitDir string, extraEnv []string, input []byte, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	ConfigureCancelableCommand(cmd)
-	return runInputCommand(ctx, cmd, gitDir, extraEnv, input)
+	return s.runInputCommand(ctx, cmd, gitDir, extraEnv, input)
 }
 
 // runLazyFetchGitInput runs a Git command that fetches objects as a lazy fetch
@@ -41,26 +41,114 @@ func (s *Store) runLazyFetchGitInput(ctx context.Context, gitDir string, input [
 	cmd := exec.CommandContext(ctx, "git", args...)
 	ConfigureCancelableCommand(cmd)
 	configureCommandSession(cmd)
-	return runInputCommand(ctx, cmd, gitDir, env, input)
+	return s.runInputCommand(ctx, cmd, gitDir, env, input)
 }
 
-func runInputCommand(ctx context.Context, cmd *exec.Cmd, gitDir string, extraEnv []string, input []byte) (string, error) {
+func (s *Store) runInputCommand(ctx context.Context, cmd *exec.Cmd, gitDir string, extraEnv []string, input []byte) (string, error) {
 	setGitWorktreeDirectory(cmd, extraEnv)
 	cmd.Env = append(os.Environ(), append([]string{"GIT_DIR=" + gitDir}, extraEnv...)...)
-	cmd.Stdin = bytes.NewReader(input)
 	var stdout bytes.Buffer
 	// A fetch's server shapes this stderr, and redaction's cost grows faster
 	// than its length.
 	stderr := &boundedGitError{limit: maxGitErrorBytes}
-	cmd.Stdout = &stdout
-	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
+	if err := RunWithFiles(cmd, s.tempDir, input, readInto(&stdout), stderr); err != nil {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		return "", errors.New(auth.RedactString(strings.TrimSpace(stderr.String())))
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", errors.New(auth.RedactString(msg))
 	}
 	return stdout.String(), nil
+}
+
+// RunWithFiles runs cmd to completion with a file, not a pipe, for each of its
+// standard streams. cmd reads input as its stdin when input is not nil. It
+// writes stdout and stderr to files. Once cmd exits, RunWithFiles passes the
+// stdout file to readStdout and copies the stderr file to stderr. A nil
+// readStdout or stderr discards that stream. Each file is unlinked in dir, or
+// in the system temp directory when dir is "", before cmd starts.
+//
+// A pipe ends only when every process that holds its write end closes it.
+// os/exec copies a stream that is not an *os.File through a pipe, waits for
+// that end at most cmd.WaitDelay after cmd exits, and then fails cmd with
+// exec.ErrWaitDelay, even when cmd exited 0. A reader of a pipe from
+// StdoutPipe waits until the end. Git can leave a holder behind, such as the
+// ssh ControlPersist master of a fetch, which keeps stderr. So can a child
+// that another goroutine forked, until it execs (golang/go#22315). A file
+// holds all of cmd's output once cmd exits.
+func RunWithFiles(cmd *exec.Cmd, dir string, input []byte, readStdout func(io.Reader) error, stderr io.Writer) error {
+	var files []*os.File
+	defer func() {
+		for _, f := range files {
+			_ = f.Close()
+		}
+	}()
+	unlinked := func() (*os.File, error) {
+		f, err := os.CreateTemp(dir, "artifact-fs-git-")
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, f)
+		return f, os.Remove(f.Name())
+	}
+	if input != nil {
+		f, err := unlinked()
+		if err != nil {
+			return err
+		}
+		if _, err := f.WriteAt(input, 0); err != nil {
+			return err
+		}
+		cmd.Stdin = f
+	}
+	var stdoutFile, stderrFile *os.File
+	if readStdout != nil {
+		f, err := unlinked()
+		if err != nil {
+			return err
+		}
+		cmd.Stdout, stdoutFile = f, f
+	}
+	if stderr != nil {
+		f, err := unlinked()
+		if err != nil {
+			return err
+		}
+		cmd.Stderr, stderrFile = f, f
+	}
+	runErr := cmd.Run()
+	var readErr, copyErr error
+	if stdoutFile != nil {
+		readErr = readWritten(stdoutFile, readStdout)
+	}
+	if stderrFile != nil {
+		copyErr = readWritten(stderrFile, func(r io.Reader) error {
+			_, err := io.Copy(stderr, r)
+			return err
+		})
+	}
+	return errors.Join(runErr, readErr, copyErr)
+}
+
+// readWritten passes read what f holds. It reads at offsets: a process that
+// still holds f shares f's offset, so a seek would move its writes.
+func readWritten(f *os.File, read func(io.Reader) error) error {
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return read(io.NewSectionReader(f, 0, info.Size()))
+}
+
+// readInto returns a readStdout for RunWithFiles that reads stdout into buf.
+func readInto(buf *bytes.Buffer) func(io.Reader) error {
+	return func(r io.Reader) error {
+		_, err := buf.ReadFrom(r)
+		return err
+	}
 }
 
 func setGitWorktreeDirectory(cmd *exec.Cmd, extraEnv []string) {
@@ -86,16 +174,16 @@ func (s *Store) runNetworkGit(ctx context.Context, gitDir string, extraEnv []str
 	cmd := exec.CommandContext(ctx, "git", args...)
 	ConfigureCancelableCommand(cmd)
 	configureCommandSession(cmd)
-	return runGitCommand(ctx, cmd, gitDir, append(env, extraEnv...), true)
+	return s.runGitCommand(ctx, cmd, gitDir, append(env, extraEnv...), true)
 }
 
-func runGitWithEnvCapture(ctx context.Context, gitDir string, extraEnv []string, captureOutput bool, args ...string) (string, error) {
+func (s *Store) runGitWithEnvCapture(ctx context.Context, gitDir string, extraEnv []string, captureOutput bool, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	ConfigureCancelableCommand(cmd)
-	return runGitCommand(ctx, cmd, gitDir, extraEnv, captureOutput)
+	return s.runGitCommand(ctx, cmd, gitDir, extraEnv, captureOutput)
 }
 
-func runGitCommand(ctx context.Context, cmd *exec.Cmd, gitDir string, extraEnv []string, captureOutput bool) (string, error) {
+func (s *Store) runGitCommand(ctx context.Context, cmd *exec.Cmd, gitDir string, extraEnv []string, captureOutput bool) (string, error) {
 	setGitWorktreeDirectory(cmd, extraEnv)
 	env := os.Environ()
 	if gitDir != "" {
@@ -103,15 +191,13 @@ func runGitCommand(ctx context.Context, cmd *exec.Cmd, gitDir string, extraEnv [
 	}
 	env = append(env, extraEnv...)
 	cmd.Env = env
-	buf := &bytes.Buffer{}
-	errBuf := &boundedGitError{limit: maxGitErrorBytes}
+	var buf bytes.Buffer
+	var readStdout func(io.Reader) error
 	if captureOutput {
-		cmd.Stdout = buf
-	} else {
-		cmd.Stdout = io.Discard
+		readStdout = readInto(&buf)
 	}
-	cmd.Stderr = errBuf
-	runErr := cmd.Run()
+	errBuf := &boundedGitError{limit: maxGitErrorBytes}
+	runErr := RunWithFiles(cmd, s.tempDir, nil, readStdout, errBuf)
 	out := strings.TrimSpace(buf.String())
 	if runErr == nil {
 		return out, nil

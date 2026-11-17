@@ -95,13 +95,13 @@ func (s *Store) BlobToCache(ctx context.Context, repo model.RepoPaths, objectOID
 // fetch runs for one missing object, so N blobs cost one fetch and one pack
 // instead of N.
 func (s *Store) FetchMissingBlobs(ctx context.Context, repo model.RepoPaths, objectOIDs []string) error {
-	missing, err := missingObjects(ctx, repo.GitDir, objectOIDs)
+	missing, err := s.missingObjects(ctx, repo.GitDir, objectOIDs)
 	if err != nil || len(missing) == 0 {
 		return err
 	}
 	// A filtered fetch from a remote that is not a promisor records it as one
 	// in the repo config, so the fetch goes only to a promisor.
-	remote, err := promisorRemote(ctx, repo.GitDir)
+	remote, err := s.promisorRemote(ctx, repo.GitDir)
 	if err == nil && remote == "" {
 		err = errors.New("no promisor remote")
 	}
@@ -121,8 +121,8 @@ func (s *Store) FetchMissingBlobs(ctx context.Context, repo model.RepoPaths, obj
 
 // promisorRemote returns the remote git's lazy fetch tries first, and "" when
 // there is none.
-func promisorRemote(ctx context.Context, gitDir string) (string, error) {
-	remotes, err := promisorRemotes(ctx, gitDir)
+func (s *Store) promisorRemote(ctx context.Context, gitDir string) (string, error) {
+	remotes, err := s.promisorRemotes(ctx, gitDir)
 	if err != nil || len(remotes) == 0 {
 		return "", err
 	}
@@ -134,14 +134,14 @@ func promisorRemote(ctx context.Context, gitDir string) (string, error) {
 // order, a remote is a promisor when remote.<name>.promisor is true or
 // remote.<name>.partialclonefilter is set, and the remote that
 // extensions.partialClone names goes last.
-func promisorRemotes(ctx context.Context, gitDir string) ([]string, error) {
-	entries, err := configEntries(ctx, gitDir, `^(remote\..+\.(promisor|partialclonefilter)|extensions\.partialclone)$`)
+func (s *Store) promisorRemotes(ctx context.Context, gitDir string) ([]string, error) {
+	entries, err := s.configEntries(ctx, gitDir, `^(remote\..+\.(promisor|partialclonefilter)|extensions\.partialclone)$`)
 	if err != nil {
 		return nil, err
 	}
 	// Git reads promisor as a boolean, so git parses it here too: an empty
 	// value is false and a nonzero number is true.
-	flags, err := configEntries(ctx, gitDir, `^remote\..+\.promisor$`, "--type=bool")
+	flags, err := s.configEntries(ctx, gitDir, `^remote\..+\.promisor$`, "--type=bool")
 	if err != nil {
 		return nil, err
 	}
@@ -181,9 +181,9 @@ type configEntry struct {
 
 // configEntries returns, in config order, the config entries whose names
 // match pattern.
-func configEntries(ctx context.Context, gitDir string, pattern string, typeArgs ...string) ([]configEntry, error) {
+func (s *Store) configEntries(ctx context.Context, gitDir string, pattern string, typeArgs ...string) ([]configEntry, error) {
 	args := append(append([]string{"config", "--null"}, typeArgs...), "--get-regexp", pattern)
-	out, err := runGit(ctx, gitDir, args...)
+	out, err := s.runGit(ctx, gitDir, args...)
 	if err != nil {
 		if exitErr, ok := errors.AsType[*gitCommandError](err); ok && exitErr.exitCode == 1 {
 			return nil, nil
@@ -203,8 +203,8 @@ func configEntries(ctx context.Context, gitDir string, pattern string, typeArgs 
 
 // missingObjects returns the objects in oids that the object store lacks.
 // GIT_NO_LAZY_FETCH keeps the check from fetching them one at a time.
-func missingObjects(ctx context.Context, gitDir string, oids []string) ([]string, error) {
-	out, err := runGitInput(ctx, gitDir, []string{"GIT_NO_LAZY_FETCH=1"}, []byte(strings.Join(oids, "\n")+"\n"), "cat-file", "--batch-check")
+func (s *Store) missingObjects(ctx context.Context, gitDir string, oids []string) ([]string, error) {
+	out, err := s.runGitInput(ctx, gitDir, []string{"GIT_NO_LAZY_FETCH=1"}, []byte(strings.Join(oids, "\n")+"\n"), "cat-file", "--batch-check")
 	if err != nil {
 		return nil, err
 	}
