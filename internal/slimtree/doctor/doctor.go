@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // Status is a check's outcome. Only StatusFail fails doctor and Require.
@@ -88,6 +90,7 @@ type check struct {
 var checks = []check{
 	{id: "fusermount3", goos: "linux", run: checkFusermount},
 	{id: "dev-fuse", goos: "linux", run: checkDevFuse},
+	{id: "cap-sys-admin", goos: "linux", run: checkCapSysAdmin},
 	{id: "git", goos: "linux", run: checkLinuxGit},
 	{id: "xcode-select", goos: "darwin", run: checkXcodeSelect},
 	{id: "git", goos: "darwin", run: checkDarwinGit},
@@ -151,6 +154,11 @@ func checkFusermount(p Probe, _ string, _ []Result) Result {
 	if err != nil {
 		return Result{Status: fail, Detail: err.Error(), Fix: installCommand(osRelease(p), "fuse3")}
 	}
+	// A setuid fusermount3 that root does not own, such as Homebrew's, cannot
+	// mount.
+	if uid, ok := ownerUID(info); !ok || uid != 0 {
+		return Result{Status: fail, Detail: path + " is not owned by root and shadows the distribution's /usr/bin/fusermount3", Fix: "put /usr/bin before " + filepath.Dir(path) + " on PATH, or " + installCommand(osRelease(p), "fuse3")}
+	}
 	if info.Mode()&fs.ModeSetuid == 0 {
 		return Result{Status: fail, Detail: path + " is not setuid", Fix: "sudo chmod u+s " + path}
 	}
@@ -161,12 +169,56 @@ func checkDevFuse(p Probe, _ string, _ []Result) Result {
 	const dev = "/dev/fuse"
 	info, err := p.Stat(dev)
 	if err != nil || info.Mode()&fs.ModeCharDevice == 0 {
-		return Result{Status: StatusFail, Detail: dev + " is not a character device", Fix: "sudo modprobe fuse, or in a container run with --device /dev/fuse --cap-add SYS_ADMIN"}
+		return Result{Status: StatusFail, Detail: dev + " is not a character device", Fix: "sudo modprobe fuse, or in a container run with " + containerFlags}
 	}
 	if err := p.ReadWrite(dev); err != nil {
 		return Result{Status: StatusFail, Detail: dev + " is not readable and writable: " + err.Error(), Fix: "sudo chmod 0666 /dev/fuse"}
 	}
 	return Result{Status: StatusOK, Detail: dev}
+}
+
+// containerFlags let a container mount: the device, the capability every FUSE
+// mount needs, and no AppArmor profile, since Docker's default denies mount.
+const containerFlags = "--device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined"
+
+// capSysAdmin is CAP_SYS_ADMIN's bit in /proc/self/status's capability masks.
+const capSysAdmin = 21
+
+// checkCapSysAdmin fails where no mount can succeed: fusermount3 mounts with
+// CAP_SYS_ADMIN, so a process whose bounding set lacks it, as in a container
+// started without --cap-add SYS_ADMIN, cannot mount. Root mounts directly and
+// needs the capability in its effective set.
+func checkCapSysAdmin(p Probe, _ string, _ []Result) Result {
+	field := "CapBnd"
+	if p.EUID == 0 {
+		field = "CapEff"
+	}
+	data, err := p.ReadFile("/proc/self/status")
+	if err != nil {
+		return Result{Status: StatusWarn, Detail: "reading /proc/self/status: " + err.Error()}
+	}
+	var mask string
+	for line := range strings.Lines(string(data)) {
+		if k, v, ok := strings.Cut(line, ":"); ok && k == field {
+			mask = strings.TrimSpace(v)
+		}
+	}
+	bits, err := strconv.ParseUint(mask, 16, 64)
+	if err != nil {
+		return Result{Status: StatusWarn, Detail: "/proc/self/status has no " + field}
+	}
+	if bits&(1<<capSysAdmin) == 0 {
+		return Result{Status: StatusFail, Detail: field + " lacks CAP_SYS_ADMIN, so no FUSE mount can succeed", Fix: "in a container, run it with " + containerFlags}
+	}
+	return Result{Status: StatusOK, Detail: field + " holds CAP_SYS_ADMIN"}
+}
+
+func ownerUID(info fs.FileInfo) (uint32, bool) {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return st.Uid, true
 }
 
 func checkLinuxGit(p Probe, _ string, _ []Result) Result {
@@ -229,7 +281,14 @@ func checkMacOSVersion(p Probe, _ string, _ []Result) Result {
 	return Result{Status: StatusOK, Detail: "macOS " + v}
 }
 
-func checkFSKit(p Probe, _ string, _ []Result) Result {
+func checkFSKit(p Probe, _ string, earlier []Result) Result {
+	// FSKitAvailable checks the macOS version first, and its error then says
+	// to install macFUSE whatever is installed.
+	for _, r := range earlier {
+		if r.ID == "macos-version" && r.Status != StatusOK {
+			return Result{Status: StatusSkip, Detail: "needs macOS 26 or later first"}
+		}
+	}
 	if err := p.FSKitAvailable(); err != nil {
 		return Result{Status: StatusFail, Detail: err.Error(), Fix: "install macFUSE 5.5 or later from https://github.com/macfuse/macfuse/releases/latest (needs an admin)"}
 	}

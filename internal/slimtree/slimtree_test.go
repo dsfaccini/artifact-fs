@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/daemon"
@@ -216,6 +217,7 @@ type modeInfo struct {
 }
 
 func (m modeInfo) Mode() fs.FileMode { return m.mode }
+func (m modeInfo) Sys() any          { return &syscall.Stat_t{} }
 
 // doctor prints its report, as JSON with --json, and exits 1 when a check
 // fails.
@@ -231,16 +233,21 @@ func TestDoctorExitsOneOnAFailedCheck(t *testing.T) {
 			return modeInfo{mode: fs.ModeSetuid | 0o755}, nil
 		},
 		ReadWrite: func(string) error { return errors.New("permission denied") },
-		ReadFile:  func(string) ([]byte, error) { return []byte("ID=debian\n"), nil },
-		Output:    func(string, ...string) (string, error) { return "git version 2.47.0\n", nil },
-		EUID:      1000,
+		ReadFile: func(path string) ([]byte, error) {
+			if path == "/proc/self/status" {
+				return []byte("CapBnd:\t000001ffffffffff\n"), nil
+			}
+			return []byte("ID=debian\n"), nil
+		},
+		Output: func(string, ...string) (string, error) { return "git version 2.47.0\n", nil },
+		EUID:   1000,
 	}
 	var stdout, stderr bytes.Buffer
 	if code := run(t.Context(), "linux", probe, []string{"doctor", "--json"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "doctor: a check failed") {
 		t.Fatalf("doctor --json with an unwritable /dev/fuse: exit %d, stderr %q, want 1", code, stderr.String())
 	}
 	var report doctor.Report
-	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || report.OK || len(report.Checks) != 3 || report.Checks[1].Fix != "sudo chmod 0666 /dev/fuse" {
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || report.OK || len(report.Checks) != 4 || report.Checks[1].Fix != "sudo chmod 0666 /dev/fuse" {
 		t.Fatalf("doctor --json = %s (%v), want a failed report with the chmod fix", stdout.String(), err)
 	}
 	stdout.Reset()
