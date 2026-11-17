@@ -499,10 +499,14 @@ func TestListReportsEachRecordsState(t *testing.T) {
 	}
 	// The worktree moved to another branch after it was made.
 	gitIn(t, paths[0], "switch", "-q", "-c", "moved")
+	stray := filepath.Join(home.Dir(), "w", "stray")
+	if err := os.WriteFile(stray, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	var stdout, stderr bytes.Buffer
-	if code := run(t.Context(), "linux", doctor.Probe{}, []string{"list", "--json"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("list --json: exit %d, stderr %q", code, stderr.String())
+	if code := run(t.Context(), "linux", doctor.Probe{}, []string{"list", "--json"}, &stdout, &stderr); code != 0 || stderr.String() != "slimtree: skipping "+stray+", which holds no readable record: open "+stray+"/worktree.json: not a directory\n" {
+		t.Fatalf("list --json: exit %d, stderr %q, want 0 and the stray entry skipped", code, stderr.String())
 	}
 	var got struct {
 		Version   int
@@ -560,5 +564,37 @@ func TestUsageErrorLeavesStdoutEmpty(t *testing.T) {
 		if code := run(t.Context(), "linux", doctor.Probe{}, tc.args, &stdout, &stderr); code != 1 || stdout.Len() != 0 || stderr.String() != tc.want {
 			t.Errorf("%q: exit %d, stdout %q, stderr %q; want 1, no stdout, stderr %q", tc.args, code, stdout.String(), stderr.String(), tc.want)
 		}
+	}
+}
+
+// git stats each unlocked worktree's .git, so a hung mount can hang git
+// worktree list. list stops git once worktreeListTimeout passes, and reports
+// the repository's worktrees as unknown.
+func TestListReportsUnknownWhenGitHangs(t *testing.T) {
+	homeDir := homeAfterFirstRun(t)
+	home, err := state.Open(homeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := home.Write(state.Record{Backend: "artifactfs", Path: "/work/hung", CommonDir: "/src/repo/.git"}); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "listing")
+	if err := os.WriteFile(filepath.Join(bin, "git"), fmt.Appendf(nil, "#!/bin/sh\n: > '%s'\nexec sleep 60\n", marker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ctx, cancel := gittest.ExpireOnFile(t.Context(), marker)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	if code := run(ctx, "linux", doctor.Probe{}, []string{"list", "--json"}, &stdout, &stderr); code != 0 || stderr.String() != "slimtree: git worktree list did not finish within 10s in /src/repo/.git, so its worktrees are unknown\n" {
+		t.Fatalf("list with a hung git: exit %d, stderr %q", code, stderr.String())
+	}
+	var got struct {
+		Worktrees []struct{ State, Reason string }
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil || len(got.Worktrees) != 1 || got.Worktrees[0].State != "unknown" || got.Worktrees[0].Reason != "git worktree list did not finish within 10s" {
+		t.Fatalf("list --json with a hung git = %s (%v), want the worktree unknown", stdout.String(), err)
 	}
 }

@@ -102,7 +102,7 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 							return err
 						}
 					}
-					l, err := listWorktrees(ctx, home, repo)
+					l, err := listWorktrees(ctx, home, repo, func(err error) { fmt.Fprintln(stderr, "slimtree:", err) })
 					if err != nil {
 						return err
 					}

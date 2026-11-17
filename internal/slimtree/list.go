@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 )
 
@@ -20,17 +22,33 @@ const (
 	stateOK      = "ok"
 	stateStopped = "stopped"
 	stateMissing = "missing"
+	// stateUnknown marks a worktree whose repository git did not list in
+	// worktreeListTimeout.
+	stateUnknown = "unknown"
 )
+
+// worktreeListTimeout bounds git worktree list, which stats each unlocked
+// worktree's .git, so a hung mount cannot hang list.
+const worktreeListTimeout = 10 * time.Second
+
+// worktreeListGrace is how long worktreeList waits for a git it stopped to
+// exit. A git stuck in a stat of a hung mount may never exit.
+const worktreeListGrace = 2 * time.Second
+
+// errWorktreeListTimeout is worktreeList's error when git did not finish.
+var errWorktreeListTimeout = errors.New("git worktree list did not finish within " + worktreeListTimeout.String())
 
 // listVersion is list --json's format. It rises when a field is renamed or
 // removed or changes its meaning.
 const listVersion = 1
 
 type listedWorktree struct {
-	Name    string    `json:"name"`
-	Path    string    `json:"path"`
-	Backend string    `json:"backend"`
-	State   string    `json:"state"`
+	Name    string `json:"name"`
+	Path    string `json:"path"`
+	Backend string `json:"backend"`
+	State   string `json:"state"`
+	// Reason says why the state is unknown.
+	Reason  string    `json:"reason,omitempty"`
 	Branch  string    `json:"branch"`
 	Repo    string    `json:"repo"`
 	Created time.Time `json:"created"`
@@ -43,29 +61,40 @@ type listing struct {
 
 // listWorktrees lists the worktrees that home's records name, of the
 // repository whose common dir is repo, or of every repository when repo is
-// "". It reads records and git's worktree list, and never stats a worktree,
-// because a hung mount would hang the stat.
-func listWorktrees(ctx context.Context, home *state.Home, repo string) (listing, error) {
-	records, err := home.Records()
+// "". It reads records and git's worktree list, and stats nothing itself.
+// git stats each unlocked worktree's .git, and skips a locked one, so each
+// repository's list is bounded by worktreeListTimeout. It passes each record
+// it skips, and each repository git did not list in time, to warn.
+func listWorktrees(ctx context.Context, home *state.Home, repo string, warn func(error)) (listing, error) {
+	records, err := home.Records(warn)
 	if err != nil {
 		return listing{}, err
 	}
 	out := listing{Version: listVersion, Worktrees: []listedWorktree{}}
-	gitWorktrees := map[string]map[string]gitWorktree{}
+	type repoList struct {
+		worktrees map[string]gitWorktree
+		err       error
+	}
+	lists := map[string]repoList{}
 	for _, r := range records {
 		if repo != "" && r.CommonDir != repo {
 			continue
 		}
-		listed, ok := gitWorktrees[r.CommonDir]
+		listed, ok := lists[r.CommonDir]
 		if !ok {
-			// A repository git cannot read lists no worktree, so each of its
-			// records is missing.
-			listed, _ = worktreeList(ctx, r.CommonDir)
-			gitWorktrees[r.CommonDir] = listed
+			listed.worktrees, listed.err = worktreeList(ctx, r.CommonDir)
+			if errors.Is(listed.err, errWorktreeListTimeout) {
+				warn(fmt.Errorf("%w in %s, so its worktrees are unknown", listed.err, r.CommonDir))
+			}
+			lists[r.CommonDir] = listed
 		}
 		w := listedWorktree{Name: r.Name(), Path: r.Path, Backend: r.Backend, Repo: r.CommonDir, Created: r.Created}
-		gw, ok := listed[r.Path]
+		gw, ok := listed.worktrees[r.Path]
 		switch {
+		case errors.Is(listed.err, errWorktreeListTimeout):
+			w.State, w.Reason = stateUnknown, listed.err.Error()
+		// A repository git cannot read lists no worktree, so each of its
+		// records is missing.
 		case !ok || gw.prunable:
 			w.State = stateMissing
 		// Without a reader of the mount table, list cannot tell a mounted
@@ -89,10 +118,39 @@ type gitWorktree struct {
 
 // worktreeList runs git worktree list in the repository whose common dir is
 // commonDir, and returns its worktrees by path. git reads each worktree's
-// branch from its own HEAD, and marks prunable a worktree whose .git file is
-// gone, so the worktree directory itself is never read.
+// branch from the HEAD in its admin directory. It stats each unlocked
+// worktree's .git and marks the worktree prunable when that is gone. When git
+// does not finish within worktreeListTimeout, worktreeList stops it and
+// returns errWorktreeListTimeout, without waiting past worktreeListGrace for
+// a git that cannot exit.
 func worktreeList(ctx context.Context, commonDir string) (map[string]gitWorktree, error) {
-	out, err := exec.CommandContext(ctx, "git", "--git-dir="+commonDir, "worktree", "list", "--porcelain", "-z").Output()
+	ctx, cancel := context.WithTimeout(ctx, worktreeListTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "--git-dir="+commonDir, "worktree", "list", "--porcelain", "-z")
+	gitstore.ConfigureCancelableCommand(cmd)
+	type result struct {
+		out []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := cmd.Output()
+		done <- result{out, err}
+	}()
+	var r result
+	select {
+	case r = <-done:
+	case <-ctx.Done():
+		select {
+		case r = <-done:
+		case <-time.After(worktreeListGrace):
+			r.err = ctx.Err()
+		}
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return nil, errWorktreeListTimeout
+	}
+	out, err := r.out, r.err
 	if err != nil {
 		return nil, fmt.Errorf("git worktree list in %s: %w", commonDir, err)
 	}

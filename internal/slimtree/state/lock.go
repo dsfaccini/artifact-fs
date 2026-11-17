@@ -22,8 +22,8 @@ var lockWait = LockWait
 // ErrLockBusy is the error of a lock another command holds.
 var ErrLockBusy = errors.New("slimtree's lock is busy")
 
-// lockWaiting, when set, runs once Lock waits on the flock. Tests use it to
-// end the wait.
+// lockWaiting, when set, runs once Lock has started the goroutine that waits
+// in flock. Tests use it to end the wait.
 var lockWaiting func()
 
 // Lock is the home's global lock, held while a command changes a worktree
@@ -43,9 +43,10 @@ type holder struct {
 }
 
 // Lock takes the global lock for a command that works on path, which may be
-// "". It waits until ctx ends or LockWait passes, then returns an error that
-// wraps ErrLockBusy and names the holder. It waits in flock, as an unbounded
-// wait does, so commands that arrive later never take the lock first.
+// "". It waits in flock, so it takes the lock as soon as the holder releases
+// it, for at most LockWait. A wait that reaches a deadline returns an error
+// that wraps ErrLockBusy and names the holder; a canceled ctx returns its
+// error.
 func (h *Home) Lock(ctx context.Context, path string) (*Lock, error) {
 	ctx, cancel := context.WithTimeout(ctx, lockWait)
 	defer cancel()
@@ -59,23 +60,30 @@ func (h *Home) Lock(ctx context.Context, path string) (*Lock, error) {
 		lockWaiting()
 	}
 	select {
-	case err := <-acquired:
-		if err != nil {
-			f.Close()
-			return nil, &os.PathError{Op: "flock", Path: f.Name(), Err: err}
-		}
-		return hold(f, path)
+	case err = <-acquired:
 	case <-ctx.Done():
-		busy := h.busy()
-		// The flock still waits. Release the lock once it lands.
-		go func() {
-			if <-acquired == nil {
-				unix.Flock(int(f.Fd()), unix.LOCK_UN)
+		// A lock that lands as the wait ends is taken.
+		select {
+		case err = <-acquired:
+		default:
+			// The flock still waits. Release the lock once it lands.
+			go func() {
+				if <-acquired == nil {
+					unix.Flock(int(f.Fd()), unix.LOCK_UN)
+				}
+				f.Close()
+			}()
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, h.busy()
 			}
-			f.Close()
-		}()
-		return nil, busy
+			return nil, ctx.Err()
+		}
 	}
+	if err != nil {
+		f.Close()
+		return nil, &os.PathError{Op: "flock", Path: f.Name(), Err: err}
+	}
+	return hold(f, path)
 }
 
 // TryLock takes the global lock for a command that works on path only when

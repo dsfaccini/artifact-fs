@@ -68,7 +68,7 @@ func (s *Store) streamTreeRecords(ctx context.Context, gitDir string, headOID st
 		return err
 	}
 	cmd := exec.CommandContext(ctx, "git", "ls-tree", "-r", "-t", "-z", headOID)
-	configureCancelableCommand(cmd)
+	ConfigureCancelableCommand(cmd)
 	// A treeless clone fetches missing trees here.
 	configureCommandSession(cmd)
 	cmd.Env = append(append(os.Environ(), "GIT_DIR="+gitDir), env...)
@@ -182,7 +182,7 @@ func (s *Store) batchResolveSizes(ctx context.Context, repo model.RepoConfig, no
 		return nil
 	}
 	cmd := exec.CommandContext(ctx, "git", "cat-file", "--batch-check", "--buffer")
-	configureCancelableCommand(cmd)
+	ConfigureCancelableCommand(cmd)
 	// GIT_NO_LAZY_FETCH prevents batch-check from fetching blob metadata from
 	// the promisor remote on blobless clones. Without it, every blob OID
 	// triggers a network round-trip, turning a millisecond operation into

@@ -59,6 +59,9 @@ func writeFirstRunMarker(dir string) error {
 		markerCreated(f)
 	}
 	_, err = fmt.Fprintf(f, "slimtree %s\n%s\n", version.String(), time.Now().UTC().Format(time.RFC3339))
+	if err == nil {
+		err = f.Sync()
+	}
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}

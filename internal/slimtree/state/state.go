@@ -39,7 +39,7 @@ type Home struct {
 // daemon must not serve its own state, and another user who can write there
 // could replace what the daemon runs.
 func Open(dir string) (*Home, error) {
-	resolved, err := daemon.EnsurePrivateRoot(dir, recordsDir)
+	resolved, err := daemon.EnsurePrivateRoot(dir, "slimtree home", "slimtree home", recordsDir)
 	if err != nil {
 		return nil, err
 	}
@@ -98,8 +98,10 @@ func (h *Home) Write(r Record) error {
 	return writeFile(dir, recordFile, append(data, '\n'))
 }
 
-// Records returns every record, sorted by path.
-func (h *Home) Records() ([]Record, error) {
+// Records returns every record, sorted by path. It skips an entry of w/
+// that holds no readable record, such as a stray file or a record a crash
+// left empty, and passes each skip's cause to skipped when it is not nil.
+func (h *Home) Records(skipped func(error)) ([]Record, error) {
 	entries, err := os.ReadDir(filepath.Join(h.dir, recordsDir))
 	if err != nil {
 		return nil, err
@@ -110,15 +112,18 @@ func (h *Home) Records() ([]Record, error) {
 		data, err := os.ReadFile(path)
 		// A directory without a record holds a worktree's state from a make
 		// that has not written its record yet.
-		if errors.Is(err, fs.ErrNotExist) {
+		if e.IsDir() && errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
-		if err != nil {
-			return nil, err
-		}
 		var r Record
-		if err := json.Unmarshal(data, &r); err != nil {
-			return nil, fmt.Errorf("reading %s: %w", path, err)
+		if err == nil {
+			err = json.Unmarshal(data, &r)
+		}
+		if err != nil {
+			if skipped != nil {
+				skipped(fmt.Errorf("skipping %s, which holds no readable record: %w", filepath.Join(h.dir, recordsDir, e.Name()), err))
+			}
+			continue
 		}
 		records = append(records, r)
 	}
@@ -130,7 +135,7 @@ func (h *Home) Records() ([]Record, error) {
 // path separator, or is . or .., is a path. Any other arg is a worktree's
 // name, and then a path below the current directory.
 func (h *Home) Resolve(arg string) (Record, error) {
-	records, err := h.Records()
+	records, err := h.Records(nil)
 	if err != nil {
 		return Record{}, err
 	}
@@ -190,8 +195,8 @@ func Canonical(path string) (string, error) {
 // create. Tests use it to fail the write that follows.
 var fileCreated func(*os.File)
 
-// writeFile writes data to name in dir through a temporary file and a
-// rename, so a failed write leaves no partial file.
+// writeFile writes data to name in dir through a temporary file, synced,
+// and a rename, so neither a failed write nor a crash leaves a partial file.
 func writeFile(dir, name string, data []byte) error {
 	f, err := os.CreateTemp(dir, "."+name+"-*")
 	if err != nil {
@@ -201,6 +206,9 @@ func writeFile(dir, name string, data []byte) error {
 		fileCreated(f)
 	}
 	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}

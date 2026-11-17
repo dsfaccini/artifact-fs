@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 )
 
 func openHome(t *testing.T) *Home {
@@ -28,7 +30,7 @@ func TestRecordRoundTrip(t *testing.T) {
 	if err := h.Write(r); err != nil {
 		t.Fatal(err)
 	}
-	got, err := h.Records()
+	got, err := h.Records(func(err error) { t.Error(err) })
 	r.Version = 1
 	if err != nil || !reflect.DeepEqual(got, []Record{r}) {
 		t.Fatalf("Records() = %+v, %v; want %+v", got, err, r)
@@ -89,8 +91,14 @@ func TestLockWaitNamesTheHolder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(t.Context())
-	lockWaiting = cancel
+	marker := filepath.Join(t.TempDir(), "waiting")
+	ctx, cancel := gittest.ExpireOnFile(t.Context(), marker)
+	defer cancel()
+	lockWaiting = func() {
+		if err := os.WriteFile(marker, nil, 0o600); err != nil {
+			t.Error(err)
+		}
+	}
 	t.Cleanup(func() { lockWaiting = nil })
 	want := regexp.MustCompile(`^slimtree's lock is busy: pid ` + regexp.QuoteMeta(strconv.Itoa(os.Getpid())+" (slimtree "+strings.Join(os.Args[1:], " ")+")") + ` has held it on /work/a for \d+\.\d s; rerun the command once it ends$`)
 	if _, err := h.Lock(ctx, ""); !errors.Is(err, ErrLockBusy) || !want.MatchString(err.Error()) {
@@ -126,7 +134,7 @@ func TestOpenRefusesAGroupWritableHome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(dir); err == nil || err.Error() != "refusing state directory "+resolved+": writable by group or others (mode 0770)" {
+	if _, err := Open(dir); err == nil || err.Error() != "refusing slimtree home "+resolved+": writable by group or others (mode 0770)" {
 		t.Fatalf("Open of a group-writable home = %v, want the refusal", err)
 	}
 }
@@ -180,5 +188,55 @@ func TestLockGivesUpAfterLockWait(t *testing.T) {
 	t.Cleanup(func() { lockWait = LockWait })
 	if _, err := h.Lock(t.Context(), ""); !errors.Is(err, ErrLockBusy) {
 		t.Fatalf("Lock while another holds it = %v, want ErrLockBusy", err)
+	}
+}
+
+// A canceled wait, as on Ctrl-C, returns the context's error, not a busy
+// lock.
+func TestLockCancelReturnsTheContextError(t *testing.T) {
+	h := openHome(t)
+	held, err := h.Lock(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { held.Unlock() })
+	ctx, cancel := context.WithCancel(t.Context())
+	lockWaiting = cancel
+	t.Cleanup(func() { lockWaiting = nil })
+	if _, err := h.Lock(ctx, ""); !errors.Is(err, context.Canceled) || errors.Is(err, ErrLockBusy) {
+		t.Fatalf("canceled Lock = %v, want context.Canceled", err)
+	}
+}
+
+// Records lists every readable record and skips a stray file and a record a
+// crash left empty, naming each.
+func TestRecordsSkipsUnreadableEntries(t *testing.T) {
+	h := openHome(t)
+	r := Record{Backend: "apfsclone", Path: "/work/a"}
+	if err := h.Write(r); err != nil {
+		t.Fatal(err)
+	}
+	w := filepath.Join(h.Dir(), "w")
+	if err := os.WriteFile(filepath.Join(w, "stray"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(w, "0123456789abcdef"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(w, "0123456789abcdef", "worktree.json"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var skipped []string
+	got, err := h.Records(func(err error) { skipped = append(skipped, err.Error()) })
+	r.Version = 1
+	if err != nil || !reflect.DeepEqual(got, []Record{r}) {
+		t.Fatalf("Records() = %+v, %v; want %+v", got, err, r)
+	}
+	want := []string{
+		"skipping " + w + "/0123456789abcdef, which holds no readable record: unexpected end of JSON input",
+		"skipping " + w + "/stray, which holds no readable record: open " + w + "/stray/worktree.json: not a directory",
+	}
+	if !reflect.DeepEqual(skipped, want) {
+		t.Fatalf("skipped %q, want %q", skipped, want)
 	}
 }

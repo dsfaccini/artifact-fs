@@ -22,7 +22,7 @@ var stateRootDirs = []string{"config", filepath.Join("config", "locks"), filepat
 // runs, such as the fsmonitor hook on every status or the SSH wrapper in
 // config/tmp, or the cached blobs that reads serve.
 func ensureStateRoot(root string) (string, error) {
-	return EnsurePrivateRoot(root, stateRootDirs...)
+	return EnsurePrivateRoot(root, "state root", "state directory", stateRootDirs...)
 }
 
 // EnsurePrivateRoot creates root and each of subdirs below it 0700, and
@@ -37,8 +37,10 @@ func ensureStateRoot(root string) (string, error) {
 // group or others can write. Ancestors of the root are not checked.
 //
 // It narrows each existing subdirectory to 0700. The root keeps its mode,
-// because the user chose it.
-func EnsurePrivateRoot(root string, subdirs ...string) (string, error) {
+// because the user chose it. Its refusals call the root rootLabel when
+// another user owns it, and call a directory that fails the privacy check
+// dirLabel.
+func EnsurePrivateRoot(root, rootLabel, dirLabel string, subdirs ...string) (string, error) {
 	// Check the owner before creating anything. With a trailing slash, macOS's
 	// mkdir follows a dangling symlink and creates its target.
 	root, err := filepath.Abs(root)
@@ -57,13 +59,13 @@ func EnsurePrivateRoot(root string, subdirs ...string) (string, error) {
 		return "", &os.PathError{Op: "lstat", Path: root, Err: err}
 	}
 	if link.Uid != uint32(os.Geteuid()) {
-		return "", fmt.Errorf("refusing state root %s: owned by another user", root)
+		return "", fmt.Errorf("refusing %s %s: owned by another user", rootLabel, root)
 	}
 	resolved, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return "", err
 	}
-	if err := checkPrivateDir(resolved); err != nil {
+	if err := checkPrivateDir(resolved, dirLabel); err != nil {
 		return "", err
 	}
 	for _, dir := range subdirs {
@@ -71,7 +73,7 @@ func EnsurePrivateRoot(root string, subdirs ...string) (string, error) {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			return "", err
 		}
-		if err := checkPrivateDir(path); err != nil {
+		if err := checkPrivateDir(path, dirLabel); err != nil {
 			return "", err
 		}
 		if err := os.Chmod(path, 0o700); err != nil {
@@ -93,16 +95,16 @@ func emptyDaemonTempDir(root string) (string, error) {
 	return dir, os.Mkdir(dir, 0o700)
 }
 
-func checkPrivateDir(path string) error {
+func checkPrivateDir(path, label string) error {
 	var st unix.Stat_t
 	if err := unix.Stat(path, &st); err != nil {
 		return &os.PathError{Op: "stat", Path: path, Err: err}
 	}
 	if st.Uid != uint32(os.Geteuid()) {
-		return fmt.Errorf("refusing state directory %s: owned by another user", path)
+		return fmt.Errorf("refusing %s %s: owned by another user", label, path)
 	}
 	if st.Mode&0o022 != 0 {
-		return fmt.Errorf("refusing state directory %s: writable by group or others (mode %04o)", path, st.Mode&0o777)
+		return fmt.Errorf("refusing %s %s: writable by group or others (mode %04o)", label, path, st.Mode&0o777)
 	}
 	return nil
 }
