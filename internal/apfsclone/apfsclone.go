@@ -111,7 +111,10 @@ type tree struct {
 // match. Before it creates anything, it refuses a commit-ish that names no
 // commit, and a base and a worktree parent that are not on one APFS volume.
 // After the worktree is filled it runs the post-checkout hook with the
-// arguments git worktree add passes it, and returns the hook's failure.
+// arguments git worktree add passes it, and returns the hook's failure. It
+// runs the hook through git hook run, which also runs the hooks that config
+// defines. Unlike git worktree add, which unsets GIT_DIR and GIT_WORK_TREE
+// for its hook, git hook run exports GIT_DIR, the new worktree's git dir.
 func Add(ctx context.Context, o Options) (Result, error) {
 	clone := o.Clone
 	if clone == nil {

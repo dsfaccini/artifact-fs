@@ -422,20 +422,27 @@ func TestAddRunsPostCheckoutAsGitWorktreeAddDoes(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, nil, nil)
 	log := filepath.Join(t.TempDir(), "post-checkout.log")
-	write(t, filepath.Join(f.base, ".git/hooks/post-checkout"), "#!/bin/sh\necho \"$(pwd -P) $(ps -o pgid= -p $$ | tr -d ' ') $*\" >> "+shellQuote(log)+"\n", 0o755)
+	write(t, filepath.Join(f.base, ".git/hooks/post-checkout"), "#!/bin/sh\necho \"$(pwd -P) $(ps -o pgid= -p $$ | tr -d ' ') GIT_DIR=${GIT_DIR-unset} $*\" >> "+shellQuote(log)+"\n", 0o755)
 	plain := f.addPlain(t, "plain")
 	clone, _ := f.add(t, "clone", newRecorder(filepath.Join(f.worktrees, "clone")).Clone)
 
 	head := run(t, f.upstream, "rev-parse", "main")
+	gitDir, err := filepath.EvalSymlinks(run(t, clone, "rev-parse", "--absolute-git-dir"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	var want []string
-	for _, worktree := range []string{plain, clone} {
-		resolved, err := filepath.EvalSymlinks(worktree)
+	// git worktree add unsets GIT_DIR for its hook. Add's git hook run exports
+	// the new worktree's git dir, and Add keeps git hook run because it also
+	// runs the hooks that config defines.
+	for _, hook := range []struct{ worktree, gitDir string }{{plain, "unset"}, {clone, gitDir}} {
+		resolved, err := filepath.EvalSymlinks(hook.worktree)
 		if err != nil {
 			t.Fatal(err)
 		}
 		// git worktree add runs the hook in its caller's process group, where
 		// the hook can read the terminal.
-		want = append(want, resolved+" "+strconv.Itoa(unix.Getpgrp())+" "+strings.Repeat("0", len(head))+" "+head+" 1")
+		want = append(want, resolved+" "+strconv.Itoa(unix.Getpgrp())+" GIT_DIR="+hook.gitDir+" "+strings.Repeat("0", len(head))+" "+head+" 1")
 	}
 	if got := strings.Split(strings.TrimSpace(read(t, log)), "\n"); !slices.Equal(got, want) {
 		t.Fatalf("post-checkout ran with %q, want %q", got, want)
