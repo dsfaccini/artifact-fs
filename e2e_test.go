@@ -126,6 +126,15 @@ func writeTestFile(t *testing.T, dir, name, content string) {
 	}
 }
 
+// renameEINTRRetries counts the renames renameInMount retried after EINTR.
+var renameEINTRRetries atomic.Int64
+
+// renameInMount renames oldPath to newPath through the mount with
+// unix.Rename.
+func renameInMount(oldPath, newPath string) error {
+	return unix.Rename(oldPath, newPath)
+}
+
 func run(t *testing.T, dir string, name string, args ...string) string {
 	t.Helper()
 	cmd := commandIn(dir, name, args...)
