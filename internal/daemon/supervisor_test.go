@@ -816,42 +816,91 @@ func TestSkippedMountCheckMountsTheRepoAtTheNextSync(t *testing.T) {
 	}
 }
 
-// A CLI preparation or a re-registration that starts and ends after a sync
-// pass listed b, and before the pass reaches b, supersedes the config or the
-// prepare request the pass listed. The mount check skips b, records no
+// supersedingGit runs supersede once, from b's mount check, at the step that
+// at names: "publish" once the opening check passed and before the publish,
+// and "prune" once the publish ran and before the prune.
+type supersedingGit struct {
+	model.GitStore
+	at        string
+	once      sync.Once
+	supersede func()
+}
+
+func (g *supersedingGit) ResolveHEAD(ctx context.Context, cfg model.RepoConfig) (string, string, error) {
+	if g.at == "publish" && cfg.Name == "b" {
+		g.once.Do(g.supersede)
+	}
+	return g.GitStore.ResolveHEAD(ctx, cfg)
+}
+
+func (g *supersedingGit) EnsureIndexInitialized(ctx context.Context, cfg model.RepoConfig) error {
+	if g.at == "prune" && cfg.Name == "b" {
+		g.once.Do(g.supersede)
+	}
+	return g.GitStore.EnsureIndexInitialized(ctx, cfg)
+}
+
+// A CLI preparation or a re-registration supersedes the config or the prepare
+// request a sync pass listed for b. At "opening check", the step starts and
+// ends after the pass listed b and before the pass reaches b. At "publish"
+// and "prune", it changes the registry while b's mount check runs, and waits
+// for the prepare lock the check holds. The mount check skips b, records no
 // failure and backs off nothing, and the next sync, which lists b anew,
 // mounts b.
 func TestSupersededMountCheckMountsTheRepoAtTheNextSync(t *testing.T) {
 	t.Parallel()
-	for _, step := range []string{"cli prepare", "re-registering sync add-repo"} {
-		t.Run(step, func(t *testing.T) {
-			t.Parallel()
-			ctx := t.Context()
-			svc, ctl, repo := newUnmountedSyncRepos(t, "a", "b")
-			var stepped atomic.Bool
-			svc.mount = func(mctx, opCtx context.Context, p model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
-				if p.Name == "a" && stepped.CompareAndSwap(false, true) {
-					if err := runCLIStep(ctx, ctl, repo, step, func() {}); err != nil {
-						t.Errorf("the %s: %v", step, err)
-					}
+	for _, at := range []string{"opening check", "publish", "prune"} {
+		for _, step := range []string{"cli prepare", "re-registering sync add-repo"} {
+			t.Run(at+"/"+step, func(t *testing.T) {
+				t.Parallel()
+				ctx := t.Context()
+				svc, ctl, repo := newUnmountedSyncRepos(t, "a", "b")
+				listed, err := svc.registry.GetRepo(ctx, "b")
+				if err != nil {
+					t.Fatal(err)
 				}
-				return fakeMount(mctx, opCtx, p, engine, gate, logger, redact)
-			}
-			if err := svc.syncRepos(ctx); err != nil {
-				t.Fatal(err)
-			}
-			if !stepped.Load() {
-				t.Fatalf("the pass never mounted a, so the %s never ran", step)
-			}
-			if rec := runtimeRecord(t, svc, "b"); rec.LastError != "" || !rec.NextRetryAt.IsZero() {
-				t.Fatalf("b's repo_runtime after the pass records the failure %q in phase %q with its next attempt at %v, want none", rec.LastError, rec.LastErrorPhase, rec.NextRetryAt)
-			}
-			if err := svc.syncRepos(ctx); err != nil {
-				t.Fatal(err)
-			}
-			if rec := runtimeRecord(t, svc, "b"); rec.State != repoStateMounted || rec.LastError != "" {
-				t.Fatalf("b's repo_runtime after the next sync = %+v, want it mounted with no failure", rec)
-			}
-		})
+				stepped := make(chan error, 1)
+				var started atomic.Bool
+				run := func() {
+					started.Store(true)
+					stepped <- runCLIStep(ctx, ctl, repo, step, func() {})
+				}
+				if at == "opening check" {
+					svc.mount = func(mctx, opCtx context.Context, p model.RepoPaths, engine *fusefs.Engine, gate *fusefs.ReadyGate, logger *slog.Logger, redact func(string) string) (fusefs.MountedFS, error) {
+						if p.Name == "a" && !started.Load() {
+							run()
+						}
+						return fakeMount(mctx, opCtx, p, engine, gate, logger, redact)
+					}
+				} else {
+					svc.mount = fakeMount
+					svc.git = &supersedingGit{GitStore: svc.git, at: at, supersede: func() {
+						go run()
+						waitFor(t, stepped, func() bool {
+							cur, err := svc.registry.GetRepo(ctx, "b")
+							return err == nil && (cur.ConfigVersion != listed.ConfigVersion || cur.PrepareRequest != listed.PrepareRequest)
+						})
+					}}
+				}
+				if err := svc.syncRepos(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if !started.Load() {
+					t.Fatalf("the %s never ran", step)
+				}
+				if rec := runtimeRecord(t, svc, "b"); rec.LastError != "" || !rec.NextRetryAt.IsZero() {
+					t.Fatalf("b's repo_runtime after the pass records the failure %q in phase %q with its next attempt at %v, want none", rec.LastError, rec.LastErrorPhase, rec.NextRetryAt)
+				}
+				if err := <-stepped; err != nil {
+					t.Fatalf("the %s: %v", step, err)
+				}
+				if err := svc.syncRepos(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if rec := runtimeRecord(t, svc, "b"); rec.State != repoStateMounted || rec.LastError != "" {
+					t.Fatalf("b's repo_runtime after the next sync = %+v, want it mounted with no failure", rec)
+				}
+			})
+		}
 	}
 }
