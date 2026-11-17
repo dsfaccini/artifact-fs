@@ -18,8 +18,19 @@
 //   - update-index --refresh then hashes every file, because read-tree records
 //     no stat data. A file that does not match its blob is rewritten from Git,
 //     and diff-files must then be empty. Refresh hashes through Git's clean
-//     filter, so it compares raw bytes only for a checkout that converts no
-//     files.
+//     filter, which compares raw bytes only because Add refuses every checkout
+//     that converts files.
+//
+// Before it creates anything, Add refuses a checkout that converts files: Git
+// would then write other bytes than the blobs', so a clone could not be
+// checked against its blob. No path of the commit may have a filter, ident,
+// working-tree-encoding, eol or crlf attribute, or a text attribute other than
+// -text, which turns end-of-line conversion off. check-attr --cached reads
+// them from the commit's index, $GIT_DIR/info/attributes and the global and
+// system attributes files. It does not read an attribute source that a
+// checkout reads instead of the index, so GIT_ATTR_SOURCE and attr.tree must
+// be unset. core.autocrlf must not be true or input. No config may hold a
+// conditional include, which can configure the new worktree unlike the base.
 //
 // Clones keep the base files' mtimes, unlike a plain checkout. A file
 // rewritten in full (an atomic save, git checkout, a branch switch) becomes a
@@ -74,6 +85,13 @@ type Options struct {
 	// Stdout and Stderr receive the output of git worktree add and of the
 	// post-checkout hook.
 	Stdout, Stderr io.Writer
+
+	// beforeRegister and afterRewrite are test hooks that production code
+	// leaves nil. beforeRegister runs after Add's checks, before git worktree
+	// add. afterRewrite runs after Add rewrites from Git the files that differ
+	// from the index, with their paths.
+	beforeRegister func()
+	afterRewrite   func(paths []string)
 }
 
 // Result counts the files of a worktree that Add made.
@@ -109,7 +127,9 @@ type tree struct {
 // Add makes the worktree o.Path from o.Base, as git worktree add with o.AddArgs
 // and o.Commit does, with the base's files cloned where Add can show they
 // match. Before it creates anything, it refuses a commit-ish that names no
-// commit, and a base and a worktree parent that are not on one APFS volume.
+// commit, a checkout that converts files, and a base and a worktree parent
+// that are not on one APFS volume. When the new worktree's HEAD is another
+// commit than the one Add checked, it checks that commit's attributes too.
 // After the worktree is filled it runs the post-checkout hook with the
 // arguments git worktree add passes it, and returns the hook's failure. It
 // runs the hook through git hook run, which also runs the hooks that config
@@ -139,18 +159,29 @@ func Add(ctx context.Context, o Options) (Result, error) {
 	if err != nil {
 		return Result{}, refuse(err)
 	}
-	if _, err := git(ctx, base, nil, "rev-parse", "--verify", "--quiet", o.Commit+"^{commit}"); err != nil {
+	out, err := git(ctx, base, nil, "rev-parse", "--verify", "--quiet", o.Commit+"^{commit}")
+	if err != nil {
 		return Result{}, refuse(fmt.Errorf("%s names no commit", o.Commit))
+	}
+	commit := strings.TrimSpace(string(out))
+	if err := refuseConvertingAttributes(ctx, base, commit); err != nil {
+		return Result{}, refuse(err)
+	}
+	if err := refuseConvertingConfig(ctx, base); err != nil {
+		return Result{}, refuse(err)
 	}
 	if err := preflight(clone, base, dest, baseHead); err != nil {
 		return Result{}, refuse(err)
 	}
-	out, err := git(ctx, base, nil, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	out, err = git(ctx, base, nil, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
 		return Result{}, refuse(err)
 	}
 	commonDir := strings.TrimSpace(string(out))
 
+	if o.beforeRegister != nil {
+		o.beforeRegister()
+	}
 	if err := register(ctx, o, base, dest, filepath.Join(commonDir, RegistrationLock)); err != nil {
 		return Result{}, err
 	}
@@ -159,7 +190,13 @@ func Add(ctx context.Context, o Options) (Result, error) {
 		return Result{}, &IncompleteError{dest, err}
 	}
 	head := strings.TrimSpace(string(out))
-	result, err := populate(ctx, clone, base, dest, baseHead, dirty)
+	// A fetch can move o.Commit after the check.
+	if head != commit {
+		if err := refuseConvertingAttributes(ctx, dest, head); err != nil {
+			return Result{}, &IncompleteError{dest, err}
+		}
+	}
+	result, err := populate(ctx, clone, base, dest, baseHead, dirty, o.afterRewrite)
 	if err != nil {
 		return Result{}, &IncompleteError{dest, err}
 	}
@@ -280,8 +317,8 @@ func preflight(clone Clonefile, base, dest string, baseHead tree) error {
 
 // populate writes dest's files, cloning from base the paths that baseHead and
 // dirty show to match, and rewrites from Git each clone that does not match
-// its entry.
-func populate(ctx context.Context, clone Clonefile, base, dest string, baseHead tree, dirty map[string]bool) (Result, error) {
+// its entry. afterRewrite, when not nil, runs after that rewrite.
+func populate(ctx context.Context, clone Clonefile, base, dest string, baseHead tree, dirty map[string]bool, afterRewrite func([]string)) (Result, error) {
 	target, err := treeEntries(ctx, dest)
 	if err != nil {
 		return Result{}, err
@@ -339,6 +376,9 @@ func populate(ctx context.Context, clone Clonefile, base, dest string, baseHead 
 	if err := checkoutIndex(ctx, dest, mismatched); err != nil {
 		return Result{}, err
 	}
+	if afterRewrite != nil {
+		afterRewrite(mismatched)
+	}
 	if still, err := diffFiles(ctx, dest); err != nil {
 		return Result{}, err
 	} else if len(still) > 0 {
@@ -371,6 +411,88 @@ func misshapenClones(dest string, target tree, paths []string) ([]string, error)
 		}
 	}
 	return misshapen, nil
+}
+
+// convertingAttributes are the attributes that can make a checkout write
+// other bytes than a blob's.
+var convertingAttributes = map[string]bool{"filter": true, "ident": true, "working-tree-encoding": true, "text": true, "eol": true, "crlf": true}
+
+// refuseConvertingAttributes refuses a commit with a path whose attributes
+// convert it on checkout. It runs check-attr --cached on a temporary index of
+// the commit, so it leaves repo's index alone. It accepts -text, which turns
+// end-of-line conversion off.
+func refuseConvertingAttributes(ctx context.Context, repo, commit string) error {
+	scratch, err := os.MkdirTemp("", "apfsclone-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(scratch)
+	env := []string{"GIT_INDEX_FILE=" + filepath.Join(scratch, "index")}
+	if _, err := gitWithEnv(ctx, repo, env, nil, "read-tree", commit); err != nil {
+		return err
+	}
+	paths, err := gitWithEnv(ctx, repo, env, nil, "ls-files", "-z")
+	if err != nil {
+		return err
+	}
+	report, err := gitWithEnv(ctx, repo, env, paths, "check-attr", "--cached", "--all", "-z", "--stdin")
+	if err != nil {
+		return err
+	}
+	fields := strings.Split(string(report), "\x00")
+	for i := 0; i+2 < len(fields); i += 3 {
+		p, attribute, value := fields[i], fields[i+1], fields[i+2]
+		if convertingAttributes[attribute] && (attribute != "text" || value != "unset") {
+			return fmt.Errorf("%s has the attribute %s=%s, which converts it on checkout", p, attribute, value)
+		}
+	}
+	return nil
+}
+
+// refuseConvertingConfig refuses a config or an environment that makes a
+// checkout in a new worktree of repo convert files that
+// refuseConvertingAttributes does not show.
+func refuseConvertingConfig(ctx context.Context, repo string) error {
+	autocrlf, err := config(ctx, repo, "--type=bool-or-str", "--get", "core.autocrlf")
+	if err != nil {
+		return err
+	}
+	if autocrlf == "true" || strings.EqualFold(autocrlf, "input") {
+		return fmt.Errorf("the config sets core.autocrlf=%s, which converts line endings", autocrlf)
+	}
+	if source := os.Getenv("GIT_ATTR_SOURCE"); source != "" {
+		return fmt.Errorf("the environment sets GIT_ATTR_SOURCE=%s, which replaces the attributes a checkout reads", source)
+	}
+	tree, err := config(ctx, repo, "--get", "attr.tree")
+	if err != nil {
+		return err
+	}
+	if tree != "" {
+		return fmt.Errorf("the config sets attr.tree=%s, which replaces the attributes a checkout reads", tree)
+	}
+	includes, err := config(ctx, repo, "--name-only", "--get-regexp", `^includeif\.`)
+	if err != nil {
+		return err
+	}
+	// A hasconfig:remote.*.url condition can name a URL with credentials.
+	if include, _, _ := strings.Cut(includes, "\n"); include != "" {
+		return fmt.Errorf("the config sets %s, a conditional include that can configure the new worktree unlike %s", auth.RedactString(include), repo)
+	}
+	return nil
+}
+
+// config returns what git config with args prints in repo, trimmed, or ""
+// when no key matches.
+func config(ctx context.Context, repo string, args ...string) (string, error) {
+	out, err := git(ctx, repo, nil, append([]string{"config"}, args...)...)
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func regular(mode string) bool { return mode == "100644" || mode == "100755" }
@@ -460,8 +582,14 @@ func configureGit(cmd *exec.Cmd) {
 
 // git runs git -C dir with args and stdin, and returns its stdout.
 func git(ctx context.Context, dir string, stdin []byte, args ...string) ([]byte, error) {
+	return gitWithEnv(ctx, dir, nil, stdin, args...)
+}
+
+// gitWithEnv runs git as git does, with env added to its environment.
+func gitWithEnv(ctx context.Context, dir string, env []string, stdin []byte, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
 	configureGit(cmd)
+	cmd.Env = append(cmd.Env, env...)
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
