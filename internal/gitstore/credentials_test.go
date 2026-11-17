@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -34,7 +35,7 @@ func TestExistingCloneCredentialOperationsKeepCredentialsOutOfArguments(t *testi
 		"printf '%s\\n' \"$*\" >> \"$AFS_GIT_COMMANDS\"\n" +
 		"if [ \"$*\" = 'remote get-url origin' ]; then printf '%s\\n' 'https://example.com/old/repo.git'; exit 0; fi\n" +
 		"if [ \"$1\" = 'fetch' ]; then printf '%s:%s\\n' \"$ARTIFACT_FS_GIT_USERNAME\" \"$ARTIFACT_FS_GIT_PASSWORD\" > \"$AFS_GIT_CREDENTIALS\"; fi\n"
-	if err := os.WriteFile(fakeGit, []byte(script), 0o755); err != nil {
+	if err := execfile.Write(fakeGit, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -363,7 +364,7 @@ func TestCloneBloblessRejectsBeforeGit(t *testing.T) {
 		t.Fatal(err)
 	}
 	marker := filepath.Join(tmp, "git-invoked")
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\n: > '"+marker+"'\nexit 1\n"), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte("#!/bin/sh\n: > '"+marker+"'\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -520,7 +521,7 @@ func TestCloneBloblessReportsServerStderrWithCaseFoldingText(t *testing.T) {
 	// overruns the original. A server controls what its transport prints.
 	tmp := t.TempDir()
 	ssh := filepath.Join(tmp, "ssh")
-	if err := os.WriteFile(ssh, []byte("#!/bin/sh\nprintf '%s\\n' 'denied x:ȺȺȺȺ://a@b here' >&2\nexit 1\n"), 0o755); err != nil {
+	if err := execfile.Write(ssh, []byte("#!/bin/sh\nprintf '%s\\n' 'denied x:ȺȺȺȺ://a@b here' >&2\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("GIT_SSH_COMMAND", ssh)
@@ -548,7 +549,7 @@ func serveSSHFromLocalRepo(t *testing.T) (commit, contacted string) {
 	run(t, "git", "-C", src, "config", "uploadpack.allowFilter", "true")
 	contacted = filepath.Join(tmp, "contacted")
 	ssh := filepath.Join(tmp, "ssh")
-	if err := os.WriteFile(ssh, []byte("#!/bin/sh\n: > '"+contacted+"'\nexec git-upload-pack '"+src+"'\n"), 0o755); err != nil {
+	if err := execfile.Write(ssh, []byte("#!/bin/sh\n: > '"+contacted+"'\nexec git-upload-pack '"+src+"'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("GIT_SSH_COMMAND", ssh)

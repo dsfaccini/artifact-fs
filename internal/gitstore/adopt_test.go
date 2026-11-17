@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -159,7 +160,7 @@ func TestAdoptedWorktreeConfigMigrationFailureKeepsWorktreePaths(t *testing.T) {
 				t.Fatal(err)
 			}
 			wrapper := fmt.Sprintf("#!/bin/sh\ncase \" $* \" in *\" %s \"*) exit 1 ;; esac\nexec '%s' \"$@\"\n", failingWrite, realGit)
-			if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
+			if err := execfile.Write(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))

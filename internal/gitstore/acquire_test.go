@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -152,7 +153,7 @@ func wrapGit(t *testing.T, dir string, script string) string {
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_REAL_GIT", realGit)
@@ -1572,7 +1573,7 @@ func TestFetchStartsBeforeAndEndsAfterItsRemoteLookup(t *testing.T) {
 		"  'remote get-url origin') trap '' TERM; echo $$ > \"$AFS_LOOKUP_PID.tmp\"; mv \"$AFS_LOOKUP_PID.tmp\" \"$AFS_LOOKUP_PID\"; i=0; while [ ! -f \"$AFS_FETCH_PID\" ] && [ $i -lt 6000 ]; do sleep 0.01; i=$((i+1)); done; while kill -0 \"$(cat \"$AFS_FETCH_PID\")\" 2>/dev/null && [ $i -lt 6000 ]; do sleep 0.01; i=$((i+1)); done; : > \"$AFS_EXPIRE\"; sleep 60; : > \"$AFS_LOOKUP_FINISHED\"; echo \"$AFS_ACTUAL_REMOTE\";;\n" +
 		"  'fetch --no-tags origin '*) echo $$ > \"$AFS_FETCH_PID.tmp\"; mv \"$AFS_FETCH_PID.tmp\" \"$AFS_FETCH_PID\"; i=0; while [ ! -f \"$AFS_LOOKUP_PID\" ] && [ $i -lt 6000 ]; do sleep 0.01; i=$((i+1)); done; [ -f \"$AFS_LOOKUP_FINISHED\" ] || : > \"$AFS_FETCH_STARTED\"; printf \"fatal: '%s' does not appear to be a git repository\\n\" \"$AFS_ACTUAL_REMOTE\" >&2; exit 128;;\n" +
 		"esac\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1636,7 +1637,7 @@ func TestFetchKeepsTheCauseOfAFailureBeforeItsRemoteLookup(t *testing.T) {
 		"  'remote get-url origin') i=0; while { [ ! -f \"$AFS_FETCH_PID\" ] || kill -0 \"$(cat \"$AFS_FETCH_PID\")\" 2>/dev/null; } && [ $i -lt 6000 ]; do sleep 0.01; i=$((i+1)); done; echo \"$AFS_ACTUAL_REMOTE\";;\n" +
 		"  'fetch --no-tags origin '*) echo $$ > \"$AFS_FETCH_PID.tmp\"; mv \"$AFS_FETCH_PID.tmp\" \"$AFS_FETCH_PID\"; printf \"fatal: '%s' does not appear to be a git repository\\n\" \"$AFS_ACTUAL_REMOTE\" >&2; exit 128;;\n" +
 		"esac\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1674,7 +1675,7 @@ func TestFetchKeepsTheCauseWhenItsContextEndsAfterItsRemoteLookup(t *testing.T) 
 		"  'remote get-url origin') echo $$ > \"$AFS_LOOKUP_PID.tmp\"; mv \"$AFS_LOOKUP_PID.tmp\" \"$AFS_LOOKUP_PID\"; echo \"$AFS_ACTUAL_REMOTE\";;\n" +
 		"  'fetch --no-tags origin '*) printf \"fatal: '%s' does not appear to be a git repository\\n\" \"$AFS_ACTUAL_REMOTE\" >&2; i=0; while { [ ! -f \"$AFS_LOOKUP_PID\" ] || kill -0 \"$(cat \"$AFS_LOOKUP_PID\")\" 2>/dev/null; } && [ $i -lt 6000 ]; do sleep 0.01; i=$((i+1)); done; : > \"$AFS_EXPIRE\"; sleep 60; exit 128;;\n" +
 		"esac\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))

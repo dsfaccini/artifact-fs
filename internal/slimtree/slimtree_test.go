@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/daemon"
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -171,7 +172,7 @@ func registerHookedRepo(t *testing.T) (link, script, token string) {
 		t.Fatal(err)
 	}
 	script = filepath.Join(t.TempDir(), "fsmonitor-hook")
-	if err := os.WriteFile(script, fmt.Appendf(nil, "#!/bin/sh\nexec '%s' fsmonitor-hook --name repo \"$@\"\n", exe), 0o700); err != nil {
+	if err := execfile.Write(script, fmt.Appendf(nil, "#!/bin/sh\nexec '%s' fsmonitor-hook --name repo \"$@\"\n", exe), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return link, script, fmt.Sprintf("artifact-fs:%s:%s:", repos[0].ID, repos[0].ConfigVersion)
@@ -582,7 +583,7 @@ func TestListReportsUnknownWhenGitHangs(t *testing.T) {
 	}
 	bin := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "listing")
-	if err := os.WriteFile(filepath.Join(bin, "git"), fmt.Appendf(nil, "#!/bin/sh\n: > '%s'\nexec sleep 60\n", marker), 0o700); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), fmt.Appendf(nil, "#!/bin/sh\n: > '%s'\nexec sleep 60\n", marker), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -613,7 +614,7 @@ func TestListFailsWhenCanceled(t *testing.T) {
 	}
 	bin := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "listing")
-	if err := os.WriteFile(filepath.Join(bin, "git"), fmt.Appendf(nil, "#!/bin/sh\n: > '%s'\nexec sleep 60\n", marker), 0o700); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), fmt.Appendf(nil, "#!/bin/sh\n: > '%s'\nexec sleep 60\n", marker), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))

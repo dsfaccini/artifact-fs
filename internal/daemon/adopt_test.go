@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
@@ -164,7 +165,7 @@ func TestRemoveRepoStopsAdoptedFSMonitor(t *testing.T) {
 	if err := os.Remove(hookPath); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\nprintf 'artifact-fs:adopted:1\\000'\n"), 0o755); err != nil {
+	if err := execfile.Write(hookPath, []byte("#!/bin/sh\nprintf 'artifact-fs:adopted:1\\000'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if got := runCmdOutput(t, "git", "-C", worktree, "status", "--porcelain"); got != "" {
@@ -469,7 +470,7 @@ func TestRemoveRepoAfterTheCleanBaselineLeavesNativeStatusQuiet(t *testing.T) {
 	// A hook that reports no changes leaves the entries the baseline marked
 	// FSMonitor-valid, which ls-files -f prints in lowercase.
 	hook := filepath.Join(t.TempDir(), "fsmonitor")
-	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
+	if err := execfile.Write(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "-c", "core.fsmonitor="+hook, "ls-files", "-f")); got != "h README.md" {
@@ -651,7 +652,7 @@ func TestAdoptedMountSwitchesAnOlderHookScriptToTheLink(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+	if err := execfile.Write(script, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	runCmd(t, "git", "-C", source, "config", "extensions.worktreeConfig", "true")
@@ -722,7 +723,7 @@ func TestAdoptedMountConfiguresWorktreeOnce(t *testing.T) {
 	}
 	spawnLog := filepath.Join(dir, "git-spawns.log")
 	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AFS_GIT_SPAWN_LOG\"\nexec \"$AFS_REAL_GIT\" \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_REAL_GIT", realGit)

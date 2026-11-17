@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 )
 
 // PrivateTempDir returns a new directory in the user's cache directory, with
@@ -288,7 +290,7 @@ func IsolatePrompts(t *testing.T) string {
 	dir := t.TempDir()
 	runs := filepath.Join(dir, "askpass-runs")
 	askpass := filepath.Join(dir, "askpass")
-	if err := os.WriteFile(askpass, []byte("#!/bin/sh\necho \"$*\" >> '"+runs+"'\necho no\n"), 0o755); err != nil {
+	if err := execfile.Write(askpass, []byte("#!/bin/sh\necho \"$*\" >> '"+runs+"'\necho no\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("SSH_ASKPASS", askpass)

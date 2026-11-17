@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
@@ -1670,7 +1671,7 @@ func TestChangeLogCoversAHEADMoveAfterTheActivationsBootstrap(t *testing.T) {
 	g.armed.Store(false)
 	// A hook that names no path: Git trusts every entry marked valid.
 	hook := filepath.Join(t.TempDir(), "fsmonitor")
-	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
+	if err := execfile.Write(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if valid := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", r.cfg.GitDir, "--work-tree", r.cfg.MountPath, "-c", "core.fsmonitor="+hook, "ls-files", "-f", "README.md")); !strings.HasPrefix(valid, "h ") {

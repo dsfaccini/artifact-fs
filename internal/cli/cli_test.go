@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/daemon"
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -223,7 +224,7 @@ func TestAddRepoCLIRejectsOptionRemoteBeforeGit(t *testing.T) {
 				t.Fatal(err)
 			}
 			marker := filepath.Join(tmp, "git-invoked")
-			if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\n: > \"$GIT_INVOKED_MARKER\"\nexit 1\n"), 0o755); err != nil {
+			if err := execfile.Write(filepath.Join(bin, "git"), []byte("#!/bin/sh\n: > \"$GIT_INVOKED_MARKER\"\nexit 1\n"), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			t.Setenv("GIT_INVOKED_MARKER", marker)

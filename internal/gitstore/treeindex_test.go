@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
@@ -98,7 +99,7 @@ func TestBuildTreeIndexPropagatesBatchCancellation(t *testing.T) {
 	started := filepath.Join(tmp, "cat-file-started")
 	oid := strings.Repeat("a", 40)
 	script := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in\nls-tree) printf '100644 blob %s\\tfile.txt\\0' ;;\ncat-file) : > \"$AFS_CAT_FILE_STARTED\"; exec sleep 30 ;;\nesac\n", oid)
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -150,7 +151,7 @@ while IFS= read -r oid; do
 	printf '%s blob 7\n' "$oid"
 done
 `
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -180,7 +181,7 @@ done
 func TestBuildTreeIndexBoundsLazyFetchStderr(t *testing.T) {
 	// A lazy tree fetch's server shapes ls-tree's stderr, which redaction reads.
 	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nprintf 'fatal: %0100000d\\n' 0 >&2\nexit 128\n"), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte("#!/bin/sh\nprintf 'fatal: %0100000d\\n' 0 >&2\nexit 128\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -281,7 +282,7 @@ func TestBuildTreeIndexPreservesDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := filepath.Join(tmp, "ls-tree-started")
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nif [ \"$1\" = ls-tree ]; then\n  : > \"$AFS_LS_TREE_STARTED\"\n  exec sleep 10\nfi\nexit 1\n"), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte("#!/bin/sh\nif [ \"$1\" = ls-tree ]; then\n  : > \"$AFS_LS_TREE_STARTED\"\n  exec sleep 10\nfi\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))

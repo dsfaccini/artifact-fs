@@ -20,6 +20,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
@@ -148,7 +149,7 @@ func (f *bootstrapFixture) removeTracked(t *testing.T) {
 func (f *bootstrapFixture) indexEntries(t *testing.T) string {
 	t.Helper()
 	hook := filepath.Join(t.TempDir(), "fsmonitor")
-	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
+	if err := execfile.Write(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return strings.TrimSpace(runCmdOutput(t, "git", "-C", f.cfg.MountPath, "-c", "core.fsmonitor="+hook, "ls-files", "-f"))
@@ -196,7 +197,7 @@ case " $* " in
 esac
 exec "$AFS_REAL_GIT" "$@"
 `
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_REAL_GIT", realGit)
@@ -703,7 +704,7 @@ func gitStatusWithAnswerIn(t *testing.T, location []string, answer []byte) (stri
 	if err := os.WriteFile(answerPath, answer, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf '%s' \"$2\" > '"+tokenPath+"'\ncat '"+answerPath+"'\n"), 0o755); err != nil {
+	if err := execfile.Write(hook, []byte("#!/bin/sh\nprintf '%s' \"$2\" > '"+tokenPath+"'\ncat '"+answerPath+"'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	status, err := exec.Command("git", append(location, "-c", "core.fsmonitor="+hook, "status", "--porcelain")...).Output()
@@ -1010,7 +1011,7 @@ func TestFSMonitorHookRescansUnlessTokenAndMountAreCurrent(t *testing.T) {
 			runCmd(t, "git", "-C", repo, "add", "README.md")
 			// An earlier hook leaves its token and fsmonitor-valid bits in the index.
 			earlierHook := filepath.Join(dir, "earlier-hook")
-			if err := os.WriteFile(earlierHook, []byte("#!/bin/sh\nprintf '%s\\000' '"+since+"'\n"), 0o755); err != nil {
+			if err := execfile.Write(earlierHook, []byte("#!/bin/sh\nprintf '%s\\000' '"+since+"'\n"), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			runCmd(t, "git", "-C", repo, "config", "core.fsmonitor", earlierHook)

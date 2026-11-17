@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"golang.org/x/sys/unix"
 )
 
@@ -31,7 +32,7 @@ func TestE2ERenameRetriesAnInterruptedHydration(t *testing.T) {
 	// The wait for release ends after about 60 s, so a regression leaves no
 	// fetch running.
 	script := "#!/bin/sh\n: > " + quote(started) + "\ni=0\nwhile [ ! -e " + quote(release) + " ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done\nexec git-upload-pack \"$@\"\n"
-	if err := os.WriteFile(uploadPack, []byte(script), 0o755); err != nil {
+	if err := execfile.Write(uploadPack, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o644) })

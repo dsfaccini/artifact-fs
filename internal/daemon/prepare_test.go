@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
@@ -770,7 +771,7 @@ func TestPreparationFailsWhenAConfigWriteFails(t *testing.T) {
 				if err := os.Mkdir(bin, 0o755); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+				if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 					t.Fatal(err)
 				}
 				realGit, err := exec.LookPath("git")
@@ -1189,7 +1190,7 @@ func TestPrepareCancelsTheAsyncPreparationItSupersedes(t *testing.T) {
 	// A clone marks its start, hangs, then marks its end. A canceled clone
 	// never marks its end.
 	script := "#!/bin/sh\nif [ \"$1\" = clone ]; then\n  : > \"$AFS_MARKERS/start-$$\"\n  sleep 60\n  : > \"$AFS_MARKERS/end-$$\"\n  exit 1\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_REAL_GIT", realGit)
@@ -1338,7 +1339,7 @@ func TestCanceledPreparationRestoresTheIndex(t *testing.T) {
 	// canceled.
 	blocked := filepath.Join(tmp, "update-ref-blocked")
 	script := "#!/bin/sh\nif [ \"$1\" = update-ref ] && [ ! -e \"$AFS_BLOCKED\" ]; then\n  : > \"$AFS_BLOCKED\"\n  sleep 60\n  exit 1\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AFS_REAL_GIT", realGit)
@@ -1425,7 +1426,7 @@ func TestCanceledReadTreeLeavesNoIndexLock(t *testing.T) {
 	blocked := filepath.Join(tmp, "read-tree-blocked")
 	hook := filepath.Join(tmp, "fsmonitor-hook")
 	script := "#!/bin/sh\nif [ -e \"$AFS_INDEX_LOCK\" ] && [ ! -e \"$AFS_BLOCKED\" ]; then\n  : > \"$AFS_BLOCKED\"\n  sleep 60\nfi\nexit 1\n"
-	if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
+	if err := execfile.Write(hook, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	runCmd(t, "git", "-C", clone, "config", "core.fsmonitor", hook)
