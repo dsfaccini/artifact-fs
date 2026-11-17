@@ -51,7 +51,8 @@ func (s *Store) runInputCommand(ctx context.Context, cmd *exec.Cmd, gitDir strin
 	// A fetch's server shapes this stderr, and redaction's cost grows faster
 	// than its length.
 	stderr := &boundedGitError{limit: maxGitErrorBytes}
-	if err := RunWithFiles(cmd, s.tempDir, input, readInto(&stdout), stderr); err != nil {
+	cmd.Stdout, cmd.Stderr = &stdout, stderr
+	if err := RunWithFiles(cmd, s.tempDir, input, nil); err != nil {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
@@ -64,12 +65,15 @@ func (s *Store) runInputCommand(ctx context.Context, cmd *exec.Cmd, gitDir strin
 	return stdout.String(), nil
 }
 
-// RunWithFiles runs cmd to completion with a file, not a pipe, for each of its
-// standard streams. cmd reads input as its stdin when input is not nil. It
-// writes stdout and stderr to files. Once cmd exits, RunWithFiles passes the
-// stdout file to readStdout and copies the stderr file to stderr. A nil
-// readStdout or stderr discards that stream. Each file is unlinked in dir, or
-// in the system temp directory when dir is "", before cmd starts.
+// RunWithFiles runs cmd to completion as cmd.Run does, with a file, not a
+// pipe, for each standard stream that is not an *os.File. cmd reads input as
+// its stdin when input is not nil. A writer the caller set as cmd.Stdout or
+// cmd.Stderr gets what cmd wrote there once cmd exits, whatever its exit
+// status. An *os.File stays as the caller set it, so a hook can still reach
+// the terminal. When readStdout is not nil, it replaces cmd.Stdout and gets
+// the stdout file only once cmd exits 0: a git that failed, as on a full
+// disk, can leave its last line cut. Each file is unlinked in dir, or in the
+// system temp directory when dir is "", before cmd starts.
 //
 // A pipe ends only when every process that holds its write end closes it.
 // os/exec copies a stream that is not an *os.File through a pipe, waits for
@@ -79,7 +83,7 @@ func (s *Store) runInputCommand(ctx context.Context, cmd *exec.Cmd, gitDir strin
 // ssh ControlPersist master of a fetch, which keeps stderr. So can a child
 // that another goroutine forked, until it execs (golang/go#22315). A file
 // holds all of cmd's output once cmd exits.
-func RunWithFiles(cmd *exec.Cmd, dir string, input []byte, readStdout func(io.Reader) error, stderr io.Writer) error {
+func RunWithFiles(cmd *exec.Cmd, dir string, input []byte, readStdout func(io.Reader) error) error {
 	var files []*os.File
 	defer func() {
 		for _, f := range files {
@@ -94,6 +98,22 @@ func RunWithFiles(cmd *exec.Cmd, dir string, input []byte, readStdout func(io.Re
 		files = append(files, f)
 		return f, os.Remove(f.Name())
 	}
+	type copyBack struct {
+		file   *os.File
+		writer io.Writer
+	}
+	var copies []copyBack
+	toFile := func(w io.Writer) (io.Writer, error) {
+		if _, ok := w.(*os.File); ok || w == nil {
+			return w, nil
+		}
+		f, err := unlinked()
+		if err != nil {
+			return nil, err
+		}
+		copies = append(copies, copyBack{f, w})
+		return f, nil
+	}
 	if input != nil {
 		f, err := unlinked()
 		if err != nil {
@@ -104,33 +124,31 @@ func RunWithFiles(cmd *exec.Cmd, dir string, input []byte, readStdout func(io.Re
 		}
 		cmd.Stdin = f
 	}
-	var stdoutFile, stderrFile *os.File
+	var stdoutFile *os.File
+	var err error
 	if readStdout != nil {
-		f, err := unlinked()
-		if err != nil {
+		if stdoutFile, err = unlinked(); err != nil {
 			return err
 		}
-		cmd.Stdout, stdoutFile = f, f
+		cmd.Stdout = stdoutFile
+	} else if cmd.Stdout, err = toFile(cmd.Stdout); err != nil {
+		return err
 	}
-	if stderr != nil {
-		f, err := unlinked()
-		if err != nil {
-			return err
-		}
-		cmd.Stderr, stderrFile = f, f
+	if cmd.Stderr, err = toFile(cmd.Stderr); err != nil {
+		return err
 	}
 	runErr := cmd.Run()
-	var readErr, copyErr error
-	if stdoutFile != nil {
-		readErr = readWritten(stdoutFile, readStdout)
-	}
-	if stderrFile != nil {
-		copyErr = readWritten(stderrFile, func(r io.Reader) error {
-			_, err := io.Copy(stderr, r)
+	var readErr error
+	for _, c := range copies {
+		readErr = errors.Join(readErr, readWritten(c.file, func(r io.Reader) error {
+			_, err := io.Copy(c.writer, r)
 			return err
-		})
+		}))
 	}
-	return errors.Join(runErr, readErr, copyErr)
+	if runErr == nil && stdoutFile != nil {
+		readErr = errors.Join(readErr, readWritten(stdoutFile, readStdout))
+	}
+	return errors.Join(runErr, readErr)
 }
 
 // readWritten passes read what f holds. It reads at offsets: a process that
@@ -141,14 +159,6 @@ func readWritten(f *os.File, read func(io.Reader) error) error {
 		return err
 	}
 	return read(io.NewSectionReader(f, 0, info.Size()))
-}
-
-// readInto returns a readStdout for RunWithFiles that reads stdout into buf.
-func readInto(buf *bytes.Buffer) func(io.Reader) error {
-	return func(r io.Reader) error {
-		_, err := buf.ReadFrom(r)
-		return err
-	}
 }
 
 func setGitWorktreeDirectory(cmd *exec.Cmd, extraEnv []string) {
@@ -192,12 +202,12 @@ func (s *Store) runGitCommand(ctx context.Context, cmd *exec.Cmd, gitDir string,
 	env = append(env, extraEnv...)
 	cmd.Env = env
 	var buf bytes.Buffer
-	var readStdout func(io.Reader) error
 	if captureOutput {
-		readStdout = readInto(&buf)
+		cmd.Stdout = &buf
 	}
 	errBuf := &boundedGitError{limit: maxGitErrorBytes}
-	runErr := RunWithFiles(cmd, s.tempDir, nil, readStdout, errBuf)
+	cmd.Stderr = errBuf
+	runErr := RunWithFiles(cmd, s.tempDir, nil, nil)
 	out := strings.TrimSpace(buf.String())
 	if runErr == nil {
 		return out, nil

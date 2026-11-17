@@ -75,11 +75,12 @@ func (s *Store) streamTreeRecords(ctx context.Context, gitDir string, headOID st
 	// A lazy fetch's server shapes this stderr, and redaction's cost grows
 	// faster than its length.
 	errBuf := &boundedGitError{limit: maxGitErrorBytes}
+	cmd.Stderr = errBuf
 	var readErr error
 	waitErr := RunWithFiles(cmd, s.tempDir, nil, func(r io.Reader) error {
-		readErr = readNullDelimited(r, fn)
+		readErr = readNullDelimited(ctx, r, fn)
 		return nil
-	}, errBuf)
+	})
 	if waitErr != nil {
 		msg := auth.RedactString(strings.TrimSpace(errBuf.String()))
 		if msg == "" {
@@ -96,9 +97,14 @@ func (s *Store) streamTreeRecords(ctx context.Context, gitDir string, headOID st
 	return readErr
 }
 
-func readNullDelimited(r io.Reader, fn func(string)) error {
+// readNullDelimited passes fn each NUL-terminated record of r. It stops once
+// ctx ends, so a stop does not parse a large listing to its end.
+func readNullDelimited(ctx context.Context, r io.Reader, fn func(string)) error {
 	reader := bufio.NewReader(r)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		record, err := reader.ReadString('\x00')
 		if err == nil && record != "" {
 			record = strings.TrimSuffix(record, "\x00")
@@ -175,16 +181,21 @@ func (s *Store) batchResolveSizes(ctx context.Context, repo model.RepoConfig, no
 	// their size resolved during hydration.
 	cmd.Env = append(os.Environ(), "GIT_DIR="+repo.GitDir, "GIT_NO_LAZY_FETCH=1")
 	errBuf := &bytes.Buffer{}
+	cmd.Stderr = errBuf
 	var scanErr error
 	waitErr := RunWithFiles(cmd, s.tempDir, []byte(strings.Join(oids, "\n")+"\n"), func(r io.Reader) error {
-		// Output format: "<oid> <type> <size>" or "<oid> missing"
+		// Output format: "<oid> <type> <size>" or "<oid> missing". It stops
+		// once ctx ends, so a stop does not parse every line.
 		scan := bufio.NewScanner(r)
 		for scan.Scan() {
+			if scanErr = ctx.Err(); scanErr != nil {
+				return nil
+			}
 			applyBatchCheckLine(nodes, index, scan.Text())
 		}
 		scanErr = scan.Err()
 		return nil
-	}, errBuf)
+	})
 	if contextErr := ctx.Err(); contextErr != nil {
 		return errors.Join(contextErr, scanErr)
 	}

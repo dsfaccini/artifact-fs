@@ -263,7 +263,7 @@ func TestBuildTreeIndexNonASCIIPaths(t *testing.T) {
 func TestReadNullDelimitedRejectsPartialFinalRecord(t *testing.T) {
 	t.Parallel()
 	var records []string
-	err := readNullDelimited(strings.NewReader("first\x00partial"), func(record string) {
+	err := readNullDelimited(t.Context(), strings.NewReader("first\x00partial"), func(record string) {
 		records = append(records, record)
 	})
 	if !errors.Is(err, io.ErrUnexpectedEOF) {

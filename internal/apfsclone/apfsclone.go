@@ -212,7 +212,7 @@ func Add(ctx context.Context, o Options) (Result, error) {
 	hook.Cancel = func() error { return hook.Process.Signal(syscall.SIGTERM) }
 	hook.WaitDelay = gitstore.GitCommandWaitDelay
 	hook.Stdout, hook.Stderr = o.Stdout, o.Stderr
-	if err := hook.Run(); err != nil {
+	if err := gitstore.RunWithFiles(hook, "", nil, nil); err != nil {
 		return result, fmt.Errorf("the post-checkout hook in %s failed: %w", dest, err)
 	}
 	return result, nil
@@ -232,7 +232,7 @@ func register(ctx context.Context, o Options, base, dest, lockPath string) (stri
 	add := exec.CommandContext(ctx, "git", append(args, dest, o.Commit)...)
 	configureGit(add)
 	add.Stdout, add.Stderr = o.Stdout, o.Stderr
-	if err := add.Run(); err != nil {
+	if err := gitstore.RunWithFiles(add, "", nil, nil); err != nil {
 		return "", fmt.Errorf("git worktree add %s: %w", dest, err)
 	}
 	out, err := git(ctx, dest, nil, "rev-parse", "--verify", "HEAD^{commit}")
@@ -605,11 +605,8 @@ func gitWithEnv(ctx context.Context, dir string, env []string, stdin []byte, arg
 	cmd.Env = append(cmd.Env, env...)
 	var out bytes.Buffer
 	stderr := gitstore.NewBoundedStderr()
-	err := gitstore.RunWithFiles(cmd, "", stdin, func(r io.Reader) error {
-		_, err := out.ReadFrom(r)
-		return err
-	}, stderr)
-	if err != nil {
+	cmd.Stdout, cmd.Stderr = &out, stderr
+	if err := gitstore.RunWithFiles(cmd, "", stdin, nil); err != nil {
 		name := args[0]
 		if strings.HasPrefix(name, "-") && len(args) > 1 {
 			name = args[1]
