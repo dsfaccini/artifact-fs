@@ -350,7 +350,7 @@ func (s *Controller) requestMount(ctx context.Context, name string, mount bool) 
 	if err != nil {
 		return err
 	}
-	if live, err := daemonRunning(s.root); err != nil {
+	if _, live, err := Running(s.root); err != nil {
 		return err
 	} else if !live {
 		return fmt.Errorf("%w: start one with artifact-fs daemon", ErrNoDaemon)
@@ -394,7 +394,7 @@ func (s *Controller) requestMount(ctx context.Context, name string, mount bool) 
 				return nil
 			}
 		}
-		if live, err := daemonRunning(s.root); err != nil {
+		if _, live, err := Running(s.root); err != nil {
 			return err
 		} else if !live {
 			return fmt.Errorf("%s %s: the daemon stopped before it carried out the request; %s", op, name, pending)

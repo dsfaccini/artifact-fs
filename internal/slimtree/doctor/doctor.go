@@ -78,6 +78,8 @@ type Probe struct {
 	// APFS checks that dir is on APFS and that a file there can be cloned. It
 	// wraps errNotWritable when it cannot write its probe file in dir.
 	APFS func(dir string) error
+	// MountIDs is mounts.UniqueMountIDs on Linux.
+	MountIDs func() (unique bool, err error)
 }
 
 // Needs is what a command does, which decides the checks Require runs. Every
@@ -118,6 +120,7 @@ var checks = []check{
 	{id: "dev-fuse", goos: "linux", mount: true, run: checkDevFuse},
 	{id: "cap-sys-admin", goos: "linux", mount: true, run: checkCapSysAdmin},
 	{id: "apparmor", goos: "linux", mount: true, run: checkAppArmor},
+	{id: "mount-id", goos: "linux", mount: true, run: checkMountID},
 	{id: "git", goos: "linux", run: checkLinuxGit},
 	{id: "xcode-select", goos: "darwin", run: checkXcodeSelect},
 	{id: "git", goos: "darwin", run: checkDarwinGit},
@@ -395,6 +398,22 @@ func ownerUID(info fs.FileInfo) (uint32, bool) {
 		return 0, false
 	}
 	return st.Uid, true
+}
+
+// checkMountID reads which mount IDs the kernel gives. slimtree unmounts a
+// mount only when its identity, which holds its ID, matches the one slimtree
+// recorded. Linux 6.8 gives IDs no later mount reuses. Linux 5.8 to 6.7 give
+// reusable ones, with which a new mount of the same worktree most likely
+// gets its old mount's identity.
+func checkMountID(p Probe, _ string, _ []Result) Result {
+	unique, err := p.MountIDs()
+	switch {
+	case err != nil:
+		return Result{Status: StatusFail, Detail: err.Error(), Fix: "upgrade to Linux 6.8 or later"}
+	case !unique:
+		return Result{Status: StatusWarn, Detail: "Linux before 6.8 reuses mount IDs, so a new mount of a worktree most likely gets the identity of the worktree's old mount, and slimtree can stop the new mount in its place", Fix: "upgrade to Linux 6.8 or later"}
+	}
+	return Result{Status: StatusOK, Detail: "unique mount IDs"}
 }
 
 func checkLinuxGit(p Probe, _ string, _ []Result) Result {
