@@ -2,6 +2,7 @@ package slimtree
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -596,5 +597,43 @@ func TestListReportsUnknownWhenGitHangs(t *testing.T) {
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil || len(got.Worktrees) != 1 || got.Worktrees[0].State != "unknown" || got.Worktrees[0].Reason != "git worktree list did not finish within 10s" {
 		t.Fatalf("list --json with a hung git = %s (%v), want the worktree unknown", stdout.String(), err)
+	}
+}
+
+// A canceled list, as on Ctrl-C, fails with the context's error instead of
+// reporting the worktrees missing.
+func TestListFailsWhenCanceled(t *testing.T) {
+	homeDir := homeAfterFirstRun(t)
+	home, err := state.Open(homeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := home.Write(state.Record{Backend: "apfsclone", Path: "/work/a", CommonDir: "/src/repo/.git"}); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "listing")
+	if err := os.WriteFile(filepath.Join(bin, "git"), fmt.Appendf(nil, "#!/bin/sh\n: > '%s'\nexec sleep 60\n", marker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() {
+		for {
+			if _, err := os.Stat(marker); err == nil {
+				cancel()
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}()
+	var stdout, stderr bytes.Buffer
+	if code := run(ctx, "linux", doctor.Probe{}, []string{"list", "--json"}, &stdout, &stderr); code != 1 || stdout.Len() != 0 || stderr.String() != "context canceled\n" {
+		t.Fatalf("canceled list: exit %d, stdout %q, stderr %q; want 1 and the context's error", code, stdout.String(), stderr.String())
 	}
 }

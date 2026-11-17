@@ -83,6 +83,9 @@ func listWorktrees(ctx context.Context, home *state.Home, repo string, warn func
 		listed, ok := lists[r.CommonDir]
 		if !ok {
 			listed.worktrees, listed.err = worktreeList(ctx, r.CommonDir)
+			if errors.Is(listed.err, context.Canceled) {
+				return listing{}, listed.err
+			}
 			if errors.Is(listed.err, errWorktreeListTimeout) {
 				warn(fmt.Errorf("%w in %s, so its worktrees are unknown", listed.err, r.CommonDir))
 			}
@@ -122,7 +125,7 @@ type gitWorktree struct {
 // worktree's .git and marks the worktree prunable when that is gone. When git
 // does not finish within worktreeListTimeout, worktreeList stops it and
 // returns errWorktreeListTimeout, without waiting past worktreeListGrace for
-// a git that cannot exit.
+// a git that cannot exit. When ctx is canceled, it returns ctx's error.
 func worktreeList(ctx context.Context, commonDir string) (map[string]gitWorktree, error) {
 	ctx, cancel := context.WithTimeout(ctx, worktreeListTimeout)
 	defer cancel()
@@ -147,8 +150,12 @@ func worktreeList(ctx context.Context, commonDir string) (map[string]gitWorktree
 			r.err = ctx.Err()
 		}
 	}
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	// A canceled list, as on Ctrl-C, tells nothing about the worktrees.
+	switch err := ctx.Err(); {
+	case errors.Is(err, context.DeadlineExceeded):
 		return nil, errWorktreeListTimeout
+	case err != nil:
+		return nil, err
 	}
 	out, err := r.out, r.err
 	if err != nil {
