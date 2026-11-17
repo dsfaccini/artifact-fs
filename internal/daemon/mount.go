@@ -32,12 +32,13 @@ var (
 )
 
 // mountDue reports whether cfg's next mount may run: no mount of it failed,
-// its backoff has passed, or a new mount request asks for one.
+// its backoff has passed, or a new mount request or registration asks for
+// one.
 func (s *Service) mountDue(cfg model.RepoConfig) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.mountRetries[cfg.ID]
-	return r == nil || r.request != cfg.MountRequest || r.due(time.Now())
+	return !r.carriesOut(cfg) || r.due(time.Now())
 }
 
 // backoffMount backs off cfg's next mount after a failed one and returns
@@ -46,8 +47,8 @@ func (s *Service) backoffMount(cfg model.RepoConfig) time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.mountRetries[cfg.ID]
-	if r == nil || r.request != cfg.MountRequest {
-		r = &mountRetry{retrier: newRetrier(phaseMount, mountRetryMin, mountRetryMax), request: cfg.MountRequest}
+	if !r.carriesOut(cfg) {
+		r = &mountRetry{retrier: newRetrier(phaseMount, mountRetryMin, mountRetryMax), request: cfg.MountRequest, configVersion: cfg.ConfigVersion}
 		s.mountRetries[cfg.ID] = r
 	}
 	return r.fail(time.Now())

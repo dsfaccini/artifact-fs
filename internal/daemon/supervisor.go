@@ -142,9 +142,15 @@ func (s *Service) syncRepos(ctx context.Context) error {
 		s.logger.Info("mounting repo", "repo", repo.Name)
 		s.recordPhase(repo, phaseMount)
 		if err := s.mountRepo(ctx, repo); err != nil {
-			// The next sync checks the repo again.
-			if errors.Is(err, errPrepareLockHeld) {
+			// The next sync checks the repo again. It lists the repo anew, so
+			// a registration or a prepare request that superseded this
+			// pass's listing is current there.
+			switch {
+			case errors.Is(err, errPrepareLockHeld):
 				s.logger.Info("repo mount deferred while another step holds the repo's prepare lock", "repo", repo.Name)
+				continue
+			case errors.Is(err, errPrepareSuperseded):
+				s.logger.Info("repo mount deferred: a newer repo config or prepare request superseded the one this sync listed", "repo", repo.Name)
 				continue
 			}
 			s.logger.Error("repo mount failed", "repo", repo.Name, "error", auth.RedactLogString(err.Error(), repo.RemoteURL))
