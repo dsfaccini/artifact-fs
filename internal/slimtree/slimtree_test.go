@@ -65,6 +65,26 @@ func TestVersionFlagPrintsSlimtree(t *testing.T) {
 // Main, through the hook link and through a hook script, and stores the
 // token each answer starts with in the index.
 func TestSlimtreeRunsTheFSMonitorHookLink(t *testing.T) {
+	link, script, token := registerHookedRepo(t)
+	for name, hook := range map[string]string{"hook link": link, "hook script": script} {
+		t.Run(name, func(t *testing.T) {
+			work := hookedWorktree(t, hook)
+			index, err := os.ReadFile(filepath.Join(work, ".git", "index"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Contains(index, []byte(token)) {
+				t.Fatalf("the index holds no token starting %q after git ran the %s", token, name)
+			}
+		})
+	}
+}
+
+// registerHookedRepo registers a repo under a new state root. It returns the
+// repo's hook link, a hook script that runs fsmonitor-hook, both running this
+// test binary, and the prefix of the tokens the hook answers.
+func registerHookedRepo(t *testing.T) (link, script, token string) {
+	t.Helper()
 	root := gittest.StateRoot(t)
 	t.Setenv("ARTIFACT_FS_ROOT", root)
 	ctx := t.Context()
@@ -96,42 +116,38 @@ func TestSlimtreeRunsTheFSMonitorHookLink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	link := gitstore.FSMonitorHookLink(resolved, repos[0].ID)
+	link = gitstore.FSMonitorHookLink(resolved, repos[0].ID)
 	if err := os.Symlink(exe, link); err != nil {
 		t.Fatal(err)
 	}
-	script := filepath.Join(t.TempDir(), "fsmonitor-hook")
+	script = filepath.Join(t.TempDir(), "fsmonitor-hook")
 	if err := os.WriteFile(script, fmt.Appendf(nil, "#!/bin/sh\nexec '%s' fsmonitor-hook --name repo \"$@\"\n", exe), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	token := fmt.Sprintf("artifact-fs:%s:%s:", repos[0].ID, repos[0].ConfigVersion)
-	for name, hook := range map[string]string{"hook link": link, "hook script": script} {
-		t.Run(name, func(t *testing.T) {
-			work := t.TempDir()
-			git := func(args ...string) {
-				t.Helper()
-				cmd := exec.CommandContext(ctx, "git", append([]string{"-C", work}, args...)...)
-				if out, err := cmd.CombinedOutput(); err != nil {
-					t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
-				}
-			}
-			git("init", "-q")
-			if err := os.WriteFile(filepath.Join(work, "a"), []byte("a\n"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			git("add", "a")
-			git("config", "core.fsmonitor", hook)
-			git("update-index", "--fsmonitor")
-			git("status", "--porcelain")
-			index, err := os.ReadFile(filepath.Join(work, ".git", "index"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Contains(index, []byte(token)) {
-				t.Fatalf("the index holds no token starting %q after git ran the %s", token, name)
-			}
-		})
+	return link, script, fmt.Sprintf("artifact-fs:%s:%s:", repos[0].ID, repos[0].ConfigVersion)
+}
+
+// hookedWorktree makes a git work tree whose core.fsmonitor is hook, and runs
+// git status there once.
+func hookedWorktree(t *testing.T, hook string) string {
+	t.Helper()
+	work := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.CommandContext(t.Context(), "git", append([]string{"-C", work}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
 	}
+	git("init", "-q")
+	if err := os.WriteFile(filepath.Join(work, "a"), []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "a")
+	git("config", "core.fsmonitor", hook)
+	git("update-index", "--fsmonitor")
+	git("status", "--porcelain")
+	return work
 }
 
 func TestHomeResolvesItsEnvironment(t *testing.T) {

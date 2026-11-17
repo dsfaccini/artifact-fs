@@ -90,7 +90,7 @@ if [ -n "$vet_targets" ]; then
 		exit 1
 	fi
 fi
-go build -o /dev/null ./cmd/artifact-fs
+go build -o /dev/null ./cmd/artifact-fs ./cmd/slimtree
 
 # The root package holds only the opt-in e2e tests and benchmarks.
 test_targets=$(printf '%s\n' $packages | grep -vx '\./\.' || true)

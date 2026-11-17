@@ -16,6 +16,7 @@ func TestMain(m *testing.M) {
 		os.Exit(Main(context.Background(), os.Args, os.Stdout, os.Stderr))
 	}
 	gittest.IsolateConfig()
+	gittest.DisableRaceExitSleep()
 	os.Exit(m.Run())
 }
 
