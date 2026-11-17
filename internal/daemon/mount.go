@@ -66,7 +66,9 @@ func (s *Service) mountSucceeded(id model.RepoID) {
 // earlier preparation published a generation, so a failed prepare never
 // unmounts a repo, also across a daemon restart. An async repo's runtime gets
 // an open gate, which a later prepare request closes while the repo prepares
-// again.
+// again. It runs on the sync loop, so it returns errPrepareLockHeld instead of
+// waiting for the repo's prepare lock, which a preparation can hold for up to
+// its timeout.
 func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 	if cfg.PrepareState == model.PrepareStateSyncPreparing {
 		return fusefs.ErrRepoNotReady
@@ -83,6 +85,7 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 	return s.prepare(ctx, cfg, preparation{
 		ambient:    true,
 		mountPoint: true,
+		noWait:     true,
 		complete: func(prepareCtx context.Context, res *prepared) error {
 			return s.startPreparedRuntime(ctx, prepareCtx, res)
 		},

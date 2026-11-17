@@ -42,6 +42,10 @@ func preparationFailurePhase(err error) string {
 // request is no longer the registry's.
 var errPrepareSuperseded = fmt.Errorf("prepare superseded by a newer repo config or prepare request: %w", registry.ErrRepoChanged)
 
+// errPrepareLockHeld is the error of a preparation that does not wait, while
+// another step holds the repo's prepare lock.
+var errPrepareLockHeld = errors.New("another step holds the repo's prepare lock")
+
 // prepareIsCurrent reports whether cfg's config and prepare request are still
 // the registry's.
 func (s *core) prepareIsCurrent(ctx context.Context, cfg model.RepoConfig) (bool, error) {
@@ -85,6 +89,10 @@ type preparation struct {
 	fetch bool
 	// mountPoint creates cfg's mount point first.
 	mountPoint bool
+	// noWait makes the pipeline return errPrepareLockHeld, and record no
+	// failure, when another step holds the repo's prepare lock. Otherwise it
+	// waits for the lock.
+	noWait bool
 	// snapshot returns the snapshot store the pipeline publishes in, and
 	// whether the pipeline owns it. nil opens cfg's store.
 	snapshot func(context.Context, model.RepoConfig) (*snapshot.Store, bool, error)
@@ -121,7 +129,7 @@ func (s *core) prepare(ctx context.Context, cfg model.RepoConfig, p preparation)
 		logEnd := s.logPreparation(prepareCtx, cfg, p, &source)
 		defer func() { logEnd(res, retErr) }()
 	}
-	err := s.withRepoPrepareLock(prepareCtx, cfg.Name, func() error {
+	run := func() error {
 		current, err := s.prepareIsCurrent(prepareCtx, cfg)
 		if err != nil {
 			return withPreparationPhase(preparePhaseValidate, err)
@@ -162,7 +170,16 @@ func (s *core) prepare(ctx context.Context, cfg model.RepoConfig, p preparation)
 			return withPreparationPhase(preparePhasePersistReady, err)
 		}
 		return p.complete(prepareCtx, &res)
-	})
+	}
+	var err error
+	if p.noWait {
+		var ran bool
+		if ran, err = s.tryRepoPrepareLock(cfg.Name, run); !ran && err == nil {
+			return errPrepareLockHeld
+		}
+	} else {
+		err = s.withRepoPrepareLock(prepareCtx, cfg.Name, run)
+	}
 	if err == nil {
 		return nil
 	}
