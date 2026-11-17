@@ -47,8 +47,9 @@ func linux(ctx context.Context, args ...string) (code int, stdout, stderr string
 // A new that fails before it writes the record stops the daemon it started
 // through the daemon's own process, also a daemon that ignores SIGTERM, and
 // removes what it made. It starts the daemon in its own session, in the
-// record directory, on the worktree's state root, and without the variables
-// that tie git to the caller's repository.
+// record directory, which holds the worktree's gitfile, on the worktree's
+// state root, and without the variables that tie git to the caller's
+// repository. The worktree and the home can be on two file systems.
 func TestNewArtifactFSStopsItsDaemonWhenItFailsBeforeTheRecord(t *testing.T) {
 	homeAfterFirstRun(t)
 	main := newRepo(t)
@@ -56,7 +57,11 @@ func TestNewArtifactFSStopsItsDaemonWhenItFailsBeforeTheRecord(t *testing.T) {
 	// slimtree.
 	t.Setenv("GIT_CONFIG_PARAMETERS", "'slimtree.test=caller'")
 	probe := filepath.Join(t.TempDir(), "probe")
-	fakeDaemon(t, "trap '' TERM\n{ echo $$; pwd -P; env; } >'"+probe+".tmp' && mv '"+probe+".tmp' '"+probe+"'\nexec sleep 60\n")
+	fakeDaemon(t, "trap '' TERM\n{ echo $$; pwd -P; cat gitfile; env; } >'"+probe+".tmp' && mv '"+probe+".tmp' '"+probe+"'\nexec sleep 60\n")
+	renameHook = func(src, dst string) error {
+		return &os.LinkError{Op: "rename", Old: src, New: dst, Err: syscall.EXDEV}
+	}
+	t.Cleanup(func() { renameHook = nil })
 	previous := daemonStopWait
 	daemonStopWait = 100 * time.Millisecond
 	t.Cleanup(func() { daemonStopWait = previous })
@@ -98,7 +103,10 @@ func TestNewArtifactFSStopsItsDaemonWhenItFailsBeforeTheRecord(t *testing.T) {
 	if lines[1] != dir {
 		t.Errorf("the daemon runs in %s, want %s", lines[1], dir)
 	}
-	env := lines[2:]
+	if !strings.HasPrefix(lines[2], "gitdir: ") {
+		t.Errorf("the record directory's gitfile holds %q, want the worktree's gitfile", lines[2])
+	}
+	env := lines[3:]
 	if !slices.Contains(env, "ARTIFACT_FS_ROOT="+filepath.Join(dir, "state")) || !slices.Contains(env, "GIT_CONFIG_GLOBAL="+os.DevNull) ||
 		slices.ContainsFunc(env, func(kv string) bool { return strings.HasPrefix(kv, "GIT_CONFIG_PARAMETERS=") }) {
 		t.Errorf("the daemon's environment = %q; want ARTIFACT_FS_ROOT, GIT_CONFIG_GLOBAL and no GIT_CONFIG_PARAMETERS", env)

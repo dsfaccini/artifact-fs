@@ -108,7 +108,7 @@ func newArtifactFS(ctx context.Context, home *state.Home, rb *rollback, goos, co
 	if _, err := apfsclone.Git(ctx, rb.base, "worktree", "lock", "--reason", artifactFSLockReason, rb.dest); err != nil {
 		return "", err
 	}
-	if err := os.Rename(filepath.Join(rb.dest, ".git"), filepath.Join(dir, gitfileName)); err != nil {
+	if err := moveFile(filepath.Join(rb.dest, ".git"), filepath.Join(dir, gitfileName)); err != nil {
 		return "", err
 	}
 	ctl, err := daemon.NewController(ctx, r.StateDir, logging.NewJSONLogger(stderr, slog.LevelWarn))
@@ -138,7 +138,7 @@ func undoArtifactFS(ctx context.Context, rb *rollback, dir string, cause error) 
 		return fmt.Errorf("%w; slimtree left %s, its registration and %s", cause, rb.dest, dir)
 	}
 	if gitfile := filepath.Join(dir, gitfileName); exists(gitfile) {
-		if err := os.Rename(gitfile, filepath.Join(rb.dest, ".git")); err != nil {
+		if err := moveFile(gitfile, filepath.Join(rb.dest, ".git")); err != nil {
 			return errors.Join(cause, fmt.Errorf("slimtree left %s, its registration and %s: %w", rb.dest, dir, err))
 		}
 	}
@@ -149,6 +149,36 @@ func undoArtifactFS(ctx context.Context, rb *rollback, dir string, cause error) 
 		return errors.Join(cause, err)
 	}
 	return cause
+}
+
+// renameHook, when set, renames in place of os.Rename in moveFile. Tests use
+// it to fail a rename across file systems.
+var renameHook func(src, dst string) error
+
+// moveFile moves the small file src to dst. A worktree and the home can be
+// on two file systems, where a rename fails with EXDEV, so moveFile then
+// copies src and removes it.
+func moveFile(src, dst string) error {
+	rename := os.Rename
+	if renameHook != nil {
+		rename = renameHook
+	}
+	err := rename(src, dst)
+	if !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+	fi, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(dst, data, fi.Mode().Perm()); err != nil {
+		return err
+	}
+	return os.Remove(src)
 }
 
 // serve starts a daemon on r's state root, waits until it mounts r.Path,
