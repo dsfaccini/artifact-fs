@@ -247,7 +247,7 @@ func TestDoctorExitsOneOnAFailedCheck(t *testing.T) {
 		t.Fatalf("doctor --json with an unwritable /dev/fuse: exit %d, stderr %q, want 1", code, stderr.String())
 	}
 	var report doctor.Report
-	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || report.OK || len(report.Checks) != 4 || report.Checks[1].Fix != "sudo chmod 0666 /dev/fuse" {
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || report.OK || len(report.Checks) != 5 || report.Checks[1].Fix != "sudo chmod 0666 /dev/fuse" {
 		t.Fatalf("doctor --json = %s (%v), want a failed report with the chmod fix", stdout.String(), err)
 	}
 	stdout.Reset()
