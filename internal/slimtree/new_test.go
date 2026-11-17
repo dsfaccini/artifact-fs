@@ -135,7 +135,13 @@ func trackedTree(t *testing.T, worktree string) map[string]string {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tree[name] = fi.Mode().Perm().String() + " " + string(data)
+		// Git tracks only the executable bit. A clone keeps the base file's
+		// other bits, and a checkout takes them from the umask.
+		kind := "file "
+		if fi.Mode().Perm()&0o111 != 0 {
+			kind = "exec "
+		}
+		tree[name] = kind + string(data)
 	}
 	return tree
 }
@@ -298,8 +304,10 @@ func TestNewRollsBackWhatItMade(t *testing.T) {
 	}
 
 	// Ctrl-C while new fills the worktree: the next git fails, after git
-	// worktree add made the branch and registered the worktree.
-	path := filepath.Join(filepath.Dir(main), "main-feat")
+	// worktree add made the branch, the directories above the worktree, and
+	// the worktree.
+	fresh := filepath.Join(filepath.Dir(main), "fresh")
+	path := filepath.Join(fresh, "deeper", "feat")
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	cloneWith(t, func(src, dst string) error {
@@ -308,10 +316,13 @@ func TestNewRollsBackWhatItMade(t *testing.T) {
 		}
 		return copyClone(src, dst)
 	})
-	if code, stdout, stderr := slimtree(ctx, "new", "feat", "--from", "topic", "--track"); code != 1 || stdout != "" || !strings.Contains(stderr, "context canceled") {
+	if code, stdout, stderr := slimtree(ctx, "new", "feat", "--from", "topic", "--track", "--path", path); code != 1 || stdout != "" || !strings.Contains(stderr, "context canceled") {
 		t.Fatalf("an interrupted new: exit %d, stdout %q, stderr %q; want 1 and context canceled", code, stdout, stderr)
 	}
 	requireNoWorktree(t, main, path)
+	if _, err := os.Lstat(fresh); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("%s, which git worktree add made, exists: %v", fresh, err)
+	}
 	gitFindsNothing(t, main, "rev-parse", "--verify", "--quiet", "refs/heads/feat")
 	gitFindsNothing(t, main, "config", "--get-regexp", `^branch\.feat\.`)
 
