@@ -167,7 +167,7 @@ Repository-specific guidance for `artifact-fs`.
 
 - Start with the narrowest relevant test: `go test ./internal/<pkg>` or `go test -run TestName ./internal/<pkg>`.
 - For non-trivial code changes, reproduce CI in order: `go run golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@v0.52.0 -fix ./...` with no resulting diff, `go build -o /dev/null ./cmd/artifact-fs ./cmd/slimtree`, `go vet ./...` with `GOOS=linux` and with `GOOS=darwin`, then `go test -race -count=1 ./...`.
-- Build only the binaries with `go build ./cmd/artifact-fs ./cmd/slimtree`.
+- Build only the binaries with `go build -o . ./cmd/artifact-fs ./cmd/slimtree`. Without `-o`, `go build` of more than one package writes no binary.
 - Enable the pre-commit checks with `git config core.hooksPath .githooks`.
 - Benchmarks are opt-in: `AFS_RUN_BENCH=1 go test -run TestBenchRepos -v`.
 - FUSE e2e tests are opt-in. Run them with the same command on macOS and Linux: `AFS_RUN_E2E_TESTS=1 go test -run 'TestE2E|TestFUSEMountSmoke' -count=1 -timeout 20m -v .`. Keep `-timeout 20m`: the default 10m can expire mid-suite, and a timeout panic skips every unmount cleanup.

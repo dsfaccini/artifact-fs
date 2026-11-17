@@ -20,6 +20,7 @@ import (
 )
 
 func TestDefaultBackendByPlatform(t *testing.T) {
+	t.Setenv("SLIMTREE_HOME", t.TempDir())
 	for _, tc := range []struct {
 		goos          string
 		want          backend
@@ -33,15 +34,22 @@ func TestDefaultBackendByPlatform(t *testing.T) {
 			if got := defaultBackend(tc.goos); got != tc.want {
 				t.Fatalf("defaultBackend(%q) = %q, want %q", tc.goos, got, tc.want)
 			}
-			var stdout, stderr bytes.Buffer
-			code := run(t.Context(), tc.goos, []string{"--backend", "apfsclone"}, &stdout, &stderr)
-			if tc.apfsCloneRuns != (code == 0) {
-				t.Fatalf("--backend apfsclone on %s: exit %d, stderr %q", tc.goos, code, stderr.String())
+			for _, c := range []struct {
+				backend string
+				runs    bool
+				refusal string
+			}{
+				{backend: "apfsclone", runs: tc.apfsCloneRuns, refusal: "apfsclone needs macOS, which clones files on APFS; use artifactfs on " + tc.goos},
+				{backend: "artifactfs", runs: true},
+				{backend: "nope", refusal: `unknown backend "nope": use apfsclone or artifactfs`},
+			} {
+				var stderr bytes.Buffer
+				code := run(t.Context(), tc.goos, []string{"--backend", c.backend}, io.Discard, &stderr)
+				if c.runs != (code == 0) || !c.runs && !strings.Contains(stderr.String(), c.refusal) {
+					t.Fatalf("--backend %s on %s: exit %d, stderr %q, want runs %v", c.backend, tc.goos, code, stderr.String(), c.runs)
+				}
 			}
-			if !tc.apfsCloneRuns && !strings.Contains(stderr.String(), "apfsclone needs macOS, which clones files on APFS; use artifactfs on "+tc.goos) {
-				t.Fatalf("--backend apfsclone on %s: stderr %q, want the refusal", tc.goos, stderr.String())
-			}
-			stdout.Reset()
+			var stdout bytes.Buffer
 			if code := run(t.Context(), tc.goos, []string{"--help"}, &stdout, io.Discard); code != 0 || !strings.Contains(stdout.String(), tc.usage) || !strings.Contains(stdout.String(), fmt.Sprintf("(default: %q)", tc.want)) {
 				t.Fatalf("--help on %s: exit %d, stdout %q, want %q and the default", tc.goos, code, stdout.String(), tc.usage)
 			}
@@ -50,6 +58,7 @@ func TestDefaultBackendByPlatform(t *testing.T) {
 }
 
 func TestVersionFlagPrintsSlimtree(t *testing.T) {
+	t.Setenv("SLIMTREE_HOME", t.TempDir())
 	var stdout, stderr bytes.Buffer
 	if code := Main(t.Context(), []string{"slimtree", "--version"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("--version exit = %d, stderr=%q", code, stderr.String())
@@ -57,6 +66,28 @@ func TestVersionFlagPrintsSlimtree(t *testing.T) {
 	want := fmt.Sprintf("slimtree dev (untagged, unknown, %s, %s/%s)\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
 	if stdout.String() != want {
 		t.Fatalf("--version = %q, want %q", stdout.String(), want)
+	}
+}
+
+// Main hands daemon and "afs <command>" to artifact-fs's CLI. A detached
+// daemon that slimtree starts runs "slimtree daemon".
+func TestMainForwardsArtifactFSCommands(t *testing.T) {
+	t.Setenv("SLIMTREE_HOME", t.TempDir())
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"slimtree", "daemon", "--help"}, want: "start the artifact-fs daemon"},
+		// artifact-fs answers --version before it looks up a command, so only a
+		// command shows that Main drops "afs".
+		{args: []string{"slimtree", "afs", "add-repo", "--help"}, want: "register a repository and prepare it for the daemon to mount"},
+		{args: []string{"slimtree", "afs", "--version"}, want: fmt.Sprintf("artifact-fs dev (untagged, unknown, %s, %s/%s)\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)},
+	} {
+		var stdout, stderr bytes.Buffer
+		code := Main(t.Context(), tc.args, &stdout, &stderr)
+		if code != 0 || !strings.Contains(stdout.String(), tc.want) {
+			t.Errorf("%q: exit %d, stdout %q, stderr %q, want %q", tc.args, code, stdout.String(), stderr.String(), tc.want)
+		}
 	}
 }
 
@@ -87,6 +118,7 @@ func registerHookedRepo(t *testing.T) (link, script, token string) {
 	t.Helper()
 	root := gittest.StateRoot(t)
 	t.Setenv("ARTIFACT_FS_ROOT", root)
+	t.Setenv("SLIMTREE_HOME", t.TempDir())
 	ctx := t.Context()
 	svc, err := daemon.NewController(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {

@@ -1,5 +1,6 @@
 # Build output
 /artifact-fs
+/slimtree
 *.exe
 *.test
 *.out
