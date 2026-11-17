@@ -405,3 +405,31 @@ func TestFirstRunSurvivesAnUnwritableHome(t *testing.T) {
 		}
 	}
 }
+
+// A write that fails after the marker's create, as on a full disk, leaves no
+// marker, so the next run prints the summary again, as the failure says.
+func TestFirstRunMarkerWriteFailureLeavesNoMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SLIMTREE_HOME", home)
+	markerCreated = func(f *os.File) {
+		if err := f.Close(); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { markerCreated = nil })
+	var stderr bytes.Buffer
+	if code := run(t.Context(), "linux", healthyLinux(), nil, io.Discard, &stderr); code != 0 || !strings.Contains(stderr.String(), "\nslimtree: cannot record the first run, so the next run prints this summary again: ") {
+		t.Fatalf("run whose marker write fails: exit %d, stderr %q, want 0 and why no marker was written", code, stderr.String())
+	}
+	if entries, err := os.ReadDir(home); err != nil || len(entries) != 0 {
+		t.Fatalf("after the failed write, %s holds %v (%v), want nothing", home, entries, err)
+	}
+	markerCreated = nil
+	stderr.Reset()
+	if code := run(t.Context(), "linux", healthyLinux(), nil, io.Discard, &stderr); code != 0 || !strings.HasPrefix(stderr.String(), "slimtree's first run: ") {
+		t.Fatalf("next run: exit %d, stderr %q, want the summary again", code, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, firstRunMarker)); err != nil {
+		t.Fatalf("next run wrote no marker: %v", err)
+	}
+}

@@ -37,10 +37,33 @@ func firstRun(stderr io.Writer, probe doctor.Probe, goos, backend string) {
 	}
 }
 
+// markerCreated, when set, runs on the temporary marker right after its
+// create. Tests use it to fail the write that follows.
+var markerCreated func(*os.File)
+
+// writeFirstRunMarker writes the marker to a temporary file and renames it
+// into place, so a failed write, as on a full disk, leaves no empty marker
+// that would hide the summary from the next run.
 func writeFirstRunMarker(home string) error {
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		return err
 	}
-	marker := fmt.Appendf(nil, "slimtree %s\n%s\n", version.String(), time.Now().UTC().Format(time.RFC3339))
-	return os.WriteFile(filepath.Join(home, firstRunMarker), marker, 0o600)
+	f, err := os.CreateTemp(home, "."+firstRunMarker+"-*")
+	if err != nil {
+		return err
+	}
+	if markerCreated != nil {
+		markerCreated(f)
+	}
+	_, err = fmt.Fprintf(f, "slimtree %s\n%s\n", version.String(), time.Now().UTC().Format(time.RFC3339))
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), filepath.Join(home, firstRunMarker))
+	}
+	if err != nil {
+		os.Remove(f.Name())
+	}
+	return err
 }
