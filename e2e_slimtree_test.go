@@ -59,6 +59,7 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 
 	base := filepath.Join(t.TempDir(), "base")
 	run(t, "", "git", "clone", "-q", createLocalTestRepo(t), base)
+	run(t, base, "git", "checkout", "-q", "main")
 	hookLog := filepath.Join(t.TempDir(), "post-checkout")
 	if err := execfile.Write(filepath.Join(base, ".git", "hooks", "post-checkout"), []byte("#!/bin/sh\necho \"$(pwd -P) $*\" >>'"+hookLog+"'\n"), 0o755); err != nil {
 		t.Fatal(err)
