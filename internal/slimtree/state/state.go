@@ -162,9 +162,27 @@ func (h *Home) Archive(r Record) (string, error) {
 	return "refs/slimtree/archive/" + id + "/" + ns + "/HEAD", nil
 }
 
+// RecordDirs returns the record directories in w/, with or without a
+// record. It skips an entry whose name starts with a dot.
+func (h *Home) RecordDirs() ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(h.dir, recordsDir))
+	if err != nil {
+		return nil, err
+	}
+	var dirs []string
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			dirs = append(dirs, filepath.Join(h.dir, recordsDir, e.Name()))
+		}
+	}
+	return dirs, nil
+}
+
 // Records returns every record, sorted by path. It skips an entry of w/
+// whose name starts with a dot, such as .DS_Store. It also skips an entry
 // that holds no readable record, such as a stray file or a record a crash
-// left empty, and passes each skip's cause to skipped when it is not nil.
+// left empty, and passes each such skip's cause to skipped when it is not
+// nil.
 func (h *Home) Records(skipped func(error)) ([]Record, error) {
 	entries, err := os.ReadDir(filepath.Join(h.dir, recordsDir))
 	if err != nil {
@@ -172,6 +190,9 @@ func (h *Home) Records(skipped func(error)) ([]Record, error) {
 	}
 	var records []Record
 	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
 		path := filepath.Join(h.dir, recordsDir, e.Name(), recordFile)
 		data, err := os.ReadFile(path)
 		// A directory without a record holds a worktree's state from a make

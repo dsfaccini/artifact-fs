@@ -88,9 +88,15 @@ func prune(ctx context.Context, home *state.Home, now time.Time) pruning {
 }
 
 // pruneRuntimes removes each runtime copy, runtimes/<SHA-256>/, that no
-// record names, whatever the rule. It removes none while a record it cannot
-// read exists, or while a daemon runs whose record names no runtime: that
-// daemon can run any copy, and Git runs its FSMonitor hook from it.
+// record names, under every rule but a broken one. It removes none while a
+// record it cannot read exists, while it cannot tell whether a daemon holds a
+// state root, or while a daemon runs that no record ties to its copy. Such a
+// daemon can run any copy, and Git runs its FSMonitor hook from it. It runs
+// with no record after a new that died, or whose stop failed, before it wrote
+// the record; with a record that names no runtime; or with another pid than
+// the record's, after a resume whose stop failed. pruneRuntimes probes the
+// state root of every record and of every record directory, with or without
+// a record.
 func pruneRuntimes(home *state.Home, problem func(error)) int {
 	unreadable := false
 	records, err := home.Records(func(err error) {
@@ -104,19 +110,33 @@ func pruneRuntimes(home *state.Home, problem func(error)) int {
 	if unreadable {
 		return 0
 	}
+	dirs, err := home.RecordDirs()
+	if err != nil {
+		problem(err)
+		return 0
+	}
 	used := map[string]bool{}
+	byRoot := map[string]state.Record{}
+	roots := map[string]bool{}
 	for _, r := range records {
 		if r.Runtime != "" {
 			used[filepath.Dir(r.Runtime)] = true
-			continue
 		}
-		if r.StateDir == "" {
-			continue
+		if r.StateDir != "" {
+			byRoot[filepath.Clean(r.StateDir)] = r
+			roots[filepath.Clean(r.StateDir)] = true
 		}
-		if _, running, err := daemon.Running(r.StateDir); err != nil || running {
-			if err != nil {
-				problem(fmt.Errorf("kept every runtime copy: %w", err))
-			}
+	}
+	for _, dir := range dirs {
+		roots[filepath.Join(dir, "state")] = true
+	}
+	for root := range roots {
+		pid, running, err := daemon.Running(root)
+		if err != nil {
+			problem(fmt.Errorf("kept every runtime copy: %w", err))
+			return 0
+		}
+		if r, ok := byRoot[root]; running && (!ok || r.Runtime == "" || pid != r.DaemonPID) {
 			return 0
 		}
 	}

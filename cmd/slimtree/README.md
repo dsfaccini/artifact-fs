@@ -60,7 +60,7 @@ How it was measured:
 | `slimtree rm <worktree>` | Removes an APFS clone worktree | Coming |
 | `slimtree list` | Lists the worktrees slimtree made | Lists the worktrees slimtree made |
 | `slimtree prune` | Deletes the archives and recovery refs `rm` left that are older than the retention rule | Evicts cached blobs not read within the retention rule, and removes the daemon binary copies no worktree uses |
-| `slimtree retention [<rule>]` | Shows or sets how long archives are kept: `week`, `month` (the default), `forever` or `<N>d` | Shows or sets the rule |
+| `slimtree retention [<rule>]` | Shows or sets how long archives are kept: `week`, `month` (the default), `forever` or `<N>d` | Shows or sets the rule, which also decides how long a cached blob stays unread before `prune` evicts it |
 | `slimtree doctor` | Checks what slimtree needs | Checks the FUSE setup, and warns that `rm` of artifact-fs worktrees is not supported yet |
 
 Release builds are tested on macOS 26, Ubuntu 24.04 and Alpine Linux. Linux

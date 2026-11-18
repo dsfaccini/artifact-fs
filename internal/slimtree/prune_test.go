@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -486,6 +487,148 @@ func TestPruneRemovesRuntimeCopiesNoWorktreeUses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	named, unnamed := runtimeCopies(t, homeDir)
+	work := t.TempDir()
+	stateDir := filepath.Join(work, "state-b")
+	for _, r := range []state.Record{
+		{Backend: "artifactfs", Path: filepath.Join(work, "a"), Runtime: filepath.Join(named, "slimtree"), StateDir: filepath.Join(work, "state-a")},
+		{Backend: "artifactfs", Path: filepath.Join(work, "b"), StateDir: stateDir},
+	} {
+		if err := home.Write(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	release := holdDaemonLock(t, stateDir, os.Getpid())
+
+	if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || strings.Contains(stderr, "runtime copies") {
+		t.Fatalf("prune while a daemon without a recorded runtime runs: exit %d, stderr %q", code, stderr)
+	}
+	requireExists(t, named)
+	requireExists(t, unnamed)
+
+	release()
+	if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || !strings.Contains(stderr, "slimtree: removed 1 runtime copies no worktree uses\n") {
+		t.Fatalf("prune: exit %d, stderr %q", code, stderr)
+	}
+	requireExists(t, named)
+	requireGone(t, unnamed)
+}
+
+// prune keeps every runtime copy while it cannot tell which copy each
+// running daemon runs, and under a broken rule. A daemon runs with no record
+// after a new that died before it wrote the record, and with another pid
+// than its record's after a resume whose stop failed.
+func TestPruneKeepsEveryRuntimeCopyWhileItCannotTellWhichADaemonRuns(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		setup    func(t *testing.T, home *state.Home, homeDir, named string)
+		wantCode int
+	}{
+		{"a daemon with no record", func(t *testing.T, _ *state.Home, homeDir, _ string) {
+			holdDaemonLock(t, filepath.Join(homeDir, "w", "0123456789abcdef", "state"), os.Getpid())
+		}, 0},
+		{"a daemon with another pid than its record's", func(t *testing.T, home *state.Home, _, named string) {
+			path := filepath.Join(t.TempDir(), "wt")
+			root := filepath.Join(home.RecordDir(path), "state")
+			if err := home.Write(state.Record{Backend: "artifactfs", Path: path, Runtime: filepath.Join(named, "slimtree"), StateDir: root, DaemonPID: os.Getpid() + 1}); err != nil {
+				t.Fatal(err)
+			}
+			holdDaemonLock(t, root, os.Getpid())
+		}, 0},
+		{"a record prune cannot read", func(t *testing.T, _ *state.Home, homeDir, _ string) {
+			dir := filepath.Join(homeDir, "w", "0123456789abcdef")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "worktree.json"), []byte("{"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, 1},
+		{"a daemon lock prune cannot open", func(t *testing.T, _ *state.Home, homeDir, _ string) {
+			config := filepath.Join(homeDir, "w", "0123456789abcdef", "state", "config")
+			if err := os.MkdirAll(config, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			// A symlink to itself fails the open with ELOOP, also as root.
+			if err := os.Symlink("daemon.lock", filepath.Join(config, "daemon.lock")); err != nil {
+				t.Fatal(err)
+			}
+		}, 1},
+		{"a broken rule", func(t *testing.T, _ *state.Home, homeDir, _ string) {
+			if err := os.WriteFile(filepath.Join(homeDir, "retention.json"), []byte("not json\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			homeDir := pruneHome(t)
+			home, err := openHome()
+			if err != nil {
+				t.Fatal(err)
+			}
+			named, unnamed := runtimeCopies(t, homeDir)
+			tt.setup(t, home, homeDir, named)
+			if code, _, stderr := slimtree(t.Context(), "prune"); code != tt.wantCode || strings.Contains(stderr, "runtime copies") {
+				t.Fatalf("prune: exit %d, stderr %q; want exit %d and no copy removed", code, stderr, tt.wantCode)
+			}
+			requireExists(t, named)
+			requireExists(t, unnamed)
+		})
+	}
+}
+
+// prune removes a runtime copy no record names under every rule but a broken
+// one, forever too, past a dotfile in w/, and while a daemon runs whose
+// record names its copy and its pid.
+func TestPruneRemovesAnUnnamedRuntimeCopy(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		setup func(t *testing.T, home *state.Home, homeDir string, r *state.Record)
+	}{
+		{"under forever", func(t *testing.T, home *state.Home, _ string, _ *state.Record) {
+			if err := home.SetRetention(state.Forever); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"past a dotfile in w", func(t *testing.T, _ *state.Home, homeDir string, _ *state.Record) {
+			if err := os.WriteFile(filepath.Join(homeDir, "w", ".DS_Store"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"while the daemon its record names runs", func(t *testing.T, home *state.Home, _ string, r *state.Record) {
+			r.StateDir = filepath.Join(home.RecordDir(r.Path), "state")
+			r.DaemonPID = os.Getpid()
+			holdDaemonLock(t, r.StateDir, os.Getpid())
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			homeDir := pruneHome(t)
+			home, err := openHome()
+			if err != nil {
+				t.Fatal(err)
+			}
+			named, unnamed := runtimeCopies(t, homeDir)
+			r := state.Record{Backend: "artifactfs", Path: filepath.Join(t.TempDir(), "wt"), Runtime: filepath.Join(named, "slimtree")}
+			if err := os.MkdirAll(filepath.Join(homeDir, "w"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			tt.setup(t, home, homeDir, &r)
+			if err := home.Write(r); err != nil {
+				t.Fatal(err)
+			}
+			if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || !strings.Contains(stderr, "slimtree: removed 1 runtime copies no worktree uses\n") {
+				t.Fatalf("prune: exit %d, stderr %q", code, stderr)
+			}
+			requireExists(t, named)
+			requireGone(t, unnamed)
+		})
+	}
+}
+
+// runtimeCopies makes two runtime copies in homeDir's runtimes/ and returns
+// their directories.
+func runtimeCopies(t *testing.T, homeDir string) (named, unnamed string) {
+	t.Helper()
 	var copies []string
 	for _, sha := range []string{strings.Repeat("a", 64), strings.Repeat("b", 64)} {
 		dir := filepath.Join(homeDir, "runtimes", sha)
@@ -497,41 +640,37 @@ func TestPruneRemovesRuntimeCopiesNoWorktreeUses(t *testing.T) {
 		}
 		copies = append(copies, dir)
 	}
-	named, unnamed := copies[0], copies[1]
-	work := t.TempDir()
-	stateDir := filepath.Join(work, "state-b")
-	if err := os.MkdirAll(filepath.Join(stateDir, "config"), 0o700); err != nil {
+	return copies[0], copies[1]
+}
+
+// holdDaemonLock holds the daemon lock of the state root root, as a daemon
+// with pid does, until the test ends or release runs. release unlocks before
+// it closes the file: a child that another goroutine forked holds a copy of
+// the descriptor until it execs, and that copy keeps a lock that Close alone
+// released.
+func holdDaemonLock(t *testing.T, root string, pid int) (release func()) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(root, "config"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	for _, r := range []state.Record{
-		{Backend: "artifactfs", Path: filepath.Join(work, "a"), Runtime: filepath.Join(named, "slimtree"), StateDir: filepath.Join(work, "state-a")},
-		{Backend: "artifactfs", Path: filepath.Join(work, "b"), StateDir: stateDir},
-	} {
-		if err := home.Write(r); err != nil {
-			t.Fatal(err)
-		}
-	}
-	lock, err := os.OpenFile(filepath.Join(stateDir, "config", "daemon.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	lock, err := os.OpenFile(filepath.Join(root, "config", "daemon.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lock.Close()
 	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
 		t.Fatal(err)
 	}
-
-	if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || strings.Contains(stderr, "runtime copies") {
-		t.Fatalf("prune while a daemon without a recorded runtime runs: exit %d, stderr %q", code, stderr)
-	}
-	requireExists(t, named)
-	requireExists(t, unnamed)
-
-	if err := lock.Close(); err != nil {
+	if _, err := lock.WriteString(strconv.Itoa(pid)); err != nil {
 		t.Fatal(err)
 	}
-	if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || !strings.Contains(stderr, "slimtree: removed 1 runtime copies no worktree uses\n") {
-		t.Fatalf("prune: exit %d, stderr %q", code, stderr)
-	}
-	requireExists(t, named)
-	requireGone(t, unnamed)
+	release = sync.OnceFunc(func() {
+		if err := unix.Flock(int(lock.Fd()), unix.LOCK_UN); err != nil {
+			t.Error(err)
+		}
+		if err := lock.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	t.Cleanup(release)
+	return release
 }
