@@ -79,7 +79,7 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 			},
 			{
 				Name:  "list",
-				Usage: "list the worktrees slimtree made; reads only its records and git's worktree list",
+				Usage: "list the worktrees slimtree made; reads its records, git's worktree list, and the process and mount tables, never a mount",
 				Flags: []ucli.Flag{
 					&ucli.BoolFlag{Name: "repo", Usage: "only the worktrees of the repository that holds the current directory"},
 					&ucli.BoolFlag{Name: "json", Usage: "print the list as JSON"},

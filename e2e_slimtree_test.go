@@ -47,8 +47,8 @@ type slimtreeRecord struct {
 
 // TestE2ESlimtreeLifecycle drives the slimtree binary through an artifactfs
 // worktree's life: new mounts it and runs its post-checkout hook, stop
-// refuses while another process uses the mount, follows the daemon's new
-// mount after an external unmount, and then unmounts it, resume mounts it
+// refuses while another process uses the mount, records the daemon's new
+// mount after an external unmount and then unmounts it, resume mounts it
 // again with its changes, and resume brings it back after its daemon was
 // killed. Its daemons run in slimtree processes, so this test process serves
 // no mount. Its subject is mounting, so it keeps its own mounts.
@@ -205,8 +205,9 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 			id, err := mounts.Identify(wt)
 			return err == nil && id != "" && string(id) != before, fmt.Sprintf("identity %q (%v), before %q", id, err, before)
 		})
-		if got := listed(); got != "mounted" {
-			t.Fatalf("slimtree list after the daemon mounted again: %s, want mounted", got)
+		// list changes nothing; the stop below records the new mount.
+		if got := listed(); got != "unknown" {
+			t.Fatalf("slimtree list after the daemon mounted again: %s, want unknown", got)
 		}
 	}
 

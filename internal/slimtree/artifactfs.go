@@ -196,9 +196,12 @@ func moveFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	if err := copyFile(dst, data, fi.Mode().Perm()); err != nil {
+	created, err := copyFile(dst, data, fi.Mode().Perm())
+	if err != nil {
 		// A partial copy at dst would stand for src.
-		os.Remove(dst)
+		if created {
+			os.Remove(dst)
+		}
 		return err
 	}
 	return os.Remove(src)
@@ -208,11 +211,12 @@ func moveFile(src, dst string) error {
 // Tests use it to fail the write that follows.
 var copyOpened func(*os.File)
 
-// copyFile writes data to the new file dst.
-func copyFile(dst string, data []byte, perm fs.FileMode) error {
+// copyFile writes data to the new file dst, and reports whether it created
+// dst.
+func copyFile(dst string, data []byte, perm fs.FileMode) (bool, error) {
 	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if copyOpened != nil {
 		copyOpened(f)
@@ -221,7 +225,7 @@ func copyFile(dst string, data []byte, perm fs.FileMode) error {
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
-	return err
+	return true, err
 }
 
 // serve starts a daemon on r's state root, waits until it mounts r.Path,
@@ -518,13 +522,17 @@ func stopWorktree(ctx context.Context, home *state.Home, arg string, stdout io.W
 }
 
 // healRemount records the identity of the mount at r.Path when r's recorded
-// daemon runs and reports r mounted, and that identity is not the recorded
-// one. After an external unmount, the daemon mounts again, with a new
-// identity.
+// daemon runs and reports r mounted, that identity is not the recorded one,
+// and git finds r's worktree and git dir through the mount. After an
+// external unmount, the daemon mounts again, with a new identity. It refuses
+// a mount where git finds another worktree.
 func healRemount(ctx context.Context, home *state.Home, r *state.Record) error {
 	id, remount, err := remountedBy(ctx, *r)
 	if err != nil || !remount {
 		return err
+	}
+	if err := checkMounted(ctx, *r); err != nil {
+		return fmt.Errorf("%s holds another mount than the one slimtree recorded, and slimtree left it: %w", r.Path, err)
 	}
 	r.MountIdentity = string(id)
 	return home.Write(*r)

@@ -221,10 +221,37 @@ func TestNewArtifactFSRollsBackAFailedGitfileCopy(t *testing.T) {
 	}
 }
 
+// A copy across file systems to a path that exists leaves that path as it
+// was, as when a rollback puts the gitfile back over an intact .git.
+func TestMoveFileKeepsAnExistingDestination(t *testing.T) {
+	renameHook = func(src, dst string) error {
+		return &os.LinkError{Op: "rename", Old: src, New: dst, Err: syscall.EXDEV}
+	}
+	t.Cleanup(func() { renameHook = nil })
+	dir := t.TempDir()
+	src, dst := filepath.Join(dir, "gitfile"), filepath.Join(dir, ".git")
+	if err := os.WriteFile(src, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("gitdir: intact\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := moveFile(src, dst); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("moveFile over an existing file = %v, want it to exist", err)
+	}
+	for path, want := range map[string]string{src: "partial", dst: "gitdir: intact\n"} {
+		if data, err := os.ReadFile(path); err != nil || string(data) != want {
+			t.Errorf("%s = %q, %v; want %q", path, data, err, want)
+		}
+	}
+}
+
 // After an external unmount, the recorded daemon mounts the worktree again,
-// with a new identity. While the daemon reports the worktree mounted, list
-// says mounted, and stop records the new identity and stops the daemon.
-// Without that report, stop refuses the other mount.
+// with a new identity. While the daemon reports the worktree mounted and git
+// finds the worktree's git dir through the mount, stop records the new
+// identity and stops the daemon. Without either, stop refuses the other
+// mount. list changes nothing, so it calls the mount unknown and names
+// resume.
 func TestStopFollowsARemountByTheRecordedDaemon(t *testing.T) {
 	homeAfterFirstRun(t)
 	parent, err := state.Canonical(t.TempDir())
@@ -254,6 +281,12 @@ func TestStopFollowsARemountByTheRecordedDaemon(t *testing.T) {
 	gitIn(t, filepath.Join(parent, "repo"), "commit", "-q", "--allow-empty", "-m", "base")
 	gitIn(t, filepath.Join(parent, "repo"), "worktree", "add", "-q", "--lock", "-b", "wt", r.Path)
 	r.CommonDir = filepath.Join(parent, "repo", ".git")
+	gitDir, err := state.Canonical(filepath.Join(r.CommonDir, "worktrees", "wt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First, the record names a git dir that git does not find at r.Path.
+	r.GitDir = filepath.Join(parent, "elsewhere")
 	if err := home.Write(r); err != nil {
 		t.Fatal(err)
 	}
@@ -295,21 +328,23 @@ func TestStopFollowsARemountByTheRecordedDaemon(t *testing.T) {
 		return "after", nil
 	}
 	t.Cleanup(func() { identifyHook = nil })
-	listed := func() string {
+	listed := func() (string, string) {
 		t.Helper()
 		code, stdout, stderr := linux(t.Context(), "list", "--json")
-		var l struct{ Worktrees []struct{ State string } }
+		var l struct {
+			Worktrees []struct{ State, Reason string }
+		}
 		if err := json.Unmarshal([]byte(stdout), &l); code != 0 || err != nil || len(l.Worktrees) != 1 {
 			t.Fatalf("list --json: exit %d, stdout %q, stderr %q (%v)", code, stdout, stderr, err)
 		}
-		return l.Worktrees[0].State
+		return l.Worktrees[0].State, l.Worktrees[0].Reason
 	}
 
 	if err := reg.PutRuntime(t.Context(), model.RepoRuntimeRecord{RepoID: model.RepoID("wt"), State: "degraded"}); err != nil {
 		t.Fatal(err)
 	}
-	if got := listed(); got != "unknown" {
-		t.Fatalf("list while the daemon reports no mount: %s, want unknown", got)
+	if got, reason := listed(); got != "unknown" || !strings.Contains(reason, "slimtree resume records the new mount") {
+		t.Fatalf("list while the daemon reports no mount: %s (%s), want unknown and resume", got, reason)
 	}
 	if code, _, stderr := linux(t.Context(), "stop", r.Path); code != 1 || !strings.Contains(stderr, "holds another mount than the one slimtree recorded") {
 		t.Fatalf("stop while the daemon reports no mount: exit %d, stderr %q; want the refusal", code, stderr)
@@ -318,8 +353,19 @@ func TestStopFollowsARemountByTheRecordedDaemon(t *testing.T) {
 	if err := reg.PutRuntime(t.Context(), model.RepoRuntimeRecord{RepoID: model.RepoID("wt"), State: "mounted"}); err != nil {
 		t.Fatal(err)
 	}
-	if got := listed(); got != "mounted" {
-		t.Fatalf("list after the daemon mounted again: %s, want mounted", got)
+	if got, reason := listed(); got != "unknown" || !strings.Contains(reason, "slimtree resume records the new mount") {
+		t.Fatalf("list after the daemon mounted again: %s (%s), want unknown and resume", got, reason)
+	}
+	if code, _, stderr := linux(t.Context(), "stop", r.Path); code != 1 || !strings.Contains(stderr, "holds another mount than the one slimtree recorded, and slimtree left it") {
+		t.Fatalf("stop where git finds another git dir: exit %d, stderr %q; want the refusal", code, stderr)
+	}
+	if got := records(t); !reflect.DeepEqual(got, []state.Record{r}) {
+		t.Fatalf("records after a refused stop = %+v, want %+v", got, r)
+	}
+
+	r.GitDir = gitDir
+	if err := home.Write(r); err != nil {
+		t.Fatal(err)
 	}
 	if code, stdout, stderr := linux(t.Context(), "stop", r.Path); code != 0 || stdout != "stopped "+r.Path+"\n" {
 		t.Fatalf("stop after the daemon mounted again: exit %d, stdout %q, stderr %q", code, stdout, stderr)

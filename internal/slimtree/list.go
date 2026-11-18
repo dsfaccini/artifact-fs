@@ -107,7 +107,7 @@ func listWorktrees(ctx context.Context, home *state.Home, repo string, warn func
 		case !ok || gw.prunable:
 			w.State = stateMissing
 		case r.Backend == string(artifactFS):
-			w.State, w.Reason = artifactFSState(ctx, home, r)
+			w.State, w.Reason = artifactFSState(home, r)
 		default:
 			w.State = stateOK
 		}
@@ -120,9 +120,9 @@ func listWorktrees(ctx context.Context, home *state.Home, repo string, warn func
 // artifactFSState returns the state of r, an artifactfs worktree that git
 // lists, and the reason for an unknown state. Without the gitfile in its
 // record directory, git cannot remove the worktree. It is mounted while its
-// recorded daemon runs and its recorded mount, or a mount the daemon reports
-// it made again, is at its path.
-func artifactFSState(ctx context.Context, home *state.Home, r state.Record) (string, string) {
+// recorded daemon runs and its recorded mount is at its path. It changes
+// nothing, so another mount stays unknown until stop or resume records it.
+func artifactFSState(home *state.Home, r state.Record) (string, string) {
 	if _, err := os.Lstat(filepath.Join(home.RecordDir(r.Path), gitfileName)); err != nil {
 		return stateMissing, ""
 	}
@@ -133,12 +133,14 @@ func artifactFSState(ctx context.Context, home *state.Home, r state.Record) (str
 	if !alive {
 		return stateStopped, ""
 	}
-	id, remount, err := remountedBy(ctx, r)
+	id, err := identify(r.Path)
 	switch {
 	case err != nil:
 		return stateUnknown, err.Error()
-	case id == "" || string(id) != r.MountIdentity && !remount:
-		return stateUnknown, "its daemon runs, and its mount is not at " + r.Path
+	case id == "":
+		return stateUnknown, "its daemon runs, and nothing is mounted at " + r.Path
+	case string(id) != r.MountIdentity:
+		return stateUnknown, "another mount than the one slimtree recorded is at " + r.Path + "; when its daemon mounted it again, slimtree resume records the new mount"
 	}
 	return stateMounted, ""
 }
