@@ -118,7 +118,7 @@ func newArtifactFS(ctx context.Context, home *state.Home, rb *rollback, goos, co
 	// The registry closes before undoArtifactFS removes the state root.
 	defer ctl.Close()
 	cfg := model.RepoConfig{
-		RepoPaths:     model.RepoPaths{Name: r.Name(), GitDir: r.GitDir, MountRoot: filepath.Dir(r.Path), BlobCacheDir: filepath.Join(home.Dir(), "blobs")},
+		RepoPaths:     model.RepoPaths{Name: r.Name(), GitDir: r.GitDir, MountRoot: filepath.Dir(r.Path), BlobCacheDir: home.BlobCacheDir()},
 		RepoSpec:      model.RepoSpec{AdoptGitDir: true},
 		RefreshPolicy: model.RefreshPolicy{RemoteRefreshDisabled: true},
 		Enabled:       true,

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
@@ -201,7 +202,7 @@ func TestRetentionRuleDecidesWhatPruneDeletes(t *testing.T) {
 		t.Fatalf("retention.json = %q, %v; want forever, unchanged by the refused rules", data, err)
 	}
 
-	if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || !strings.Contains(stderr, "slimtree: archives and their recovery refs are kept forever\n") {
+	if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || !strings.Contains(stderr, "slimtree: archives, their recovery refs and blobs are kept forever\n") {
 		t.Fatalf("prune under forever: exit %d, stderr %q", code, stderr)
 	}
 	requireExists(t, tenDays)
@@ -408,5 +409,58 @@ func TestDiskUseKeepsASmallTotalReadable(t *testing.T) {
 		if got := diskUse(tc.used, tc.disk); got != tc.want {
 			t.Errorf("diskUse(%d, %d) = %q, want %q", tc.used, tc.disk, got, tc.want)
 		}
+	}
+}
+
+// installBlob adds a blob of content to the cache dir as the hydrator does,
+// read last at read, and returns its path.
+func installBlob(t *testing.T, dir, oid, content string, read time.Time) string {
+	t.Helper()
+	staged, err := blobcache.Stage(dir, oid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staged, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := blobcache.Install(dir, oid, staged); err != nil {
+		t.Fatal(err)
+	}
+	path := blobcache.Path(dir, oid)
+	if err := os.Chtimes(path, read, read); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// prune evicts the blobs of the shared cache not read within the rule, and
+// keeps the others. Under forever it evicts nothing.
+func TestPruneEvictsBlobsNotReadWithinTheRule(t *testing.T) {
+	homeDir := pruneHome(t)
+	blobs := filepath.Join(homeDir, "blobs")
+	now := time.Now()
+	old := installBlob(t, blobs, strings.Repeat("a", 40), "old", now.Add(-40*24*time.Hour))
+	recent := installBlob(t, blobs, strings.Repeat("b", 40), "recent", now.Add(-10*24*time.Hour))
+
+	if code, _, stderr := slimtree(t.Context(), "retention", "forever"); code != 0 {
+		t.Fatalf("retention forever: exit %d, stderr %q", code, stderr)
+	}
+	if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || !strings.Contains(stderr, "blobs are kept forever\n") {
+		t.Fatalf("prune under forever: exit %d, stderr %q", code, stderr)
+	}
+	requireExists(t, old)
+	requireExists(t, recent)
+
+	if code, _, stderr := slimtree(t.Context(), "retention", "month"); code != 0 {
+		t.Fatalf("retention month: exit %d, stderr %q", code, stderr)
+	}
+	code, _, stderr := slimtree(t.Context(), "prune")
+	if want := "slimtree: they evict blobs not read for 30 days; this one evicted 1, 3 B\n"; code != 0 || !strings.Contains(stderr, want) {
+		t.Fatalf("prune: exit %d, stderr %q; want exit 0 and %q", code, stderr, want)
+	}
+	requireGone(t, old)
+	requireExists(t, recent)
+	if st, err := blobcache.ReadStats(blobs); err != nil || st.Blobs != 1 || st.Bytes != int64(len("recent")) {
+		t.Fatalf("cache stats = %+v, %v; want the one recent blob", st, err)
 	}
 }

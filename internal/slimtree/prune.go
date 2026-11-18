@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/apfsclone"
+	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 )
 
@@ -25,13 +27,17 @@ type pruning struct {
 	// their repository is gone.
 	kept     []string
 	problems []error
+	// evicted counts the blobs prune evicted from the blob cache, and
+	// evictedBytes their bytes.
+	evicted, evictedBytes int64
 	// used is the bytes the archives take, and disk the size of the home's
 	// file system. disk is 0 when prune could not measure them.
 	used, disk uint64
 }
 
-// prune deletes each archive older than the home's retention rule with its
-// recovery ref, the ref first, so no ref outlives its archive. It keeps both
+// prune evicts each blob of the shared blob cache not read within the
+// home's retention rule, with blobcache.Evict, and deletes each archive
+// older than the rule with its recovery ref, the ref first, so no ref outlives its archive. It keeps both
 // while the archive's repository is gone, as on a volume that is not
 // mounted: no later prune could find the ref, which would pin its commits.
 // Hold the home's lock. prune never returns an error: each problem goes into
@@ -56,6 +62,12 @@ func prune(ctx context.Context, home *state.Home, now time.Time) pruning {
 			default:
 				p.deleted++
 			}
+		}
+		// No byte budget: Evict removes only the blobs not read since the cutoff.
+		res, err := blobcache.Evict(ctx, home.BlobCacheDir(), math.MaxInt64, cutoff)
+		p.evicted, p.evictedBytes = res.Evicted, res.EvictedBytes
+		if err != nil {
+			p.problems = append(p.problems, fmt.Errorf("evicting blobs: %w", err))
 		}
 	}
 	var err error
@@ -167,24 +179,26 @@ func inRepo(ctx context.Context, commonDir string, f func(context.Context) (bool
 // shellQuote quotes s for a POSIX shell.
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
+// size describes n bytes in B, KB, MB or GB.
+func size(n uint64) string {
+	switch {
+	case n < 1e3:
+		return fmt.Sprintf("%d B", n)
+	case n < 1e6:
+		return fmt.Sprintf("%.1f KB", float64(n)/1e3)
+	case n < 1e9:
+		return fmt.Sprintf("%.1f MB", float64(n)/1e6)
+	}
+	return fmt.Sprintf("%.2f GB", float64(n)/1e9)
+}
+
 // diskUse describes used bytes of a disk of disk bytes.
 func diskUse(used, disk uint64) string {
-	var size string
-	switch {
-	case used < 1e3:
-		size = fmt.Sprintf("%d B", used)
-	case used < 1e6:
-		size = fmt.Sprintf("%.1f KB", float64(used)/1e3)
-	case used < 1e9:
-		size = fmt.Sprintf("%.1f MB", float64(used)/1e6)
-	default:
-		size = fmt.Sprintf("%.2f GB", float64(used)/1e9)
-	}
 	share := 100 * float64(used) / float64(disk)
 	if used > 0 && share < 0.001 {
-		return size + ", under 0.001% of the disk"
+		return size(used) + ", under 0.001% of the disk"
 	}
-	return fmt.Sprintf("%s, %.3f%% of the disk", size, share)
+	return fmt.Sprintf("%s, %.3f%% of the disk", size(used), share)
 }
 
 // write writes what p did, for rm and prune.
@@ -196,9 +210,10 @@ func (p pruning) write(w io.Writer) {
 	case p.ruleErr != nil:
 		fmt.Fprintf(w, "slimtree: pruned nothing: %v\n", p.ruleErr)
 	case p.rule == state.Forever:
-		fmt.Fprintln(w, "slimtree: archives and their recovery refs are kept forever")
+		fmt.Fprintln(w, "slimtree: archives, their recovery refs and blobs are kept forever")
 	default:
 		fmt.Fprintf(w, "slimtree: rm and prune delete archives older than %d days with their recovery refs; this one deleted %d\n", p.rule, p.deleted)
+		fmt.Fprintf(w, "slimtree: they evict blobs not read for %d days; this one evicted %d, %s\n", p.rule, p.evicted, size(uint64(p.evictedBytes)))
 	}
 	for _, k := range p.kept {
 		fmt.Fprintln(w, "slimtree:", k)

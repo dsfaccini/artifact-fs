@@ -91,6 +91,10 @@ type Record struct {
 	Head string `json:"head,omitempty"`
 }
 
+// BlobCacheDir is the blob cache every artifactfs worktree of the home
+// shares.
+func (h *Home) BlobCacheDir() string { return filepath.Join(h.dir, "blobs") }
+
 // RecordDir is the directory of the record of the worktree at path. An
 // artifactfs worktree keeps its gitfile, its daemon's log and its state root
 // there.
