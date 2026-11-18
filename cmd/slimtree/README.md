@@ -29,8 +29,8 @@ How it was measured:
 
 - `slimtree --version`: `slimtree 0.1.0a1 (v0.1.0-alpha.1, f2eed729d076,
   go1.27.4, darwin/arm64)`, the binary that `uvx slimtree@0.1.0a1` installs.
-  0.1.0 changes none of the code that `slimtree new` and `slimtree rm` run on
-  macOS.
+  Since 0.1.0a1, `slimtree new` and `slimtree rm` change only in how they
+  release their locks; the cloning and hashing the table times are unchanged.
 - Both tools made a new branch: `slimtree new <branch> --from <commit> --path
   <path>` and `git worktree add -b <branch> <path> <commit>`, from the same
   base worktree.
