@@ -102,13 +102,16 @@ How it was measured:
   time, before the index's, so none of them is racily clean. Its first
   `git status` took between 118 ms and 157 ms, and its second between 10 ms
   and 13 ms.
-- The wait also slows slimtree's first `git status`, because this machine's
-  CPU runs at a lower clock after it idles; slimtree does the same work.
+- The wait also slows slimtree's first `git status`, from 117 ms to about
+  140 ms, measured on a build of 059723a. slimtree and git run the same
+  instructions at either wait, and a fixed-work program unrelated to slimtree
+  slows the same way, so the cause is how this machine behaves after it
+  idles. The mechanism is not confirmed.
 - Each slimtree run had its own `SLIMTREE_HOME`, so its blob cache started
   empty. The blob cache is shared, so a later worktree of the same repository
   reuses the blobs an earlier one hydrated.
 - Disk is what `du` counts right after the create. It was the same in every
-  round: byte for byte for slimtree, within 4 KiB for git. For slimtree at the
+  round: byte for byte for slimtree, within 8 KiB for git. For slimtree at the
   base worktree's commit: the worktree's record directory in its home
   (2.67 MiB, mostly the state root's databases; 2.68 MiB at the pull request's
   commit), its admin directory in the base's `.git/worktrees` (0.83 MiB), and
