@@ -283,7 +283,7 @@ func TestDoctorExitsOneOnAFailedCheck(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
 		t.Fatal(err)
 	}
-	want := doctor.Result{ID: "backend", Status: doctor.StatusWarn, Detail: "slimtree rm of artifactfs worktrees is not in this release yet", Fix: "upgrade slimtree once a release removes artifactfs worktrees"}
+	want := doctor.Result{ID: "backend", Status: doctor.StatusWarn, Detail: "slimtree rm of artifactfs worktrees is not supported yet", Fix: "upgrade slimtree once a release removes artifactfs worktrees"}
 	for i, c := range report.Checks {
 		if !report.OK || i == 0 && c != want || i > 0 && c.Status == doctor.StatusFail {
 			t.Fatalf("doctor --json on a healthy machine = %+v, want %+v first and no failure", report.Checks, want)
@@ -299,7 +299,7 @@ func TestDoctorSaysArtifactFSRmIsNotInThisRelease(t *testing.T) {
 	probe.FSKitAvailable = func() error { return nil }
 	var stdout bytes.Buffer
 	if code := run(t.Context(), "darwin", probe, []string{"--backend", "artifactfs", "doctor"}, &stdout, io.Discard); code != 0 ||
-		!strings.HasPrefix(stdout.String(), "warn  backend        slimtree rm of artifactfs worktrees is not in this release yet\n      fix: upgrade slimtree once a release removes artifactfs worktrees\n") {
+		!strings.HasPrefix(stdout.String(), "warn  backend        slimtree rm of artifactfs worktrees is not supported yet\n      fix: upgrade slimtree once a release removes artifactfs worktrees\n") {
 		t.Fatalf("--backend artifactfs doctor on macOS: exit %d, stdout %q; want exit 0 and the backend warning first", code, stdout.String())
 	}
 }
@@ -369,7 +369,7 @@ func TestFirstRunSummaryPrintsOnce(t *testing.T) {
 		want  string
 	}{
 		{goos: "linux", probe: healthyLinux(), want: "slimtree's first run: what --backend artifactfs needs here (slimtree doctor checks again)\n" +
-			"warn  backend        slimtree rm of artifactfs worktrees is not in this release yet\n" +
+			"warn  backend        slimtree rm of artifactfs worktrees is not supported yet\n" +
 			"      fix: upgrade slimtree once a release removes artifactfs worktrees\n" +
 			"ok    fusermount     /usr/bin/fusermount3\n" +
 			"ok    dev-fuse       /dev/fuse\n" +

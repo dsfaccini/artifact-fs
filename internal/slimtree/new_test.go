@@ -441,7 +441,7 @@ func TestRmRemovesTheWorktreeAndItsRecord(t *testing.T) {
 func TestRmOfArtifactFSWorktreesIsNotInThisReleaseYet(t *testing.T) {
 	homeAfterFirstRun(t)
 	main := newRepo(t)
-	const notYet = ": removing artifactfs worktrees is not in this release yet; slimtree stop unmounts one\n"
+	const notYet = ": removing artifactfs worktrees is not supported yet; slimtree stop unmounts one\n"
 	served := filepath.Join(filepath.Dir(main), "served")
 	if err := os.Mkdir(served, 0o755); err != nil {
 		t.Fatal(err)

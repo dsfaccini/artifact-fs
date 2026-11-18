@@ -467,6 +467,53 @@ func TestCloseReleasesTheDaemonLockAfterAFailedUnmount(t *testing.T) {
 	next.Close()
 }
 
+// Close ends the workers of a runtime whose unmount failed before it returns.
+// A HEAD reconcile that waits to run git as Close begins otherwise runs it
+// after Close closed the Store and released the daemon lock, and its stream
+// files land in the state root's temp directory.
+func TestCloseEndsTheWorkersOfARuntimeItCouldNotUnmount(t *testing.T) {
+	t.Parallel()
+	svc, _ := newSyncedDaemon(t)
+	svc.mountPointEntry = heldMountPoint
+	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("busy")}
+	t.Cleanup(func() { close(mfs.exit) })
+	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
+		return mfs, nil
+	}
+	reached, released, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var first sync.Once
+	svc.headReconcileStarting = func() {
+		first.Do(func() {
+			svc.mu.Lock()
+			rt := svc.running["repo"]
+			svc.mu.Unlock()
+			close(reached)
+			select {
+			case <-rt.ctx.Done():
+			case <-release:
+			}
+			close(released)
+		})
+	}
+	if err := svc.syncRepos(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.Lock()
+	rt := svc.running["repo"]
+	svc.mu.Unlock()
+	svc.signalHEADReconcile(rt)
+	<-reached
+	if err := svc.Close(); err == nil || !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("Close = %v, want the unmount failure", err)
+	}
+	select {
+	case <-released:
+	default:
+		t.Fatal("Close returned while a HEAD reconcile of the runtime it could not unmount still waited to run git")
+	}
+}
+
 // A mount that serves again ends the connection failure before it, so
 // mount_error clears.
 func TestRemountClearsAConnectionFailure(t *testing.T) {

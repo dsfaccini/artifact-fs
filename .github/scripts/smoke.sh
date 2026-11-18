@@ -81,13 +81,13 @@ EOF
 	git rev-parse --verify --quiet refs/heads/feat >/dev/null || fail "slimtree rm deleted the branch feat"
 	;;
 Linux)
-	# This release removes no artifactfs worktree, Linux's default backend.
+	# slimtree rm of artifactfs worktrees, Linux's default backend, is not supported yet.
 	python3 - "$work/doctor.json" <<'EOF'
 import json, sys
 report = json.load(open(sys.argv[1]))
 backend = report["checks"][0]
 assert backend["id"] == "backend" and backend["status"] == "warn", report
-assert backend["detail"] == "slimtree rm of artifactfs worktrees is not in this release yet", backend
+assert backend["detail"] == "slimtree rm of artifactfs worktrees is not supported yet", backend
 EOF
 	states() {
 		"$slimtree" list --json | python3 -c 'import json, sys; print(" ".join(w["name"] + "=" + w["state"] for w in json.load(sys.stdin)["worktrees"]))'
@@ -104,7 +104,7 @@ EOF
 		"$slimtree" rm app-feat 2>"$work/rm.err" || status=$?
 		cat "$work/rm.err"
 		[ "$status" -eq 1 ] || fail "slimtree rm of an artifactfs worktree exited $status, want 1"
-		grep -q 'removing artifactfs worktrees is not in this release yet' "$work/rm.err" || fail "slimtree rm did not say removing artifactfs worktrees is not in this release"
+		grep -q 'removing artifactfs worktrees is not supported yet' "$work/rm.err" || fail "slimtree rm did not say removing artifactfs worktrees is not supported yet"
 	else
 		# Without FUSE, new refuses before it changes anything.
 		status=0

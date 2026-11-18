@@ -30,7 +30,7 @@ on:
       tag:
         description: The release tag a dry run builds as. A manual run publishes nothing.
         required: true
-        default: v0.1.0-alpha.1
+        default: v0.1.0
 
 permissions: {}
 
