@@ -11,7 +11,9 @@ file contents from Git's objects as they are needed.
 ## Measured
 
 A new worktree of [pydantic-ai](https://github.com/pydantic/pydantic-ai)
-(6,069 tracked paths, 333 MiB), median of 5 rounds:
+(6,069 tracked paths, 333 MiB), median of 5 rounds.
+
+### macOS
 
 | | slimtree | `git worktree add` |
 |---|---|---|
@@ -49,6 +51,73 @@ How it was measured:
   5-minute load average was under 20; it stayed between 6.7 and 8.9.
 - MacBook Air (Apple M4, 24 GB), macOS 27.2, internal SSD, Git 2.54.0 (Apple
   Git-157), 2026-11-17.
+
+### Linux
+
+| | slimtree | `git worktree add` |
+|---|---|---|
+| Disk, at the base worktree's commit | 3.51 MiB | 348 MiB |
+| Disk, at a pull request's commit | 3.51 MiB | 348 MiB |
+| Create | 0.33 s | 0.95 s |
+| First `git status` | 120 ms | 593 ms |
+| Second `git status` | 11 ms | 10 ms |
+| Remove | 0.31 s | 0.12 s |
+
+On Linux slimtree saves disk and time. It checks out no files: the mount reads
+file contents from Git's objects as they are needed, and the worktree's
+FSMonitor hook tells `git status` which files changed. Only remove takes
+longer: `slimtree rm` stops the daemon and archives the worktree's state before
+it removes the worktree.
+
+How it was measured:
+
+- `slimtree --version`: `slimtree dev (untagged, f8ce3fc239f2, go1.27.4,
+  linux/amd64)`, built from main f8ce3fc as the release workflow builds it
+  (`CGO_ENABLED=0 go build -trimpath -ldflags "-s -w"`), without its version
+  stamp.
+- Both tools made a new branch at the macOS table's two commits:
+  `slimtree --backend artifactfs new <branch> --from <commit> --path <path>`
+  and `git worktree add -b <branch> <path> <commit>`, from the same base
+  worktree. Each run then ran `git status --porcelain=v1` twice and removed the
+  worktree with `slimtree rm <path>` or `git worktree remove <path>`.
+- Each slimtree run had its own `SLIMTREE_HOME`, so its blob cache started
+  empty. The blob cache is shared, so a later worktree of the same repository
+  reuses the blobs an earlier one hydrated.
+- Disk is what `du` counts right after the create. For slimtree: the
+  worktree's record directory in its home (2.67 MiB, mostly the state root's
+  databases), its admin directory in the base's `.git/worktrees` (0.83 MiB),
+  and the blob cache (0.01 MiB). The mount point is an empty directory. For git:
+  the worktree (347 MiB) and its admin directory (0.84 MiB). ext4 shares no
+  blocks between files, so `du` counts git's checkout in full.
+- The first `git status` hydrated 12 blobs, 2.02 MiB: every regular file at the
+  root of the tree. The slimtree worktree then took 5.57 MiB. The second
+  `git status` hydrated none.
+- `slimtree new` copies its own binary (12.1 MiB) into its home when the home
+  holds no copy of that build, and every worktree's daemon runs that copy. Each
+  home got the copy before the run, so create's time and disk leave the copy
+  out. Create's time includes the summary that slimtree prints on a home's
+  first run, which takes about 10 ms.
+- `slimtree rm` leaves a 0.88 MiB archive of the worktree's state, which
+  `slimtree prune` deletes under the retention rule.
+- Times are the wall-clock time of each command, at the base worktree's commit.
+  At the pull request's commit they were: create 0.39 s and 0.95 s, first
+  `git status` 120 ms and 457 ms, second `git status` 11 ms and 10 ms, remove
+  0.30 s and 0.13 s, for slimtree and git.
+- The daemon's log splits slimtree's create at the base worktree's commit:
+  197 ms before the daemon began to mount, 97 ms to mount, and 19 ms more until
+  `slimtree new` returned. At the pull request's commit: 184 ms, 130 ms and
+  80 ms.
+- git's first `git status` took between 236 ms and 674 ms at the base
+  worktree's commit, and between 158 ms and 598 ms at the pull request's. Its
+  second `git status` took 10 ms, except in the rounds where its first was the
+  fastest: 214 ms in one round at the base worktree's commit, and 135 ms and
+  139 ms in two at the pull request's. slimtree's first `git status` took
+  between 115 ms and 138 ms, and its second 11 ms in every round.
+- The tools alternated in order each round. Every run started and ran while the
+  5-minute load average was under 20; it stayed between 2.96 and 3.07.
+- AMD Ryzen 7 7700 (8 cores, 16 threads), 62 GiB, Ubuntu 26.04.1, Linux
+  7.0.0-43, ext4 on RAID 1 over two NVMe SSDs, fuse3 3.18.2, Git 2.53.0,
+  2026-11-18.
 
 ## What works in this release
 
