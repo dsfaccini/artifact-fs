@@ -32,8 +32,9 @@ func TestMain(m *testing.M) {
 	if _, _, ok := gitstore.ParseFSMonitorHookLink(os.Args[0]); ok || len(os.Args) > 1 && os.Args[1] == "fsmonitor-hook" {
 		os.Exit(cli.Main(context.Background(), os.Args, os.Stdout, os.Stderr))
 	}
-	// AFS_E2E_REPO opts into a real remote, and the README authenticates it
-	// through the machine's ambient Git credential helper, so keep that config.
+	// AFS_E2E_REPO opts into a real remote, which docs/artifact-fs.md says to
+	// authenticate through the machine's ambient Git credential helper, so keep
+	// that config.
 	if os.Getenv("AFS_E2E_REPO") == "" {
 		gittest.IsolateConfig()
 	}

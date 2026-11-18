@@ -6,7 +6,7 @@
 <sub>A fresh pydantic-ai worktree took about 43 MiB through artifact-fs, against about 371 MiB for `git worktree add`. That counts the checkout, its git dir and its virtualenv's private bytes, median of three runs on a 16-core Linux box with ext4, and leaves out the shared blob cache, which every worktree reuses.</sub>
 
 <p align="center">
-  <img src="artifact-fs.png" alt="ArtifactFS" width="720">
+  <img src="../artifact-fs.png" alt="ArtifactFS" width="720">
 </p>
 
 # ArtifactFS
@@ -477,7 +477,7 @@ The remote must advertise Git partial-clone filtering for file contents to hydra
 
 ## Sandboxes and Containers
 
-See the [generic container example](examples/README.md) for Docker-compatible runtimes or the [Cloudflare Sandbox SDK example](examples/cloudflare-sandbox-sdk/README.md) for Workers and Containers.
+See the [generic container example](../examples/README.md) for Docker-compatible runtimes or the [Cloudflare Sandbox SDK example](../examples/cloudflare-sandbox-sdk/README.md) for Workers and Containers.
 
 ## Architecture
 
@@ -798,7 +798,7 @@ Contributions are welcome, but not all contributions will be accepted. As guidan
 
 AI/LLM submissions are welcome, but overall issue/PR quality is ultimately the responsibility of the submitter, and the codebase is the responsibility (and long term maintenance burden) of the maintainers.
 
-See [AGENTS.md](AGENTS.md) for build commands, architecture details, and conventions. Before submitting changes, run the CI checks in the order that AGENTS.md lists them under "Validation".
+See [AGENTS.md](../AGENTS.md) for build commands, architecture details, and conventions. Before submitting changes, run the CI checks in the order that AGENTS.md lists them under "Validation".
 
 Enable the pre-commit checks with `git config core.hooksPath .githooks`. For staged Go changes they run `gofmt`, `go vet`, `modernize`, a CLI build, and the changed packages' unit tests. The hook skips the tests when the machine is under load; set `AFS_PRECOMMIT_TESTS` to `always` or `never` to override, or tune `AFS_PRECOMMIT_LOAD_PER_CPU` (default `1`).
 
