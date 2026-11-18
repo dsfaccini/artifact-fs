@@ -112,12 +112,13 @@ slimtree resume --all        # after a reboot
 `slimtree rm` takes a worktree by its directory name or its path. It refuses a
 worktree with changes unless you pass `--force`, and `slimtree rm --check` runs
 only its checks. It keeps the worktree's `HEAD` in a ref under
-`refs/slimtree/archive/` and never deletes a branch. On Linux it also refuses
-while another process works inside the mount, also with `--force`. It then
-stops the daemon, and keeps the files your changes made, with the worktree's
-git dir, in `state.tar.gz` in the archive. `--exclude <glob>` leaves out the
-files at paths with a component that the glob matches, such as
-`--exclude node_modules`. Each `slimtree rm`, and
+`refs/slimtree/archive/` and never deletes a branch. For a worktree on an
+artifact-fs mount, Linux's default, it also refuses while another process
+works inside the mount, also with `--force`. It then stops the worktree's
+daemon, and keeps the files your changes made, with the worktree's git dir, in
+`state.tar.gz` in the archive. `--exclude <glob>` leaves out the files at paths
+with a component that the glob matches, such as `--exclude node_modules`. Each
+`slimtree rm`, and
 `slimtree prune`, deletes the archives and recovery refs older than the
 retention rule, a month by default, and evicts artifact-fs's cached blobs not
 read within it; `slimtree retention week|month|forever|<N>d`
