@@ -15,7 +15,7 @@ def jobs(text):
     """Return each job's id and its lines, from the jobs section."""
     found, current = {}, None
     for line in text.split("\njobs:\n", 1)[1].splitlines():
-        if m := re.fullmatch(r"  ([a-z0-9-]+):", line):
+        if m := re.fullmatch(r"  ([A-Za-z_][A-Za-z0-9_-]*):", line):
             current = found[m.group(1)] = []
         elif current is not None:
             current.append(line)

@@ -20,6 +20,16 @@ def lines(text):
     return {line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")}
 
 
+def permissions(text):
+    """Return each permissions key's value, and the entries of its block
+    mapping, without comments."""
+    found = []
+    for m in re.finditer(r"^( *)permissions:(.*)\n((?:\1  .*\n|\s*\n)*)", text, re.M):
+        entries = [re.sub(r"\s+#.*", "", line).strip() for line in m.group(3).splitlines()]
+        found.append((re.sub(r"\s+#.*", "", m.group(2)).strip(), [e for e in entries if e and not e.startswith("#")]))
+    return found
+
+
 def job_permissions(job):
     m = re.search(r"^    permissions:(.*)\n((?:      .*\n)*)", job + "\n", re.M)
     return m and lines(m.group(1) + "\n" + m.group(2))
@@ -46,7 +56,14 @@ class RunnerRetryWorkflowTest(unittest.TestCase):
         self.assertGreater(len(others), 0)
         for workflow in others:
             text = workflow.read_text()
-            self.assertNotRegex(text, r"actions:\s*['\"]?write|write-all", workflow.name)
+            # Only plain block entries, which these checks read: a flow mapping
+            # or a quoted key could spell actions: write another way.
+            for value, entries in permissions(text):
+                if value:
+                    self.assertIn(value, {"{}", "read-all"}, workflow.name)
+                for entry in entries:
+                    self.assertRegex(entry, r"^[a-z-]+: (read|write|none)$", workflow.name)
+                    self.assertNotEqual(entry, "actions: write", workflow.name)
             # A job without permissions of its own or of its workflow gets the
             # repository's default, which can write actions.
             if not re.search(r"^permissions:", text, re.M):
