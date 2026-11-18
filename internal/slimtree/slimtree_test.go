@@ -38,8 +38,8 @@ func TestDefaultBackendByPlatform(t *testing.T) {
 		apfsCloneRuns bool
 		usage         string
 	}{
-		{goos: "darwin", want: apfsClone, apfsCloneRuns: true, usage: "apfsclone (artifactfs worktrees are not in this release yet)"},
-		{goos: "linux", want: artifactFS, usage: "artifactfs, whose worktrees are not in this release yet (apfsclone needs macOS)"},
+		{goos: "darwin", want: apfsClone, apfsCloneRuns: true, usage: "apfsclone (artifactfs worktrees are not supported yet; Linux support is coming)"},
+		{goos: "linux", want: artifactFS, usage: "artifactfs, whose worktrees are not supported yet; Linux support is coming (apfsclone needs macOS)"},
 	} {
 		t.Run(tc.goos, func(t *testing.T) {
 			if got := defaultBackend(tc.goos); got != tc.want {
@@ -282,7 +282,7 @@ func TestDoctorExitsOneOnAFailedCheck(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
 		t.Fatal(err)
 	}
-	want := doctor.Result{ID: "backend", Status: doctor.StatusFail, Detail: "artifactfs worktrees are not in this release yet", Fix: "upgrade slimtree once a release makes artifactfs worktrees"}
+	want := doctor.Result{ID: "backend", Status: doctor.StatusFail, Detail: "artifactfs worktrees are not supported yet; Linux support is coming", Fix: "upgrade slimtree once a release makes artifactfs worktrees"}
 	for i, c := range report.Checks {
 		if i == 0 && c != want || i > 0 && c.Status == doctor.StatusFail {
 			t.Fatalf("doctor --json on a healthy machine = %+v, want only %+v to fail", report.Checks, want)
@@ -299,7 +299,7 @@ func TestDoctorSaysArtifactFSIsNotInThisRelease(t *testing.T) {
 	probe.FSKitAvailable = func() error { return nil }
 	var stdout bytes.Buffer
 	if code := run(t.Context(), "darwin", probe, []string{"--backend", "artifactfs", "doctor"}, &stdout, io.Discard); code != 1 ||
-		!strings.HasPrefix(stdout.String(), "fail  backend        artifactfs worktrees are not in this release yet\n      fix: use --backend apfsclone, the default on macOS\n") {
+		!strings.HasPrefix(stdout.String(), "fail  backend        artifactfs worktrees are not supported yet; Linux support is coming\n      fix: use --backend apfsclone, the default on macOS\n") {
 		t.Fatalf("--backend artifactfs doctor on macOS: exit %d, stdout %q; want exit 1 and the backend failure first", code, stdout.String())
 	}
 }
@@ -369,7 +369,7 @@ func TestFirstRunSummaryPrintsOnce(t *testing.T) {
 		want  string
 	}{
 		{goos: "linux", probe: healthyLinux(), want: "slimtree's first run: what --backend artifactfs needs here (slimtree doctor checks again)\n" +
-			"fail  backend        artifactfs worktrees are not in this release yet\n" +
+			"fail  backend        artifactfs worktrees are not supported yet; Linux support is coming\n" +
 			"      fix: upgrade slimtree once a release makes artifactfs worktrees\n" +
 			"ok    fusermount     /usr/bin/fusermount3\n" +
 			"ok    dev-fuse       /dev/fuse\n" +
