@@ -2,6 +2,7 @@ package apfsclone
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
@@ -135,8 +136,25 @@ func newFixture(t *testing.T, beforeClone, beforeAdvance func(upstream string)) 
 	write(t, filepath.Join(f.upstream, "changed.txt"), "upstream\n", 0o644)
 	run(t, f.upstream, "commit", "-qam", "upstream moves")
 	run(t, f.base, "fetch", "-q", "upstream")
+	// A checkout's files are usually older than any git status in it, so Add
+	// trusts their clones.
+	err := filepath.WalkDir(f.base, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() && d.Name() == ".git" {
+			return cmp.Or(err, fs.SkipDir)
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		return os.Chtimes(p, time.Time{}, baseMtime)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	return f
 }
+
+// baseMtime is the mtime of every file in a fixture's base.
+var baseMtime = time.Date(2020, 1, 2, 3, 4, 5, 6000, time.UTC)
 
 // commitUpstream commits files, by path, to upstream main. It adds only those
 // paths, so the attributes of a .gitattributes among them convert no other
@@ -270,7 +288,11 @@ func copyClone(src, dst string) error {
 	if err := out.Close(); err != nil {
 		return err
 	}
-	return os.Chmod(dst, fi.Mode().Perm())
+	if err := os.Chmod(dst, fi.Mode().Perm()); err != nil {
+		return err
+	}
+	// clonefile(2) keeps the source's mtime.
+	return os.Chtimes(dst, time.Time{}, fi.ModTime())
 }
 
 // recorder records the paths of worktree that its clone made.

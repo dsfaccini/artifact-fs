@@ -15,11 +15,21 @@
 //     clone that is not is rewritten from Git. diff-files ignores the
 //     executable bit under core.fileMode=false, which a plain checkout still
 //     writes.
-//   - update-index --refresh then hashes every file, because read-tree records
-//     no stat data. A file that does not match its blob is rewritten from Git,
-//     and diff-files must then be empty. Refresh hashes through Git's clean
-//     filter, which compares raw bytes only because Add refuses every checkout
-//     that converts files.
+//   - Add records each clone's stat data in the index, so Git trusts the clone
+//     and never checks it byte for byte against its blob. The trust rests on
+//     the base's git status: on its index's stat data, core.checkStat,
+//     core.trustctime and its fsmonitor. Add records none for a clone
+//     rewritten from Git, a clone whose size is not its blob's, a path that
+//     the base's index marks assume-unchanged or skip-worktree, a path that
+//     the base's attributes convert, or a clone whose mtime is not older than
+//     the second in which Add read the base's HEAD. It records none at all
+//     when the base's HEAD moved before Add registered the worktree.
+//   - update-index --refresh then hashes every other file, because read-tree
+//     records no stat data, and every entry that Git treats as racily clean.
+//     A file that does not match its blob is rewritten from Git, and
+//     diff-files must then be empty. Refresh hashes through Git's clean
+//     filter, which compares raw bytes only because Add refuses every
+//     checkout that converts files.
 //
 // Before it creates anything, Add refuses a checkout that converts files: Git
 // would then write other bytes than the blobs', so a clone could not be
@@ -44,12 +54,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -85,14 +98,16 @@ type Options struct {
 	// Stdout and Stderr receive the output of git worktree add.
 	Stdout, Stderr io.Writer
 
-	// beforeRegister, afterRegister and afterRewrite are test hooks that
+	// beforeRegister, afterRegister, afterRewrite and now are test hooks that
 	// production code leaves nil. beforeRegister runs after Add's checks,
 	// before git worktree add. afterRegister runs once the new worktree's
 	// index is filled. afterRewrite runs after Add rewrites from Git the files
-	// that differ from the index, with their paths.
+	// that differ from the index, with their paths. now returns, in place of
+	// time.Now, when Add's git status in the base starts.
 	beforeRegister func()
 	afterRegister  func()
 	afterRewrite   func(paths []string)
+	now            func() time.Time
 }
 
 // Result describes a worktree that Add made.
@@ -151,11 +166,25 @@ func Add(ctx context.Context, o Options) (Result, error) {
 	refuse := func(err error) error {
 		return fmt.Errorf("apfsclone cannot clone %s into %s: %w", base, dest, err)
 	}
-	baseHead, err := treeEntries(ctx, base, "HEAD")
+	// A file that changes in the base once Add reads the base's HEAD has an
+	// mtime in this second or later.
+	checked := time.Now()
+	if o.now != nil {
+		checked = o.now()
+	}
+	baseCommit, err := resolveCommit(ctx, base, "HEAD")
+	if err != nil {
+		return Result{}, refuse(err)
+	}
+	baseHead, err := treeEntries(ctx, base, baseCommit)
 	if err != nil {
 		return Result{}, refuse(err)
 	}
 	dirty, err := dirtyPaths(ctx, base)
+	if err != nil {
+		return Result{}, refuse(err)
+	}
+	untrusted, err := untrustedPaths(ctx, base)
 	if err != nil {
 		return Result{}, refuse(err)
 	}
@@ -182,6 +211,12 @@ func Add(ctx context.Context, o Options) (Result, error) {
 	if o.beforeRegister != nil {
 		o.beforeRegister()
 	}
+	// A commit, checkout or reset in the base that lands between the HEAD read
+	// and git status makes status compare with another tree than baseHead.
+	moved, err := resolveCommit(ctx, base, "HEAD")
+	if err != nil {
+		return Result{}, refuse(err)
+	}
 	// head is the commit in the new worktree's index. Add checks, fills and
 	// reports it, never HEAD again, so another process that moves the new
 	// branch cannot pair one commit's checks with another commit's index.
@@ -198,7 +233,7 @@ func Add(ctx context.Context, o Options) (Result, error) {
 			return Result{}, &IncompleteError{dest, err}
 		}
 	}
-	result, err := populate(ctx, clone, base, dest, head, baseHead, dirty, o.afterRewrite)
+	result, err := populate(ctx, clone, base, dest, head, baseState{baseHead, dirty, untrusted, checked, moved == baseCommit}, o.afterRewrite)
 	if err != nil {
 		return Result{}, &IncompleteError{dest, err}
 	}
@@ -396,10 +431,10 @@ func preflight(clone Clonefile, base, dest string, baseHead tree) error {
 }
 
 // populate writes dest's files from head, the commit in its index, cloning
-// from base the paths that baseHead and dirty show to match, and rewrites
-// from Git each clone that does not match its entry. afterRewrite, when not
-// nil, runs after that rewrite.
-func populate(ctx context.Context, clone Clonefile, base, dest, head string, baseHead tree, dirty map[string]bool, afterRewrite func([]string)) (Result, error) {
+// from base the paths that b shows to match. It records the stat data of each
+// clone it trusts, and rewrites from Git each clone that does not match its
+// entry. afterRewrite, when not nil, runs after that rewrite.
+func populate(ctx context.Context, clone Clonefile, base, dest, head string, b baseState, afterRewrite func([]string)) (Result, error) {
 	target, err := treeEntries(ctx, dest, head)
 	if err != nil {
 		return Result{}, err
@@ -411,7 +446,7 @@ func populate(ctx context.Context, clone Clonefile, base, dest, head string, bas
 			continue
 		}
 		e := target.entries[p]
-		if b, ok := baseHead.entries[p]; ok && regular(e.mode) && b == e && !dirty[p] {
+		if be, ok := b.head.entries[p]; ok && regular(e.mode) && be == e && !b.dirty[p] {
 			toClone = append(toClone, p)
 		} else {
 			write = append(write, p)
@@ -446,6 +481,23 @@ func populate(ctx context.Context, clone Clonefile, base, dest, head string, bas
 	if err := checkoutIndex(ctx, dest, misshapen); err != nil {
 		return Result{}, err
 	}
+	rewritten := map[string]bool{}
+	for _, p := range misshapen {
+		rewritten[p] = true
+	}
+	trusted := map[string]string{}
+	for _, p := range cloned {
+		if b.steady && !rewritten[p] && !b.untrusted[p] {
+			trusted[p] = target.entries[p].oid
+		}
+	}
+	sizes, err := blobSizes(ctx, dest, trusted)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := recordStats(ctx, dest, sizes, b.checked); err != nil {
+		return Result{}, err
+	}
 
 	err = gitWrite(ctx, func(ctx context.Context) error {
 		_, err := git(ctx, dest, nil, "update-index", "-q", "--refresh")
@@ -469,8 +521,7 @@ func populate(ctx context.Context, clone Clonefile, base, dest, head string, bas
 	} else if len(still) > 0 {
 		return Result{}, errors.New("tracked files still differ from the index after rewriting them from Git")
 	}
-	rewritten := map[string]bool{}
-	for _, p := range append(misshapen, mismatched...) {
+	for _, p := range mismatched {
 		rewritten[p] = true
 	}
 	kept := 0
@@ -525,14 +576,26 @@ func refuseConvertingAttributes(ctx context.Context, repo, commit string) error 
 	if err != nil {
 		return err
 	}
-	fields := strings.Split(string(report), "\x00")
-	for i := 0; i+2 < len(fields); i += 3 {
-		p, attribute, value := fields[i], fields[i+1], fields[i+2]
-		if convertingAttributes[attribute] && (attribute != "text" || value != "unset") {
-			return fmt.Errorf("%s has the attribute %s=%s, which converts it on checkout", p, attribute, value)
-		}
+	for p, attribute := range converting(report) {
+		return fmt.Errorf("%s has the attribute %s, which converts it on checkout", p, attribute)
 	}
 	return nil
+}
+
+// converting yields each path in report, the output of git check-attr --all
+// -z, that has an attribute that converts it on checkout, with the first
+// such attribute as attribute=value. -text turns end-of-line conversion off,
+// so it converts nothing.
+func converting(report []byte) iter.Seq2[string, string] {
+	return func(yield func(string, string) bool) {
+		fields := strings.Split(string(report), "\x00")
+		for i := 0; i+2 < len(fields); i += 3 {
+			p, attribute, value := fields[i], fields[i+1], fields[i+2]
+			if convertingAttributes[attribute] && (attribute != "text" || value != "unset") && !yield(p, attribute+"="+value) {
+				return
+			}
+		}
+	}
 }
 
 // refuseConvertingConfig refuses a config or an environment that makes a
@@ -608,6 +671,95 @@ func treeEntries(ctx context.Context, repo, commit string) (tree, error) {
 		t.paths = append(t.paths, p)
 	}
 	return t, nil
+}
+
+// baseState is what Add read from the base before it registered the new
+// worktree: the tree of the base's HEAD, the paths git status lists, the
+// paths whose clones Add must not trust, when Add read HEAD, and whether
+// HEAD stayed put through git status.
+type baseState struct {
+	head             tree
+	dirty, untrusted map[string]bool
+	checked          time.Time
+	steady           bool
+}
+
+// untrustedPaths returns the paths of repo whose bytes can differ from their
+// blobs although git status does not list them: the paths that repo's index
+// marks assume-unchanged or skip-worktree, whose changes status skips, and
+// the paths that repo's attributes convert, which status compares through
+// the conversion.
+func untrustedPaths(ctx context.Context, repo string) (map[string]bool, error) {
+	out, err := git(ctx, repo, nil, "ls-files", "-v", "-z")
+	if err != nil {
+		return nil, err
+	}
+	untrusted := map[string]bool{}
+	var paths []byte
+	for record := range strings.SplitSeq(string(out), "\x00") {
+		if len(record) < 2 {
+			continue
+		}
+		if record[0] == 'S' || 'a' <= record[0] && record[0] <= 'z' {
+			untrusted[record[2:]] = true
+		}
+		paths = append(append(paths, record[2:]...), 0)
+	}
+	// Without --cached, check-attr reads the work tree's .gitattributes, as
+	// git status does.
+	report, err := git(ctx, repo, paths, "check-attr", "--all", "-z", "--stdin")
+	if err != nil {
+		return nil, err
+	}
+	for p := range converting(report) {
+		untrusted[p] = true
+	}
+	return untrusted, nil
+}
+
+// resolveCommit returns the commit that rev names in repo.
+func resolveCommit(ctx context.Context, repo, rev string) (string, error) {
+	out, err := git(ctx, repo, nil, "rev-parse", "--verify", rev+"^{commit}")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// blobSizes returns the size of each path's blob in oids, by path. It reads
+// the sizes without lazy fetch, and leaves out a path whose blob is missing.
+func blobSizes(ctx context.Context, repo string, oids map[string]string) (map[string]int64, error) {
+	sizes := map[string]int64{}
+	if len(oids) == 0 {
+		return sizes, nil
+	}
+	var stdin []byte
+	for _, oid := range oids {
+		stdin = append(append(stdin, oid...), '\n')
+	}
+	out, err := gitWithEnv(ctx, repo, []string{"GIT_NO_LAZY_FETCH=1"}, stdin, "cat-file", "--batch-check", "--buffer")
+	if err != nil {
+		return nil, err
+	}
+	byOID := map[string]int64{}
+	for line := range strings.SplitSeq(string(out), "\n") {
+		// "<oid> <type> <size>", or "<oid> missing".
+		fields := strings.Fields(line)
+		if len(fields) != 3 {
+			continue
+		}
+		size, err := strconv.ParseInt(fields[2], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("git cat-file printed %q", line)
+		}
+		byOID[fields[0]] = size
+	}
+	for p, oid := range oids {
+		if size, ok := byOID[oid]; ok {
+			sizes[p] = size
+		}
+	}
+	return sizes, nil
 }
 
 // dirtyPaths returns the tracked paths that git status in repo lists.

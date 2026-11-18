@@ -12,8 +12,9 @@ on:
     tags: ["v*"]
     branches: ["**"]
     # GitHub skips path filters for tag pushes. The smoke tests check
-    # slimtree's commands, so a change to slimtree runs a dry run too. So does
-    # a change to a check that a release runs.
+    # slimtree's commands, so a change to slimtree, or to apfsclone, which
+    # slimtree new runs, runs a dry run too. So does a change to a check that a
+    # release runs.
     paths:
       - .github/workflows/release.yml
       - .github/workflows/build-test.yml
@@ -29,6 +30,7 @@ on:
       - .github/scripts/smoke.sh
       - .github/scripts/third_party_licenses.sh
       - cmd/slimtree/**
+      - internal/apfsclone/**
       - internal/slimtree/**
       - internal/version/**
   workflow_dispatch:
