@@ -174,11 +174,15 @@ jobs:
             -test.v
 
   # A failing fuzz run uploads only the ciphertext of its inputs. This job fails
-  # one on a planted input and checks its upload. seal-fuzz-inputs-log checks
-  # its log.
+  # one on a planted input and checks the ciphertext it uploads.
+  # seal-fuzz-inputs-log checks its log and reads the upload back.
   seal-fuzz-inputs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      artifact-id: ${{ steps.seal.outputs.artifact-id }}
+      artifact-digest: ${{ steps.seal.outputs.artifact-digest }}
+      ciphertext-sha256: ${{ steps.check.outputs.ciphertext-sha256 }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -227,6 +231,7 @@ jobs:
         run: test "$FUZZ_OUTCOME" = failure
 
       - name: Seal the fuzz inputs
+        id: seal
         uses: ./.github/actions/seal-fuzz-inputs
         with:
           corpus: ${{ runner.temp }}/plant/testdata/fuzz
@@ -234,32 +239,44 @@ jobs:
           artifact: planted-fuzz-inputs
 
       - name: Seal the fuzz inputs without a recipient
+        id: unsealed
         uses: ./.github/actions/seal-fuzz-inputs
         with:
           corpus: ${{ runner.temp }}/plant/testdata/fuzz
           artifact: unsealed-fuzz-inputs
 
-      - name: Download the upload
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: planted-fuzz-inputs
-          path: ${{ runner.temp }}/uploaded
-
+      # Checks the file that upload-artifact received, never a download: a
+      # lookup right after the upload can miss it. seal-fuzz-inputs-log reads
+      # the upload back by its ID.
       - name: Check that the upload is only ciphertext
+        id: check
         working-directory: ${{ runner.temp }}
         shell: bash
+        env:
+          ARTIFACT_ID: ${{ steps.seal.outputs.artifact-id }}
+          CIPHERTEXT: ${{ steps.seal.outputs.path }}
+          UNSEALED_ID: ${{ steps.unsealed.outputs.artifact-id }}
+          UNSEALED_PATH: ${{ steps.unsealed.outputs.path }}
         run: |
+          if [ -z "$ARTIFACT_ID" ] || [ "$(basename "$CIPHERTEXT")" != planted-fuzz-inputs.tar.age ]; then
+            echo "::error::seal-fuzz-inputs uploaded no planted-fuzz-inputs.tar.age."
+            exit 1
+          fi
+          if [ -n "$UNSEALED_ID$UNSEALED_PATH" ]; then
+            echo "::error::The seal without a recipient uploaded the fuzz inputs."
+            exit 1
+          fi
           planted=plant/testdata/fuzz/FuzzPlanted/planted
           marker=$(sed -n 's/^string("\(.*\)")$/\1/p' "$planted")
           test -n "$marker"
-          test "$(find uploaded -type f)" = uploaded/planted-fuzz-inputs.tar.age
-          if grep -rqF "$marker" uploaded; then
+          if grep -qF "$marker" "$CIPHERTEXT"; then
             echo "::error::The upload holds the planted input."
             exit 1
           fi
           mkdir recovered
-          age -d -i key uploaded/planted-fuzz-inputs.tar.age | tar -x -C recovered
+          age -d -i key "$CIPHERTEXT" | tar -x -C recovered
           cmp "$planted" recovered/FuzzPlanted/planted
+          echo "ciphertext-sha256=$(sha256sum "$CIPHERTEXT" | cut -d' ' -f1)" >>"$GITHUB_OUTPUT"
 
   # A job's log is readable only once the job ends.
   seal-fuzz-inputs-log:
@@ -269,10 +286,13 @@ jobs:
     permissions:
       actions: read
     steps:
-      - name: Check seal-fuzz-inputs' log and uploads
+      - name: Check seal-fuzz-inputs' log and upload
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.seal-fuzz-inputs.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.seal-fuzz-inputs.outputs.artifact-digest }}
+          CIPHERTEXT_SHA256: ${{ needs.seal-fuzz-inputs.outputs.ciphertext-sha256 }}
         run: |
           run="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           # A calling workflow prefixes the name with the name of its own job.
@@ -297,12 +317,16 @@ jobs:
             echo "::error::seal-fuzz-inputs' log shows the planted input."
             exit 1
           fi
-          uploads=$(gh api "$run/artifacts" --paginate --jq '.artifacts[].name')
-          if ! grep -qx planted-fuzz-inputs <<<"$uploads"; then
-            echo "::error::seal-fuzz-inputs uploaded no planted-fuzz-inputs artifact."
+          # The upload, read by its ID with no list or name lookup. Its digest
+          # is the one upload-artifact computed, and it holds the ciphertext
+          # that seal-fuzz-inputs checked.
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" >upload.zip
+          if [ "$(sha256sum upload.zip | cut -d' ' -f1)" != "${ARTIFACT_DIGEST#sha256:}" ]; then
+            echo "::error::The download of artifact $ARTIFACT_ID does not have the digest of the upload."
             exit 1
           fi
-          if grep -qx unsealed-fuzz-inputs <<<"$uploads"; then
-            echo "::error::The seal without a recipient uploaded the fuzz inputs."
+          if [ "$(unzip -Z1 upload.zip)" != planted-fuzz-inputs.tar.age ] ||
+            [ "$(unzip -p upload.zip planted-fuzz-inputs.tar.age | sha256sum | cut -d' ' -f1)" != "$CIPHERTEXT_SHA256" ]; then
+            echo "::error::Artifact $ARTIFACT_ID holds more or other than the ciphertext seal-fuzz-inputs checked."
             exit 1
           fi

@@ -1,5 +1,6 @@
 """Tests of how redaction-fuzz.yml seals a failing input, read as text. The
-seal jobs of build-test.yml test the action itself."""
+seal jobs of build-test.yml test the action itself, and these tests pin how
+those jobs read its upload."""
 
 import unittest
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 from test_release_workflow import jobs, steps
 
 WORKFLOWS = Path(__file__).resolve().parents[1] / "workflows"
+ACTIONS = Path(__file__).resolve().parents[1] / "actions"
 
 
 def lines(step):
@@ -46,6 +48,22 @@ class RedactionFuzzWorkflowTest(unittest.TestCase):
         for name, job in checked.items():
             for step in setup_go_steps(job):
                 self.assertIn("cache: false", lines(step), name)
+
+    # A lookup by name, or a list of the run's artifacts, right after an upload
+    # can miss it, and download-artifact lists the run's artifacts even for
+    # artifact-ids. So the seal jobs read the upload only by the ID that
+    # upload-artifact returns.
+    def test_the_seal_jobs_read_the_upload_only_by_its_id(self):
+        build_test = jobs((WORKFLOWS / "build-test.yml").read_text())
+        seal, log = build_test["seal-fuzz-inputs"], build_test["seal-fuzz-inputs-log"]
+        for name, job in [("seal-fuzz-inputs", seal), ("seal-fuzz-inputs-log", log)]:
+            self.assertNotIn("actions/download-artifact@", job, name)
+            self.assertNotRegex(job, r"/artifacts[\"'?\s]", name)
+        action = (ACTIONS / "seal-fuzz-inputs" / "action.yml").read_text()
+        self.assertIn("value: ${{ steps.upload.outputs.artifact-id }}", lines(action))
+        self.assertIn("artifact-id: ${{ steps.seal.outputs.artifact-id }}", lines(seal))
+        self.assertIn("ARTIFACT_ID: ${{ needs.seal-fuzz-inputs.outputs.artifact-id }}", lines(log))
+        self.assertIn('gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" >upload.zip', lines(log))
 
 
 if __name__ == "__main__":
