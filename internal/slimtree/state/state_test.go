@@ -240,3 +240,25 @@ func TestRecordsSkipsUnreadableEntries(t *testing.T) {
 		t.Fatalf("skipped %q, want %q", skipped, want)
 	}
 }
+
+// A child that another goroutine forked holds a copy of the lock file until
+// it execs. Unlock releases the lock while such a copy is open, so the next
+// command takes it.
+func TestUnlockReleasesTheLockAForkedChildHolds(t *testing.T) {
+	h := openHome(t)
+	l, err := h.Lock(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gittest.HoldForkedCopies(t, filepath.Join(h.Dir(), "lock"))
+	if err := l.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	next, err := h.TryLock("")
+	if err != nil {
+		t.Fatalf("TryLock after Unlock: %v, want the lock", err)
+	}
+	if err := next.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+}

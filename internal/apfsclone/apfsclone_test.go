@@ -892,3 +892,16 @@ func TestGitBoundsTheStderrItQuotes(t *testing.T) {
 		t.Fatalf("error of %d bytes, want the first paths, a truncation label, and at most 17 KiB: %.200s", len(err.Error()), err)
 	}
 }
+
+// The func lockFile returns releases the lock while a child that another
+// goroutine forked holds a copy of the lock file, until it execs.
+func TestLockFileReleasesTheLockAForkedChildHolds(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lock")
+	unlock, err := lockFile(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gittest.HoldForkedCopies(t, path)
+	unlock()
+	gittest.RequireFlockFree(t, path)
+}

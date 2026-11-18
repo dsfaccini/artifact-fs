@@ -44,7 +44,7 @@ func probeLock(lock, log, label string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	default:
-		defer f.Close()
+		defer unlockFile(f)
 		if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); errors.Is(err, unix.EWOULDBLOCK) {
 			finding = "held"
 		} else if err != nil {

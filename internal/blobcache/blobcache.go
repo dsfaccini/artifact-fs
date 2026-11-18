@@ -95,7 +95,7 @@ func Install(dir, oid, staged string) error {
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer unlockStats(lock)
 	st, valid, err := readStats(lock)
 	if err == nil && valid {
 		// Write the mark before the rename. A crash between a rename and a
@@ -168,7 +168,7 @@ func Recount(dir string) (Stats, error) {
 	if err != nil {
 		return Stats{}, err
 	}
-	defer lock.Close()
+	defer unlockStats(lock)
 	st, _, err := recountLocked(context.Background(), dir, lock)
 	return st, err
 }
@@ -186,7 +186,7 @@ func ReadStats(dir string) (Stats, error) {
 	if err != nil {
 		return Stats{}, err
 	}
-	defer lock.Close()
+	defer unlockStats(lock)
 	st, valid, err := readStats(lock)
 	if err != nil || valid {
 		return st, err
@@ -228,7 +228,7 @@ func Evict(ctx context.Context, dir string, maxBytes int64, readBefore time.Time
 		return EvictResult{}, err
 	}
 	st, candidates, err := recountLocked(ctx, dir, lock)
-	_ = lock.Close()
+	unlockStats(lock)
 	res := EvictResult{Remaining: st}
 	if err != nil {
 		return res, err
@@ -263,7 +263,7 @@ func evictBatchLocked(ctx context.Context, dir string, maxBytes int64, readBefor
 	if err != nil {
 		return nil, err
 	}
-	defer lock.Close()
+	defer unlockStats(lock)
 	st, valid, err := readStats(lock)
 	if err == nil && !valid {
 		st, _, err = recountLocked(ctx, dir, lock)
@@ -308,7 +308,7 @@ func fits(st Stats, maxBytes int64) bool {
 }
 
 // lockStats opens dir's stats file and takes an exclusive flock on it.
-// Closing the file releases the lock.
+// unlockStats releases the lock.
 func lockStats(dir string) (*os.File, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -328,6 +328,14 @@ func lockStats(dir string) (*os.File, error) {
 		return nil, err
 	}
 	return f, nil
+}
+
+// unlockStats releases the flock f holds, then closes f. Closing f alone
+// keeps the lock while a child that another goroutine forked holds a copy of
+// f, until it execs.
+func unlockStats(f *os.File) {
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = f.Close()
 }
 
 // readStats reads the counters. valid is false when the file holds none yet,

@@ -195,12 +195,12 @@ func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error
 	}
 	tempDir, err := emptyDaemonTempDir(root)
 	if err != nil {
-		lock.Close()
+		releaseDaemonLock(lock)
 		return nil, err
 	}
 	c, err := newCore(ctx, root, tempDir, logger)
 	if err != nil {
-		lock.Close()
+		releaseDaemonLock(lock)
 		return nil, err
 	}
 	return &Service{
@@ -303,7 +303,7 @@ func (s *Service) Close() error {
 	if err := s.registry.Close(); err != nil {
 		errs = append(errs, err)
 	}
-	if err := s.lock.Close(); err != nil {
+	if err := releaseDaemonLock(s.lock); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
