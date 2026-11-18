@@ -64,7 +64,8 @@ How it was measured:
 | Remove | 0.30 s | 0.12 s |
 
 On Linux slimtree saves disk, makes a worktree in less than half git's time,
-and runs the first `git status` about four times as fast as git. Its second
+and runs the first `git status` 4.7 times as fast as git at the base
+worktree's commit and 3.8 times as fast at the pull request's. Its second
 `git status` is within about 2 ms of git's. It checks out no files: the mount
 reads file contents from Git's objects as they are needed, and the worktree's
 FSMonitor hook tells `git status` which files changed. Remove takes longer:
@@ -100,6 +101,9 @@ How it was measured:
   between 262 ms and 672 ms. slimtree's files carry their commit's time,
   before the index's, so none of them is racily clean. Its first `git status`
   took between 118 ms and 150 ms, and its second between 10 ms and 12 ms.
+- The wait raised slimtree's own first `git status` at the base worktree's
+  commit from 117 ms, in a series without it on the same build, to 144 ms.
+  The cause is not diagnosed.
 - Each slimtree run had its own `SLIMTREE_HOME`, so its blob cache started
   empty. The blob cache is shared, so a later worktree of the same repository
   reuses the blobs an earlier one hydrated.
