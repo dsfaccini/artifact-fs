@@ -118,7 +118,7 @@ func newArtifactFS(ctx context.Context, home *state.Home, rb *rollback, goos, co
 	// The registry closes before undoArtifactFS removes the state root.
 	defer ctl.Close()
 	cfg := model.RepoConfig{
-		RepoPaths:     model.RepoPaths{Name: r.Name(), GitDir: r.GitDir, MountRoot: filepath.Dir(r.Path), BlobCacheDir: filepath.Join(home.Dir(), "blobs")},
+		RepoPaths:     model.RepoPaths{Name: r.Name(), GitDir: r.GitDir, MountRoot: filepath.Dir(r.Path), BlobCacheDir: home.BlobCacheDir()},
 		RepoSpec:      model.RepoSpec{AdoptGitDir: true},
 		RefreshPolicy: model.RefreshPolicy{RemoteRefreshDisabled: true},
 		Enabled:       true,
@@ -250,7 +250,7 @@ func serve(ctx context.Context, home *state.Home, ctl *daemon.Controller, r stat
 	if err != nil {
 		return err
 	}
-	r.DaemonPID, r.DaemonToken, r.MountIdentity = d.proc.Pid, d.token, string(id)
+	r.DaemonPID, r.DaemonToken, r.MountIdentity, r.Runtime = d.proc.Pid, d.token, string(id), d.program
 	if err := home.Write(r); err != nil {
 		return fmt.Errorf("writing the record of %s: %w", r.Path, err)
 	}
@@ -262,7 +262,9 @@ func serve(ctx context.Context, home *state.Home, ctl *daemon.Controller, r stat
 type launchedDaemon struct {
 	proc  *os.Process
 	token string
-	log   string
+	// program is the runtime copy the daemon runs.
+	program string
+	log     string
 	// done closes once the wait for the daemon returned waitErr.
 	done    chan struct{}
 	waitErr error
@@ -295,7 +297,7 @@ func startDaemon(home *state.Home, r state.Record, goos string) (*launchedDaemon
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	d := &launchedDaemon{proc: cmd.Process, log: logPath, done: make(chan struct{})}
+	d := &launchedDaemon{proc: cmd.Process, program: program, log: logPath, done: make(chan struct{})}
 	// The child is not reaped before the wait starts, so its PID is its own.
 	token, tokenErr := mounts.StartToken(cmd.Process.Pid)
 	go func() {
@@ -440,7 +442,7 @@ func runtimeCopy(home *state.Home, goos string) (string, error) {
 		return "", err
 	}
 	sum := sha256.Sum256(data)
-	dir := filepath.Join(home.Dir(), "runtimes", hex.EncodeToString(sum[:]))
+	dir := filepath.Join(home.RuntimesDir(), hex.EncodeToString(sum[:]))
 	path := filepath.Join(dir, "slimtree")
 	if copied, err := os.ReadFile(path); err == nil && sha256.Sum256(copied) == sum {
 		return path, nil

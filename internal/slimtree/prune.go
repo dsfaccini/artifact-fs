@@ -6,12 +6,16 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/apfsclone"
+	"github.com/cloudflare/artifact-fs/internal/blobcache"
+	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 )
 
@@ -25,13 +29,19 @@ type pruning struct {
 	// their repository is gone.
 	kept     []string
 	problems []error
+	// runtimes counts the runtime copies prune removed.
+	runtimes int
+	// evicted counts the blobs prune evicted from the blob cache, and
+	// evictedBytes their bytes.
+	evicted, evictedBytes int64
 	// used is the bytes the archives take, and disk the size of the home's
 	// file system. disk is 0 when prune could not measure them.
 	used, disk uint64
 }
 
-// prune deletes each archive older than the home's retention rule with its
-// recovery ref, the ref first, so no ref outlives its archive. It keeps both
+// prune evicts each blob of the shared blob cache not read within the
+// home's retention rule, with blobcache.Evict, and deletes each archive
+// older than the rule with its recovery ref, the ref first, so no ref outlives its archive. It keeps both
 // while the archive's repository is gone, as on a volume that is not
 // mounted: no later prune could find the ref, which would pin its commits.
 // Hold the home's lock. prune never returns an error: each problem goes into
@@ -41,6 +51,9 @@ func prune(ctx context.Context, home *state.Home, now time.Time) pruning {
 	if p.rule, p.ruleErr = home.Retention(); p.ruleErr == nil && p.rule != state.Forever {
 		cutoff := now.Add(-time.Duration(p.rule) * 24 * time.Hour)
 		archives, err := home.Archives(func(err error) { p.problems = append(p.problems, err) })
+		// hung holds each repository that did not answer, so its other
+		// archives wait no longer.
+		hung := map[string]error{}
 		if err != nil {
 			p.problems = append(p.problems, err)
 		}
@@ -48,7 +61,7 @@ func prune(ctx context.Context, home *state.Home, now time.Time) pruning {
 			if !a.Made.Before(cutoff) {
 				continue
 			}
-			switch kept, err := pruneArchive(ctx, home, a); {
+			switch kept, err := pruneArchive(ctx, home, a, hung); {
 			case err != nil:
 				p.problems = append(p.problems, fmt.Errorf("kept %s: %w", a.Dir, err))
 			case kept != "":
@@ -57,6 +70,15 @@ func prune(ctx context.Context, home *state.Home, now time.Time) pruning {
 				p.deleted++
 			}
 		}
+		// No byte budget: Evict removes only the blobs not read since the cutoff.
+		res, err := blobcache.Evict(ctx, home.BlobCacheDir(), math.MaxInt64, cutoff)
+		p.evicted, p.evictedBytes = res.Evicted, res.EvictedBytes
+		if err != nil {
+			p.problems = append(p.problems, fmt.Errorf("evicting blobs: %w", err))
+		}
+	}
+	if p.ruleErr == nil {
+		p.runtimes = pruneRuntimes(home, func(err error) { p.problems = append(p.problems, err) })
 	}
 	var err error
 	if p.used, p.disk, err = home.ArchivesUse(); err != nil {
@@ -65,14 +87,96 @@ func prune(ctx context.Context, home *state.Home, now time.Time) pruning {
 	return p
 }
 
+// pruneRuntimes removes each runtime copy, runtimes/<SHA-256>/, that no
+// record names, under every rule but a broken one. It removes none while a
+// record it cannot read exists, while it cannot tell whether a daemon holds a
+// state root, or while a daemon runs that no record ties to its copy. Such a
+// daemon can run any copy, and Git runs its FSMonitor hook from it. It runs
+// with no record after a new that died, or whose stop failed, before it wrote
+// the record; with a record that names no runtime; or with another pid than
+// the record's, after a resume whose stop failed. pruneRuntimes probes the
+// state root of every record and of every record directory, with or without
+// a record.
+func pruneRuntimes(home *state.Home, problem func(error)) int {
+	unreadable := false
+	records, err := home.Records(func(err error) {
+		problem(err)
+		unreadable = true
+	})
+	if err != nil {
+		problem(err)
+		return 0
+	}
+	if unreadable {
+		return 0
+	}
+	dirs, err := home.RecordDirs()
+	if err != nil {
+		problem(err)
+		return 0
+	}
+	used := map[string]bool{}
+	byRoot := map[string]state.Record{}
+	roots := map[string]bool{}
+	for _, r := range records {
+		if r.Runtime != "" {
+			used[filepath.Dir(r.Runtime)] = true
+		}
+		if r.StateDir != "" {
+			byRoot[filepath.Clean(r.StateDir)] = r
+			roots[filepath.Clean(r.StateDir)] = true
+		}
+	}
+	for _, dir := range dirs {
+		roots[filepath.Join(dir, "state")] = true
+	}
+	for root := range roots {
+		pid, running, err := daemon.Running(root)
+		if err != nil {
+			problem(fmt.Errorf("kept every runtime copy: %w", err))
+			return 0
+		}
+		if r, ok := byRoot[root]; running && (!ok || r.Runtime == "" || pid != r.DaemonPID) {
+			return 0
+		}
+	}
+	entries, err := os.ReadDir(home.RuntimesDir())
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		problem(err)
+		return 0
+	}
+	removed := 0
+	for _, e := range entries {
+		dir := filepath.Join(home.RuntimesDir(), e.Name())
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || used[dir] {
+			continue
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			problem(err)
+			continue
+		}
+		removed++
+	}
+	return removed
+}
+
 // pruneRepoTimeout bounds pruneArchive's stat and git commands in an
 // archive's repository. rm holds the global lock while it prunes, so a
-// repository on a hung mount must not hang it.
-const pruneRepoTimeout = 10 * time.Second
+// repository on a hung mount must not hang it. Tests lower it.
+var pruneRepoTimeout = 10 * time.Second
+
+// errNoAnswer marks a repository that did not answer within
+// pruneRepoTimeout.
+var errNoAnswer = errors.New("did not answer")
 
 // pruneArchive deletes a and its recovery ref, or returns the repository
-// that holds the ref when that repository is gone.
-func pruneArchive(ctx context.Context, home *state.Home, a state.Archived) (string, error) {
+// that holds the ref when that repository is gone. It keeps a when its
+// repository is in hung, and adds the repository to hung when it does not
+// answer.
+func pruneArchive(ctx context.Context, home *state.Home, a state.Archived, hung map[string]error) (string, error) {
 	r, err := a.Record()
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -83,9 +187,15 @@ func pruneArchive(ctx context.Context, home *state.Home, a state.Archived) (stri
 	case r.CommonDir == "":
 		return "", errors.New("its record names no repository")
 	default:
+		if err, ok := hung[r.CommonDir]; ok {
+			return "", err
+		}
 		gone, err := inRepo(ctx, r.CommonDir, func(ctx context.Context) (bool, error) {
 			return deleteRecoveryRef(ctx, r, a)
 		})
+		if errors.Is(err, errNoAnswer) {
+			hung[r.CommonDir] = err
+		}
 		if err != nil {
 			return "", err
 		}
@@ -157,7 +267,7 @@ func inRepo(ctx context.Context, commonDir string, f func(context.Context) (bool
 	}
 	switch err := ctx.Err(); {
 	case errors.Is(err, context.DeadlineExceeded):
-		return false, fmt.Errorf("its repository %s did not answer within %s", commonDir, pruneRepoTimeout)
+		return false, fmt.Errorf("its repository %s %w within %s", commonDir, errNoAnswer, pruneRepoTimeout)
 	case err != nil:
 		return false, err
 	}
@@ -167,24 +277,26 @@ func inRepo(ctx context.Context, commonDir string, f func(context.Context) (bool
 // shellQuote quotes s for a POSIX shell.
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
+// size describes n bytes in B, KB, MB or GB.
+func size(n uint64) string {
+	switch {
+	case n < 1e3:
+		return fmt.Sprintf("%d B", n)
+	case n < 1e6:
+		return fmt.Sprintf("%.1f KB", float64(n)/1e3)
+	case n < 1e9:
+		return fmt.Sprintf("%.1f MB", float64(n)/1e6)
+	}
+	return fmt.Sprintf("%.2f GB", float64(n)/1e9)
+}
+
 // diskUse describes used bytes of a disk of disk bytes.
 func diskUse(used, disk uint64) string {
-	var size string
-	switch {
-	case used < 1e3:
-		size = fmt.Sprintf("%d B", used)
-	case used < 1e6:
-		size = fmt.Sprintf("%.1f KB", float64(used)/1e3)
-	case used < 1e9:
-		size = fmt.Sprintf("%.1f MB", float64(used)/1e6)
-	default:
-		size = fmt.Sprintf("%.2f GB", float64(used)/1e9)
-	}
 	share := 100 * float64(used) / float64(disk)
 	if used > 0 && share < 0.001 {
-		return size + ", under 0.001% of the disk"
+		return size(used) + ", under 0.001% of the disk"
 	}
-	return fmt.Sprintf("%s, %.3f%% of the disk", size, share)
+	return fmt.Sprintf("%s, %.3f%% of the disk", size(used), share)
 }
 
 // write writes what p did, for rm and prune.
@@ -196,9 +308,13 @@ func (p pruning) write(w io.Writer) {
 	case p.ruleErr != nil:
 		fmt.Fprintf(w, "slimtree: pruned nothing: %v\n", p.ruleErr)
 	case p.rule == state.Forever:
-		fmt.Fprintln(w, "slimtree: archives and their recovery refs are kept forever")
+		fmt.Fprintln(w, "slimtree: archives, their recovery refs and blobs are kept forever")
 	default:
 		fmt.Fprintf(w, "slimtree: rm and prune delete archives older than %d days with their recovery refs; this one deleted %d\n", p.rule, p.deleted)
+		fmt.Fprintf(w, "slimtree: they evict blobs not read for %d days; this one evicted %d, %s\n", p.rule, p.evicted, size(uint64(p.evictedBytes)))
+	}
+	if p.runtimes > 0 {
+		fmt.Fprintf(w, "slimtree: removed %d runtime copies no worktree uses\n", p.runtimes)
 	}
 	for _, k := range p.kept {
 		fmt.Fprintln(w, "slimtree:", k)
