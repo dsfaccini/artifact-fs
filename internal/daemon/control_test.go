@@ -114,7 +114,7 @@ func TestStatusTrustsTheRecordOnlyWhileADaemonRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lock.Close()
+	defer releaseDaemonLock(lock)
 	st, err = ctl.Status(ctx, "repo")
 	if err != nil {
 		t.Fatal(err)
@@ -145,13 +145,7 @@ func TestRunningNamesTheDaemonLockHolder(t *testing.T) {
 		t.Fatal(err)
 	}
 	running(os.Getpid(), true)
-	// A child that a parallel test forks shares the lock's descriptor until
-	// it execs (golang/go#22315), so a close alone can leave the flock held
-	// for that instant. LOCK_UN drops it from the shared descriptor.
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_UN); err != nil {
-		t.Fatal(err)
-	}
-	if err := lock.Close(); err != nil {
+	if err := releaseDaemonLock(lock); err != nil {
 		t.Fatal(err)
 	}
 	if data, err := os.ReadFile(daemonLockPath(root)); err != nil || len(data) == 0 {
@@ -163,7 +157,7 @@ func TestRunningNamesTheDaemonLockHolder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer releaseDaemonLock(f)
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +273,7 @@ func heldDaemonLock(t *testing.T, ctl *Controller) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = lock.Close() })
+	t.Cleanup(func() { _ = releaseDaemonLock(lock) })
 }
 
 func newRegisteredController(t *testing.T) *Controller {

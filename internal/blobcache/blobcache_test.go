@@ -257,7 +257,7 @@ func statsLocked(t *testing.T, dir string) bool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer unlockStats(f)
 	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if errors.Is(err, syscall.EWOULDBLOCK) {
 		return true

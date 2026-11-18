@@ -381,6 +381,11 @@ func HoldForkedCopies(t testing.TB, path string) {
 		t.Fatal(err)
 	}
 	var copies []int
+	t.Cleanup(func() {
+		for _, fd := range copies {
+			_ = unix.Close(fd)
+		}
+	})
 	for _, name := range names {
 		fd, err := strconv.Atoi(name)
 		if err != nil {
@@ -399,11 +404,6 @@ func HoldForkedCopies(t testing.TB, path string) {
 	if len(copies) == 0 {
 		t.Fatalf("this process holds no descriptor of %s", path)
 	}
-	t.Cleanup(func() {
-		for _, fd := range copies {
-			_ = unix.Close(fd)
-		}
-	})
 }
 
 // RequireFlockFree fails t when another open file holds a flock on path.
