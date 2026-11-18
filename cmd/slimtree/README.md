@@ -22,6 +22,7 @@ A new worktree of [pydantic-ai](https://github.com/pydantic/pydantic-ai)
 | Create | 1.10 s | 1.49 s |
 | First `git status` | 35 ms | 453 ms |
 | Second `git status` | 33 ms | 29 ms |
+| Remove | 0.39 s | 0.33 s |
 
 slimtree saves disk and makes a worktree faster than git. It clones the base
 worktree's files instead of writing them, and records each clone's stat data in
@@ -29,7 +30,9 @@ the new worktree's index, so its first `git status` hashes no clone and is as
 fast as its second. Create plus first `git status` takes 1.16 s against git's
 1.85 s. slimtree checks no clone byte for byte against its blob: it trusts a
 clone when the base's `git status` does not list the file, the clone has its
-blob's size, and the file is older than the create.
+blob's size, and the file is older than the create. Remove takes longer:
+`slimtree rm` archives the worktree's record and keeps a recovery ref of its
+HEAD before it removes the worktree.
 
 How it was measured:
 
@@ -56,8 +59,8 @@ How it was measured:
   worktree's in 56 paths.
 - Times are the wall-clock time of each command, at the base worktree's commit.
   At the pull request's commit they were: create 1.14 s and 1.21 s, first
-  `git status` 38 ms and 196 ms, second `git status` 31 ms and 28 ms, for
-  slimtree and git.
+  `git status` 38 ms and 196 ms, second `git status` 31 ms and 28 ms, remove
+  0.40 s and 0.35 s, for slimtree and git.
 - git's first `git status` took between 154 ms and 960 ms at the base
   worktree's commit, and between 79 ms and 506 ms at the pull request's.
   slimtree's took between 32 ms and 57 ms, and between 34 ms and 47 ms.
