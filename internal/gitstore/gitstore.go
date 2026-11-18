@@ -46,6 +46,9 @@ type Store struct {
 	// testHookBetweenHEADReads, when set, runs in ResolveHEAD between its
 	// read of HEAD's ref and its read of HEAD's commit.
 	testHookBetweenHEADReads func()
+	// testHookBatchStarting, when set, runs in a batch pool's acquire after
+	// its closed check, before it starts a git cat-file --batch.
+	testHookBatchStarting func()
 }
 
 func New(logger *slog.Logger) *Store {
@@ -85,6 +88,20 @@ func (s *Store) Close() {
 	if sshWrapperDir != "" {
 		_ = os.RemoveAll(sshWrapperDir)
 	}
+}
+
+// checkOpen returns errStoreClosed once Close has begun. Every git the Store
+// starts checks it first: Store.runWithFiles for each git that runs to
+// completion, and lazyFetchEnv for each pooled git cat-file --batch.
+// BootstrapCleanIndexForFSMonitor checks it before it takes index.lock. It
+// holds s.mu only to read closed.
+func (s *Store) checkOpen() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errStoreClosed
+	}
+	return nil
 }
 
 // SetTempDir sets the directory under which the Store makes the SSH wrapper

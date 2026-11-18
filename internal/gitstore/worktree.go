@@ -425,8 +425,13 @@ const FSMonitorBootstrapEnv = "ARTIFACT_FS_FSMONITOR_BOOTSTRAP"
 
 // BootstrapCleanIndexForFSMonitor marks snapshot paths valid only while the
 // real index is locked and proven to match the immutable snapshot commit.
+// Once Close has begun, it returns errStoreClosed before it takes index.lock
+// or makes a file.
 func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.RepoConfig, snapshotOID string, validate func() (bool, error)) (bool, error) {
 	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if err := s.checkOpen(); err != nil {
 		return false, err
 	}
 	if snapshotOID == "" {

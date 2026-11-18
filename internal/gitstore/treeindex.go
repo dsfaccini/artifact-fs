@@ -77,10 +77,13 @@ func (s *Store) streamTreeRecords(ctx context.Context, gitDir string, headOID st
 	errBuf := &boundedGitError{limit: maxGitErrorBytes}
 	cmd.Stderr = errBuf
 	var readErr error
-	waitErr := RunWithFiles(cmd, s.tempDir, nil, func(r io.Reader) error {
+	waitErr := s.runWithFiles(cmd, nil, func(r io.Reader) error {
 		readErr = readNullDelimited(ctx, r, fn)
 		return nil
 	})
+	if errors.Is(waitErr, errStoreClosed) {
+		return waitErr
+	}
 	if waitErr != nil {
 		msg := auth.RedactString(strings.TrimSpace(errBuf.String()))
 		if msg == "" {
@@ -183,7 +186,7 @@ func (s *Store) batchResolveSizes(ctx context.Context, repo model.RepoConfig, no
 	errBuf := &bytes.Buffer{}
 	cmd.Stderr = errBuf
 	var scanErr error
-	waitErr := RunWithFiles(cmd, s.tempDir, []byte(strings.Join(oids, "\n")+"\n"), func(r io.Reader) error {
+	waitErr := s.runWithFiles(cmd, []byte(strings.Join(oids, "\n")+"\n"), func(r io.Reader) error {
 		// Output format: "<oid> <type> <size>" or "<oid> missing". It stops
 		// once ctx ends, so a stop does not parse every line.
 		scan := bufio.NewScanner(r)
@@ -201,6 +204,9 @@ func (s *Store) batchResolveSizes(ctx context.Context, repo model.RepoConfig, no
 	}
 	if scanErr != nil {
 		return scanErr
+	}
+	if errors.Is(waitErr, errStoreClosed) {
+		return waitErr
 	}
 	if waitErr != nil {
 		msg := auth.RedactString(strings.TrimSpace(errBuf.String()))

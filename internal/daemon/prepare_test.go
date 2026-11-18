@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -1373,6 +1374,100 @@ func TestCanceledPreparationRestoresTheIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if _, err := os.Stat(filepath.Join(gitDir, "index.lock")); err == nil {
+		t.Fatal("the canceled preparation left index.lock")
+	}
+	if head := strings.TrimSpace(runCmdOutput(t, realGit, "--git-dir", gitDir, "rev-parse", "HEAD")); head != base {
+		t.Fatalf("HEAD = %s, want %s", head, base)
+	}
+	if staged := runCmdOutput(t, realGit, "--git-dir", gitDir, "diff-index", "--cached", "--name-only", "HEAD"); staged != "" {
+		t.Fatalf("the index differs from HEAD in %q", staged)
+	}
+}
+
+// Service.Close closes the Store only after every rollback ended. Here a
+// runtime's stop fails, and its HEAD reconcile outlives Close's wait for its
+// workers. Another repo's preparation, under a context Close does not end,
+// has moved the index and waits in its branch update. Close cancels that
+// preparation and waits for its rollback, so the index matches HEAD.
+func TestCloseWaitsForARollbackAfterWorkersOutliveTheirWait(t *testing.T) {
+	ctx := context.Background()
+	tmp := shortTempDir(t)
+	svc, _ := newDaemonWithRepo(t, tmp, AddRepoOptions{})
+	svc.stopWait = time.Nanosecond
+	svc.mountPointEntry = heldMountPoint
+	mfs := &exitingMount{exit: make(chan struct{}), err: errors.New("busy")}
+	t.Cleanup(func() { close(mfs.exit) })
+	svc.mount = func(context.Context, context.Context, model.RepoPaths, *fusefs.Engine, *fusefs.ReadyGate, *slog.Logger, func(string) string) (fusefs.MountedFS, error) {
+		return mfs, nil
+	}
+	// The HEAD reconcile ignores the runtime's cancel until the test ends.
+	reached, release := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var first sync.Once
+	svc.headReconcileStarting = func() {
+		first.Do(func() {
+			close(reached)
+			<-release
+		})
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.Lock()
+	rt := svc.running["repo"]
+	svc.mu.Unlock()
+	svc.signalHEADReconcile(rt)
+	<-reached
+
+	remote := filepath.Join(tmp, "prep-remote")
+	runCmd(t, "git", "init", "--initial-branch", "main", remote)
+	base := commitFile(t, remote, "README.md", "main\n")
+	clone := filepath.Join(tmp, "prep-clone")
+	runCmd(t, "git", "clone", remote, clone)
+	commitFile(t, remote, "ADVANCED.md", "advanced\n")
+	gitDir := filepath.Join(clone, ".git")
+	if err := svc.ctl().AddRepoWithOptions(ctx, model.RepoConfig{RepoPaths: model.RepoPaths{Name: "prep", GitDir: gitDir}, RepoSpec: model.RepoSpec{RemoteURL: "file://" + remote, Branch: "main"}, Enabled: true}, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := svc.registry.GetRepo(ctx, "prep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The branch update after the index moved hangs until the preparation is
+	// canceled.
+	blocked := filepath.Join(tmp, "update-ref-blocked")
+	script := "#!/bin/sh\nif [ \"$1\" = update-ref ] && [ ! -e \"$AFS_BLOCKED\" ]; then\n  : > \"$AFS_BLOCKED\"\n  sleep 60\n  exit 1\nfi\nexec \"$AFS_REAL_GIT\" \"$@\"\n"
+	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AFS_REAL_GIT", realGit)
+	t.Setenv("AFS_BLOCKED", blocked)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// No runtime serves prep, so the preparation runs under prepCtx alone, as
+	// one runs under Start's context.
+	prepCtx, cancelPrep := context.WithCancel(ctx)
+	t.Cleanup(cancelPrep)
+	svc.startPrepareWorker(prepCtx, cfg)
+	waitFor(t, preparationsEnded(svc, "prep"), func() bool {
+		_, err := os.Stat(blocked)
+		return err == nil
+	})
+
+	if err := svc.Close(); err == nil || !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("Close = %v, want the unmount failure", err)
+	}
+	// A preparation that Close left running ends only now, after Store.Close.
+	cancelPrep()
+	svc.prepareWorkers.Wait()
 	if _, err := os.Stat(filepath.Join(gitDir, "index.lock")); err == nil {
 		t.Fatal("the canceled preparation left index.lock")
 	}
