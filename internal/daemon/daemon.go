@@ -189,6 +189,10 @@ type Service struct {
 	// serializes the writes, and is taken before mu.
 	recordMu sync.Mutex
 	records  map[model.RepoID]*model.RepoRuntimeRecord
+	// notifyFD is the descriptor NotifyRuntimeWrites gave, while notifying.
+	// recordMu guards both.
+	notifyFD  int
+	notifying bool
 }
 
 // New returns the daemon for root. It takes the daemon lock, so a second

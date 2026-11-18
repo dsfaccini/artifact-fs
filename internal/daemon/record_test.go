@@ -6,11 +6,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
@@ -81,6 +84,79 @@ func requireFailure(t *testing.T, ctl *Controller, phase string, wantInError str
 		t.Fatalf("status leaked a credential: %q", st.LastError)
 	}
 	return st
+}
+
+// hookedRegistry runs putRuntime before each repo_runtime write.
+type hookedRegistry struct {
+	model.Registry
+	putRuntime func(model.RepoRuntimeRecord)
+}
+
+func (r *hookedRegistry) PutRuntime(ctx context.Context, rec model.RepoRuntimeRecord) error {
+	r.putRuntime(rec)
+	return r.Registry.PutRuntime(ctx, rec)
+}
+
+// The daemon writes a byte to the notify descriptor after each repo_runtime
+// write, never before it. A reader that reads status after each byte then
+// sees every write, and so sees the mount the last byte follows.
+func TestRuntimeWritesNotifyAfterTheWrite(t *testing.T) {
+	t.Parallel()
+	var fds [2]int
+	if err := unix.Pipe(fds[:]); err != nil {
+		t.Fatal(err)
+	}
+	// The daemon's Close, a cleanup that runs before this one, still writes.
+	t.Cleanup(func() { unix.Close(fds[0]) })
+	if err := unix.SetNonblock(fds[0], true); err != nil {
+		t.Fatal(err)
+	}
+	svc, ctl := newSyncedDaemon(t)
+	// The hook runs on the goroutines that write repo_runtime.
+	var mu sync.Mutex
+	read := 0
+	drain := func() {
+		buf := make([]byte, 64)
+		for {
+			n, err := unix.Read(fds[0], buf)
+			if errors.Is(err, unix.EAGAIN) {
+				return
+			}
+			if err != nil || n == 0 {
+				t.Errorf("reading the notify pipe: %d, %v", n, err)
+				return
+			}
+			read += n
+		}
+	}
+	var states []string
+	svc.registry = &hookedRegistry{Registry: svc.registry, putRuntime: func(rec model.RepoRuntimeRecord) {
+		mu.Lock()
+		defer mu.Unlock()
+		drain()
+		if read != len(states) {
+			t.Errorf("before repo_runtime write %d the daemon had written %d bytes, want one per earlier write", len(states), read)
+		}
+		states = append(states, rec.State)
+	}}
+	if err := svc.NotifyRuntimeWrites(fds[1]); err != nil {
+		t.Fatal(err)
+	}
+
+	syncAndFinishStops(t, svc)
+	mu.Lock()
+	drain()
+	got, written := slices.Clone(states), read
+	mu.Unlock()
+	if len(got) == 0 || got[len(got)-1] != repoStateMounted {
+		t.Fatalf("the repo_runtime writes recorded states %q, want the mount last", got)
+	}
+	if written != len(got) {
+		t.Fatalf("after %d repo_runtime writes the daemon had written %d bytes, want one per write", len(got), written)
+	}
+	if st, err := ctl.Status(t.Context(), "repo"); err != nil || st.State != repoStateMounted {
+		t.Fatalf("status = %+v, %v; want mounted", st, err)
+	}
 }
 
 // A store that a newer build migrated fails the mount before the FUSE mount,
