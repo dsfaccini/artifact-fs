@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
@@ -473,4 +475,63 @@ func TestPruneEvictsBlobsNotReadWithinTheRule(t *testing.T) {
 	if st, err := blobcache.ReadStats(blobs); err != nil || st.Blobs != 1 || st.Bytes != int64(len("recent")) {
 		t.Fatalf("cache stats = %+v, %v; want the one recent blob", st, err)
 	}
+}
+
+// prune removes each runtime copy no record names, and keeps the copy a
+// record names. It removes none while a daemon runs whose record names no
+// runtime, which a held daemon lock stands for here.
+func TestPruneRemovesRuntimeCopiesNoWorktreeUses(t *testing.T) {
+	homeDir := pruneHome(t)
+	home, err := openHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var copies []string
+	for _, sha := range []string{strings.Repeat("a", 64), strings.Repeat("b", 64)} {
+		dir := filepath.Join(homeDir, "runtimes", sha)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := execfile.Write(filepath.Join(dir, "slimtree"), []byte("#!/bin/sh\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		copies = append(copies, dir)
+	}
+	named, unnamed := copies[0], copies[1]
+	work := t.TempDir()
+	stateDir := filepath.Join(work, "state-b")
+	if err := os.MkdirAll(filepath.Join(stateDir, "config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []state.Record{
+		{Backend: "artifactfs", Path: filepath.Join(work, "a"), Runtime: filepath.Join(named, "slimtree"), StateDir: filepath.Join(work, "state-a")},
+		{Backend: "artifactfs", Path: filepath.Join(work, "b"), StateDir: stateDir},
+	} {
+		if err := home.Write(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lock, err := os.OpenFile(filepath.Join(stateDir, "config", "daemon.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+
+	if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || strings.Contains(stderr, "runtime copies") {
+		t.Fatalf("prune while a daemon without a recorded runtime runs: exit %d, stderr %q", code, stderr)
+	}
+	requireExists(t, named)
+	requireExists(t, unnamed)
+
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || !strings.Contains(stderr, "slimtree: removed 1 runtime copies no worktree uses\n") {
+		t.Fatalf("prune: exit %d, stderr %q", code, stderr)
+	}
+	requireExists(t, named)
+	requireGone(t, unnamed)
 }

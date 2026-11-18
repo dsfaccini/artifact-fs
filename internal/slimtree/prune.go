@@ -9,11 +9,13 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/apfsclone"
 	"github.com/cloudflare/artifact-fs/internal/blobcache"
+	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 )
 
@@ -27,6 +29,8 @@ type pruning struct {
 	// their repository is gone.
 	kept     []string
 	problems []error
+	// runtimes counts the runtime copies prune removed.
+	runtimes int
 	// evicted counts the blobs prune evicted from the blob cache, and
 	// evictedBytes their bytes.
 	evicted, evictedBytes int64
@@ -73,11 +77,70 @@ func prune(ctx context.Context, home *state.Home, now time.Time) pruning {
 			p.problems = append(p.problems, fmt.Errorf("evicting blobs: %w", err))
 		}
 	}
+	if p.ruleErr == nil {
+		p.runtimes = pruneRuntimes(home, func(err error) { p.problems = append(p.problems, err) })
+	}
 	var err error
 	if p.used, p.disk, err = home.ArchivesUse(); err != nil {
 		p.problems = append(p.problems, fmt.Errorf("measuring the archives: %w", err))
 	}
 	return p
+}
+
+// pruneRuntimes removes each runtime copy, runtimes/<SHA-256>/, that no
+// record names, whatever the rule. It removes none while a record it cannot
+// read exists, or while a daemon runs whose record names no runtime: that
+// daemon can run any copy, and Git runs its FSMonitor hook from it.
+func pruneRuntimes(home *state.Home, problem func(error)) int {
+	unreadable := false
+	records, err := home.Records(func(err error) {
+		problem(err)
+		unreadable = true
+	})
+	if err != nil {
+		problem(err)
+		return 0
+	}
+	if unreadable {
+		return 0
+	}
+	used := map[string]bool{}
+	for _, r := range records {
+		if r.Runtime != "" {
+			used[filepath.Dir(r.Runtime)] = true
+			continue
+		}
+		if r.StateDir == "" {
+			continue
+		}
+		if _, running, err := daemon.Running(r.StateDir); err != nil || running {
+			if err != nil {
+				problem(fmt.Errorf("kept every runtime copy: %w", err))
+			}
+			return 0
+		}
+	}
+	entries, err := os.ReadDir(home.RuntimesDir())
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		problem(err)
+		return 0
+	}
+	removed := 0
+	for _, e := range entries {
+		dir := filepath.Join(home.RuntimesDir(), e.Name())
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || used[dir] {
+			continue
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			problem(err)
+			continue
+		}
+		removed++
+	}
+	return removed
 }
 
 // pruneRepoTimeout bounds pruneArchive's stat and git commands in an
@@ -229,6 +292,9 @@ func (p pruning) write(w io.Writer) {
 	default:
 		fmt.Fprintf(w, "slimtree: rm and prune delete archives older than %d days with their recovery refs; this one deleted %d\n", p.rule, p.deleted)
 		fmt.Fprintf(w, "slimtree: they evict blobs not read for %d days; this one evicted %d, %s\n", p.rule, p.evicted, size(uint64(p.evictedBytes)))
+	}
+	if p.runtimes > 0 {
+		fmt.Fprintf(w, "slimtree: removed %d runtime copies no worktree uses\n", p.runtimes)
 	}
 	for _, k := range p.kept {
 		fmt.Fprintln(w, "slimtree:", k)

@@ -86,6 +86,9 @@ type Record struct {
 	// MountIdentity is the identity mounts.Identify gave the daemon's mount
 	// once it served.
 	MountIdentity string `json:"mount_identity,omitempty"`
+	// Runtime is the program an artifactfs worktree's daemon runs, a copy
+	// below runtimes/.
+	Runtime string `json:"runtime,omitempty"`
 	// Head is the commit rm keeps in an archive's recovery ref. Only an
 	// archived record has it, and slimtree 0.1.0's rm wrote none.
 	Head string `json:"head,omitempty"`
@@ -94,6 +97,10 @@ type Record struct {
 // BlobCacheDir is the blob cache every artifactfs worktree of the home
 // shares.
 func (h *Home) BlobCacheDir() string { return filepath.Join(h.dir, "blobs") }
+
+// RuntimesDir holds the copies of slimtree that daemons run, one directory
+// per SHA-256.
+func (h *Home) RuntimesDir() string { return filepath.Join(h.dir, "runtimes") }
 
 // RecordDir is the directory of the record of the worktree at path. An
 // artifactfs worktree keeps its gitfile, its daemon's log and its state root
