@@ -102,16 +102,8 @@ How it was measured:
   time, before the index's, so none of them is racily clean. Its first
   `git status` took between 118 ms and 157 ms, and its second between 10 ms
   and 13 ms.
-- The wait also slows slimtree's first `git status`, and the cause is this
-  machine, not slimtree. On a build of 059723a, that status took 117 ms at the
-  base worktree's commit when it ran up to 0.35 s after `slimtree new`
-  returned, and between 137 ms and 142 ms when it ran 0.45 s or later, median
-  of 4 rounds at each wait. Git and the daemon did the same work at either
-  wait, and the daemon ran the same instructions at a lower clock. A program
-  that touches neither slimtree nor git slows the same way: two processes
-  that pass 2,500 messages and compute between them took 108.5 ms 0.2 s after
-  `slimtree new` and 126.0 ms 2 s after it, median of 6 rounds, each round at
-  2 s slower than every round at 0.2 s.
+- The wait also slows slimtree's first `git status`, because this machine's
+  CPU runs at a lower clock after it idles; slimtree does the same work.
 - Each slimtree run had its own `SLIMTREE_HOME`, so its blob cache started
   empty. The blob cache is shared, so a later worktree of the same repository
   reuses the blobs an earlier one hydrated.
