@@ -15,7 +15,6 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/execfile"
-	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 )
 
@@ -362,34 +361,45 @@ func TestPruneKeepsARecoveryRefThatMoved(t *testing.T) {
 	}
 }
 
-// prune gives up on a repository that does not answer, as on a hung mount,
-// and keeps the archive and its ref. A fake git hangs in update-ref, and the
-// deadline expires once it started.
+// prune gives up on a repository that does not answer within
+// pruneRepoTimeout, as on a hung mount, and keeps the archive and its ref. It
+// calls that repository no more in the run: its other archive stays without
+// a call. A fake git hangs in update-ref and marks each call. The command's
+// context has no deadline, as rm's has none, so only the bound expires.
 func TestPruneGivesUpOnARepositoryThatDoesNotAnswer(t *testing.T) {
 	homeDir := pruneHome(t)
 	commonDir, commit := commitRepo(t)
-	dir, ref := archiveAt(t, homeDir, filepath.Dir(commonDir)+"-feat", commonDir, time.Now().Add(-40*24*time.Hour), commit, commit)
+	work := filepath.Dir(commonDir) + "-feat"
+	first, firstRef := archiveAt(t, homeDir, work, commonDir, time.Now().Add(-41*24*time.Hour), commit, commit)
+	second, secondRef := archiveAt(t, homeDir, work, commonDir, time.Now().Add(-40*24*time.Hour), commit, commit)
 	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatal(err)
 	}
 	bin := t.TempDir()
-	started := filepath.Join(bin, "started")
-	script := "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = update-ref ]; then : > '" + started + "'; sleep 60; exit 1; fi\ndone\nexec '" + realGit + "' \"$@\"\n"
+	calls := filepath.Join(bin, "calls")
+	script := "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = update-ref ]; then echo call >> '" + calls + "'; sleep 60; exit 1; fi\ndone\nexec '" + realGit + "' \"$@\"\n"
 	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	ctx, cancel := gittest.ExpireOnFile(t.Context(), started)
-	defer cancel()
-	code, _, stderr := slimtree(ctx, "prune")
-	want := "slimtree: pruning problem: kept " + dir + ": its repository " + commonDir + " did not answer within 10s\n"
-	if code != 1 || !strings.Contains(stderr, want) {
-		t.Fatalf("prune: exit %d, stderr %q; want exit 1 and %q", code, stderr, want)
+	previous := pruneRepoTimeout
+	pruneRepoTimeout = 2 * time.Second
+	t.Cleanup(func() { pruneRepoTimeout = previous })
+
+	code, _, stderr := slimtree(t.Context(), "prune")
+	for _, dir := range []string{first, second} {
+		want := "slimtree: pruning problem: kept " + dir + ": its repository " + commonDir + " did not answer within 2s\n"
+		if code != 1 || !strings.Contains(stderr, want) {
+			t.Fatalf("prune: exit %d, stderr %q; want exit 1 and %q", code, stderr, want)
+		}
+		requireExists(t, dir)
 	}
-	requireExists(t, dir)
-	if got := recoveryRefs(t, commonDir); got != ref+"\n" {
-		t.Fatalf("recovery refs = %q, want %s kept", got, ref)
+	if got := recoveryRefs(t, commonDir); got != firstRef+"\n"+secondRef+"\n" {
+		t.Fatalf("recovery refs = %q, want %s and %s kept", got, firstRef, secondRef)
+	}
+	if data, err := os.ReadFile(calls); err != nil || string(data) != "call\n" {
+		t.Fatalf("update-ref calls = %q, %v; want one, for the first archive", data, err)
 	}
 }
 

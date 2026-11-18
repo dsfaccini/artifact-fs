@@ -47,6 +47,9 @@ func prune(ctx context.Context, home *state.Home, now time.Time) pruning {
 	if p.rule, p.ruleErr = home.Retention(); p.ruleErr == nil && p.rule != state.Forever {
 		cutoff := now.Add(-time.Duration(p.rule) * 24 * time.Hour)
 		archives, err := home.Archives(func(err error) { p.problems = append(p.problems, err) })
+		// hung holds each repository that did not answer, so its other
+		// archives wait no longer.
+		hung := map[string]error{}
 		if err != nil {
 			p.problems = append(p.problems, err)
 		}
@@ -54,7 +57,7 @@ func prune(ctx context.Context, home *state.Home, now time.Time) pruning {
 			if !a.Made.Before(cutoff) {
 				continue
 			}
-			switch kept, err := pruneArchive(ctx, home, a); {
+			switch kept, err := pruneArchive(ctx, home, a, hung); {
 			case err != nil:
 				p.problems = append(p.problems, fmt.Errorf("kept %s: %w", a.Dir, err))
 			case kept != "":
@@ -79,12 +82,18 @@ func prune(ctx context.Context, home *state.Home, now time.Time) pruning {
 
 // pruneRepoTimeout bounds pruneArchive's stat and git commands in an
 // archive's repository. rm holds the global lock while it prunes, so a
-// repository on a hung mount must not hang it.
-const pruneRepoTimeout = 10 * time.Second
+// repository on a hung mount must not hang it. Tests lower it.
+var pruneRepoTimeout = 10 * time.Second
+
+// errNoAnswer marks a repository that did not answer within
+// pruneRepoTimeout.
+var errNoAnswer = errors.New("did not answer")
 
 // pruneArchive deletes a and its recovery ref, or returns the repository
-// that holds the ref when that repository is gone.
-func pruneArchive(ctx context.Context, home *state.Home, a state.Archived) (string, error) {
+// that holds the ref when that repository is gone. It keeps a when its
+// repository is in hung, and adds the repository to hung when it does not
+// answer.
+func pruneArchive(ctx context.Context, home *state.Home, a state.Archived, hung map[string]error) (string, error) {
 	r, err := a.Record()
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -95,9 +104,15 @@ func pruneArchive(ctx context.Context, home *state.Home, a state.Archived) (stri
 	case r.CommonDir == "":
 		return "", errors.New("its record names no repository")
 	default:
+		if err, ok := hung[r.CommonDir]; ok {
+			return "", err
+		}
 		gone, err := inRepo(ctx, r.CommonDir, func(ctx context.Context) (bool, error) {
 			return deleteRecoveryRef(ctx, r, a)
 		})
+		if errors.Is(err, errNoAnswer) {
+			hung[r.CommonDir] = err
+		}
 		if err != nil {
 			return "", err
 		}
@@ -169,7 +184,7 @@ func inRepo(ctx context.Context, commonDir string, f func(context.Context) (bool
 	}
 	switch err := ctx.Err(); {
 	case errors.Is(err, context.DeadlineExceeded):
-		return false, fmt.Errorf("its repository %s did not answer within %s", commonDir, pruneRepoTimeout)
+		return false, fmt.Errorf("its repository %s %w within %s", commonDir, errNoAnswer, pruneRepoTimeout)
 	case err != nil:
 		return false, err
 	}
