@@ -102,7 +102,7 @@ func runOutput(t *testing.T, name string, args ...string) string {
 // neither run nor make files in the Store's temp directory.
 func TestStoreRunsNoGitAfterClose(t *testing.T) {
 	tmp := t.TempDir()
-	gitDir, _, blob := partialClone(t, tmp, "blob:none")
+	gitDir, commit, blob := partialClone(t, tmp, "blob:none")
 	starts := filepath.Join(tmp, "git-starts")
 	t.Setenv("AFS_GIT_STARTS", starts)
 	wrapGit(t, tmp, "#!/bin/sh\necho \"$*\" >> \"$AFS_GIT_STARTS\"\nexec \"$AFS_REAL_GIT\" \"$@\"\n")
@@ -131,6 +131,9 @@ func TestStoreRunsNoGitAfterClose(t *testing.T) {
 	if err := store.FetchMissingBlobs(t.Context(), repo.RepoPaths, []string{blob}); !errors.Is(err, errStoreClosed) {
 		t.Fatalf("FetchMissingBlobs after Close returned %v, want %v", err, errStoreClosed)
 	}
+	if _, err := store.BootstrapCleanIndexForFSMonitor(t.Context(), repo, commit, nil); !errors.Is(err, errStoreClosed) {
+		t.Fatalf("BootstrapCleanIndexForFSMonitor after Close returned %v, want %v", err, errStoreClosed)
+	}
 	if ran, err := os.ReadFile(starts); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("git ran after Close: %q (%v)", ran, err)
 	}
@@ -140,5 +143,25 @@ func TestStoreRunsNoGitAfterClose(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("the Store's temp directory holds %v after Close, want nothing", entries)
+	}
+}
+
+// A batch pool starts no git cat-file --batch once Store.Close has begun,
+// also when Close lands after the pool's own closed check. GIT_SSH keeps
+// lazyFetchEnv from writing the SSH wrapper, whose own check would refuse.
+func TestBatchPoolStartsNoGitAfterClose(t *testing.T) {
+	tmp := t.TempDir()
+	gitDir, _, blob := partialClone(t, tmp, "blob:none")
+	starts := filepath.Join(tmp, "git-starts")
+	t.Setenv("AFS_GIT_STARTS", starts)
+	t.Setenv("GIT_SSH", "ssh")
+	wrapGit(t, tmp, "#!/bin/sh\necho \"$*\" >> \"$AFS_GIT_STARTS\"\nexec \"$AFS_REAL_GIT\" \"$@\"\n")
+	store := New(nil)
+	store.testHookBatchStarting = store.Close
+	if _, err := store.ReadBlob(t.Context(), model.RepoPaths{Name: "x", GitDir: gitDir}, blob, 1<<20); !errors.Is(err, errStoreClosed) {
+		t.Fatalf("ReadBlob returned %v, want %v", err, errStoreClosed)
+	}
+	if ran, err := os.ReadFile(starts); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("git ran after Close: %q (%v)", ran, err)
 	}
 }

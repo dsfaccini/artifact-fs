@@ -1,10 +1,14 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
+	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -142,6 +146,10 @@ type Service struct {
 	// pass the gate held, before it waits for the gate. headReconcileStarting
 	// runs on a runtime's HEAD reconcile worker before each reconcile.
 	runtimeStarted, mountReleased, joinRecorded, joinFinished, readyRecorded, gateOpened, passDeferred, headReconcileStarting func()
+	// stopWait, when set, replaces stopWaitTimeout as the time from the start
+	// of a repo's stop in Close until Close stops waiting for the repo's
+	// workers.
+	stopWait time.Duration
 	// headReconcileBackoff is the first retry delay after a failed HEAD
 	// reconcile; zero means headReconcileMinBackoff.
 	headReconcileBackoff time.Duration
@@ -277,9 +285,9 @@ func (s *Service) hydrationWorkers() int {
 // also not return within stopWaitTimeout. In each case Close cancels the
 // runtime's context and waits for the runtime's workers, within the same
 // stopWaitTimeout. It leaves the runtime's FUSE server and hydrator to the
-// process exit. When a runtime's workers outlive the wait, a preparation of
-// the runtime can still run, so Close then does not wait for the
-// preparations.
+// process exit. Close closes the Store only after every preparation's
+// rollback ended: when a runtime's workers outlive the wait, endPreparations
+// cancels the preparations and waits for their rollbacks.
 func (s *Service) Close() error {
 	s.mu.Lock()
 	s.closing = true
@@ -291,7 +299,7 @@ func (s *Service) Close() error {
 	var errs []error
 	workersEnded := true
 	for _, cfg := range cfgs {
-		deadline := time.Now().Add(stopWaitTimeout)
+		deadline := time.Now().Add(cmp.Or(s.stopWait, stopWaitTimeout))
 		if err := s.unmount(cfg.ID); err != nil {
 			errs = append(errs, err)
 			if err := s.endWorkers(cfg.ID, deadline); err != nil {
@@ -311,6 +319,8 @@ func (s *Service) Close() error {
 	}
 	if workersEnded {
 		s.prepareWorkers.Wait()
+	} else if err := s.endPreparations(); err != nil {
+		errs = append(errs, err)
 	}
 	s.git.Close()
 	if err := s.registry.Close(); err != nil {
@@ -323,6 +333,37 @@ func (s *Service) Close() error {
 		return errs[0]
 	}
 	return nil
+}
+
+// endPreparations cancels every async preparation and waits for them, at
+// most gitstore.RollbackBound. Close runs it when a runtime's workers outlived
+// their wait: a preparation among them, or one that runs under Start's
+// context, could then still run. A canceled preparation rolls back the index
+// and refs it changed within gitstore.RollbackBound. The Store refuses every
+// git once closed, so a rollback that runs after Store.Close leaves the git
+// dir with the index at one commit and HEAD at another.
+func (s *Service) endPreparations() error {
+	s.mu.Lock()
+	workers := slices.Collect(maps.Values(s.preparing))
+	s.mu.Unlock()
+	for _, worker := range workers {
+		if worker.cancel != nil {
+			worker.cancel()
+		}
+	}
+	ended := make(chan struct{})
+	go func() {
+		s.prepareWorkers.Wait()
+		close(ended)
+	}()
+	timer := time.NewTimer(gitstore.RollbackBound)
+	defer timer.Stop()
+	select {
+	case <-ended:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("preparations have not ended %s after their cancel", gitstore.RollbackBound)
+	}
 }
 
 func (s *core) fillPaths(cfg *model.RepoConfig) {
