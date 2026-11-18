@@ -212,19 +212,24 @@ func target(t *testing.T, worktree string) []string {
 }
 
 // TestAddHashesACloneNewerThanItsBaseStatus gives the clone of data/blob.bin
-// other bytes of its size and an mtime that is not older than Add's git
-// status in the base. Add records no stat data for it, so refresh hashes it
-// and Add rewrites it from Git. Git itself hashes an entry whose mtime is not
-// older than the index file's, which it treats as racily clean. Add's check
-// covers every such entry, since Add writes the index after its git status.
+// other bytes of its size and an mtime that is not older than the second in
+// which Add's git status in the base started. Add records no stat data for
+// it, so refresh hashes it and Add rewrites it from Git. Git itself hashes an
+// entry whose mtime is not older than the index file's, which it treats as
+// racily clean, so the case "changed as git status started" alone needs Add's
+// check: the file changed in an earlier second than Add writes the index.
 func TestAddHashesACloneNewerThanItsBaseStatus(t *testing.T) {
 	t.Parallel()
+	started := time.Date(2021, 1, 2, 3, 4, 5, 0, time.UTC)
 	for _, tc := range []struct {
 		name  string
+		now   func() time.Time
 		mtime func(time.Time) time.Time
 	}{
-		{"mtime now", func(time.Time) time.Time { return time.Now() }},
-		{"mtime in the future", func(time.Time) time.Time { return time.Now().Add(time.Hour) }},
+		{"changed as git status started", func() time.Time { return started },
+			func(time.Time) time.Time { return started.Add(500 * time.Millisecond) }},
+		{"mtime now", nil, func(time.Time) time.Time { return time.Now() }},
+		{"mtime in the future", nil, func(time.Time) time.Time { return time.Now().Add(time.Hour) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -235,7 +240,7 @@ func TestAddHashesACloneNewerThanItsBaseStatus(t *testing.T) {
 			_, err := Add(t.Context(), Options{Base: f.base, Path: path, Commit: "upstream/main",
 				AddArgs: []string{"-q", "-b", "feat/clone"}, Stderr: &stderr,
 				Clone:        alteringClone(newRecorder(path).Clone, path, "data/blob.bin", tc.mtime),
-				afterRewrite: func(paths []string) { rewritten = paths }})
+				afterRewrite: func(paths []string) { rewritten = paths }, now: tc.now})
 			if err != nil {
 				t.Fatalf("Add: %v\n%s", err, stderr.Bytes())
 			}

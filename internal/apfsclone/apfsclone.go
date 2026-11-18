@@ -92,14 +92,16 @@ type Options struct {
 	// Stdout and Stderr receive the output of git worktree add.
 	Stdout, Stderr io.Writer
 
-	// beforeRegister, afterRegister and afterRewrite are test hooks that
+	// beforeRegister, afterRegister, afterRewrite and now are test hooks that
 	// production code leaves nil. beforeRegister runs after Add's checks,
 	// before git worktree add. afterRegister runs once the new worktree's
 	// index is filled. afterRewrite runs after Add rewrites from Git the files
-	// that differ from the index, with their paths.
+	// that differ from the index, with their paths. now returns, in place of
+	// time.Now, when Add's git status in the base starts.
 	beforeRegister func()
 	afterRegister  func()
 	afterRewrite   func(paths []string)
+	now            func() time.Time
 }
 
 // Result describes a worktree that Add made.
@@ -165,6 +167,9 @@ func Add(ctx context.Context, o Options) (Result, error) {
 	// A file that changes in the base once its git status starts has an mtime
 	// in this second or later.
 	checked := time.Now()
+	if o.now != nil {
+		checked = o.now()
+	}
 	dirty, err := dirtyPaths(ctx, base)
 	if err != nil {
 		return Result{}, refuse(err)
