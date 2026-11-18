@@ -813,11 +813,65 @@ func TestBootstrapCleanIndexForFSMonitorSkipsMissingAttributesBlob(t *testing.T)
 		t.Fatal(err)
 	}
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}}
-	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); err != nil || bootstrapped {
-		t.Fatalf("missing attributes blob bootstrap = %v, %v; want false, nil", bootstrapped, err)
+	// The error tells the daemon's log why the bootstrap skipped.
+	const want = "fetch 1 .gitattributes blobs: no promisor remote"
+	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); bootstrapped || err == nil || err.Error() != want {
+		t.Fatalf("missing attributes blob bootstrap = %v, %v; want false, %s", bootstrapped, err, want)
 	}
 	if after, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(after, before) {
 		t.Fatalf("missing attributes blob changed index: err=%v", err)
+	}
+}
+
+// A blobless clone holds no blob of its HEAD, and check-attr --cached reads
+// .gitattributes without lazy fetch. The bootstrap fetches the .gitattributes
+// blobs, and no other, so the first git status stats only the paths they
+// leave to Git.
+func TestBootstrapCleanIndexForFSMonitorFetchesTheAttributesOfABloblessClone(t *testing.T) {
+	t.Parallel()
+	files := map[string]string{
+		".gitattributes":      "*.png binary\n",
+		"docs/.gitattributes": "*.md text\n",
+		"docs/readme.md":      "readme\n",
+		"tracked.txt":         "base\n",
+	}
+	tmp := t.TempDir()
+	gitDir := filepath.Join(tmp, "repo.git")
+	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: gitDir, MountPath: filepath.Join(tmp, "mnt")}, RepoSpec: model.RepoSpec{RemoteURL: gittest.PartialCloneRemote(t, files), Branch: "main"}}
+	store := New(nil)
+	defer store.Close()
+	if err := store.CloneBlobless(t.Context(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	local := func(path string) bool {
+		cmd := exec.Command("git", "--git-dir", gitDir, "cat-file", "-e", "HEAD:"+path)
+		cmd.Env = append(os.Environ(), "GIT_NO_LAZY_FETCH=1")
+		return cmd.Run() == nil
+	}
+	for path := range files {
+		if local(path) {
+			t.Fatalf("blobless clone holds the blob of %s", path)
+		}
+	}
+	hook := filepath.Join(tmp, "fsmonitor")
+	if err := execfile.Write(hook, []byte("#!/bin/sh\nprintf 'token\\0'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "--git-dir", gitDir, "config", "core.fsmonitor", hook)
+	head := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", "HEAD"))
+	if bootstrapped, err := store.BootstrapCleanIndexForFSMonitor(t.Context(), cfg, head, nil); err != nil || !bootstrapped {
+		t.Fatalf("BootstrapCleanIndexForFSMonitor = %v, %v; want true, nil", bootstrapped, err)
+	}
+	// docs/.gitattributes converts docs/readme.md, so only that entry is
+	// left for Git to compare.
+	want := "h .gitattributes\nh docs/.gitattributes\nH docs/readme.md\nh tracked.txt"
+	if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "ls-files", "-f")); got != want {
+		t.Fatalf("fsmonitor-valid entries = %q, want %q", got, want)
+	}
+	for path := range files {
+		if want := filepath.Base(path) == ".gitattributes"; local(path) != want {
+			t.Fatalf("after the bootstrap, the blob of %s is local = %v, want %v", path, !want, want)
+		}
 	}
 }
 

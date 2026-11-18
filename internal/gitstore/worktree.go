@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -446,6 +447,12 @@ func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.
 		}
 		return false, nil
 	}
+	if err := s.fetchGitAttributes(ctx, repo.GitDir, snapshotOID); err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, err
+	}
 	indexPath := filepath.Join(repo.GitDir, "index")
 	lockPath := indexPath + ".lock"
 	lock, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
@@ -587,7 +594,10 @@ func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.
 		return false, nil
 	}
 	if err := s.verifyGitAttributesPresent(ctx, repo, env); err != nil {
-		return skip()
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, err
 	}
 	validInput := []byte(strings.Join(validPaths, "\x00") + "\x00")
 	updateEnv := append([]string{FSMonitorBootstrapEnv + "=1"}, env...)
@@ -672,8 +682,45 @@ func (s *Store) verifyGitAttributesPresent(ctx context.Context, repo model.RepoC
 			return errors.New("unmerged .gitattributes entry")
 		}
 		if err := s.runGitDiscardOutputWithEnv(ctx, repo.GitDir, env, "cat-file", "-e", parts[1]+"^{blob}"); err != nil {
-			return err
+			return fmt.Errorf("the blob of %s is not in the object store: %w", path, err)
 		}
+	}
+	return nil
+}
+
+// attributesFetchTimeout bounds the bootstrap's fetch of .gitattributes
+// blobs, which runs under the repo's prepare lock.
+const attributesFetchTimeout = 30 * time.Second
+
+// fetchGitAttributes fetches, in one fetch, the blobs of commit's
+// .gitattributes files that the object store lacks. check-attr --cached reads
+// them without lazy fetch, and a blobless clone lacks the blob of every commit
+// it never checked out. Without them the bootstrap skips, and the first git
+// status reads every file.
+func (s *Store) fetchGitAttributes(ctx context.Context, gitDir, commit string) error {
+	tree, err := s.runGitWithEnv(ctx, gitDir, []string{"GIT_NO_LAZY_FETCH=1"}, "ls-tree", "-r", "-z", "--full-tree", commit)
+	if err != nil {
+		return err
+	}
+	var oids []string
+	for entry := range strings.SplitSeq(tree, "\x00") {
+		meta, path, ok := strings.Cut(entry, "\t")
+		parts := strings.Fields(meta)
+		if ok && len(parts) == 3 && parts[1] == "blob" && filepath.Base(path) == ".gitattributes" {
+			oids = append(oids, parts[2])
+		}
+	}
+	if len(oids) == 0 {
+		return nil
+	}
+	missing, err := s.missingObjects(ctx, gitDir, oids)
+	if err != nil || len(missing) == 0 {
+		return err
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, attributesFetchTimeout)
+	defer cancel()
+	if err := s.fetchObjects(fetchCtx, gitDir, missing); err != nil {
+		return fmt.Errorf("fetch %d .gitattributes blobs: %w", len(missing), err)
 	}
 	return nil
 }
