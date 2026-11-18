@@ -709,3 +709,33 @@ func TestRmForceRefusesWhatWouldLoseFiles(t *testing.T) {
 	}
 	requireUnchanged(t, main, r)
 }
+
+// rm --force of an artifactfs worktree on an unborn branch, as after git
+// switch --orphan, archives its files and removes it, and writes no recovery
+// ref: git worktree list gives its HEAD as the null object ID, which names
+// no commit.
+func TestRmForceRemovesAnArtifactFSWorktreeOnAnUnbornBranch(t *testing.T) {
+	main, r := stoppedArtifactFS(t, map[string]string{"notes.txt": "kept\n"})
+	gitIn(t, main, "--git-dir="+r.GitDir, "symbolic-ref", "HEAD", "refs/heads/orphan")
+	home, err := openHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := linux(t.Context(), "rm", "--force", "wt")
+	archives := filepath.Join(home.Dir(), "archives", state.ID(r.Path))
+	m := regexp.MustCompile(`^removed ` + regexp.QuoteMeta(r.Path) + `; ` + regexp.QuoteMeta(archives) + `/(\d+)/state\.tar\.gz keeps its files` + "\n$").FindStringSubmatch(stdout)
+	if code != 0 || m == nil {
+		t.Fatalf("rm --force of a worktree on an unborn branch: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	requireNoWorktree(t, main, r.Path)
+	if refs := recoveryRefs(t, r.CommonDir); refs != "" {
+		t.Errorf("recovery refs %q, want none", refs)
+	}
+	archived, err := state.Archived{Dir: filepath.Join(archives, m[1])}.Record()
+	if err != nil || archived.Head != "" || archived.Path != r.Path {
+		t.Errorf("archived record = %+v, %v; want the worktree's, without head", archived, err)
+	}
+	if files := archiveFiles(t, filepath.Join(archives, m[1])); files["gitdir/HEAD"] != "ref: refs/heads/orphan\n" {
+		t.Errorf("the archive's gitdir/HEAD = %q, want the unborn branch", files["gitdir/HEAD"])
+	}
+}
