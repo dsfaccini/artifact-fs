@@ -17,13 +17,16 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// recordStats records in the index of worktree each path's stat data, as
-// checkout-index records the stat data of a file it writes, so refresh hashes
-// none of them. Git still hashes an entry it treats as racily clean: one whose
-// mtime is not older than the index file's. It leaves the index alone when it
-// is not a regular file, or when it is a split index or has a version that
-// recordStats does not know. It writes the index as Git does, through
-// index.lock, which it creates only when no other process holds it.
+// recordStats records in the index of worktree the stat data of each of
+// paths, as Git records the stat data of a file it checks out, so that Git
+// does not hash the file. It records none for a file whose mtime is not older
+// than the second of before. Git still hashes an entry whose mtime is not
+// older than the index file's, which it treats as racily clean. recordStats
+// leaves the index unchanged when the index is not a regular file, when its
+// version is not 2, 3 or 4, when its object format is unknown, and when it
+// has an extension that Git must understand to read it, such as a split
+// index's link. It writes the index as Git does: it creates index.lock, which
+// fails while another process holds it, then renames the lock over the index.
 func recordStats(ctx context.Context, worktree string, paths []string, before time.Time) error {
 	if len(paths) == 0 {
 		return nil
@@ -76,7 +79,7 @@ func recordStats(ctx context.Context, worktree string, paths []string, before ti
 		}
 		var st unix.Stat_t
 		if err := unix.Lstat(filepath.Join(worktree, filepath.FromSlash(name)), &st); err != nil {
-			return nil, err
+			return nil, &os.PathError{Op: "lstat", Path: name, Err: err}
 		}
 		if st.Mtim.Sec >= before.Unix() {
 			return nil, nil
@@ -99,68 +102,78 @@ func recordStats(ctx context.Context, worktree string, paths []string, before ti
 	return nil
 }
 
-// entryStatSize is the size of an index entry's stat fields: ctime, mtime,
-// dev, ino, mode, uid, gid and size, each 32 bits.
-const entryStatSize = 40
+const (
+	// entryStatSize is the size of an index entry's stat fields: ctime,
+	// mtime, dev, ino, mode, uid, gid and size, each 32 bits.
+	entryStatSize = 40
+	// entryExtended is the flag of an entry with a second, extended flags
+	// field.
+	entryExtended = 0x4000
+	// entryNameMask masks the name length in an entry's flags. A name of
+	// this length or longer stores the mask, and ends at its NUL.
+	entryNameMask = 0xfff
+)
 
 // patchIndexStats sets, in data, an index file, the stat fields of each entry
-// that stat returns a result for, and then the trailing checksum, unless it is
-// zero, as index.skipHash writes it. It keeps each entry's mode. It returns
-// false and leaves data unchanged for a split index or a version other than
-// 2, 3 or 4.
+// that stat returns a stat for, and then the trailing checksum, unless it is
+// zero, as index.skipHash writes it. It keeps each entry's mode and every
+// other byte. It parses the entries as Git's create_from_disk does. It returns
+// false and leaves data unchanged for a version other than 2, 3 or 4, for an
+// extension whose signature does not start with an uppercase letter, which
+// Git must understand to read the index, and when it patches no entry.
 func patchIndexStats(data []byte, newHash func() hash.Hash, stat func(name string) (*unix.Stat_t, error)) (bool, error) {
 	hashSize := newHash().Size()
 	malformed := errors.New("the index is malformed")
 	if len(data) < 12+hashSize || string(data[:4]) != "DIRC" {
 		return false, malformed
 	}
-	version := binary.BigEndian.Uint32(data[4:])
+	be := binary.BigEndian
+	version := be.Uint32(data[4:])
 	if version < 2 || version > 4 {
 		return false, nil
 	}
-	count := binary.BigEndian.Uint32(data[8:])
 	end := len(data) - hashSize
-	type patch struct {
-		offset int
-		st     *unix.Stat_t
-	}
-	var patches []patch
+	var patches []int
+	var stats []*unix.Stat_t
 	offset := 12
 	var name []byte
-	for range count {
+	for range be.Uint32(data[8:]) {
 		start := offset
-		fixed := entryStatSize + hashSize + 2
-		if offset+fixed > end {
+		nameAt := start + entryStatSize + hashSize + 2
+		if nameAt > end {
 			return false, malformed
 		}
-		flags := binary.BigEndian.Uint16(data[offset+fixed-2:])
-		offset += fixed
-		if flags&0x4000 != 0 {
-			if version < 3 {
-				return false, malformed
-			}
-			offset += 2
+		flags := be.Uint16(data[nameAt-2:])
+		if flags&entryExtended != 0 {
+			nameAt += 2
 		}
+		length := int(flags & entryNameMask)
 		if version == 4 {
-			strip, n := decodeVarint(data[offset:end])
+			strip, n := decodeVarint(data[min(nameAt, end):end])
 			if n == 0 || strip > uint64(len(name)) {
 				return false, malformed
 			}
-			offset += n
-			suffix := bytes.IndexByte(data[offset:end], 0)
-			if suffix < 0 {
+			name = name[:len(name)-int(strip)]
+			nameAt += n
+			suffix := length - len(name)
+			if length == entryNameMask {
+				suffix = bytes.IndexByte(data[min(nameAt, end):end], 0)
+			}
+			if suffix < 0 || nameAt+suffix >= end || data[nameAt+suffix] != 0 {
 				return false, malformed
 			}
-			name = append(name[:len(name)-int(strip)], data[offset:offset+suffix]...)
-			offset += suffix + 1
+			name = append(name, data[nameAt:nameAt+suffix]...)
+			offset = nameAt + suffix + 1
 		} else {
-			length := bytes.IndexByte(data[offset:end], 0)
-			if length < 0 {
+			if length == entryNameMask {
+				length = bytes.IndexByte(data[min(nameAt, end):end], 0)
+			}
+			if length < 0 || nameAt+length >= end || data[nameAt+length] != 0 {
 				return false, malformed
 			}
-			name = append(name[:0], data[offset:offset+length]...)
-			// An entry is padded with 1 to 8 NULs to a multiple of 8 bytes.
-			offset = start + (offset-start+length+8)&^7
+			name = append(name[:0], data[nameAt:nameAt+length]...)
+			// The name ends with 1 to 8 NULs, to a multiple of 8 bytes.
+			offset = start + (nameAt-start+length+8)&^7
 			if offset > end {
 				return false, malformed
 			}
@@ -170,27 +183,25 @@ func patchIndexStats(data []byte, newHash func() hash.Hash, stat func(name strin
 			return false, err
 		}
 		if st != nil {
-			patches = append(patches, patch{start, st})
+			patches = append(patches, start)
+			stats = append(stats, st)
 		}
 	}
 	for offset+8 <= end {
-		if string(data[offset:offset+4]) == "link" {
+		if signature := data[offset]; signature < 'A' || signature > 'Z' {
 			return false, nil
 		}
-		size := binary.BigEndian.Uint32(data[offset+4:])
-		if uint64(offset)+8+uint64(size) > uint64(end) {
+		size := uint64(be.Uint32(data[offset+4:]))
+		if uint64(offset)+8+size > uint64(end) {
 			return false, malformed
 		}
 		offset += 8 + int(size)
 	}
-	if offset != end {
-		return false, malformed
-	}
 	if len(patches) == 0 {
 		return false, nil
 	}
-	for _, p := range patches {
-		putStat(data[p.offset:], p.st)
+	for i, start := range patches {
+		putStat(data[start:], stats[i])
 	}
 	if trailer := data[end:]; !bytes.Equal(trailer, make([]byte, hashSize)) {
 		h := newHash()
@@ -216,7 +227,7 @@ func putStat(b []byte, st *unix.Stat_t) {
 }
 
 // decodeVarint decodes the variable-length integer that index version 4
-// prefixes each path with, as Git's decode_varint does. It returns the value
+// puts before each name, as Git's decode_varint does. It returns the value
 // and the bytes read, or 0 bytes on overflow or truncation.
 func decodeVarint(b []byte) (uint64, int) {
 	if len(b) == 0 {

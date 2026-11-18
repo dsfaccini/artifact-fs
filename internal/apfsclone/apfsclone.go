@@ -410,9 +410,9 @@ func preflight(clone Clonefile, base, dest string, baseHead tree) error {
 }
 
 // populate writes dest's files from head, the commit in its index, cloning
-// from base the paths that baseHead and dirty show to match, and rewrites
-// from Git each clone that does not match its entry. afterRewrite, when not
-// nil, runs after that rewrite.
+// from base the paths that b shows to match. It records the stat data of each
+// clone it trusts, and rewrites from Git each clone that does not match its
+// entry. afterRewrite, when not nil, runs after that rewrite.
 func populate(ctx context.Context, clone Clonefile, base, dest, head string, b baseState, afterRewrite func([]string)) (Result, error) {
 	target, err := treeEntries(ctx, dest, head)
 	if err != nil {
