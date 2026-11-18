@@ -18,39 +18,53 @@ A new worktree of [pydantic-ai](https://github.com/pydantic/pydantic-ai)
 | | slimtree | `git worktree add` |
 |---|---|---|
 | Disk, at the base worktree's commit | 0.84 MiB | 346 MiB |
-| Disk, at a pull request's commit | 2.08 MiB | 346 MiB |
-| Create | 3.31 s | 1.39 s |
-| First `git status` | 38 ms | 420 ms |
-| Second `git status` | 35 ms | 31 ms |
+| Disk, at a pull request's commit | 2.07 MiB | 346 MiB |
+| Create | 1.10 s | 1.49 s |
+| First `git status` | 35 ms | 453 ms |
+| Second `git status` | 33 ms | 29 ms |
 
-slimtree saves disk, not time. It takes longer than git to make a worktree,
-because it hashes every file once to check each clone against Git
-(`git update-index --refresh`). Its first `git status` is then as fast as the
-second, but create plus first `git status` still takes 3.36 s against git's
-1.81 s.
+slimtree saves disk and makes a worktree faster than git. It clones the base
+worktree's files instead of writing them, and records each clone's stat data in
+the new worktree's index, so its first `git status` hashes no clone and is as
+fast as its second. Create plus first `git status` takes 1.16 s against git's
+1.85 s. slimtree checks no clone byte for byte against its blob: it trusts a
+clone when the base's `git status` does not list the file, the clone has its
+blob's size, and the file is older than the create.
 
 How it was measured:
 
-- `slimtree --version`: `slimtree 0.1.0a1 (v0.1.0-alpha.1, f2eed729d076,
-  go1.27.4, darwin/arm64)`, the binary that `uvx slimtree@0.1.0a1` installs.
-  Since 0.1.0a1, `slimtree new` and `slimtree rm` change only in how they
-  release their locks; the cloning and hashing the table times are unchanged.
+- `slimtree --version`: `slimtree dev (untagged, e5fed326a40c, go1.27.4,
+  darwin/arm64)`, built from main e5fed32 as the release workflow builds it
+  (`CGO_ENABLED=0 go build -trimpath -ldflags "-s -w"`), without its version
+  stamp.
 - Both tools made a new branch: `slimtree new <branch> --from <commit> --path
   <path>` and `git worktree add -b <branch> <path> <commit>`, from the same
-  base worktree.
+  base worktree. Each run then read the disk, ran `git status --porcelain=v1`
+  twice, and removed the worktree with `slimtree rm <path>` or
+  `git worktree remove <path>`.
+- The first `git status` ran between 2.0 s and 15.3 s after the create. The
+  disk readings fill that gap. In 9 of the 20 runs they took less than 2 s,
+  and the run waited out the rest. Git here compares file times in whole
+  seconds, as a Git built without `USE_NSEC` does, so a gap over 1 s puts the
+  first `git status`'s index write in a later second than every file the
+  create wrote. git's second `git status` then took between 28 ms and 47 ms in
+  every round.
 - Disk is the data only the new worktree and its admin directory hold: the sum
   of APFS's private size (`ATTR_CMNEXT_PRIVATESIZE`) over their files, read
   right after the create. `du` counts a clone's shared blocks, so it reports
   345 MiB for either tool. The pull request's commit differs from the base
   worktree's in 56 paths.
 - Times are the wall-clock time of each command, at the base worktree's commit.
-  At the pull request's commit they were: create 3.16 s and 1.51 s, first
-  `git status` 33 ms and 477 ms, second `git status` 33 ms and 28 ms, for
+  At the pull request's commit they were: create 1.14 s and 1.21 s, first
+  `git status` 38 ms and 196 ms, second `git status` 31 ms and 28 ms, for
   slimtree and git.
+- git's first `git status` took between 154 ms and 960 ms at the base
+  worktree's commit, and between 79 ms and 506 ms at the pull request's.
+  slimtree's took between 32 ms and 57 ms, and between 34 ms and 47 ms.
 - The tools alternated in order each round. Every run started and ran while the
-  5-minute load average was under 20; it stayed between 6.7 and 8.9.
+  5-minute load average was under 20; it stayed between 5.9 and 7.0.
 - MacBook Air (Apple M4, 24 GB), macOS 27.2, internal SSD, Git 2.54.0 (Apple
-  Git-157), 2026-11-17.
+  Git-157), 2026-11-18.
 
 ### Linux
 
