@@ -14,8 +14,9 @@ on:
     # GitHub skips path filters for tag pushes. The smoke tests check
     # slimtree's commands, so a change to slimtree, or to apfsclone, which
     # slimtree new runs, runs a dry run too. So does a change to a check that a
-    # release runs.
+    # release runs, and to README.md, which each wheel and archive carries.
     paths:
+      - README.md
       - .github/workflows/release.yml
       - .github/workflows/build-test.yml
       - .github/workflows/redaction-fuzz.yml
@@ -172,10 +173,10 @@ jobs:
           for target in linux-amd64 linux-arm64 darwin-arm64; do
             python3 -B .github/scripts/build_wheel.py wheel --binary "$RUNNER_TEMP/bin/$target/slimtree" --target "$target" \
               --version "$VERSION" --license LICENSE --license THIRD_PARTY_LICENSES \
-              --readme cmd/slimtree/README.md --out dist/wheels
+              --readme README.md --out dist/wheels
             dir="slimtree-$VERSION-$target"
             mkdir -p "$RUNNER_TEMP/archive/$dir"
-            cp "$RUNNER_TEMP/bin/$target/slimtree" LICENSE THIRD_PARTY_LICENSES cmd/slimtree/README.md "$RUNNER_TEMP/archive/$dir/"
+            cp "$RUNNER_TEMP/bin/$target/slimtree" LICENSE THIRD_PARTY_LICENSES README.md "$RUNNER_TEMP/archive/$dir/"
             tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" -C "$RUNNER_TEMP/archive" -cf - "$dir" | gzip -n >"dist/archives/$dir.tar.gz"
           done
           (cd dist/wheels && sha256sum -- *.whl && cd ../archives && sha256sum -- *.tar.gz) >SHA256SUMS

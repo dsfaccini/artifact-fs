@@ -1,3 +1,7 @@
+> This repository is a fork of [cloudflare/artifact-fs](https://github.com/cloudflare/artifact-fs).
+> artifact-fs's docs are in
+> [docs/artifact-fs.md](https://github.com/dsfaccini/artifact-fs/blob/main/docs/artifact-fs.md).
+
 # slimtree
 
 slimtree makes git worktrees that take little disk. On macOS it clones the
@@ -5,8 +9,8 @@ files of an existing worktree of the repository with APFS clones, which share
 their blocks with the originals until either side changes a file. Git sees an
 ordinary worktree, so `git status`, commits and branches work as they do after
 `git worktree add`. On Linux it serves each worktree from an
-[artifact-fs](https://github.com/dsfaccini/artifact-fs) FUSE mount, which reads
-file contents from Git's objects as they are needed.
+[artifact-fs](https://github.com/dsfaccini/artifact-fs/blob/main/docs/artifact-fs.md)
+FUSE mount, which reads file contents from Git's objects as they are needed.
 
 ## Measured
 
