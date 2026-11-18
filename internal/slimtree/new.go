@@ -228,7 +228,8 @@ type rollback struct {
 // run removes what a failed new made: the worktree new registered, the
 // directories above it that git worktree add made, and the branch while it
 // still points at rb.start, with the tracking config new wrote. It outlives
-// ctx's cancellation, for at most rollbackTimeout.
+// ctx's cancellation, for at most rollbackTimeout, plus writeGrace for a write
+// that runs then.
 func (rb rollback) run(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
 	defer cancel()

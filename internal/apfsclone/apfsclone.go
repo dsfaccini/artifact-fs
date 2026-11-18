@@ -292,9 +292,9 @@ var writeOutlived func()
 // gitWrite runs run, which runs one git that writes the user's refs, config or
 // index under gitstore.WriteContext. That git contacts no remote, or is a
 // read-tree, which can lazily fetch missing trees as gitstore's
-// runNetworkGitWrite can. The git starts
-// only while ctx lives, and runs for at most writeGrace once ctx ends, so its
-// stop finds the handler that removes its lock files installed.
+// runNetworkGitWrite can. The git starts only while ctx lives, and runs for at
+// most writeGrace once ctx ends, so its stop finds the handler that removes
+// its lock files installed.
 func gitWrite(ctx context.Context, run func(context.Context) error) error {
 	writeCtx, done, err := gitstore.WriteContext(ctx, writeGrace, writeOutlived)
 	if err != nil {
