@@ -129,7 +129,7 @@ How it was measured:
   second `git status` took 10 ms, except in the rounds where its first was the
   fastest: 214 ms in round 3 at the base worktree's commit, and 139 ms and
   135 ms in rounds 2 and 5 at the pull request's. git's remove was slow in the
-  same rounds: 0.30 s, and 0.24 s in both, against 0.12 s to 0.13 s in every
+  same rounds: 0.30 s, and 0.24 s and 0.23 s, against 0.12 s to 0.13 s in every
   other round. slimtree's first `git status` took between 115 ms and 138 ms,
   and its second 11 ms in every round.
 - The tools alternated in order each round. Every run started and ran while the
