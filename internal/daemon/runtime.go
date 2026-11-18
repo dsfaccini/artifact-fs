@@ -48,14 +48,13 @@ const (
 // ExitBound is how long a daemon that serves one repo can take to exit after
 // SIGTERM. Close gives the repo's stop and the runtime's workers
 // stopWaitTimeout, then the preparations gitstore.RollbackBound, and
-// exitSlack covers what follows. It leaves out
-// the time Start needs to finish a sync pass that runs when SIGTERM arrives,
-// so it is not strictly an upper bound. Wait at least this long before
-// SIGKILL, so Close finishes its unmount, its drain and its records. A
-// SIGKILL during Close leaves a mount the daemon did not unmount, which no
-// FUSE server answers, and on FSKit unmount(2) of such a volume can hang.
-// Close stops repos one at a time, so a daemon that serves more repos can
-// take longer.
+// exitSlack covers what follows. It leaves out the time Start needs to
+// finish a sync pass that runs when SIGTERM arrives, so it is not strictly
+// an upper bound. Wait at least this long before SIGKILL, so Close finishes
+// its unmount, its drain and its records. A SIGKILL during Close leaves a
+// mount the daemon did not unmount, which no FUSE server answers, and on
+// FSKit unmount(2) of such a volume can hang. Close stops repos one at a
+// time, so a daemon that serves more repos can take longer.
 const ExitBound = stopWaitTimeout + gitstore.RollbackBound + exitSlack
 
 // mountState is where a runtime's FUSE mount stands.
