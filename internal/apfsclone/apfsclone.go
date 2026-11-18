@@ -16,10 +16,14 @@
 //     executable bit under core.fileMode=false, which a plain checkout still
 //     writes.
 //   - Add records each clone's stat data in the index, so Git trusts the clone
-//     and never checks it byte for byte against its blob. It records none for
-//     a clone rewritten from Git, a path that the base's index marks
-//     assume-unchanged or skip-worktree, or a clone whose mtime is not older
-//     than the second in which the base's git status started.
+//     and never checks it byte for byte against its blob. The trust rests on
+//     the base's git status: on its index's stat data, core.checkStat,
+//     core.trustctime and its fsmonitor. Add records none for a clone
+//     rewritten from Git, a clone whose size is not its blob's, a path that
+//     the base's index marks assume-unchanged or skip-worktree, a path that
+//     the base's attributes convert, or a clone whose mtime is not older than
+//     the second in which Add read the base's HEAD. It records none at all
+//     when the base's HEAD moved before Add registered the worktree.
 //   - update-index --refresh then hashes every other file, because read-tree
 //     records no stat data, and every entry that Git treats as racily clean.
 //     A file that does not match its blob is rewritten from Git, and

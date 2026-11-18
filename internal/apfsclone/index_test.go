@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // blobBin is data/blob.bin's content in a fixture.
@@ -566,5 +568,57 @@ func TestRecordStatsPatchesEveryIndexGitWrites(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestPutStatWritesTheSizeGitWrites calls putStat directly: no test can make
+// a clone of a 4 GiB blob. Git's munge_st_size writes 0x80000000 for a
+// nonzero multiple of 4 GiB, because a size of 0 marks a racily smudged
+// entry.
+func TestPutStatWritesTheSizeGitWrites(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		size int64
+		want uint32
+	}{{7, 7}, {4 << 30, 0x80000000}, {4<<30 + 3, 3}, {8 << 30, 0x80000000}} {
+		b := make([]byte, entryStatSize)
+		putStat(b, &unix.Stat_t{Size: tc.size})
+		if got := binary.BigEndian.Uint32(b[36:]); got != tc.want {
+			t.Errorf("size %d: putStat wrote %#x, want %#x", tc.size, got, tc.want)
+		}
+	}
+}
+
+// TestRecordStatsKeepsTheIndexMode gives the index mode 0640, which
+// core.sharedRepository or a user can set, and which index.lock under the
+// default umask would not have.
+func TestRecordStatsKeepsTheIndexMode(t *testing.T) {
+	t.Parallel()
+	repo := t.TempDir()
+	run(t, repo, "init", "-q")
+	write(t, filepath.Join(repo, "a.txt"), "a\n", 0o644)
+	if err := os.Chtimes(filepath.Join(repo, "a.txt"), time.Time{}, baseMtime); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repo, "add", "a.txt")
+	run(t, repo, "commit", "-qm", "a")
+	run(t, repo, "read-tree", "HEAD")
+	index := filepath.Join(repo, ".git", "index")
+	if err := os.Chmod(index, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	before := indexFile(t, repo)
+	if err := recordStats(t.Context(), repo, map[string]int64{"a.txt": 2}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("recordStats: %v", err)
+	}
+	if bytes.Equal(indexFile(t, repo), before) {
+		t.Fatal("recordStats left the index unchanged")
+	}
+	fi, err := os.Stat(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o640 {
+		t.Errorf("index mode = %#o, want 0640", got)
 	}
 }
