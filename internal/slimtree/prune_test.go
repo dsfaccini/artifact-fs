@@ -15,6 +15,18 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 )
 
+// pruneHome sets SLIMTREE_HOME as homeAfterFirstRun does, and returns the
+// home with its symlinks resolved, as prune prints its paths. On macOS the
+// temporary directory lies below the symlink /var.
+func pruneHome(t *testing.T) string {
+	t.Helper()
+	dir, err := state.Canonical(homeAfterFirstRun(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 // commitRepo makes a repository with one commit and returns its canonical
 // git dir and the commit.
 func commitRepo(t *testing.T) (string, string) {
@@ -80,7 +92,7 @@ var archivesUse = regexp.MustCompile(`(?m)^slimtree: archives use \d+\.\d MB, \d
 // archive whose removal stopped before the ref, or before the record, by the
 // same rule.
 func TestPruneDeletesArchivesOlderThanTheRuleWithTheirRecoveryRefs(t *testing.T) {
-	homeDir := homeAfterFirstRun(t)
+	homeDir := pruneHome(t)
 	commonDir, commit := commitRepo(t)
 	work := filepath.Join(filepath.Dir(filepath.Dir(commonDir)), "repo-feat")
 	now := time.Now()
@@ -114,7 +126,7 @@ func TestPruneDeletesArchivesOlderThanTheRuleWithTheirRecoveryRefs(t *testing.T)
 // prune keeps an old archive and its recovery ref while the repository is
 // gone, as on a volume that is not mounted, and deletes both once it is back.
 func TestPruneKeepsAnArchiveWhoseRepositoryIsGone(t *testing.T) {
-	homeDir := homeAfterFirstRun(t)
+	homeDir := pruneHome(t)
 	commonDir, commit := commitRepo(t)
 	repo := filepath.Dir(commonDir)
 	dir, ref := archiveAt(t, homeDir, repo+"-feat", commonDir, time.Now().Add(-40*24*time.Hour), commit)
@@ -146,7 +158,7 @@ func TestPruneKeepsAnArchiveWhoseRepositoryIsGone(t *testing.T) {
 // forever or a number of days. Under forever, prune deletes nothing. Under a
 // rule file that holds no rule, prune deletes nothing and fails.
 func TestRetentionRuleDecidesWhatPruneDeletes(t *testing.T) {
-	homeDir := homeAfterFirstRun(t)
+	homeDir := pruneHome(t)
 	commonDir, commit := commitRepo(t)
 	work := filepath.Join(filepath.Dir(filepath.Dir(commonDir)), "repo-feat")
 	tenDays, tenDaysRef := archiveAt(t, homeDir, work, commonDir, time.Now().Add(-10*24*time.Hour), commit)
@@ -205,7 +217,7 @@ func TestRetentionRuleDecidesWhatPruneDeletes(t *testing.T) {
 // prune never follows a symlink in archives/ out of the home, and reports
 // it.
 func TestPruneKeepsASymlinkedArchive(t *testing.T) {
-	homeDir := homeAfterFirstRun(t)
+	homeDir := pruneHome(t)
 	outside := t.TempDir()
 	old := filepath.Join(outside, strconv.FormatInt(time.Now().Add(-40*24*time.Hour).UnixNano(), 10))
 	if err := os.Mkdir(old, 0o700); err != nil {
@@ -228,7 +240,7 @@ func TestPruneKeepsASymlinkedArchive(t *testing.T) {
 
 // prune deletes nothing, and succeeds, while another command holds the lock.
 func TestPruneSkipsWhileAnotherCommandHoldsTheLock(t *testing.T) {
-	homeDir := homeAfterFirstRun(t)
+	homeDir := pruneHome(t)
 	commonDir, commit := commitRepo(t)
 	dir, ref := archiveAt(t, homeDir, filepath.Dir(commonDir)+"-feat", commonDir, time.Now().Add(-40*24*time.Hour), commit)
 	home, err := openHome()
@@ -254,7 +266,7 @@ func TestPruneSkipsWhileAnotherCommandHoldsTheLock(t *testing.T) {
 // recovery ref, keeps the archive and ref it made, and reports the archives'
 // disk use.
 func TestRmPrunesAfterwards(t *testing.T) {
-	homeDir := homeAfterFirstRun(t)
+	homeDir := pruneHome(t)
 	cloneWith(t, nil)
 	main := newRepo(t)
 	commonDir := filepath.Join(main, ".git")
