@@ -139,8 +139,9 @@ type Service struct {
 	// after an async preparation persisted ready, before it activates the
 	// runtime. gateOpened runs once an activation opened its runtime's gate,
 	// still holding s.mu. passDeferred runs on the worker that sends a switch
-	// pass the gate held, before it waits for the gate.
-	runtimeStarted, mountReleased, joinRecorded, joinFinished, readyRecorded, gateOpened, passDeferred func()
+	// pass the gate held, before it waits for the gate. headReconcileStarting
+	// runs on a runtime's HEAD reconcile worker before each reconcile.
+	runtimeStarted, mountReleased, joinRecorded, joinFinished, readyRecorded, gateOpened, passDeferred, headReconcileStarting func()
 	// headReconcileBackoff is the first retry delay after a failed HEAD
 	// reconcile; zero means headReconcileMinBackoff.
 	headReconcileBackoff time.Duration
@@ -195,12 +196,12 @@ func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error
 	}
 	tempDir, err := emptyDaemonTempDir(root)
 	if err != nil {
-		lock.Close()
+		releaseDaemonLock(lock)
 		return nil, err
 	}
 	c, err := newCore(ctx, root, tempDir, logger)
 	if err != nil {
-		lock.Close()
+		releaseDaemonLock(lock)
 		return nil, err
 	}
 	return &Service{
@@ -269,10 +270,16 @@ func (s *Service) hydrationWorkers() int {
 	return DefaultHydrationConcurrency
 }
 
-// Close unmounts every repo and releases the registry, the git processes and
-// the daemon lock, also when an unmount fails. It returns the first error. A
-// runtime that failed to unmount keeps its workers, so Close does not wait
-// for its preparation.
+// Close stops every repo and releases the registry, the git processes and the
+// daemon lock, also when a stop fails. It returns the first error. A stop
+// fails when its unmount fails, which keeps the mount, when its drain times
+// out, or when an earlier unmount of the repo has not returned. A stop can
+// also not return within stopWaitTimeout. In each case Close cancels the
+// runtime's context and waits for the runtime's workers, within the same
+// stopWaitTimeout. It leaves the runtime's FUSE server and hydrator to the
+// process exit. When a runtime's workers outlive the wait, a preparation of
+// the runtime can still run, so Close then does not wait for the
+// preparations.
 func (s *Service) Close() error {
 	s.mu.Lock()
 	s.closing = true
@@ -282,9 +289,15 @@ func (s *Service) Close() error {
 	}
 	s.mu.Unlock()
 	var errs []error
+	workersEnded := true
 	for _, cfg := range cfgs {
+		deadline := time.Now().Add(stopWaitTimeout)
 		if err := s.unmount(cfg.ID); err != nil {
 			errs = append(errs, err)
+			if err := s.endWorkers(cfg.ID, deadline); err != nil {
+				errs = append(errs, err)
+				workersEnded = false
+			}
 			continue
 		}
 		// The next daemon on the root finds no mount of this one's to
@@ -296,14 +309,14 @@ func (s *Service) Close() error {
 			clearFailure(rec, phaseUnmount)
 		})
 	}
-	if len(errs) == 0 {
+	if workersEnded {
 		s.prepareWorkers.Wait()
 	}
 	s.git.Close()
 	if err := s.registry.Close(); err != nil {
 		errs = append(errs, err)
 	}
-	if err := s.lock.Close(); err != nil {
+	if err := releaseDaemonLock(s.lock); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {

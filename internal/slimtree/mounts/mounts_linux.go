@@ -224,6 +224,9 @@ func holds(proc, path string, key Key) bool {
 	return false
 }
 
+// ParentPID returns the PID of pid's parent.
+func ParentPID(pid int) (int, error) { return parentPID(pid) }
+
 // parentPID returns pid's parent from /proc/<pid>/stat.
 func parentPID(pid int) (int, error) {
 	fields, err := readStat(pid)

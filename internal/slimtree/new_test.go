@@ -436,30 +436,12 @@ func TestRmRemovesTheWorktreeAndItsRecord(t *testing.T) {
 	}
 }
 
-// This release makes and removes only apfsclone worktrees. new refuses an
-// artifactfs worktree, Linux's default, and rm an artifactfs record, each with
-// exit 1, and changes nothing.
-func TestArtifactFSWorktreesAreNotInThisReleaseYet(t *testing.T) {
+// This release removes no artifactfs worktree: rm refuses an artifactfs
+// record with exit 1, and changes nothing.
+func TestRmOfArtifactFSWorktreesIsNotInThisReleaseYet(t *testing.T) {
 	homeAfterFirstRun(t)
 	main := newRepo(t)
-	const notYet = ": artifactfs worktrees are not in this release yet; this release makes and removes only apfsclone worktrees, on macOS\n"
-	for _, tc := range []struct {
-		goos  string
-		probe doctor.Probe
-		args  []string
-	}{
-		{goos: "linux", probe: healthyLinux(), args: []string{"new", "feat"}},
-		{goos: "linux", probe: healthyLinux(), args: []string{"--backend", "artifactfs", "new", "feat"}},
-		{goos: "darwin", probe: healthyDarwin(), args: []string{"--backend", "artifactfs", "new", "feat"}},
-	} {
-		var stdout, stderr bytes.Buffer
-		if code := run(t.Context(), tc.goos, tc.probe, tc.args, &stdout, &stderr); code != 1 || stdout.Len() != 0 || stderr.String() != "slimtree new"+notYet {
-			t.Fatalf("%s on %s: exit %d, stdout %q, stderr %q; want exit 1 and the refusal", tc.args, tc.goos, code, stdout.String(), stderr.String())
-		}
-		requireNoWorktree(t, main, filepath.Join(filepath.Dir(main), "main-feat"))
-		gitFindsNothing(t, main, "rev-parse", "--verify", "--quiet", "refs/heads/feat")
-	}
-
+	const notYet = ": removing artifactfs worktrees is not supported yet; slimtree stop unmounts one\n"
 	served := filepath.Join(filepath.Dir(main), "served")
 	if err := os.Mkdir(served, 0o755); err != nil {
 		t.Fatal(err)
@@ -484,6 +466,37 @@ func TestArtifactFSWorktreesAreNotInThisReleaseYet(t *testing.T) {
 			t.Fatalf("rm on %s removed %s: %v", goos, served, err)
 		}
 	}
+}
+
+// new refuses, before git runs, a worktree whose record directory holds an
+// earlier worktree's state, which the new record and rm would take over.
+func TestNewRefusesARetainedRecordDirectory(t *testing.T) {
+	homeAfterFirstRun(t)
+	main := newRepo(t)
+	cloneWith(t, nil)
+	home, err := openHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(filepath.Dir(main), "main-feat")
+	kept := filepath.Join(home.RecordDir(dest), "state", "kept")
+	if err := os.MkdirAll(filepath.Dir(kept), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(kept, []byte("overlay\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, stdout, stderr := slimtree(t.Context(), "new", "feat"); code != 1 || stdout != "" ||
+		!strings.Contains(stderr, "holds the state of an earlier worktree at "+dest) || strings.Contains(stderr, "Preparing worktree") {
+		t.Fatalf("new over a retained record directory: exit %d, stdout %q, stderr %q; want exit 1 and the refusal before git worktree add", code, stdout, stderr)
+	}
+	if data, err := os.ReadFile(kept); err != nil || string(data) != "overlay\n" {
+		t.Errorf("the earlier worktree's state = %q, %v; want it kept", data, err)
+	}
+	if _, err := os.Lstat(dest); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("%s exists: %v", dest, err)
+	}
+	gitFindsNothing(t, main, "rev-parse", "--verify", "--quiet", "refs/heads/feat")
 }
 
 // rm refuses a worktree in which git status lists anything, and changes

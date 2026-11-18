@@ -114,7 +114,7 @@ func TestStatusTrustsTheRecordOnlyWhileADaemonRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lock.Close()
+	defer releaseDaemonLock(lock)
 	st, err = ctl.Status(ctx, "repo")
 	if err != nil {
 		t.Fatal(err)
@@ -145,13 +145,7 @@ func TestRunningNamesTheDaemonLockHolder(t *testing.T) {
 		t.Fatal(err)
 	}
 	running(os.Getpid(), true)
-	// A child that a parallel test forks shares the lock's descriptor until
-	// it execs (golang/go#22315), so a close alone can leave the flock held
-	// for that instant. LOCK_UN drops it from the shared descriptor.
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_UN); err != nil {
-		t.Fatal(err)
-	}
-	if err := lock.Close(); err != nil {
+	if err := releaseDaemonLock(lock); err != nil {
 		t.Fatal(err)
 	}
 	if data, err := os.ReadFile(daemonLockPath(root)); err != nil || len(data) == 0 {
@@ -163,7 +157,7 @@ func TestRunningNamesTheDaemonLockHolder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer releaseDaemonLock(f)
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +273,7 @@ func heldDaemonLock(t *testing.T, ctl *Controller) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = lock.Close() })
+	t.Cleanup(func() { _ = releaseDaemonLock(lock) })
 }
 
 func newRegisteredController(t *testing.T) *Controller {
@@ -355,4 +349,23 @@ func TestStartRunsWithoutTheControlSocket(t *testing.T) {
 		st, err := ctl.Status(context.Background(), "repo")
 		return err == nil && st.State == repoStateMounted
 	})
+}
+
+// Close releases the daemon lock while a child that another goroutine forked
+// holds a copy of the lock file, until it execs, so the CLI sees no daemon and
+// the next daemon starts.
+func TestCloseReleasesTheDaemonLockAForkedChildHolds(t *testing.T) {
+	t.Parallel()
+	root := filepath.Join(shortTempDir(t), "artifact-fs")
+	svc, err := New(t.Context(), root, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gittest.HoldForkedCopies(t, daemonLockPath(root))
+	if err := svc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, running, err := Running(root); err != nil || running {
+		t.Fatalf("Running after Close = %v, %v; want no daemon", running, err)
+	}
 }

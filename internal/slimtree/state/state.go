@@ -75,9 +75,27 @@ type Record struct {
 	SlimtreeVersion string    `json:"slimtree_version"`
 	// StateDir is an artifactfs worktree's artifact-fs state root.
 	StateDir string `json:"state_dir,omitempty"`
+	// GitDir is an artifactfs worktree's git dir, below the common dir's
+	// worktrees directory.
+	GitDir string `json:"git_dir,omitempty"`
+	// DaemonPID and DaemonToken name the daemon that serves an artifactfs
+	// worktree, by its PID and the start token mounts.StartToken gave right
+	// after slimtree started it.
+	DaemonPID   int    `json:"daemon_pid,omitempty"`
+	DaemonToken string `json:"daemon_start_token,omitempty"`
+	// MountIdentity is the identity mounts.Identify gave the daemon's mount
+	// once it served.
+	MountIdentity string `json:"mount_identity,omitempty"`
 	// Head is the commit rm keeps in an archive's recovery ref. Only an
 	// archived record has it, and slimtree 0.1.0's rm wrote none.
 	Head string `json:"head,omitempty"`
+}
+
+// RecordDir is the directory of the record of the worktree at path. An
+// artifactfs worktree keeps its gitfile, its daemon's log and its state root
+// there.
+func (h *Home) RecordDir(path string) string {
+	return filepath.Join(h.dir, recordsDir, ID(path))
 }
 
 // Name is the worktree's directory name, by which commands find it.
@@ -98,7 +116,7 @@ func (h *Home) Write(r Record) error {
 	if err != nil {
 		return err
 	}
-	dir := filepath.Join(h.dir, recordsDir, ID(r.Path))
+	dir := h.RecordDir(r.Path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -107,7 +125,7 @@ func (h *Home) Write(r Record) error {
 
 // Remove removes the record of the worktree at path, with its directory.
 func (h *Home) Remove(path string) error {
-	return os.RemoveAll(filepath.Join(h.dir, recordsDir, ID(path)))
+	return os.RemoveAll(h.RecordDir(path))
 }
 
 // Archive writes a copy of r to archives/<ID>/<ns>/worktree.json, ns being

@@ -79,7 +79,7 @@ class GateTest(unittest.TestCase):
         outside = self.dir / "outside"
         outside.mkdir()
         for name, env, tag in [
-            ("branch push", {"GITHUB_EVENT_NAME": "push", "GITHUB_REF_TYPE": "branch", "GITHUB_REF_NAME": "main"}, "v0.1.0-alpha.1"),
+            ("branch push", {"GITHUB_EVENT_NAME": "push", "GITHUB_REF_TYPE": "branch", "GITHUB_REF_NAME": "main"}, "v0.1.0"),
             ("manual run", {"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF_TYPE": "branch", "DRY_RUN_TAG": "v0.2.0-rc.1"}, "v0.2.0-rc.1"),
             (
                 "manual run on a tag",

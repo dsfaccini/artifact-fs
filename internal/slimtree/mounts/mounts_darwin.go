@@ -148,6 +148,18 @@ func StartToken(pid int) (string, error) {
 	return fmt.Sprintf("%d:%d", t.Sec, t.Usec), nil
 }
 
+// ParentPID returns the PID of pid's parent.
+func ParentPID(pid int) (int, error) {
+	procs, err := unix.SysctlKinfoProcSlice("kern.proc.pid", pid)
+	if err != nil {
+		return 0, err
+	}
+	if len(procs) == 0 {
+		return 0, os.NewSyscallError("kern.proc.pid", unix.ESRCH)
+	}
+	return int(procs[0].Eproc.Ppid), nil
+}
+
 // Signal sends sig to the process pid names while its start token is token,
 // and returns ErrGone otherwise, also for a zombie, which has no token. With
 // signal 0 it only tells whether the process runs. macOS has no pidfd: a process that took pid

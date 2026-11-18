@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/apfsclone"
+	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 	"github.com/cloudflare/artifact-fs/internal/version"
 )
@@ -31,12 +32,16 @@ type newOptions struct {
 	// from is the commit-ish a new branch starts at.
 	from string
 	// track makes a new branch track from.
-	track bool
-	path  string
+	track   bool
+	path    string
+	backend backend
+	// goos is the platform slimtree runs on.
+	goos string
 }
 
-// newWorktree makes an apfsclone worktree on o.branch, cloned from the base
-// worktree, writes its record, and prints its path to stdout. It then runs
+// newWorktree makes a worktree on o.branch with o.backend, writes its
+// record, and prints its path to stdout. An apfsclone worktree is cloned from
+// the base worktree, and an artifactfs worktree is mounted. It then runs
 // the post-checkout hook, holding no lock, so the hook can run slimtree and a
 // long hook stalls no other command. A failed hook leaves the worktree and its
 // record, as git worktree add keeps its worktree.
@@ -77,6 +82,12 @@ func makeWorktree(ctx context.Context, home *state.Home, o newOptions, stdout, s
 	if o.path != "" {
 		if dest, err = state.Canonical(o.path); err != nil {
 			return "", "", err
+		}
+	}
+	// artifact-fs names the repo it mounts at dest after dest.
+	if o.backend == artifactFS {
+		if err := model.ValidateRepoName(filepath.Base(dest)); err != nil {
+			return "", "", fmt.Errorf("slimtree cannot mount a worktree at %s: %w", dest, err)
 		}
 	}
 	lock, err := home.Lock(ctx, dest)
@@ -133,11 +144,24 @@ func makeWorktree(ctx context.Context, home *state.Home, o newOptions, stdout, s
 	if _, ok := listed[dest]; ok {
 		return "", "", fmt.Errorf("git already registers a worktree at %s", dest)
 	}
+	// The directory of an earlier worktree's record can hold its state, which
+	// the new worktree's record and rm would take over.
+	if dir := home.RecordDir(dest); exists(dir) {
+		return "", "", fmt.Errorf("%s holds the state of an earlier worktree at %s; slimtree makes no worktree there while it exists", dir, dest)
+	}
 	// git worktree add makes the directories above dest that are missing.
 	for dir := filepath.Dir(dest); !exists(dir); dir = filepath.Dir(dir) {
 		rb.missing = dir
 	}
 
+	if o.backend == artifactFS {
+		head, err := newArtifactFS(ctx, home, &rb, o.goos, commit, addArgs, stderr)
+		if err != nil {
+			return "", "", err
+		}
+		fmt.Fprintln(stdout, dest)
+		return dest, head, nil
+	}
 	result, err := apfsclone.Add(ctx, apfsclone.Options{Base: base, Path: dest, Commit: commit, AddArgs: addArgs,
 		Clone: cloneFile, Stdout: stderr, Stderr: stderr})
 	var incomplete *apfsclone.IncompleteError

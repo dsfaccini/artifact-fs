@@ -8,9 +8,77 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
 )
+
+// defaultWriteGrace is how long a local write runs once its context ends.
+// Git creates a lock file, such as config.lock or index.lock, before it
+// installs the handler that removes its lock files on SIGTERM. A SIGTERM in
+// between kills Git and leaves the lock, and every later Git that takes it
+// fails. The window lasts microseconds, so a SIGTERM that waits this long
+// finds the handler installed.
+const defaultWriteGrace = 2 * time.Second
+
+// writeContext returns the context of one local write under ctx. A cancel or
+// deadline of ctx does not stop the write: the write ends at most s.writeGrace
+// after ctx does. It returns ctx's error when ctx has already ended, so no
+// write starts once its context ended. Call the returned func once the write
+// returns.
+func (s *Store) writeContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	writeCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stop := context.AfterFunc(ctx, func() {
+		if s.testHookWriteOutlived != nil {
+			s.testHookWriteOutlived()
+		}
+		time.AfterFunc(s.writeGrace, cancel)
+	})
+	return writeCtx, func() { stop(); cancel() }, nil
+}
+
+// write runs one local write under writeContext. A write that the grace
+// stopped fails with ctx's error, as a write that ctx stopped did.
+func (s *Store) write(ctx context.Context, run func(context.Context) (string, error)) (string, error) {
+	writeCtx, done, err := s.writeContext(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer done()
+	out, err := run(writeCtx)
+	if err != nil && writeCtx.Err() != nil {
+		if gitErr, ok := errors.AsType[*gitCommandError](err); ok {
+			gitErr.contextErr = ctx.Err()
+		} else if errors.Is(err, writeCtx.Err()) {
+			err = ctx.Err()
+		}
+	}
+	return out, err
+}
+
+// runGitWrite runs a git command that writes the git dir and contacts no
+// remote, such as git config, update-ref or symbolic-ref, under
+// writeContext.
+func (s *Store) runGitWrite(ctx context.Context, gitDir string, args ...string) (string, error) {
+	return s.runGitWriteWithEnv(ctx, gitDir, nil, args...)
+}
+
+func (s *Store) runGitWriteWithEnv(ctx context.Context, gitDir string, extraEnv []string, args ...string) (string, error) {
+	return s.write(ctx, func(ctx context.Context) (string, error) { return s.runGitWithEnv(ctx, gitDir, extraEnv, args...) })
+}
+
+func (s *Store) runGitWriteInput(ctx context.Context, gitDir string, extraEnv []string, input []byte, args ...string) (string, error) {
+	return s.write(ctx, func(ctx context.Context) (string, error) { return s.runGitInput(ctx, gitDir, extraEnv, input, args...) })
+}
+
+// runNetworkGitWrite runs a git read-tree, which writes the index and can
+// lazily fetch missing trees, as runNetworkGit does, under writeContext.
+func (s *Store) runNetworkGitWrite(ctx context.Context, gitDir string, args ...string) (string, error) {
+	return s.write(ctx, func(ctx context.Context) (string, error) { return s.runNetworkGit(ctx, gitDir, nil, args...) })
+}
 
 func (s *Store) runGit(ctx context.Context, gitDir string, args ...string) (string, error) {
 	return s.runGitWithEnv(ctx, gitDir, nil, args...)

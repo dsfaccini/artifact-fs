@@ -83,7 +83,7 @@ func (s *Store) CloneBlobless(ctx context.Context, cfg model.RepoConfig) error {
 		return err
 	}
 	// Populate the index so git status works inside the mount.
-	if _, err := s.runNetworkGit(ctx, targetGitDir, nil, "read-tree", "HEAD"); err != nil {
+	if _, err := s.runNetworkGitWrite(ctx, targetGitDir, "read-tree", "HEAD"); err != nil {
 		return err
 	}
 	if err := os.Rename(filepath.Join(target, ".git"), cfg.GitDir); err != nil {
@@ -146,22 +146,22 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 			initArgs = append(initArgs, "--object-format=sha256")
 		}
 		initArgs = append(initArgs, candidateGitDir)
-		if _, err := s.runGitWithEnv(ctx, "", env, initArgs...); err != nil {
+		if _, err := s.runGitWriteWithEnv(ctx, "", env, initArgs...); err != nil {
 			return err
 		}
 		// The Git directory is exposed through the mount's .git file, so Git
 		// must treat callers in the mounted directory as worktree operations.
-		if _, err := s.runGitWithEnv(ctx, candidateGitDir, env, "config", "core.bare", "false"); err != nil {
+		if _, err := s.runGitWriteWithEnv(ctx, candidateGitDir, env, "config", "core.bare", "false"); err != nil {
 			return err
 		}
 		if err := s.configureArtifactWorktree(ctx, candidateGitDir); err != nil {
 			return err
 		}
-		if _, err := s.runGitWithEnv(ctx, candidateGitDir, env, "remote", "add", "--", "origin", safeURL); err != nil {
+		if _, err := s.runGitWriteWithEnv(ctx, candidateGitDir, env, "remote", "add", "--", "origin", safeURL); err != nil {
 			return err
 		}
 		refspec := "+" + requirement.Ref + ":" + verifiedSourceTrackingRef
-		if _, err := s.runGitWithEnv(ctx, candidateGitDir, env, "config", "--replace-all", "remote.origin.fetch", refspec); err != nil {
+		if _, err := s.runGitWriteWithEnv(ctx, candidateGitDir, env, "config", "--replace-all", "remote.origin.fetch", refspec); err != nil {
 			return err
 		}
 		args := []string{"fetch", "--filter=blob:none", "--no-tags"}
@@ -210,7 +210,7 @@ func (s *Store) configureArtifactWorktree(ctx context.Context, gitDir string) er
 		{"core.symlinks", "true"},
 	}
 	for _, setting := range settings {
-		if _, err := s.runGit(ctx, gitDir, "config", "--local", setting[0], setting[1]); err != nil {
+		if _, err := s.runGitWrite(ctx, gitDir, "config", "--local", setting[0], setting[1]); err != nil {
 			return err
 		}
 	}
@@ -242,15 +242,15 @@ func (s *Store) cloneExactRef(ctx context.Context, target string, safeURL string
 		return fmt.Errorf("source ref %s advertised an unsupported object ID", ref)
 	}
 	initArgs = append(initArgs, target)
-	if _, err := s.runGitWithEnv(ctx, "", env, initArgs...); err != nil {
+	if _, err := s.runGitWriteWithEnv(ctx, "", env, initArgs...); err != nil {
 		return err
 	}
 	gitDir := filepath.Join(target, ".git")
-	if _, err := s.runGitWithEnv(ctx, gitDir, env, "remote", "add", "--", "origin", safeURL); err != nil {
+	if _, err := s.runGitWriteWithEnv(ctx, gitDir, env, "remote", "add", "--", "origin", safeURL); err != nil {
 		return err
 	}
 	refspec := "+" + ref + ":" + fetchedFullRefRemoteTrackingRef
-	if _, err := s.runGitWithEnv(ctx, gitDir, env, "config", "--replace-all", "remote.origin.fetch", refspec); err != nil {
+	if _, err := s.runGitWriteWithEnv(ctx, gitDir, env, "config", "--replace-all", "remote.origin.fetch", refspec); err != nil {
 		return err
 	}
 	fetchArgs := []string{"fetch", "--filter=blob:none", "--no-tags"}
@@ -265,7 +265,7 @@ func (s *Store) cloneExactRef(ctx context.Context, target string, safeURL string
 	if err != nil {
 		return fmt.Errorf("source ref %s did not resolve to a commit: %w", ref, err)
 	}
-	_, err = s.runGit(ctx, gitDir, "update-ref", "--no-deref", "HEAD", strings.TrimSpace(commit))
+	_, err = s.runGitWrite(ctx, gitDir, "update-ref", "--no-deref", "HEAD", strings.TrimSpace(commit))
 	return err
 }
 
@@ -300,13 +300,13 @@ func (s *Store) prepareFixedHEAD(ctx context.Context, gitDir string, commit stri
 	if !strings.EqualFold(strings.TrimSpace(resolved), commit) {
 		return fmt.Errorf("required commit %s resolved unexpectedly", commit)
 	}
-	if _, err := s.runGit(ctx, gitDir, "update-ref", "--no-deref", "HEAD", commit); err != nil {
+	if _, err := s.runGitWrite(ctx, gitDir, "update-ref", "--no-deref", "HEAD", commit); err != nil {
 		return err
 	}
 	if !resetIndex {
 		return nil
 	}
-	_, err = s.runNetworkGit(ctx, gitDir, nil, "read-tree", commit)
+	_, err = s.runNetworkGitWrite(ctx, gitDir, "read-tree", commit)
 	return err
 }
 
@@ -506,7 +506,7 @@ func (s *Store) configureRemote(ctx context.Context, repo model.RepoConfig, targ
 		return err
 	}
 	if strings.TrimSpace(actualRemote) != strings.TrimSpace(targetRemote) {
-		if _, err := s.runGitWithEnv(ctx, repo.GitDir, env, "remote", "set-url", "--", "origin", targetRemote); err != nil {
+		if _, err := s.runGitWriteWithEnv(ctx, repo.GitDir, env, "remote", "set-url", "--", "origin", targetRemote); err != nil {
 			return err
 		}
 	}
@@ -554,7 +554,7 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 		if strings.Trim(oldHeadOID, "0") != "" {
 			updateArgs = append(updateArgs, oldHeadOID)
 		}
-		if _, err := s.runGit(ctx, repo.GitDir, updateArgs...); err != nil {
+		if _, err := s.runGitWrite(ctx, repo.GitDir, updateArgs...); err != nil {
 			return s.rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
 		}
 		return nil
@@ -573,10 +573,10 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 	if err := s.readTreeTransition(ctx, repo.GitDir, oldOID, oid); err != nil {
 		return s.rollbackLandedReadTree(ctx, repo.GitDir, index, oldOID, oid, err)
 	}
-	if _, err := s.runGit(ctx, repo.GitDir, "update-ref", refName, oid, oldBranchOID); err != nil {
+	if _, err := s.runGitWrite(ctx, repo.GitDir, "update-ref", refName, oid, oldBranchOID); err != nil {
 		return s.rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
 	}
-	if _, err := s.runGit(ctx, repo.GitDir, "symbolic-ref", "HEAD", refName); err != nil {
+	if _, err := s.runGitWrite(ctx, repo.GitDir, "symbolic-ref", "HEAD", refName); err != nil {
 		ctx, cancel := s.rollbackContext(ctx)
 		defer cancel()
 		// HEAD resolves to the fetched commit when it was on the branch
@@ -616,7 +616,7 @@ func (s *Store) trackRemoteBranch(ctx context.Context, repo model.RepoConfig, br
 		return err
 	}
 	if !slices.ContainsFunc(refspecs, func(e configEntry) bool { return e.value == refspec }) {
-		if _, err := s.runGit(ctx, repo.GitDir, "config", "--add", "remote.origin.fetch", refspec); err != nil {
+		if _, err := s.runGitWrite(ctx, repo.GitDir, "config", "--add", "remote.origin.fetch", refspec); err != nil {
 			return err
 		}
 	}
@@ -641,7 +641,7 @@ func (s *Store) trackRemoteBranch(ctx context.Context, repo model.RepoConfig, br
 // other failure as err. Only exit code 128 under a live context is a refusal:
 // a failed config write exits 1, and a canceled command can exit with any code.
 func (s *Store) setOriginUpstream(ctx context.Context, gitDir, branch string) (refusal, err error) {
-	if _, err := s.runGit(ctx, gitDir, "branch", "--set-upstream-to", "refs/remotes/origin/"+branch, "--", branch); err != nil {
+	if _, err := s.runGitWrite(ctx, gitDir, "branch", "--set-upstream-to", "refs/remotes/origin/"+branch, "--", branch); err != nil {
 		if exitErr, ok := errors.AsType[*gitCommandError](err); ok && exitErr.exitCode == 128 && ctx.Err() == nil {
 			return err, nil
 		}
@@ -654,7 +654,7 @@ func (s *Store) setOriginUpstream(ctx context.Context, gitDir, branch string) (r
 	if remote == "origin" {
 		return nil, nil
 	}
-	if _, err := s.runGit(ctx, gitDir, "branch", "--unset-upstream", "--", branch); err != nil {
+	if _, err := s.runGitWrite(ctx, gitDir, "branch", "--unset-upstream", "--", branch); err != nil {
 		return nil, err
 	}
 	return fmt.Errorf("git tracks branch %s on remote %s, not origin", branch, remote), nil
@@ -674,10 +674,11 @@ func (s *Store) refOIDOrZero(ctx context.Context, gitDir string, refName string)
 const defaultRollbackTimeout = 20 * time.Second
 
 // RollbackBound bounds how long PrepareFetchedBranch runs once its context
-// ends: the git command the cancel stops exits within GitCommandWaitDelay,
-// then the rollback ends at its deadline, plus GitCommandWaitDelay for the git
-// command that deadline stops. The daemon's drain must outlast it.
-const RollbackBound = defaultRollbackTimeout + 2*GitCommandWaitDelay
+// ends. A local write that runs then goes on for at most defaultWriteGrace,
+// and any git command the end stops exits within GitCommandWaitDelay. The
+// rollback then ends at its deadline, plus as much again for the git command
+// that runs then. The daemon's drain must outlast it.
+const RollbackBound = defaultRollbackTimeout + 2*(defaultWriteGrace+GitCommandWaitDelay)
 
 // defaultRollbackContext is the context of one rollback: it outlives ctx's
 // cancellation and ends after defaultRollbackTimeout.
@@ -769,7 +770,7 @@ func (s *Store) restoreIndex(ctx context.Context, gitDir string, fromOID string,
 }
 
 func (s *Store) restoreRef(ctx context.Context, gitDir string, refName string, oldOID string, newOID string) error {
-	if _, err := s.runGit(ctx, gitDir, "update-ref", refName, oldOID, newOID); err != nil {
+	if _, err := s.runGitWrite(ctx, gitDir, "update-ref", refName, oldOID, newOID); err != nil {
 		return fmt.Errorf("restore ref after HEAD update failure: %w", err)
 	}
 	return nil
@@ -793,7 +794,7 @@ func (s *Store) currentOrEmptyTreeOID(ctx context.Context, gitDir string) (strin
 // readTreeTransition moves the index from oldOID's tree to newOID's. In a git
 // dir cloned without trees, read-tree fetches the trees it lacks.
 func (s *Store) readTreeTransition(ctx context.Context, gitDir string, oldOID string, newOID string) error {
-	_, err := s.runNetworkGit(ctx, gitDir, nil, "read-tree", "-m", oldOID, newOID)
+	_, err := s.runNetworkGitWrite(ctx, gitDir, "read-tree", "-m", oldOID, newOID)
 	return err
 }
 

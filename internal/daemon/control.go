@@ -35,7 +35,7 @@ func controlSocketFits(path string) bool {
 }
 
 // acquireDaemonLock takes the flock that marks root's daemon as running and
-// writes the daemon's pid into the lock file. Closing the file releases it.
+// writes the daemon's pid into the lock file. releaseDaemonLock releases it.
 func acquireDaemonLock(root string) (*os.File, error) {
 	path := daemonLockPath(root)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
@@ -57,14 +57,25 @@ func acquireDaemonLock(root string) (*os.File, error) {
 		}
 	}
 	if err := f.Truncate(0); err != nil {
-		f.Close()
+		releaseDaemonLock(f)
 		return nil, err
 	}
 	if _, err := f.WriteAt([]byte(strconv.Itoa(os.Getpid())+"\n"), 0); err != nil {
-		f.Close()
+		releaseDaemonLock(f)
 		return nil, err
 	}
 	return f, nil
+}
+
+// releaseDaemonLock releases the daemon lock f holds, then closes f. Closing
+// f alone keeps the lock while a child that another goroutine forked holds a
+// copy of f, until it execs, so a daemon started meanwhile would fail.
+func releaseDaemonLock(f *os.File) error {
+	err := unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 // Running reports whether a daemon holds root's daemon lock, and the pid the

@@ -153,9 +153,12 @@ jobs:
         run: |
           # The daemon runs inside the test binary, so -race covers it under kernel load.
           go test -race -c -o "$RUNNER_TEMP/artifact-fs-e2e.test" .
+          # TestE2ESlimtreeLifecycle drives this binary. The root run has no go on PATH to build it.
+          go build -o "$RUNNER_TEMP/slimtree" ./cmd/slimtree
+          export AFS_E2E_SLIMTREE="$RUNNER_TEMP/slimtree"
           as_user=()
           if [ "${{ matrix.user }}" = root ]; then
-            as_user=(sudo --preserve-env=AFS_RUN_E2E_TESTS)
+            as_user=(sudo --preserve-env=AFS_RUN_E2E_TESTS,AFS_E2E_SLIMTREE)
           fi
           # A hang can stop the binary's -test.timeout panic from printing, so a
           # watchdog dumps every goroutine a minute after that timeout.

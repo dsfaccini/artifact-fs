@@ -225,6 +225,27 @@ func PostCheckout(ctx context.Context, path, head string, stdout, stderr io.Writ
 	return nil
 }
 
+// Register registers the worktree o.Path from o.Base as git worktree add
+// --no-checkout with o.AddArgs and o.Commit does, and reads the commit it
+// checks out into its index, holding the registration lock, as Add does. It
+// clones and writes no file. It returns that commit. A failure after git
+// worktree add returns an IncompleteError.
+func Register(ctx context.Context, o Options) (string, error) {
+	base, err := filepath.Abs(o.Base)
+	if err != nil {
+		return "", err
+	}
+	dest, err := filepath.Abs(o.Path)
+	if err != nil {
+		return "", err
+	}
+	out, err := git(ctx, base, nil, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	return register(ctx, o, base, dest, filepath.Join(strings.TrimSpace(string(out)), RegistrationLock))
+}
+
 // register runs git worktree add --no-checkout, resolves the new worktree's
 // HEAD and reads that commit into its index, holding the flock on lockPath.
 // It returns the commit. A failure after git worktree add returns an
@@ -254,7 +275,9 @@ func register(ctx context.Context, o Options, base, dest, lockPath string) (stri
 }
 
 // lockFile takes an exclusive flock on path, which it creates when missing.
-// The returned func releases it. A canceled ctx ends the wait.
+// The returned func releases it with LOCK_UN, then closes the file: closing
+// alone keeps the lock while a child that another goroutine forked holds a
+// copy of the file, until it execs. A canceled ctx ends the wait.
 func lockFile(ctx context.Context, path string) (func(), error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o666)
 	if err != nil {
@@ -276,15 +299,24 @@ func lockFile(ctx context.Context, path string) (func(), error) {
 			f.Close()
 			return nil, fmt.Errorf("flock %s: %w", path, err)
 		}
-		return func() { f.Close() }, nil
+		return func() { unlockFile(f) }, nil
 	case <-ctx.Done():
-		// Closing the file releases a flock that lands later.
+		// Release a flock that lands later.
 		go func() {
-			<-acquired
-			f.Close()
+			if <-acquired == nil {
+				unlockFile(f)
+			} else {
+				f.Close()
+			}
 		}()
 		return nil, ctx.Err()
 	}
+}
+
+// unlockFile releases the flock f holds, then closes f.
+func unlockFile(f *os.File) {
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	f.Close()
 }
 
 // preflight refuses a base and a parent of dest that are not on one volume,
