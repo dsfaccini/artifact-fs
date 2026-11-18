@@ -48,7 +48,7 @@ func backendUsage(goos string) string {
 // notInThisRelease refuses cmd on a worktree of backend b, which this release
 // cannot make or remove.
 func notInThisRelease(cmd, b string) error {
-	return fmt.Errorf("%s: %s worktrees are not supported yet, and Linux support is coming; slimtree makes and removes only apfsclone worktrees, on macOS", cmd, b)
+	return fmt.Errorf("%s: %s worktrees are not supported yet; Linux support is coming, and until then slimtree makes and removes only apfsclone worktrees, on macOS", cmd, b)
 }
 
 // runDoctor runs doctor's checks for backend. An artifactfs report also
