@@ -24,6 +24,11 @@ type Store struct {
 	gitRetryDelays []time.Duration
 	// rollbackContext makes the context of one rollback. Tests replace it.
 	rollbackContext func(context.Context) (context.Context, context.CancelFunc)
+	// writeGrace is how long a local write runs once its context ends.
+	writeGrace time.Duration
+	// testHookWriteOutlived, when set, runs once the context of a running
+	// local write ends.
+	testHookWriteOutlived func()
 	// tempDir holds the SSH wrapper's directory, the bootstrap's private
 	// worktree and each git's stream files; "" means the system temp
 	// directory.
@@ -53,6 +58,7 @@ func New(logger *slog.Logger) *Store {
 		pools:           map[string]*batchPool{},
 		gitRetryDelays:  append([]time.Duration(nil), defaultGitRetryDelays...),
 		rollbackContext: defaultRollbackContext,
+		writeGrace:      defaultWriteGrace,
 	}
 }
 
