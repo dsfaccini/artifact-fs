@@ -21,6 +21,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/registry"
@@ -47,6 +48,14 @@ func linux(ctx context.Context, args ...string) (code int, stdout, stderr string
 	var out, errOut bytes.Buffer
 	code = run(ctx, "linux", healthyLinux(), args, &out, &errOut)
 	return code, out.String(), errOut.String()
+}
+
+// slimtree waits for a daemon's exit after SIGTERM at least as long as the
+// daemon's Close can take, so its SIGKILL never cuts the unmount short.
+func TestDaemonTermWaitOutlastsTheDaemonsExit(t *testing.T) {
+	if daemonTermWait < daemon.ExitBound {
+		t.Fatalf("daemonTermWait = %v, want at least daemon.ExitBound %v", daemonTermWait, daemon.ExitBound)
+	}
 }
 
 // A new that fails before it writes the record stops the daemon it started

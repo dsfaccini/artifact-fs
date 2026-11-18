@@ -50,7 +50,7 @@ const (
 
 // daemonTermWait is how long a daemon has to exit after SIGTERM. Tests
 // lower it.
-var daemonTermWait = time.Minute
+var daemonTermWait = daemon.ExitBound
 
 // daemonKillWait bounds the reap of a daemon slimtree started, after SIGKILL.
 const daemonKillWait = time.Minute
