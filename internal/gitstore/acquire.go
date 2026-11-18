@@ -674,11 +674,11 @@ func (s *Store) refOIDOrZero(ctx context.Context, gitDir string, refName string)
 const defaultRollbackTimeout = 20 * time.Second
 
 // RollbackBound bounds how long PrepareFetchedBranch runs once its context
-// ends. A local write that runs then goes on for at most defaultWriteGrace,
+// ends. A local write that runs then goes on for at most WriteGrace,
 // and any git command the end stops exits within GitCommandWaitDelay. The
 // rollback then ends at its deadline, plus as much again for the git command
 // that runs then. The daemon's drain must outlast it.
-const RollbackBound = defaultRollbackTimeout + 2*(defaultWriteGrace+GitCommandWaitDelay)
+const RollbackBound = defaultRollbackTimeout + 2*(WriteGrace+GitCommandWaitDelay)
 
 // defaultRollbackContext is the context of one rollback: it outlives ctx's
 // cancellation and ends after defaultRollbackTimeout.

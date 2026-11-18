@@ -257,10 +257,13 @@ func register(ctx context.Context, o Options, base, dest, lockPath string) (stri
 	}
 	defer unlock()
 	args := append([]string{"-C", base, "worktree", "add", "--no-checkout"}, o.AddArgs...)
-	add := exec.CommandContext(ctx, "git", append(args, dest, o.Commit)...)
-	configureGit(add)
-	add.Stdout, add.Stderr = o.Stdout, o.Stderr
-	if err := gitstore.RunWithFiles(add, "", nil, nil); err != nil {
+	err = gitWrite(ctx, func(ctx context.Context) error {
+		add := exec.CommandContext(ctx, "git", append(args, dest, o.Commit)...)
+		configureGit(add)
+		add.Stdout, add.Stderr = o.Stdout, o.Stderr
+		return gitstore.RunWithFiles(add, "", nil, nil)
+	})
+	if err != nil {
 		return "", fmt.Errorf("git worktree add %s: %w", dest, err)
 	}
 	out, err := git(ctx, dest, nil, "rev-parse", "--verify", "HEAD^{commit}")
@@ -268,10 +271,37 @@ func register(ctx context.Context, o Options, base, dest, lockPath string) (stri
 		return "", &IncompleteError{dest, err}
 	}
 	head := strings.TrimSpace(string(out))
-	if _, err := git(ctx, dest, nil, "read-tree", head); err != nil {
+	err = gitWrite(ctx, func(ctx context.Context) error {
+		_, err := git(ctx, dest, nil, "read-tree", head)
+		return err
+	})
+	if err != nil {
 		return "", &IncompleteError{dest, err}
 	}
 	return head, nil
+}
+
+// writeGrace is how long a git that gitWrite runs keeps running once its
+// context ends.
+var writeGrace = gitstore.WriteGrace
+
+// writeOutlived, when set, runs when the context of a git that gitWrite runs
+// ends before the git returns. Production code leaves it nil.
+var writeOutlived func()
+
+// gitWrite runs run, which runs one git that writes the user's refs, config or
+// index under gitstore.WriteContext. That git contacts no remote, or is a
+// read-tree, which can lazily fetch missing trees as gitstore's
+// runNetworkGitWrite can. The git starts
+// only while ctx lives, and runs for at most writeGrace once ctx ends, so its
+// stop finds the handler that removes its lock files installed.
+func gitWrite(ctx context.Context, run func(context.Context) error) error {
+	writeCtx, done, err := gitstore.WriteContext(ctx, writeGrace, writeOutlived)
+	if err != nil {
+		return err
+	}
+	defer done()
+	return run(writeCtx)
 }
 
 // lockFile takes an exclusive flock on path, which it creates when missing.

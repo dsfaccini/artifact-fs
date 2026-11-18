@@ -30,7 +30,7 @@ func waitForFile(t *testing.T, path string, done <-chan error) {
 }
 
 // newShortGraceStore is New with a write grace short enough that a test whose
-// fake git hangs until it is stopped does not wait out defaultWriteGrace. Use
+// fake git hangs until it is stopped does not wait out WriteGrace. Use
 // it where the grace is not the test's subject.
 func newShortGraceStore(logger *slog.Logger) *Store {
 	s := New(logger)

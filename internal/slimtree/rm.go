@@ -89,7 +89,7 @@ func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, g
 		if ref, err = home.Archive(r); err != nil {
 			return err
 		}
-		if _, err := apfsclone.Git(ctx, r.CommonDir, "update-ref", ref, head, ""); err != nil {
+		if _, err := gitWrite(ctx, r.CommonDir, "update-ref", ref, head, ""); err != nil {
 			return err
 		}
 	}

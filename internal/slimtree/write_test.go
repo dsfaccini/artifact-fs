@@ -1,0 +1,185 @@
+package slimtree
+
+import (
+	"context"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/cloudflare/artifact-fs/internal/apfsclone"
+	"github.com/cloudflare/artifact-fs/internal/execfile"
+	"github.com/cloudflare/artifact-fs/internal/gittest"
+)
+
+// heldWrite is a fake git first on PATH that holds each git whose arguments
+// contain hold until released exists, and marks a SIGTERM in termed. Its
+// outlived closes once the context of a git that gitWrite runs ends. Its
+// grace outlasts the test, so a SIGTERM can only come from that end.
+type heldWrite struct {
+	started, released, termed string
+	outlived                  chan struct{}
+}
+
+// holdWrite installs a heldWrite. Its test is serial: it sets PATH,
+// writeGrace and writeOutlived.
+func holdWrite(t *testing.T, hold string) heldWrite {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	h := heldWrite{started: filepath.Join(dir, "started"), released: filepath.Join(dir, "released"), termed: filepath.Join(dir, "termed"), outlived: make(chan struct{})}
+	if err := execfile.Write(filepath.Join(dir, "git"), []byte("#!/bin/sh\ncase \" $* \" in *\""+hold+"\"*)\n"+
+		"  trap ': > \"$AFS_TERMED\"; exit 143' TERM\n  : > \"$AFS_STARTED\"\n  i=0\n"+
+		"  while [ ! -e \"$AFS_RELEASED\" ] && [ \"$i\" -lt 6000 ]; do sleep 0.01; i=$((i+1)); done\n  ;;\nesac\n"+
+		"exec '"+realGit+"' \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AFS_STARTED", h.started)
+	t.Setenv("AFS_RELEASED", h.released)
+	t.Setenv("AFS_TERMED", h.termed)
+	var once sync.Once
+	grace, hook := writeGrace, writeOutlived
+	writeGrace, writeOutlived = time.Hour, func() { once.Do(func() { close(h.outlived) }) }
+	t.Cleanup(func() { writeGrace, writeOutlived = grace, hook })
+	return h
+}
+
+// outlive ends the held git's context with end once the git started, checks
+// that the git outlived it, and releases the git. It fails t when returned
+// delivers first.
+func (h heldWrite) outlive(t *testing.T, end func(), returned <-chan int) {
+	t.Helper()
+	for {
+		if _, err := os.Stat(h.started); err == nil {
+			break
+		}
+		select {
+		case code := <-returned:
+			t.Fatalf("slimtree exited %d before the held git started", code)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	end()
+	select {
+	case <-h.outlived:
+	case code := <-returned:
+		t.Fatalf("slimtree exited %d while the held git waited, want the git to outlive its context", code)
+	}
+	if _, err := os.Stat(h.termed); err == nil {
+		t.Fatal("the end of its context sent the running git SIGTERM")
+	}
+	if err := os.WriteFile(h.released, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// requireNoGitLock fails t when gitDir holds a lock file that a git left.
+// apfsclone's registration lock stays by design.
+func requireNoGitLock(t *testing.T, gitDir string) {
+	t.Helper()
+	err := filepath.WalkDir(gitDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if strings.HasSuffix(d.Name(), ".lock") && d.Name() != apfsclone.RegistrationLock {
+			t.Errorf("git left %s", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A Ctrl-C that lands while rm writes the recovery ref does not stop the
+// write. Git creates the ref's lock before it installs the handler that
+// removes its lock files on SIGTERM, so a SIGTERM in between would leave the
+// lock in the user's repository.
+func TestACanceledRmWritesItsRecoveryRef(t *testing.T) {
+	homeAfterFirstRun(t)
+	cloneWith(t, nil)
+	main := newRepo(t)
+	path := filepath.Join(filepath.Dir(main), "main-feat")
+	if code, _, stderr := slimtree(t.Context(), "new", "feat"); code != 0 {
+		t.Fatalf("new feat: exit %d, stderr %q", code, stderr)
+	}
+	head := gitIn(t, path, "rev-parse", "HEAD")
+	h := holdWrite(t, " update-ref refs/slimtree/")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	returned := make(chan int, 1)
+	go func() {
+		code, _, _ := slimtree(ctx, "rm", "main-feat")
+		returned <- code
+	}()
+	h.outlive(t, cancel, returned)
+	// git worktree remove starts no git once the context ended.
+	if code := <-returned; code != 1 {
+		t.Fatalf("rm exited %d, want 1", code)
+	}
+	if got := gitIn(t, main, "for-each-ref", "--format=%(objectname)", "refs/slimtree/"); got != head {
+		t.Fatalf("recovery refs point at %q, want %s", got, head)
+	}
+	requireNoGitLock(t, filepath.Join(main, ".git"))
+}
+
+// A rollback whose deadline passes while it deletes the branch new made, or
+// unsets the tracking config new wrote, does not stop the write. The
+// deadline expires once the held write started.
+func TestARollbackPastItsDeadlineEndsItsWrite(t *testing.T) {
+	for _, tc := range []struct{ name, hold string }{
+		{"branch", " update-ref -d refs/heads/feat "},
+		{"tracking config", " config --unset-all branch.feat.remote "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			homeAfterFirstRun(t)
+			main := newRepo(t)
+			expire := filepath.Join(t.TempDir(), "expire")
+			rollbackContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+				return gittest.ExpireOnFile(ctx, expire)
+			}
+			t.Cleanup(func() { rollbackContext = nil })
+			// The first clone ends new, which then rolls back.
+			path := filepath.Join(filepath.Dir(main), "main-feat")
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			cloneWith(t, func(src, dst string) error {
+				if strings.HasPrefix(dst, path+string(filepath.Separator)) {
+					cancel()
+				}
+				return copyClone(src, dst)
+			})
+			h := holdWrite(t, tc.hold)
+
+			returned := make(chan int, 1)
+			go func() {
+				code, _, _ := slimtree(ctx, "new", "feat", "--from", "topic", "--track")
+				returned <- code
+			}()
+			h.outlive(t, func() {
+				if err := os.WriteFile(expire, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}, returned)
+			if code := <-returned; code != 1 {
+				t.Fatalf("new exited %d, want 1", code)
+			}
+			switch tc.name {
+			case "branch":
+				gitFindsNothing(t, main, "rev-parse", "--verify", "--quiet", "refs/heads/feat")
+			case "tracking config":
+				gitFindsNothing(t, main, "config", "branch.feat.remote")
+			}
+			requireNoGitLock(t, filepath.Join(main, ".git"))
+		})
+	}
+}

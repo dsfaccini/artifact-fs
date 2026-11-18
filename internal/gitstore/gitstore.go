@@ -61,7 +61,7 @@ func New(logger *slog.Logger) *Store {
 		pools:           map[string]*batchPool{},
 		gitRetryDelays:  append([]time.Duration(nil), defaultGitRetryDelays...),
 		rollbackContext: defaultRollbackContext,
-		writeGrace:      defaultWriteGrace,
+		writeGrace:      WriteGrace,
 	}
 }
 
