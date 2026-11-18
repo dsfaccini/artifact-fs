@@ -18,6 +18,17 @@ inputs:
     description: The artifact's name. The ciphertext inside is <artifact>.tar.age.
     required: true
 
+outputs:
+  path:
+    description: The ciphertext that the action uploaded, or empty when it uploaded nothing.
+    value: ${{ steps.seal.outputs.path }}
+  artifact-id:
+    description: The uploaded artifact's ID, or empty when the action uploaded nothing.
+    value: ${{ steps.upload.outputs.artifact-id }}
+  artifact-digest:
+    description: The SHA-256 digest of the uploaded artifact's zip archive, or empty when the action uploaded nothing.
+    value: ${{ steps.upload.outputs.artifact-digest }}
+
 runs:
   using: composite
   steps:
@@ -56,6 +67,7 @@ runs:
         echo "Uploading the fuzz inputs, encrypted with age, as artifact $ARTIFACT."
 
     - name: Upload the ciphertext
+      id: upload
       if: steps.seal.outputs.path != ''
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
