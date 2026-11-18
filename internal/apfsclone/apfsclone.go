@@ -254,7 +254,9 @@ func register(ctx context.Context, o Options, base, dest, lockPath string) (stri
 }
 
 // lockFile takes an exclusive flock on path, which it creates when missing.
-// The returned func releases it. A canceled ctx ends the wait.
+// The returned func releases it with LOCK_UN, then closes the file: closing
+// alone keeps the lock while a child that another goroutine forked holds a
+// copy of the file, until it execs. A canceled ctx ends the wait.
 func lockFile(ctx context.Context, path string) (func(), error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o666)
 	if err != nil {
@@ -276,15 +278,24 @@ func lockFile(ctx context.Context, path string) (func(), error) {
 			f.Close()
 			return nil, fmt.Errorf("flock %s: %w", path, err)
 		}
-		return func() { f.Close() }, nil
+		return func() { unlockFile(f) }, nil
 	case <-ctx.Done():
-		// Closing the file releases a flock that lands later.
+		// Release a flock that lands later.
 		go func() {
-			<-acquired
-			f.Close()
+			if <-acquired == nil {
+				unlockFile(f)
+			} else {
+				f.Close()
+			}
 		}()
 		return nil, ctx.Err()
 	}
+}
+
+// unlockFile releases the flock f holds, then closes f.
+func unlockFile(f *os.File) {
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	f.Close()
 }
 
 // preflight refuses a base and a parent of dest that are not on one volume,

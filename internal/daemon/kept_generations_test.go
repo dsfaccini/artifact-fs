@@ -67,7 +67,7 @@ func TestKeptGenerationsWarnOnceEachTimeTheyReachTheThreshold(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { _ = lock.Close() })
+			t.Cleanup(func() { _ = releaseDaemonLock(lock) })
 			f.svc.recordRuntimeState(f.rt)
 			self, parent := uint32(os.Getpid()), uint32(os.Getppid())
 

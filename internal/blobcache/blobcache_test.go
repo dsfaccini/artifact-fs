@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/cloudflare/artifact-fs/internal/gittest"
 )
 
 // stage writes a blob of size bytes for oid to a staged file and returns its
@@ -255,7 +257,7 @@ func statsLocked(t *testing.T, dir string) bool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer unlockStats(f)
 	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if errors.Is(err, syscall.EWOULDBLOCK) {
 		return true
@@ -393,4 +395,18 @@ func TestFailedMoveLeavesPendingCountersToARecount(t *testing.T) {
 		t.Fatal("Install onto a directory succeeded; want the rename error")
 	}
 	requireStats(t, dir, Stats{Blobs: 2, Bytes: 20})
+}
+
+// Install releases the stats lock while a child that another goroutine forked
+// holds a copy of the stats file, until it execs.
+func TestInstallReleasesTheStatsLockAForkedChildHolds(t *testing.T) {
+	dir := t.TempDir()
+	oid := strings.Repeat("a", 40)
+	staged := stage(t, dir, oid, 4)
+	testHookAfterInstallMove = func(*os.File) { gittest.HoldForkedCopies(t, filepath.Join(dir, statsName)) }
+	defer func() { testHookAfterInstallMove = nil }()
+	if err := Install(dir, oid, staged); err != nil {
+		t.Fatal(err)
+	}
+	gittest.RequireFlockFree(t, filepath.Join(dir, statsName))
 }

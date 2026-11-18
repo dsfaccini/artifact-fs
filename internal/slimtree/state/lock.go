@@ -69,9 +69,10 @@ func (h *Home) Lock(ctx context.Context, path string) (*Lock, error) {
 			// The flock still waits. Release the lock once it lands.
 			go func() {
 				if <-acquired == nil {
-					unix.Flock(int(f.Fd()), unix.LOCK_UN)
+					release(f)
+				} else {
+					f.Close()
 				}
-				f.Close()
 			}()
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				return nil, h.busy()
@@ -107,7 +108,18 @@ func (h *Home) TryLock(path string) (*Lock, error) {
 // Unlock clears the holder and releases the lock.
 func (l *Lock) Unlock() error {
 	err := l.f.Truncate(0)
-	if closeErr := l.f.Close(); err == nil {
+	if releaseErr := release(l.f); err == nil {
+		err = releaseErr
+	}
+	return err
+}
+
+// release releases the flock f holds, then closes f. Closing f alone keeps the
+// lock while a child that another goroutine forked holds a copy of f, until it
+// execs.
+func release(f *os.File) error {
+	err := flock(f, unix.LOCK_UN)
+	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
 	return err
@@ -138,7 +150,7 @@ func hold(f *os.File, path string) (*Lock, error) {
 		_, err = f.WriteAt(data, 0)
 	}
 	if err != nil {
-		f.Close()
+		release(f)
 		return nil, err
 	}
 	return &Lock{f: f}, nil
