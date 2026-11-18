@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/apfsclone"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/doctor"
@@ -19,12 +20,12 @@ import (
 var goneListed func()
 
 // removeWorktree removes the apfsclone worktree arg names, with its ignored
-// files, as git worktree remove does, and its record. Without force, it
+// files, as git worktree remove does, and its record, then prunes. Without force, it
 // refuses a worktree in which git status lists a change or an untracked file,
 // whatever the config hides, and a worktree whose directory is gone, which
 // can be on a volume that is not mounted. It first writes the worktree's HEAD
 // to a recovery ref in the repository, and never deletes a branch.
-func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, goos, arg string, force bool, stdout io.Writer) error {
+func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, goos, arg string, force bool, stdout, stderr io.Writer) error {
 	lock, err := home.Lock(ctx, "")
 	if err != nil {
 		return err
@@ -86,6 +87,7 @@ func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, g
 
 	ref := ""
 	if head != "" {
+		r.Head = head
 		if ref, err = home.Archive(r); err != nil {
 			return err
 		}
@@ -107,8 +109,9 @@ func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, g
 	}
 	if ref == "" {
 		fmt.Fprintf(stdout, "removed %s\n", r.Path)
-		return nil
+	} else {
+		fmt.Fprintf(stdout, "removed %s; %s keeps its HEAD %s\n", r.Path, ref, head)
 	}
-	fmt.Fprintf(stdout, "removed %s; %s keeps its HEAD %s\n", r.Path, ref, head)
+	prune(ctx, home, time.Now()).write(stderr)
 	return nil
 }
