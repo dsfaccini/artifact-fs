@@ -3,6 +3,7 @@ package gitstore
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,15 @@ func waitForFile(t *testing.T, path string, done <-chan error) {
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
+}
+
+// newShortGraceStore is New with a write grace short enough that a test whose
+// fake git hangs until it is stopped does not wait out defaultWriteGrace. Use
+// it where the grace is not the test's subject.
+func newShortGraceStore(logger *slog.Logger) *Store {
+	s := New(logger)
+	s.writeGrace = 10 * time.Millisecond
+	return s
 }
 
 // A cancel that lands while a local write runs does not stop the write. Git
