@@ -17,18 +17,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// recordStats records in the index of worktree the stat data of each of
-// paths, as Git records the stat data of a file it checks out, so that Git
+// recordStats records in the index of worktree the stat data of each path in
+// sizes, as Git records the stat data of a file it checks out, so that Git
 // does not hash the file. It records none for a path that is not a regular
-// file, or whose mtime is not older than the second of before. Git still hashes an entry whose mtime is not
-// older than the index file's, which it treats as racily clean. recordStats
-// leaves the index unchanged when the index is not a regular file, when its
-// version is not 2, 3 or 4, when its object format is unknown, and when it
-// has an extension that Git must understand to read it, such as a split
-// index's link. It writes the index as Git does: it creates index.lock, which
-// fails while another process holds it, then renames the lock over the index.
-func recordStats(ctx context.Context, worktree string, paths []string, before time.Time) error {
-	if len(paths) == 0 {
+// file of the size that sizes holds for it, or whose mtime is not older than
+// the second of before. Git still hashes an entry whose mtime is not older
+// than the index file's, which it treats as racily clean. recordStats leaves
+// the index unchanged when the index is not a regular file, when its version
+// is not 2, 3 or 4, when its object format is unknown, and when it has an
+// extension that Git must understand to read it, such as a split index's
+// link. It writes the index as Git does: it creates index.lock, which fails
+// while another process holds it, gives the lock the index's mode, then
+// renames the lock over the index. On a failure it removes only that lock.
+func recordStats(ctx context.Context, worktree string, sizes map[string]int64, before time.Time) error {
+	if len(sizes) == 0 {
 		return nil
 	}
 	out, err := git(ctx, worktree, nil, "rev-parse", "--path-format=absolute", "--git-path", "index", "--show-object-format")
@@ -48,14 +50,12 @@ func recordStats(ctx context.Context, worktree string, paths []string, before ti
 	default:
 		return nil
 	}
-	if fi, err := os.Lstat(indexPath); err != nil {
+	fi, err := os.Lstat(indexPath)
+	if err != nil {
 		return err
-	} else if !fi.Mode().IsRegular() {
-		return nil
 	}
-	want := make(map[string]bool, len(paths))
-	for _, p := range paths {
-		want[p] = true
+	if !fi.Mode().IsRegular() {
+		return nil
 	}
 	lockPath := indexPath + ".lock"
 	lock, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
@@ -69,18 +69,23 @@ func recordStats(ctx context.Context, worktree string, paths []string, before ti
 			os.Remove(lockPath)
 		}
 	}()
+	// core.sharedRepository can give the index group permissions.
+	if err := lock.Chmod(fi.Mode().Perm()); err != nil {
+		return err
+	}
 	data, err := os.ReadFile(indexPath)
 	if err != nil {
 		return err
 	}
 	patched, err := patchIndexStats(data, newHash, func(name string) (*unix.Stat_t, error) {
-		if !want[name] {
+		size, ok := sizes[name]
+		if !ok {
 			return nil, nil
 		}
 		// Refresh handles a file that is gone or no longer regular.
 		var st unix.Stat_t
 		if unix.Lstat(filepath.Join(worktree, filepath.FromSlash(name)), &st) != nil ||
-			st.Mode&unix.S_IFMT != unix.S_IFREG || st.Mtim.Sec >= before.Unix() {
+			st.Mode&unix.S_IFMT != unix.S_IFREG || st.Size != size || st.Mtim.Sec >= before.Unix() {
 			return nil, nil
 		}
 		return &st, nil
@@ -211,7 +216,7 @@ func patchIndexStats(data []byte, newHash func() hash.Hash, stat func(name strin
 }
 
 // putStat writes st into the stat fields at the start of b, an index entry,
-// as Git's fill_stat_data does, and keeps the entry's mode.
+// as Git's fill_stat_data and munge_st_size do, and keeps the entry's mode.
 func putStat(b []byte, st *unix.Stat_t) {
 	be := binary.BigEndian
 	be.PutUint32(b[0:], uint32(st.Ctim.Sec))
@@ -222,7 +227,13 @@ func putStat(b []byte, st *unix.Stat_t) {
 	be.PutUint32(b[20:], uint32(st.Ino))
 	be.PutUint32(b[28:], st.Uid)
 	be.PutUint32(b[32:], st.Gid)
-	be.PutUint32(b[36:], uint32(st.Size))
+	// A size that is a nonzero multiple of 4 GiB would truncate to 0, which
+	// marks an entry racily smudged.
+	size := uint32(st.Size)
+	if size == 0 && st.Size != 0 {
+		size = 0x80000000
+	}
+	be.PutUint32(b[36:], size)
 }
 
 // decodeVarint decodes the variable-length integer that index version 4

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,10 +21,10 @@ import (
 var blobBin = strings.Repeat("blob\x00\xff", 8192)
 
 // alteringClone clones as clone does, then gives the clone of name in
-// worktree other bytes of its size and the mtime that mtime returns for the
-// clone's mtime. It stands for a base file that changed after Add's git
-// status.
-func alteringClone(clone Clonefile, worktree, name string, mtime func(time.Time) time.Time) Clonefile {
+// worktree the bytes that alter returns for its bytes, and the mtime that
+// mtime returns for its mtime. It stands for a base file that changed after
+// Add's git status.
+func alteringClone(clone Clonefile, worktree, name string, alter func([]byte) []byte, mtime func(time.Time) time.Time) Clonefile {
 	return func(src, dst string) error {
 		if err := clone(src, dst); err != nil || dst != filepath.Join(worktree, filepath.FromSlash(name)) {
 			return err
@@ -40,7 +41,11 @@ func alteringClone(clone Clonefile, worktree, name string, mtime func(time.Time)
 		if err != nil {
 			return err
 		}
-		_, err = f.WriteAt(flipped(data), 0)
+		data = alter(data)
+		_, err = f.WriteAt(data, 0)
+		if err == nil {
+			err = f.Truncate(int64(len(data)))
+		}
 		if closeErr := f.Close(); err == nil {
 			err = closeErr
 		}
@@ -145,7 +150,7 @@ func TestAddRecordsTheStatDataOfItsClones(t *testing.T) {
 			var stderr bytes.Buffer
 			_, err := Add(t.Context(), Options{Base: f.base, Path: path, Commit: "upstream/main",
 				AddArgs: []string{"-q", "-b", "feat/clone"}, Stderr: &stderr,
-				Clone: alteringClone(newRecorder(path).Clone, path, "data/blob.bin", keep),
+				Clone: alteringClone(newRecorder(path).Clone, path, "data/blob.bin", flipped, keep),
 				afterRegister: func() {
 					if tc.skipWorktree {
 						run(t, path, "update-index", "--skip-worktree", "Makefile")
@@ -239,7 +244,7 @@ func TestAddHashesACloneNewerThanItsBaseStatus(t *testing.T) {
 			var stderr bytes.Buffer
 			_, err := Add(t.Context(), Options{Base: f.base, Path: path, Commit: "upstream/main",
 				AddArgs: []string{"-q", "-b", "feat/clone"}, Stderr: &stderr,
-				Clone:        alteringClone(newRecorder(path).Clone, path, "data/blob.bin", tc.mtime),
+				Clone:        alteringClone(newRecorder(path).Clone, path, "data/blob.bin", flipped, tc.mtime),
 				afterRewrite: func(paths []string) { rewritten = paths }, now: tc.now})
 			if err != nil {
 				t.Fatalf("Add: %v\n%s", err, stderr.Bytes())
@@ -345,12 +350,221 @@ func TestRecordStatsLeavesAnIndexItDoesNotKnow(t *testing.T) {
 			write(t, filepath.Join(repo, "new.txt"), "new\n", 0o644)
 			tc.index(t, repo)
 			before := indexFile(t, repo)
-			if err := recordStats(t.Context(), repo, []string{"new.txt"}, time.Now().Add(time.Hour)); err != nil {
+			if err := recordStats(t.Context(), repo, map[string]int64{"new.txt": 4}, time.Now().Add(time.Hour)); err != nil {
 				t.Fatalf("recordStats: %v", err)
 			}
 			if !bytes.Equal(indexFile(t, repo), before) {
 				t.Error("recordStats changed the index")
 			}
 		})
+	}
+}
+
+// keepMtime keeps a clone's mtime.
+func keepMtime(mtime time.Time) time.Time { return mtime }
+
+// addClone runs Add for the worktree clone on the new branch feat/clone,
+// cloning with clone, and returns its path and the paths it rewrote.
+func addClone(t *testing.T, f fixture, clone func(path string) Clonefile, o Options) (string, []string) {
+	t.Helper()
+	path := filepath.Join(f.worktrees, "clone")
+	var rewritten []string
+	var stderr bytes.Buffer
+	o.Base, o.Path, o.Commit, o.AddArgs, o.Stderr = f.base, path, "upstream/main", []string{"-q", "-b", "feat/clone"}, &stderr
+	o.Clone = clone(path)
+	o.afterRewrite = func(paths []string) { rewritten = paths }
+	if _, err := Add(t.Context(), o); err != nil {
+		t.Fatalf("Add: %v\n%s", err, stderr.Bytes())
+	}
+	return path, rewritten
+}
+
+// TestAddHashesACloneOfAnotherSize gives the clone of data/blob.bin 5 more
+// bytes, keeping the base file's mtime. A clone whose size is not its blob's
+// cannot hold its blob's bytes, because Add refuses every checkout that
+// converts files. Add records no stat data for it, and rewrites it from Git.
+func TestAddHashesACloneOfAnotherSize(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil, nil)
+	grow := func(data []byte) []byte { return append(data, "grown"...) }
+	path, rewritten := addClone(t, f, func(path string) Clonefile {
+		return alteringClone(newRecorder(path).Clone, path, "data/blob.bin", grow, keepMtime)
+	}, Options{})
+	if !slices.Contains(rewritten, "data/blob.bin") {
+		t.Errorf("Add rewrote %q, want data/blob.bin among them", rewritten)
+	}
+	if read(t, filepath.Join(path, "data/blob.bin")) != blobBin {
+		t.Errorf("data/blob.bin does not hold its blob")
+	}
+}
+
+// commitInBase commits README.md with other bytes of its size in the base,
+// and gives the file an mtime older than any Add's clock.
+func commitInBase(t *testing.T, f fixture) {
+	t.Helper()
+	readme := filepath.Join(f.base, "README.md")
+	write(t, readme, "README\n", 0o644)
+	run(t, f.base, "commit", "-qm", "edit README.md", "README.md")
+	if err := os.Chtimes(readme, time.Time{}, baseMtime); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAddReadsTheBasesHEADOnceItsClockStarts commits README.md in the base
+// when Add reads its clock, as a commit, checkout or pull that writes the
+// file a second earlier would. Add then reads the new HEAD, whose README.md
+// differs from upstream main's, so it writes README.md from Git. Reading
+// HEAD before the clock trusted a clone of the new README.md. Add's HEAD
+// check before registration also catches this commit, so the test fails
+// only when both are gone.
+func TestAddReadsTheBasesHEADOnceItsClockStarts(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil, nil)
+	path, _ := addClone(t, f, func(path string) Clonefile { return newRecorder(path).Clone },
+		Options{now: func() time.Time { commitInBase(t, f); return time.Now() }})
+	if got := read(t, filepath.Join(path, "README.md")); got != "readme\n" {
+		t.Errorf("README.md = %q, want upstream main's", got)
+	}
+}
+
+// TestAddTrustsNoCloneOnceTheBasesHEADMoves commits a README.md edit in the
+// base after its git status, which therefore did not list the edit. Add
+// finds HEAD moved before it registers the worktree, trusts no clone, and
+// rewrites README.md from Git.
+func TestAddTrustsNoCloneOnceTheBasesHEADMoves(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil, nil)
+	path, rewritten := addClone(t, f, func(path string) Clonefile { return newRecorder(path).Clone },
+		Options{beforeRegister: func() { commitInBase(t, f) }})
+	if !slices.Contains(rewritten, "README.md") {
+		t.Errorf("Add rewrote %q, want README.md among them", rewritten)
+	}
+	if got := read(t, filepath.Join(path, "README.md")); got != "readme\n" {
+		t.Errorf("README.md = %q, want upstream main's", got)
+	}
+}
+
+// TestAddHashesAPathTheBasesAttributesConvert gives the base an untracked
+// .gitattributes whose filter swaps a and b in README.md, and a README.md of
+// swapped bytes. git status compares README.md through the filter, so it
+// lists nothing, and upstream main's attributes convert nothing. Add records
+// no stat data for README.md, and rewrites it from Git.
+func TestAddHashesAPathTheBasesAttributesConvert(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil, nil)
+	run(t, f.base, "config", "filter.swap.clean", "tr ab ba")
+	run(t, f.base, "config", "filter.swap.smudge", "tr ab ba")
+	write(t, filepath.Join(f.base, ".gitattributes"), "README.md filter=swap\n", 0o644)
+	readme := filepath.Join(f.base, "README.md")
+	write(t, readme, "rebdme\n", 0o644)
+	if err := os.Chtimes(readme, time.Time{}, baseMtime); err != nil {
+		t.Fatal(err)
+	}
+	if got := run(t, f.base, "status", "--porcelain", "--untracked-files=no", "--", "README.md"); got != "" {
+		t.Fatalf("git status in the base lists %q", got)
+	}
+	path, rewritten := addClone(t, f, func(path string) Clonefile { return newRecorder(path).Clone }, Options{})
+	if !slices.Contains(rewritten, "README.md") {
+		t.Errorf("Add rewrote %q, want README.md among them", rewritten)
+	}
+	if got := read(t, filepath.Join(path, "README.md")); got != "readme\n" {
+		t.Errorf("README.md = %q, want its blob", got)
+	}
+}
+
+// TestRecordStatsPatchesEveryIndexGitWrites has Git write indexes in each
+// object format and version, with and without the EOIE and IEOT extensions
+// that index.threads records, and with and without index.skipHash. Their
+// names are 0xFFE, 0xFFF, 0x1000 and 5000 bytes long, share long prefixes,
+// and one name of 0xFFF bytes is skip-worktree, which needs extended flags.
+// recordStats patches the entries of the files on disk, and the index must
+// then read back as the same index after Git's own refresh, and pass git
+// fsck. A parse that lands on the wrong entry writes stat data there under a
+// valid checksum.
+func TestRecordStatsPatchesEveryIndexGitWrites(t *testing.T) {
+	t.Parallel()
+	long := func(n int) string { return "long/" + strings.Repeat("n", n-len("long/")) }
+	prefix := "pre/" + strings.Repeat("p", 200) + "/"
+	files := []string{"a.txt", prefix + "a.txt", prefix + "b.txt", "zz.txt"}
+	for i := range 20 {
+		files = append(files, fmt.Sprintf("z/%02d.txt", i))
+	}
+	names := []string{long(0xffe), long(0xfff), long(0x1000), long(5000)}
+	for _, format := range []string{"sha1", "sha256"} {
+		for _, version := range []int{2, 3, 4} {
+			for _, threads := range []bool{false, true} {
+				for _, skipHash := range []bool{false, true} {
+					name := fmt.Sprintf("%s/version %d/threads %t/skipHash %t", format, version, threads, skipHash)
+					t.Run(name, func(t *testing.T) {
+						t.Parallel()
+						repo := t.TempDir()
+						run(t, repo, "init", "-q", "--object-format="+format)
+						run(t, repo, "config", "index.skipHash", strconv.FormatBool(skipHash))
+						if threads {
+							run(t, repo, "config", "index.threads", "4")
+							run(t, repo, "config", "index.recordEndOfIndexEntries", "true")
+							run(t, repo, "config", "index.recordOffsetTable", "true")
+						} else {
+							run(t, repo, "config", "index.threads", "1")
+						}
+						var info strings.Builder
+						sizes := map[string]int64{}
+						for _, p := range files {
+							content := "file " + p + "\n"
+							write(t, filepath.Join(repo, p), content, 0o644)
+							if err := os.Chtimes(filepath.Join(repo, p), time.Time{}, baseMtime); err != nil {
+								t.Fatal(err)
+							}
+							sizes[p] = int64(len(content))
+						}
+						for _, p := range append(slices.Clone(files), names...) {
+							oid := runInput(t, repo, "content of "+p, "hash-object", "-w", "--stdin")
+							if slices.Contains(files, p) {
+								oid = run(t, repo, "hash-object", "-w", p)
+							}
+							fmt.Fprintf(&info, "100644 %s\t%s\n", oid, p)
+						}
+						runInput(t, repo, info.String(), "update-index", "--add", "--index-info")
+						if version > 2 {
+							run(t, repo, "update-index", "--skip-worktree", long(0xfff))
+						}
+						run(t, repo, "update-index", "--index-version", strconv.Itoa(version))
+						index := indexFile(t, repo)
+						if got := binary.BigEndian.Uint32(index[4:]); got != uint32(version) {
+							t.Fatalf("index version = %d, want %d", got, version)
+						}
+						for _, ext := range []string{"EOIE", "IEOT"} {
+							if got := bytes.Contains(index, []byte(ext)); got != threads {
+								t.Fatalf("the index holds %s: %t", ext, got)
+							}
+						}
+						hashed := filepath.Join(t.TempDir(), "index")
+						if err := os.WriteFile(hashed, index, 0o644); err != nil {
+							t.Fatal(err)
+						}
+						runEnv(t, repo, []string{"GIT_INDEX_FILE=" + hashed}, "update-index", "-q", "--ignore-missing", "--refresh")
+
+						if err := recordStats(t.Context(), repo, sizes, time.Now().Add(time.Hour)); err != nil {
+							t.Fatalf("recordStats: %v", err)
+						}
+						patched := indexFile(t, repo)
+						hashSize := map[string]int{"sha1": 20, "sha256": 32}[format]
+						if zero := bytes.Equal(patched[len(patched)-hashSize:], make([]byte, hashSize)); zero != skipHash {
+							t.Fatalf("the index's checksum is zero: %t", zero)
+						}
+						got := runEnv(t, repo, nil, "ls-files", "--debug")
+						if want := runEnv(t, repo, []string{"GIT_INDEX_FILE=" + hashed}, "ls-files", "--debug"); got != want {
+							t.Errorf("git ls-files --debug after recordStats:\n%s\nafter Git's refresh:\n%s", got, want)
+						}
+						for _, p := range files {
+							if !strings.Contains(got, p+"\n  ctime: ") || strings.Contains(got, p+"\n  ctime: 0:0\n") {
+								t.Errorf("recordStats recorded no stat data for %s", p)
+							}
+						}
+						run(t, repo, "fsck", "--no-progress", "--no-dangling")
+					})
+				}
+			}
+		}
 	}
 }
