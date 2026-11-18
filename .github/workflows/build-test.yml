@@ -172,3 +172,137 @@ jobs:
             -test.run '^TestE2E' \
             -test.timeout=20m \
             -test.v
+
+  # A failing fuzz run uploads only the ciphertext of its inputs. This job fails
+  # one on a planted input and checks its upload. seal-fuzz-inputs-log checks
+  # its log.
+  seal-fuzz-inputs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # The planted input holds a string that no file of the repository holds
+      # and no step prints, so any copy of it in an upload or the log leaked.
+      - name: Plant a failing fuzz input
+        id: plant
+        working-directory: ${{ runner.temp }}
+        run: |
+          ssh-keygen -q -t ed25519 -N '' -C '' -f key
+          # FUZZ_AGE_RECIPIENT holds a key without a comment.
+          echo "recipient=$(cut -d' ' -f1,2 key.pub)" >>"$GITHUB_OUTPUT"
+          mkdir -p plant/testdata/fuzz/FuzzPlanted
+          cd plant
+          go mod init plant
+          cat >plant_test.go <<'EOF'
+          package plant
+
+          import "testing"
+
+          // Fails on every input and shows it, as a failure of redaction does.
+          func FuzzPlanted(f *testing.F) {
+            f.Fuzz(func(t *testing.T, s string) { t.Fatalf("leaked %q", s) })
+          }
+          EOF
+          # seal-fuzz-inputs-log derives the same string.
+          marker=$(echo "planted-$GITHUB_RUN_ID" | sha256sum | cut -c1-32)
+          printf 'go test fuzz v1\nstring("%s")\n' "$marker" >testdata/fuzz/FuzzPlanted/planted
+
+      - name: Fuzz the planted input
+        id: fuzz
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/plant
+        run: '"$GITHUB_WORKSPACE/.github/scripts/fuzz.sh" . FuzzPlanted 10s'
+
+      - name: Check that the planted input failed the run
+        env:
+          FUZZ_OUTCOME: ${{ steps.fuzz.outcome }}
+        run: test "$FUZZ_OUTCOME" = failure
+
+      - name: Seal the fuzz inputs
+        uses: ./.github/actions/seal-fuzz-inputs
+        with:
+          corpus: ${{ runner.temp }}/plant/testdata/fuzz
+          recipient: ${{ steps.plant.outputs.recipient }}
+          artifact: planted-fuzz-inputs
+
+      - name: Seal the fuzz inputs without a recipient
+        uses: ./.github/actions/seal-fuzz-inputs
+        with:
+          corpus: ${{ runner.temp }}/plant/testdata/fuzz
+          artifact: unsealed-fuzz-inputs
+
+      - name: Download the upload
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: planted-fuzz-inputs
+          path: ${{ runner.temp }}/uploaded
+
+      - name: Check that the upload is only ciphertext
+        working-directory: ${{ runner.temp }}
+        shell: bash
+        run: |
+          planted=plant/testdata/fuzz/FuzzPlanted/planted
+          marker=$(sed -n 's/^string("\(.*\)")$/\1/p' "$planted")
+          test -n "$marker"
+          test "$(find uploaded -type f)" = uploaded/planted-fuzz-inputs.tar.age
+          if grep -rqF "$marker" uploaded; then
+            echo "::error::The upload holds the planted input."
+            exit 1
+          fi
+          mkdir recovered
+          age -d -i key uploaded/planted-fuzz-inputs.tar.age | tar -x -C recovered
+          cmp "$planted" recovered/FuzzPlanted/planted
+
+  # A job's log is readable only once the job ends.
+  seal-fuzz-inputs-log:
+    needs: seal-fuzz-inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      - name: Check seal-fuzz-inputs' log and uploads
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          # A calling workflow prefixes the name with the name of its own job.
+          job=$(gh api "$run/jobs?filter=latest" --paginate \
+            --jq '.jobs[] | select(.name == "seal-fuzz-inputs" or (.name | endswith(" / seal-fuzz-inputs"))) | .id')
+          # The log can trail the job's end. It holds the escape sequences of
+          # colored output.
+          for _ in 1 2 3 4 5; do
+            gh api --allow-escape-sequences "repos/$GITHUB_REPOSITORY/actions/jobs/$job/logs" >log && break
+            sleep 15
+          done
+          if ! grep -qF -- '--- FAIL: FuzzPlanted' log; then
+            echo "::error::Found no log of seal-fuzz-inputs' failing fuzz run."
+            exit 1
+          fi
+          if ! grep -qF '##[warning]FUZZ_AGE_RECIPIENT is not set, so no fuzz inputs were uploaded.' log; then
+            echo "::error::seal-fuzz-inputs' log lacks the warning of the seal without a recipient."
+            exit 1
+          fi
+          marker=$(echo "planted-$GITHUB_RUN_ID" | sha256sum | cut -c1-32)
+          if grep -qF "$marker" log; then
+            echo "::error::seal-fuzz-inputs' log shows the planted input."
+            exit 1
+          fi
+          uploads=$(gh api "$run/artifacts" --paginate --jq '.artifacts[].name')
+          if ! grep -qx planted-fuzz-inputs <<<"$uploads"; then
+            echo "::error::seal-fuzz-inputs uploaded no planted-fuzz-inputs artifact."
+            exit 1
+          fi
+          if grep -qx unsealed-fuzz-inputs <<<"$uploads"; then
+            echo "::error::The seal without a recipient uploaded the fuzz inputs."
+            exit 1
+          fi

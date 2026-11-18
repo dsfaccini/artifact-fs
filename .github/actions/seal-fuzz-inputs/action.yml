@@ -1,0 +1,64 @@
+name: Seal fuzz inputs
+description: >-
+  Encrypts a fuzz corpus with age to one recipient and uploads only the
+  ciphertext, because a failing input can show a secret that redaction missed.
+  Puts age on PATH for the job's later steps.
+
+inputs:
+  corpus:
+    description: The corpus directory, such as internal/auth/testdata/fuzz.
+    required: true
+  recipient:
+    description: >-
+      The age recipient, such as an ssh-ed25519 public key. When it is empty,
+      the action uploads nothing and logs that.
+    required: false
+    default: ""
+  artifact:
+    description: The artifact's name. The ciphertext inside is <artifact>.tar.age.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Encrypt the corpus
+      id: seal
+      shell: bash
+      env:
+        AGE_VERSION: v1.3.2
+        AGE_SHA256: cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10
+        CORPUS: ${{ inputs.corpus }}
+        RECIPIENT: ${{ inputs.recipient }}
+        ARTIFACT: ${{ inputs.artifact }}
+      run: |
+        if [ -z "$RECIPIENT" ]; then
+          echo "::warning::FUZZ_AGE_RECIPIENT is not set, so no fuzz inputs were uploaded."
+          exit 0
+        fi
+        if [ "$RUNNER_OS" != Linux ] || [ "$RUNNER_ARCH" != X64 ]; then
+          echo "::error::seal-fuzz-inputs installs age for Linux X64 only, and this runner is $RUNNER_OS $RUNNER_ARCH."
+          exit 1
+        fi
+        bin="$RUNNER_TEMP/age-$AGE_VERSION"
+        if [ ! -x "$bin/age" ]; then
+          mkdir -p "$bin"
+          curl -fsSL -o "$bin/age.tar.gz" \
+            "https://github.com/FiloSottile/age/releases/download/$AGE_VERSION/age-$AGE_VERSION-linux-amd64.tar.gz"
+          echo "$AGE_SHA256  $bin/age.tar.gz" | sha256sum -c --quiet -
+          tar -xzf "$bin/age.tar.gz" -C "$bin" --strip-components=1 age/age
+          echo "$bin" >>"$GITHUB_PATH"
+        fi
+        # The ciphertext's own directory, so the upload holds nothing else.
+        out="$RUNNER_TEMP/sealed-$ARTIFACT"
+        mkdir "$out"
+        tar -C "$CORPUS" -cf - . | "$bin/age" -r "$RECIPIENT" -o "$out/$ARTIFACT.tar.age"
+        echo "path=$out/$ARTIFACT.tar.age" >>"$GITHUB_OUTPUT"
+        echo "Uploading the fuzz inputs, encrypted with age, as artifact $ARTIFACT."
+
+    - name: Upload the ciphertext
+      if: steps.seal.outputs.path != ''
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ inputs.artifact }}
+        path: ${{ steps.seal.outputs.path }}
+        if-no-files-found: error

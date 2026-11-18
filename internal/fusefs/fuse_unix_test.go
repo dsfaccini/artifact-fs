@@ -743,7 +743,6 @@ func TestLookUpInodeResolvesUnknownBaseAttributeSizes(t *testing.T) {
 }
 
 func TestFirstFileReadPrefetchesItsDirectoryAndListingPrefetchesNothing(t *testing.T) {
-	ctx := context.Background()
 	files := map[string]string{
 		"src/a.go":      "package a\n",
 		"src/b.go":      "package b\n",
@@ -751,6 +750,112 @@ func TestFirstFileReadPrefetchesItsDirectoryAndListingPrefetchesNothing(t *testi
 		"docs/guide.md": "# guide\n",
 		"top.txt":       "top\n",
 	}
+	fs, h, queue, repo, oids := newClonedPrefetchFixture(t, files)
+	packs := packCount(t, repo.GitDir)
+
+	walkListing(t, fs, fuseops.RootInodeID, ".")
+	if got := queue.queued.Load(); got != 0 {
+		t.Fatalf("a listing-only walk queued %d blobs for hydration", got)
+	}
+
+	h.Start(4, repo)
+	src := lookUpInode(t, fs, fuseops.RootInodeID, "src")
+	if got := readWholeFile(t, fs, lookUpInode(t, fs, src, "a.go")); got != files["src/a.go"] {
+		t.Fatalf("src/a.go = %q, want %q", got, files["src/a.go"])
+	}
+	for _, path := range []string{"src/b.go", "src/c.go"} {
+		waitForCachedBlob(t, repo, oids[path])
+	}
+	// One fetch for a.go itself and one for its siblings.
+	if got := packCount(t, repo.GitDir); got != packs+2 {
+		t.Fatalf("packs = %d after reading src/a.go, want %d", got, packs+2)
+	}
+	for _, name := range []string{"b.go", "c.go"} {
+		if got := readWholeFile(t, fs, lookUpInode(t, fs, src, name)); got != files["src/"+name] {
+			t.Fatalf("src/%s = %q, want %q", name, got, files["src/"+name])
+		}
+	}
+	if got := packCount(t, repo.GitDir); got != packs+2 {
+		t.Fatalf("packs = %d after reading the prefetched siblings, want %d", got, packs+2)
+	}
+	for _, path := range []string{"docs/guide.md", "top.txt"} {
+		if _, err := os.Stat(blobcache.Path(repo.BlobCacheDir, oids[path])); err == nil {
+			t.Fatalf("%s was hydrated though nothing in its directory was read", path)
+		}
+	}
+}
+
+// A first git status in a clean worktree reads no file but the .gitignore of
+// each directory that holds a directory, the .gitattributes that apply to
+// those, and the root's .gitmodules while the index holds a submodule. git
+// log reads the root's .mailmap.
+func TestReadsOfGitRuleFilesPrefetchNothing(t *testing.T) {
+	files := map[string]string{
+		".gitignore":      "*.log\n",
+		".gitattributes":  "*.bin binary\n",
+		".gitmodules":     "[submodule \"m\"]\n",
+		".mailmap":        "A <a@example.com>\n",
+		"README.md":       "# readme\n",
+		"top.txt":         "top\n",
+		"src/.gitignore":  "*.tmp\n",
+		"src/.mailmap":    "B <b@example.com>\n",
+		"src/a.go":        "package a\n",
+		"src/b.go":        "package b\n",
+		"lib/.gitmodules": "[submodule \"n\"]\n",
+		"lib/c.go":        "package c\n",
+	}
+	fs, h, queue, repo, _ := newClonedPrefetchFixture(t, files)
+	h.Start(4, repo)
+	src := lookUpInode(t, fs, fuseops.RootInodeID, "src")
+	for _, read := range []struct {
+		dir  fuseops.InodeID
+		path string
+	}{
+		{fuseops.RootInodeID, ".gitignore"},
+		{fuseops.RootInodeID, ".gitattributes"},
+		{fuseops.RootInodeID, ".gitmodules"},
+		{fuseops.RootInodeID, ".mailmap"},
+		{src, "src/.gitignore"},
+	} {
+		if got := readWholeFile(t, fs, lookUpInode(t, fs, read.dir, filepath.Base(read.path))); got != files[read.path] {
+			t.Fatalf("%s = %q, want %q", read.path, got, files[read.path])
+		}
+	}
+	if got := queue.queued.Load(); got != 0 {
+		t.Fatalf("reads of Git's rule files queued %d prefetch tasks, want 0", got)
+	}
+	// A rule file's read leaves its directory to the next read.
+	if got := readWholeFile(t, fs, lookUpInode(t, fs, fuseops.RootInodeID, "README.md")); got != files["README.md"] {
+		t.Fatalf("README.md = %q, want %q", got, files["README.md"])
+	}
+	if got := queue.queued.Load(); got != 6 {
+		t.Fatalf("a read of README.md queued %d prefetch tasks, want the root's 6 files", got)
+	}
+	// Git reads only the root's .gitmodules and .mailmap.
+	queued := queue.queued.Load()
+	for _, nested := range []struct {
+		dir   fuseops.InodeID
+		path  string
+		files int64
+	}{
+		{src, "src/.mailmap", 4},
+		{lookUpInode(t, fs, fuseops.RootInodeID, "lib"), "lib/.gitmodules", 2},
+	} {
+		if got := readWholeFile(t, fs, lookUpInode(t, fs, nested.dir, filepath.Base(nested.path))); got != files[nested.path] {
+			t.Fatalf("%s = %q, want %q", nested.path, got, files[nested.path])
+		}
+		if got := queue.queued.Load() - queued; got != nested.files {
+			t.Fatalf("a read of %s queued %d prefetch tasks, want its directory's %d files", nested.path, got, nested.files)
+		}
+		queued += nested.files
+	}
+}
+
+// newClonedPrefetchFixture serves a blobless clone of files from the real
+// stores, through a hydrator that counts what is queued and starts no worker.
+func newClonedPrefetchFixture(t *testing.T, files map[string]string) (*ArtifactFuse, *hydrator.Service, *enqueueCounter, model.RepoPaths, map[string]string) {
+	t.Helper()
+	ctx := context.Background()
 	tmp := t.TempDir()
 	repo := model.RepoConfig{
 		RepoPaths: model.RepoPaths{
@@ -803,38 +908,7 @@ func TestFirstFileReadPrefetchesItsDirectoryAndListingPrefetchesNothing(t *testi
 	resolver := &Resolver{Snapshot: snap, Overlay: ov}
 	resolver.SetGeneration(gen)
 	fs := NewArtifactFuse(repo.RepoPaths, &Engine{Resolver: resolver, Repo: repo.RepoPaths, Overlay: ov, Hydrator: queue})
-	packs := packCount(t, repo.GitDir)
-
-	walkListing(t, fs, fuseops.RootInodeID, ".")
-	if got := queue.queued.Load(); got != 0 {
-		t.Fatalf("a listing-only walk queued %d blobs for hydration", got)
-	}
-
-	h.Start(4, repo.RepoPaths)
-	src := lookUpInode(t, fs, fuseops.RootInodeID, "src")
-	if got := readWholeFile(t, fs, lookUpInode(t, fs, src, "a.go")); got != files["src/a.go"] {
-		t.Fatalf("src/a.go = %q, want %q", got, files["src/a.go"])
-	}
-	for _, path := range []string{"src/b.go", "src/c.go"} {
-		waitForCachedBlob(t, repo.RepoPaths, oids[path])
-	}
-	// One fetch for a.go itself and one for its siblings.
-	if got := packCount(t, repo.GitDir); got != packs+2 {
-		t.Fatalf("packs = %d after reading src/a.go, want %d", got, packs+2)
-	}
-	for _, name := range []string{"b.go", "c.go"} {
-		if got := readWholeFile(t, fs, lookUpInode(t, fs, src, name)); got != files["src/"+name] {
-			t.Fatalf("src/%s = %q, want %q", name, got, files["src/"+name])
-		}
-	}
-	if got := packCount(t, repo.GitDir); got != packs+2 {
-		t.Fatalf("packs = %d after reading the prefetched siblings, want %d", got, packs+2)
-	}
-	for _, path := range []string{"docs/guide.md", "top.txt"} {
-		if _, err := os.Stat(blobcache.Path(repo.BlobCacheDir, oids[path])); err == nil {
-			t.Fatalf("%s was hydrated though nothing in its directory was read", path)
-		}
-	}
+	return fs, h, queue, repo.RepoPaths, oids
 }
 
 func TestReadsPrefetchEachDirectoryOncePerGeneration(t *testing.T) {
