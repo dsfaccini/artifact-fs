@@ -82,6 +82,8 @@ jobs:
     uses: ./.github/workflows/build-test.yml
     permissions:
       contents: read
+      # seal-fuzz-inputs-log reads another job's log.
+      actions: read
 
   semgrep:
     needs: gate
