@@ -37,8 +37,9 @@ func fakeDaemon(t *testing.T, body string) {
 	if err := execfile.Write(script, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	previous := daemonProgram
 	daemonProgram = func(*state.Home, string) (string, error) { return script, nil }
-	t.Cleanup(func() { daemonProgram = runtimeCopy })
+	t.Cleanup(func() { daemonProgram = previous })
 }
 
 // linux runs slimtree's commands with args as on a healthy Linux machine.

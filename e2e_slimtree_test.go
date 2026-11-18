@@ -81,7 +81,13 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 		}
 	})
 	mountDir := newE2EMountDir(t)
-	wt := filepath.Join(mountDir, repoName)
+	// slimtree prints and records canonical paths: on macOS, /var is a
+	// symlink to /private/var.
+	canonicalMountDir, err := filepath.EvalSymlinks(mountDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := filepath.Join(canonicalMountDir, repoName)
 	slimtree := func(args ...string) (string, string, error) {
 		cmd := commandIn(base, bin, args...)
 		cmd.Env = append(os.Environ(), "SLIMTREE_HOME="+home)
@@ -129,17 +135,25 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 	}
 
 	// Each new and resume that mounts counts against the FSKit budget.
+	// Before any assertion can end the test, so a failure leaves no daemon
+	// and no mount.
+	t.Cleanup(func() {
+		if _, stderr, err := slimtree("stop", wt); err != nil {
+			t.Errorf("slimtree stop at cleanup: %v: %s", err, stderr)
+			stopRecordedDaemon(t, home)
+		}
+	})
 	e2eMountsStarted.Add(1)
 	if got := mustSlimtree("--backend", "artifactfs", "new", "--path", wt, "feat"); got != wt+"\n" {
 		t.Fatalf("slimtree new printed %q, want %s", got, wt)
 	}
-	t.Cleanup(func() {
-		if _, stderr, err := slimtree("stop", wt); err != nil {
-			t.Errorf("slimtree stop at cleanup: %v: %s", err, stderr)
-			r := record()
-			mounts.Signal(r.DaemonPID, r.DaemonToken, syscall.SIGKILL)
-		}
-	})
+	logs, err := filepath.Glob(filepath.Join(home, "w", "*", "daemon.log"))
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("daemon logs = %q, %v; want one", logs, err)
+	}
+	if data, err := os.ReadFile(logs[0]); err != nil || !bytes.Contains(data, []byte(`"msg":"fuse mounted"`)) {
+		t.Fatalf("%s holds %q (%v), want the daemon's mount", logs[0], data, err)
+	}
 	if got := listed(); got != "mounted" {
 		t.Fatalf("slimtree list after new: %s, want mounted", got)
 	}
@@ -262,6 +276,31 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 	assertGitStatus(t, wt, map[string]string{"notes.txt": "??"})
 	if data, err := readMountFile(filepath.Join(wt, "notes.txt")); err != nil || string(data) != "kept across stops\n" {
 		t.Fatalf("notes.txt after resume = %q, %v", data, err)
+	}
+}
+
+// stopRecordedDaemon sends the daemon that the record in home names SIGTERM
+// and waits for it to exit, as stop does. A daemon that exits unmounts its
+// mount. It never sends SIGKILL, which on FSKit can leave a volume that
+// cannot be unmounted until reboot.
+func stopRecordedDaemon(t *testing.T, home string) {
+	t.Helper()
+	paths, _ := filepath.Glob(filepath.Join(home, "w", "*", "worktree.json"))
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		var r slimtreeRecord
+		if err != nil || json.Unmarshal(data, &r) != nil || r.DaemonPID == 0 {
+			continue
+		}
+		if err := mounts.Signal(r.DaemonPID, r.DaemonToken, syscall.SIGTERM); err != nil {
+			continue
+		}
+		if err := pollCondition(time.Minute, "the daemon's exit", func() (bool, string) {
+			err := mounts.Signal(r.DaemonPID, r.DaemonToken, 0)
+			return errors.Is(err, mounts.ErrGone), "signal 0: " + errString(err)
+		}); err != nil {
+			t.Errorf("the daemon %d of %s: %v", r.DaemonPID, path, err)
+		}
 	}
 }
 

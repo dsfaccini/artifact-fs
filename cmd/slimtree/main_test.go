@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -21,6 +22,12 @@ const mainEnv = "SLIMTREE_TEST_MAIN"
 func TestMain(m *testing.M) {
 	if os.Getenv(mainEnv) == "1" {
 		main()
+	}
+	// slimtree starts the daemon from a copy of its own binary. Running the
+	// tests again as the daemon would launch the next copy.
+	if len(os.Args) > 1 && (os.Args[1] == "daemon" || os.Args[1] == "afs") {
+		fmt.Fprintln(os.Stderr, "the slimtree test binary is not a daemon")
+		os.Exit(2)
 	}
 	gittest.IsolateConfig()
 	os.Exit(m.Run())
