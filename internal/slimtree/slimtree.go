@@ -9,10 +9,12 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/cli"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/doctor"
+	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 	"github.com/cloudflare/artifact-fs/internal/version"
 	ucli "github.com/urfave/cli/v3"
 )
@@ -143,7 +145,64 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 					if err != nil {
 						return err
 					}
-					return removeWorktree(ctx, home, probe, goos, c.Args().First(), c.Bool("force"), stdout)
+					return removeWorktree(ctx, home, probe, goos, c.Args().First(), c.Bool("force"), stdout, stderr)
+				},
+			},
+			{
+				Name:  "prune",
+				Usage: "delete the archives rm left that are older than the retention rule, with their recovery refs; skipped while another slimtree command runs",
+				Action: func(ctx context.Context, c *ucli.Command) error {
+					if c.Args().Len() != 0 {
+						return errors.New("slimtree prune takes no arguments")
+					}
+					home, err := openHome()
+					if err != nil {
+						return err
+					}
+					lock, err := home.TryLock("")
+					if errors.Is(err, state.ErrLockBusy) {
+						fmt.Fprintln(stderr, "slimtree: pruned nothing:", err)
+						return nil
+					}
+					if err != nil {
+						return err
+					}
+					defer lock.Unlock()
+					p := prune(ctx, home, time.Now())
+					p.write(stderr)
+					if p.ruleErr != nil || len(p.problems) > 0 {
+						return errPruneFailed
+					}
+					return nil
+				},
+			},
+			{
+				Name:      "retention",
+				Usage:     "show the retention rule, or set it: " + state.RetentionUsage + " (default month)",
+				ArgsUsage: "[" + state.RetentionUsage + "]",
+				Action: func(_ context.Context, c *ucli.Command) error {
+					if c.Args().Len() > 1 {
+						return errors.New("slimtree retention takes at most one rule")
+					}
+					home, err := openHome()
+					if err != nil {
+						return err
+					}
+					if c.Args().Len() == 1 {
+						rule, err := state.ParseRetention(c.Args().First())
+						if err != nil {
+							return err
+						}
+						if err := home.SetRetention(rule); err != nil {
+							return err
+						}
+					}
+					rule, err := home.Retention()
+					if err != nil {
+						return err
+					}
+					fmt.Fprintln(stdout, rule)
+					return nil
 				},
 			},
 		},
@@ -163,6 +222,8 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 }
 
 var errDoctorFailed = errors.New("doctor: a check failed")
+
+var errPruneFailed = errors.New("prune: see the problems above")
 
 func printDoctor(w io.Writer, r doctor.Report, asJSON bool) error {
 	if asJSON {
