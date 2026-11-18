@@ -193,7 +193,7 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 			},
 			{
 				Name:  "prune",
-				Usage: "delete the archives rm left that are older than the retention rule, with their recovery refs; skipped while another slimtree command runs",
+				Usage: "delete the archives rm left that are older than the retention rule, with their recovery refs, evict the cached blobs not read within the rule, and remove the daemon binary copies no worktree uses; skipped while another slimtree command runs",
 				Action: func(ctx context.Context, c *ucli.Command) error {
 					if c.Args().Len() != 0 {
 						return errors.New("slimtree prune takes no arguments")

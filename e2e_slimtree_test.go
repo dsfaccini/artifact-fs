@@ -183,6 +183,21 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 	if err != nil || homeErr != nil || !strings.HasPrefix(target, filepath.Join(resolvedHome, "runtimes")+"/") {
 		t.Fatalf("core.fsmonitor %s links to %q (%v, %v), want a copy below %s/runtimes", link, target, err, homeErr, home)
 	}
+	// The record names the copy the daemon runs, so prune keeps that copy
+	// while the daemon runs, and removes a copy no worktree uses.
+	unused := filepath.Join(resolvedHome, "runtimes", strings.Repeat("0", 64))
+	if err := os.MkdirAll(unused, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, stderr, err := slimtree("prune"); err != nil || !strings.Contains(stderr, "slimtree: removed 1 runtime copies no worktree uses\n") {
+		t.Fatalf("slimtree prune while the daemon runs: %v, stderr %q", err, stderr)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("prune removed the copy the daemon runs: %v", err)
+	}
+	if _, err := os.Lstat(unused); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("prune kept %s, which no worktree uses: %v", unused, err)
+	}
 	if err := writeMountFile(filepath.Join(wt, "notes.txt"), []byte("kept across stops\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

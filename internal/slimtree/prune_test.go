@@ -10,11 +10,14 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
+	"github.com/cloudflare/artifact-fs/internal/blobcache"
 	"github.com/cloudflare/artifact-fs/internal/execfile"
-	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 )
 
@@ -201,7 +204,7 @@ func TestRetentionRuleDecidesWhatPruneDeletes(t *testing.T) {
 		t.Fatalf("retention.json = %q, %v; want forever, unchanged by the refused rules", data, err)
 	}
 
-	if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || !strings.Contains(stderr, "slimtree: archives and their recovery refs are kept forever\n") {
+	if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || !strings.Contains(stderr, "slimtree: archives, their recovery refs and blobs are kept forever\n") {
 		t.Fatalf("prune under forever: exit %d, stderr %q", code, stderr)
 	}
 	requireExists(t, tenDays)
@@ -361,34 +364,45 @@ func TestPruneKeepsARecoveryRefThatMoved(t *testing.T) {
 	}
 }
 
-// prune gives up on a repository that does not answer, as on a hung mount,
-// and keeps the archive and its ref. A fake git hangs in update-ref, and the
-// deadline expires once it started.
+// prune gives up on a repository that does not answer within
+// pruneRepoTimeout, as on a hung mount, and keeps the archive and its ref. It
+// calls that repository no more in the run: its other archive stays without
+// a call. A fake git hangs in update-ref and marks each call. The command's
+// context has no deadline, as rm's has none, so only the bound expires.
 func TestPruneGivesUpOnARepositoryThatDoesNotAnswer(t *testing.T) {
 	homeDir := pruneHome(t)
 	commonDir, commit := commitRepo(t)
-	dir, ref := archiveAt(t, homeDir, filepath.Dir(commonDir)+"-feat", commonDir, time.Now().Add(-40*24*time.Hour), commit, commit)
+	work := filepath.Dir(commonDir) + "-feat"
+	first, firstRef := archiveAt(t, homeDir, work, commonDir, time.Now().Add(-41*24*time.Hour), commit, commit)
+	second, secondRef := archiveAt(t, homeDir, work, commonDir, time.Now().Add(-40*24*time.Hour), commit, commit)
 	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatal(err)
 	}
 	bin := t.TempDir()
-	started := filepath.Join(bin, "started")
-	script := "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = update-ref ]; then : > '" + started + "'; sleep 60; exit 1; fi\ndone\nexec '" + realGit + "' \"$@\"\n"
+	calls := filepath.Join(bin, "calls")
+	script := "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = update-ref ]; then echo call >> '" + calls + "'; sleep 60; exit 1; fi\ndone\nexec '" + realGit + "' \"$@\"\n"
 	if err := execfile.Write(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	ctx, cancel := gittest.ExpireOnFile(t.Context(), started)
-	defer cancel()
-	code, _, stderr := slimtree(ctx, "prune")
-	want := "slimtree: pruning problem: kept " + dir + ": its repository " + commonDir + " did not answer within 10s\n"
-	if code != 1 || !strings.Contains(stderr, want) {
-		t.Fatalf("prune: exit %d, stderr %q; want exit 1 and %q", code, stderr, want)
+	previous := pruneRepoTimeout
+	pruneRepoTimeout = 2 * time.Second
+	t.Cleanup(func() { pruneRepoTimeout = previous })
+
+	code, _, stderr := slimtree(t.Context(), "prune")
+	for _, dir := range []string{first, second} {
+		want := "slimtree: pruning problem: kept " + dir + ": its repository " + commonDir + " did not answer within 2s\n"
+		if code != 1 || !strings.Contains(stderr, want) {
+			t.Fatalf("prune: exit %d, stderr %q; want exit 1 and %q", code, stderr, want)
+		}
+		requireExists(t, dir)
 	}
-	requireExists(t, dir)
-	if got := recoveryRefs(t, commonDir); got != ref+"\n" {
-		t.Fatalf("recovery refs = %q, want %s kept", got, ref)
+	if got := recoveryRefs(t, commonDir); got != firstRef+"\n"+secondRef+"\n" {
+		t.Fatalf("recovery refs = %q, want %s and %s kept", got, firstRef, secondRef)
+	}
+	if data, err := os.ReadFile(calls); err != nil || string(data) != "call\n" {
+		t.Fatalf("update-ref calls = %q, %v; want one, for the first archive", data, err)
 	}
 }
 
@@ -409,4 +423,254 @@ func TestDiskUseKeepsASmallTotalReadable(t *testing.T) {
 			t.Errorf("diskUse(%d, %d) = %q, want %q", tc.used, tc.disk, got, tc.want)
 		}
 	}
+}
+
+// installBlob adds a blob of content to the cache dir as the hydrator does,
+// read last at read, and returns its path.
+func installBlob(t *testing.T, dir, oid, content string, read time.Time) string {
+	t.Helper()
+	staged, err := blobcache.Stage(dir, oid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staged, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := blobcache.Install(dir, oid, staged); err != nil {
+		t.Fatal(err)
+	}
+	path := blobcache.Path(dir, oid)
+	if err := os.Chtimes(path, read, read); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// prune evicts the blobs of the shared cache not read within the rule, and
+// keeps the others. Under forever it evicts nothing.
+func TestPruneEvictsBlobsNotReadWithinTheRule(t *testing.T) {
+	homeDir := pruneHome(t)
+	blobs := filepath.Join(homeDir, "blobs")
+	now := time.Now()
+	old := installBlob(t, blobs, strings.Repeat("a", 40), "old", now.Add(-40*24*time.Hour))
+	recent := installBlob(t, blobs, strings.Repeat("b", 40), "recent", now.Add(-10*24*time.Hour))
+
+	if code, _, stderr := slimtree(t.Context(), "retention", "forever"); code != 0 {
+		t.Fatalf("retention forever: exit %d, stderr %q", code, stderr)
+	}
+	if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || !strings.Contains(stderr, "blobs are kept forever\n") {
+		t.Fatalf("prune under forever: exit %d, stderr %q", code, stderr)
+	}
+	requireExists(t, old)
+	requireExists(t, recent)
+
+	if code, _, stderr := slimtree(t.Context(), "retention", "month"); code != 0 {
+		t.Fatalf("retention month: exit %d, stderr %q", code, stderr)
+	}
+	code, _, stderr := slimtree(t.Context(), "prune")
+	if want := "slimtree: they evict blobs not read for 30 days; this one evicted 1, 3 B\n"; code != 0 || !strings.Contains(stderr, want) {
+		t.Fatalf("prune: exit %d, stderr %q; want exit 0 and %q", code, stderr, want)
+	}
+	requireGone(t, old)
+	requireExists(t, recent)
+	if st, err := blobcache.ReadStats(blobs); err != nil || st.Blobs != 1 || st.Bytes != int64(len("recent")) {
+		t.Fatalf("cache stats = %+v, %v; want the one recent blob", st, err)
+	}
+}
+
+// prune removes each runtime copy no record names, and keeps the copy a
+// record names. It removes none while a daemon runs whose record names no
+// runtime, which a held daemon lock stands for here.
+func TestPruneRemovesRuntimeCopiesNoWorktreeUses(t *testing.T) {
+	homeDir := pruneHome(t)
+	home, err := openHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	named, unnamed := runtimeCopies(t, homeDir)
+	work := t.TempDir()
+	stateDir := filepath.Join(work, "state-b")
+	for _, r := range []state.Record{
+		{Backend: "artifactfs", Path: filepath.Join(work, "a"), Runtime: filepath.Join(named, "slimtree"), StateDir: filepath.Join(work, "state-a")},
+		{Backend: "artifactfs", Path: filepath.Join(work, "b"), StateDir: stateDir},
+	} {
+		if err := home.Write(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	release := holdDaemonLock(t, stateDir, os.Getpid())
+
+	if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || strings.Contains(stderr, "runtime copies") {
+		t.Fatalf("prune while a daemon without a recorded runtime runs: exit %d, stderr %q", code, stderr)
+	}
+	requireExists(t, named)
+	requireExists(t, unnamed)
+
+	release()
+	if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || !strings.Contains(stderr, "slimtree: removed 1 runtime copies no worktree uses\n") {
+		t.Fatalf("prune: exit %d, stderr %q", code, stderr)
+	}
+	requireExists(t, named)
+	requireGone(t, unnamed)
+}
+
+// prune keeps every runtime copy while it cannot tell which copy each
+// running daemon runs, and under a broken rule. A daemon runs with no record
+// after a new that died before it wrote the record, and with another pid
+// than its record's after a resume whose stop failed.
+func TestPruneKeepsEveryRuntimeCopyWhileItCannotTellWhichADaemonRuns(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		setup    func(t *testing.T, home *state.Home, homeDir, named string)
+		wantCode int
+	}{
+		{"a daemon with no record", func(t *testing.T, _ *state.Home, homeDir, _ string) {
+			holdDaemonLock(t, filepath.Join(homeDir, "w", "0123456789abcdef", "state"), os.Getpid())
+		}, 0},
+		{"a daemon with another pid than its record's", func(t *testing.T, home *state.Home, _, named string) {
+			path := filepath.Join(t.TempDir(), "wt")
+			root := filepath.Join(home.RecordDir(path), "state")
+			if err := home.Write(state.Record{Backend: "artifactfs", Path: path, Runtime: filepath.Join(named, "slimtree"), StateDir: root, DaemonPID: os.Getpid() + 1}); err != nil {
+				t.Fatal(err)
+			}
+			holdDaemonLock(t, root, os.Getpid())
+		}, 0},
+		{"a record prune cannot read", func(t *testing.T, _ *state.Home, homeDir, _ string) {
+			dir := filepath.Join(homeDir, "w", "0123456789abcdef")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "worktree.json"), []byte("{"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, 1},
+		{"a daemon lock prune cannot open", func(t *testing.T, _ *state.Home, homeDir, _ string) {
+			config := filepath.Join(homeDir, "w", "0123456789abcdef", "state", "config")
+			if err := os.MkdirAll(config, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			// A symlink to itself fails the open with ELOOP, also as root.
+			if err := os.Symlink("daemon.lock", filepath.Join(config, "daemon.lock")); err != nil {
+				t.Fatal(err)
+			}
+		}, 1},
+		{"a broken rule", func(t *testing.T, _ *state.Home, homeDir, _ string) {
+			if err := os.WriteFile(filepath.Join(homeDir, "retention.json"), []byte("not json\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			homeDir := pruneHome(t)
+			home, err := openHome()
+			if err != nil {
+				t.Fatal(err)
+			}
+			named, unnamed := runtimeCopies(t, homeDir)
+			tt.setup(t, home, homeDir, named)
+			if code, _, stderr := slimtree(t.Context(), "prune"); code != tt.wantCode || strings.Contains(stderr, "runtime copies") {
+				t.Fatalf("prune: exit %d, stderr %q; want exit %d and no copy removed", code, stderr, tt.wantCode)
+			}
+			requireExists(t, named)
+			requireExists(t, unnamed)
+		})
+	}
+}
+
+// prune removes a runtime copy no record names under every rule but a broken
+// one, forever too, past a dotfile in w/, and while a daemon runs whose
+// record names its copy and its pid.
+func TestPruneRemovesAnUnnamedRuntimeCopy(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		setup func(t *testing.T, home *state.Home, homeDir string, r *state.Record)
+	}{
+		{"under forever", func(t *testing.T, home *state.Home, _ string, _ *state.Record) {
+			if err := home.SetRetention(state.Forever); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"past a dotfile in w", func(t *testing.T, _ *state.Home, homeDir string, _ *state.Record) {
+			if err := os.WriteFile(filepath.Join(homeDir, "w", ".DS_Store"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"while the daemon its record names runs", func(t *testing.T, home *state.Home, _ string, r *state.Record) {
+			r.StateDir = filepath.Join(home.RecordDir(r.Path), "state")
+			r.DaemonPID = os.Getpid()
+			holdDaemonLock(t, r.StateDir, os.Getpid())
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			homeDir := pruneHome(t)
+			home, err := openHome()
+			if err != nil {
+				t.Fatal(err)
+			}
+			named, unnamed := runtimeCopies(t, homeDir)
+			r := state.Record{Backend: "artifactfs", Path: filepath.Join(t.TempDir(), "wt"), Runtime: filepath.Join(named, "slimtree")}
+			if err := os.MkdirAll(filepath.Join(homeDir, "w"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			tt.setup(t, home, homeDir, &r)
+			if err := home.Write(r); err != nil {
+				t.Fatal(err)
+			}
+			if code, _, stderr := slimtree(t.Context(), "prune"); code != 0 || !strings.Contains(stderr, "slimtree: removed 1 runtime copies no worktree uses\n") {
+				t.Fatalf("prune: exit %d, stderr %q", code, stderr)
+			}
+			requireExists(t, named)
+			requireGone(t, unnamed)
+		})
+	}
+}
+
+// runtimeCopies makes two runtime copies in homeDir's runtimes/ and returns
+// their directories.
+func runtimeCopies(t *testing.T, homeDir string) (named, unnamed string) {
+	t.Helper()
+	var copies []string
+	for _, sha := range []string{strings.Repeat("a", 64), strings.Repeat("b", 64)} {
+		dir := filepath.Join(homeDir, "runtimes", sha)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := execfile.Write(filepath.Join(dir, "slimtree"), []byte("#!/bin/sh\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		copies = append(copies, dir)
+	}
+	return copies[0], copies[1]
+}
+
+// holdDaemonLock holds the daemon lock of the state root root, as a daemon
+// with pid does, until the test ends or release runs. release unlocks before
+// it closes the file: a child that another goroutine forked holds a copy of
+// the descriptor until it execs, and that copy keeps a lock that Close alone
+// released.
+func holdDaemonLock(t *testing.T, root string, pid int) (release func()) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(root, "config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(filepath.Join(root, "config", "daemon.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lock.WriteString(strconv.Itoa(pid)); err != nil {
+		t.Fatal(err)
+	}
+	release = sync.OnceFunc(func() {
+		if err := unix.Flock(int(lock.Fd()), unix.LOCK_UN); err != nil {
+			t.Error(err)
+		}
+		if err := lock.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	t.Cleanup(release)
+	return release
 }

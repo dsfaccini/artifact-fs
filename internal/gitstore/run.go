@@ -13,31 +13,36 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/auth"
 )
 
-// defaultWriteGrace is how long a local write runs once its context ends.
-// Git creates a lock file, such as config.lock or index.lock, before it
-// installs the handler that removes its lock files on SIGTERM. A SIGTERM in
-// between kills Git and leaves the lock, and every later Git that takes it
-// fails. The window lasts microseconds, so a SIGTERM that waits this long
-// finds the handler installed.
-const defaultWriteGrace = 2 * time.Second
+// WriteGrace is how long a local write runs once its context ends. Git
+// creates a lock file, such as config.lock or index.lock, before it installs
+// the handler that removes its lock files on SIGTERM. A SIGTERM in between
+// kills Git and leaves the lock, and every later Git that takes it fails. The
+// window lasts microseconds, so a SIGTERM that waits this long finds the
+// handler installed.
+const WriteGrace = 2 * time.Second
 
-// writeContext returns the context of one local write under ctx. A cancel or
-// deadline of ctx does not stop the write: the write ends at most s.writeGrace
-// after ctx does. It returns ctx's error when ctx has already ended, so no
-// write starts once its context ended. Call the returned func once the write
-// returns.
-func (s *Store) writeContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+// WriteContext returns the context of one local write under ctx. A cancel or
+// deadline of ctx does not stop the write: the write ends at most grace after
+// ctx does. It returns ctx's error when ctx has already ended, so no write
+// starts once its context ended. outlived, when not nil, runs when ctx ends
+// before the write returns. Call the returned func once the write returns.
+func WriteContext(ctx context.Context, grace time.Duration, outlived func()) (context.Context, context.CancelFunc, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
 	writeCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	stop := context.AfterFunc(ctx, func() {
-		if s.testHookWriteOutlived != nil {
-			s.testHookWriteOutlived()
+		if outlived != nil {
+			outlived()
 		}
-		time.AfterFunc(s.writeGrace, cancel)
+		time.AfterFunc(grace, cancel)
 	})
 	return writeCtx, func() { stop(); cancel() }, nil
+}
+
+// writeContext is WriteContext with the Store's grace.
+func (s *Store) writeContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	return WriteContext(ctx, s.writeGrace, s.testHookWriteOutlived)
 }
 
 // write runs one local write under writeContext. A write that the grace

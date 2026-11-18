@@ -59,8 +59,8 @@ How it was measured:
 | `slimtree resume <worktree>` | Only for `--backend artifactfs` | Mounts the worktree again; `--all` mounts every one, as after a reboot |
 | `slimtree rm <worktree>` | Removes an APFS clone worktree | Stops the worktree's daemon, archives its files and removes it |
 | `slimtree list` | Lists the worktrees slimtree made | Lists the worktrees slimtree made |
-| `slimtree prune` | Deletes the archives and recovery refs `rm` left that are older than the retention rule | Deletes the archives and recovery refs `rm` left that are older than the retention rule |
-| `slimtree retention [<rule>]` | Shows or sets how long archives are kept: `week`, `month` (the default), `forever` or `<N>d` | Shows or sets the rule |
+| `slimtree prune` | Deletes the archives and recovery refs `rm` left that are older than the retention rule | Deletes the archives and recovery refs `rm` left that are older than the retention rule, evicts cached blobs not read within it, and removes the daemon binary copies no worktree uses |
+| `slimtree retention [<rule>]` | Shows or sets how long archives are kept: `week`, `month` (the default), `forever` or `<N>d` | Shows or sets the rule, which also decides how long a cached blob stays unread before `prune` evicts it |
 | `slimtree doctor` | Checks what slimtree needs | Checks the FUSE setup |
 
 Release builds are tested on macOS 26, Ubuntu 24.04 and Alpine Linux. On
@@ -119,7 +119,8 @@ git dir, in `state.tar.gz` in the archive. `--exclude <glob>` leaves out the
 files at paths with a component that the glob matches, such as
 `--exclude node_modules`. Each `slimtree rm`, and
 `slimtree prune`, deletes the archives and recovery refs older than the
-retention rule, a month by default; `slimtree retention week|month|forever|<N>d`
+retention rule, a month by default, and evicts artifact-fs's cached blobs not
+read within it; `slimtree retention week|month|forever|<N>d`
 changes the rule. Run `slimtree --help` for every flag.
 
 ## Source and license
