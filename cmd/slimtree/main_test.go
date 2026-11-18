@@ -19,18 +19,41 @@ import (
 // mainEnv makes this test binary run main, as the slimtree binary does.
 const mainEnv = "SLIMTREE_TEST_MAIN"
 
+// notADaemon is what this test binary says when it runs as the daemon.
+const notADaemon = "the slimtree test binary is not a daemon"
+
 func TestMain(m *testing.M) {
+	// slimtree starts the daemon from a copy of its own binary, and the
+	// daemon's environment keeps mainEnv. Running main as the daemon would
+	// mount, and running the tests again would launch the next copy.
+	if len(os.Args) > 1 && (os.Args[1] == "daemon" || os.Args[1] == "afs") {
+		fmt.Fprintln(os.Stderr, notADaemon)
+		os.Exit(2)
+	}
 	if os.Getenv(mainEnv) == "1" {
 		main()
 	}
-	// slimtree starts the daemon from a copy of its own binary. Running the
-	// tests again as the daemon would launch the next copy.
-	if len(os.Args) > 1 && (os.Args[1] == "daemon" || os.Args[1] == "afs") {
-		fmt.Fprintln(os.Stderr, "the slimtree test binary is not a daemon")
-		os.Exit(2)
-	}
 	gittest.IsolateConfig()
 	os.Exit(m.Run())
+}
+
+// The test binary refuses to run as daemon or afs, also when mainEnv makes
+// it run main. The flag after the command fails a real daemon command at
+// once, so a regression exits instead of serving.
+func TestTestBinaryIsNotADaemonWhenItRunsMain(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, arg := range []string{"daemon", "afs"} {
+		cmd := exec.CommandContext(t.Context(), exe, arg, "--no-such-flag")
+		cmd.Env = append(os.Environ(), mainEnv+"=1")
+		out, err := cmd.CombinedOutput()
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 2 || string(out) != notADaemon+"\n" {
+			t.Errorf("the test binary as %s with %s=1: %v, output %q; want exit 2 and %q", arg, mainEnv, err, out, notADaemon)
+		}
+	}
 }
 
 func TestGitIgnoresMachineConfig(t *testing.T) { gittest.RequireConfigIsolated(t) }
