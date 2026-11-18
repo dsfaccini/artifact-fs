@@ -12,6 +12,7 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
+	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
@@ -37,7 +38,24 @@ const (
 	// stopWaitTimeout bounds how long a caller waits for a stop: its unmount,
 	// then its drain.
 	stopWaitTimeout = unmountTimeout + unmountReturnSlack + drainTimeout
+	// exitSlack covers what a daemon runs after SIGTERM beside Close's waits:
+	// a repo_runtime write, which prepareStateWriteTimeout bounds, and
+	// Store.Close's end of its pooled git cat-file processes, which takes
+	// about 2*gitstore.GitCommandWaitDelay.
+	exitSlack = 5 * time.Second
 )
+
+// ExitBound is how long a daemon that serves one repo can take to exit after
+// SIGTERM. Close gives the repo's stop and the runtime's workers
+// stopWaitTimeout, then the preparations gitstore.RollbackBound, and
+// exitSlack covers what follows. It leaves out the time Start needs to
+// finish a sync pass that runs when SIGTERM arrives, so it is not strictly
+// an upper bound. Wait at least this long before SIGKILL, so Close finishes
+// its unmount, its drain and its records. A SIGKILL during Close leaves a
+// mount the daemon did not unmount, which no FUSE server answers, and on
+// FSKit unmount(2) of such a volume can hang. Close stops repos one at a
+// time, so a daemon that serves more repos can take longer.
+const ExitBound = stopWaitTimeout + gitstore.RollbackBound + exitSlack
 
 // mountState is where a runtime's FUSE mount stands.
 type mountState string
@@ -723,9 +741,10 @@ func (s *Service) unmount(id model.RepoID) error {
 // runtime whose unmount failed serving, so that a live daemon's mount stays
 // up. Close ends the daemon, and the process exits after it, so Close ends
 // those workers before it closes the Store, the registry and the daemon lock.
-// A worker that outlived Close would run git in the state root, which a
-// caller may be removing. The FUSE server and the hydrator are not workers:
-// they serve the mount's ops until the process exits.
+// A worker that outlived Close would still touch the state root, which a
+// caller may be removing, while every git of the closed Store fails. The
+// FUSE server and the hydrator are not workers: they serve the mount's ops
+// until the process exits.
 func (s *Service) endWorkers(id model.RepoID, deadline time.Time) error {
 	s.mu.Lock()
 	rt := s.running[id]
