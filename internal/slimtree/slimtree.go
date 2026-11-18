@@ -176,7 +176,7 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 				Usage:     "remove a worktree slimtree made, with its ignored files, as git worktree remove does; a recovery ref keeps its HEAD, an archive keeps an artifactfs worktree's files, and its branch stays",
 				ArgsUsage: "<worktree>",
 				Flags: []ucli.Flag{
-					&ucli.BoolFlag{Name: "force", Usage: "discard the changes git status lists, or drop a worktree whose directory is gone or, for artifactfs, that no daemon serves"},
+					&ucli.BoolFlag{Name: "force", Usage: "discard the changes git status lists, or drop a worktree whose directory is gone or, for artifactfs, that no daemon serves; twice, also drop a worktree whose repository is missing, which keeps git's registration of it"},
 					&ucli.BoolFlag{Name: "check", Usage: "only check whether rm would refuse; changes nothing"},
 					&ucli.StringSliceFlag{Name: "exclude", Usage: "leave out of an artifactfs worktree's archive the files at paths with a component that this glob matches; repeatable", Validator: checkExcludes},
 				},
@@ -188,7 +188,7 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 					if err != nil {
 						return err
 					}
-					return removeWorktree(ctx, home, probe, goos, c.Args().First(), rmOptions{force: c.Bool("force"), check: c.Bool("check"), excludes: c.StringSlice("exclude")}, stdout, stderr)
+					return removeWorktree(ctx, home, probe, goos, c.Args().First(), rmOptions{force: c.Count("force") > 0, forceTwice: c.Count("force") > 1, check: c.Bool("check"), excludes: c.StringSlice("exclude")}, stdout, stderr)
 				},
 			},
 			{

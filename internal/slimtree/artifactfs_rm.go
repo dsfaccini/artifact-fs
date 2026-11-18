@@ -30,6 +30,10 @@ type rmOptions struct {
 	// force discards the changes git status lists, and removes a worktree
 	// whose directory is gone or that no daemon serves.
 	force bool
+	// forceTwice is set when --force came twice. rm then also removes a
+	// worktree whose repository is missing, and leaves git's registration of
+	// it there.
+	forceTwice bool
 	// check runs only the refusals, and changes nothing.
 	check bool
 	// excludes are globs. An artifactfs worktree's archive leaves out the
@@ -51,6 +55,18 @@ func checkExcludes(excludes []string) error {
 	return nil
 }
 
+// refuseMissingRepo refuses r while its repository is missing, as on a
+// volume that is not mounted, unless --force came twice. Without the
+// repository, rm cannot remove git's registration of r, so the branch would
+// stay checked out in a worktree that no longer exists, as git worktree
+// remove --force --force accepts for a locked worktree.
+func refuseMissingRepo(r state.Record, o rmOptions) error {
+	if _, err := os.Stat(r.CommonDir); !errors.Is(err, fs.ErrNotExist) || o.forceTwice {
+		return nil
+	}
+	return fmt.Errorf("the repository %s is missing; reconnect its volume and run slimtree rm again, or if the repository is gone for good, pass --force twice", r.CommonDir)
+}
+
 // removeArtifactFS removes the artifactfs worktree r for removeWorktree,
 // which holds the global lock. Only through the mount can git status tell
 // whether r holds changes, so without force it refuses a worktree that its
@@ -61,6 +77,9 @@ func checkExcludes(excludes []string) error {
 // finishRemoval. A failure after the stop leaves a worktree that rm --force
 // removes.
 func removeArtifactFS(ctx context.Context, home *state.Home, probe doctor.Probe, goos string, r state.Record, o rmOptions, stdout, stderr io.Writer) error {
+	if err := refuseMissingRepo(r, o); err != nil {
+		return err
+	}
 	if err := healRemount(ctx, home, &r, !o.check); err != nil {
 		return err
 	}
@@ -149,7 +168,8 @@ func finishRemoval(ctx context.Context, home *state.Home, r state.Record, exclud
 		return ctxErr
 	}
 	if err != nil {
-		// A repository that is gone holds no registration.
+		// With --force twice, a repository that is missing holds no
+		// registration that rm can remove.
 		if _, statErr := os.Stat(r.CommonDir); !errors.Is(statErr, fs.ErrNotExist) {
 			return err
 		}

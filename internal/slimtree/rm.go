@@ -55,6 +55,9 @@ func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, g
 		return err
 	}
 
+	if err := refuseMissingRepo(r, o); err != nil {
+		return err
+	}
 	head, registered := "", true
 	switch _, err := os.Lstat(r.Path); {
 	case errors.Is(err, fs.ErrNotExist):
@@ -71,7 +74,8 @@ func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, g
 		if errors.Is(err, errWorktreeListTimeout) {
 			return err
 		}
-		// A repository git cannot read holds no registration.
+		// A repository git cannot read holds no registration. One that is
+		// missing gets here only with --force twice.
 		var w gitWorktree
 		w, registered = listed[r.Path]
 		head = w.head

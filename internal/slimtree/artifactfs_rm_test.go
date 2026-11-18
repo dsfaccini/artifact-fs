@@ -739,3 +739,57 @@ func TestRmForceRemovesAnArtifactFSWorktreeOnAnUnbornBranch(t *testing.T) {
 		t.Errorf("the archive's gitdir/HEAD = %q, want the unborn branch", files["gitdir/HEAD"])
 	}
 }
+
+// rm refuses a worktree whose repository is missing, as on a volume that is
+// not mounted, also with --force once and with --check, and changes nothing.
+// Without the repository, rm cannot remove git's registration, which keeps
+// the branch checked out. --force twice removes the worktree's record and
+// archives its files, and leaves the registration, as the repository shows
+// once it is back. The same holds for an apfsclone worktree.
+func TestRmRefusesAWorktreeWhoseRepositoryIsMissing(t *testing.T) {
+	main, r := stoppedArtifactFS(t, map[string]string{"notes.txt": "kept\n"})
+	home, err := openHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloned := state.Record{Version: 1, Backend: "apfsclone", Path: filepath.Join(filepath.Dir(main), "cloned"), CommonDir: r.CommonDir, Branch: "cloned"}
+	if err := home.Write(cloned); err != nil {
+		t.Fatal(err)
+	}
+	away := main + "-away"
+	t.Chdir(filepath.Dir(main))
+	if err := os.Rename(main, away); err != nil {
+		t.Fatal(err)
+	}
+	want := "the repository " + r.CommonDir + " is missing; reconnect its volume and run slimtree rm again, or if the repository is gone for good, pass --force twice"
+	for _, args := range [][]string{{"rm", "wt"}, {"rm", "--force", "wt"}, {"rm", "--check", "--force", "wt"}, {"rm", "--force", "cloned"}} {
+		if code, stdout, stderr := linux(t.Context(), args...); code != 1 || stdout != "" || !strings.Contains(stderr, want) {
+			t.Errorf("%q while the repository is missing: exit %d, stdout %q, stderr %q; want exit 1 and %q", args, code, stdout, stderr, want)
+		}
+	}
+	if got := records(t); !reflect.DeepEqual(got, []state.Record{cloned, r}) {
+		t.Fatalf("records after the refusals = %+v, want %+v", got, []state.Record{cloned, r})
+	}
+	if _, err := os.Stat(r.StateDir); err != nil {
+		t.Fatalf("the state root after the refusals: %v", err)
+	}
+
+	for _, name := range []string{"wt", "cloned"} {
+		if code, stdout, stderr := linux(t.Context(), "rm", "--force", "--force", name); code != 0 || !strings.HasPrefix(stdout, "removed "+filepath.Join(filepath.Dir(main), name)) {
+			t.Fatalf("rm --force --force %s: exit %d, stdout %q, stderr %q", name, code, stdout, stderr)
+		}
+	}
+	if got := records(t); len(got) != 0 {
+		t.Errorf("records = %+v, want none", got)
+	}
+	archives, err := filepath.Glob(filepath.Join(home.Dir(), "archives", state.ID(r.Path), "*", stateArchiveName))
+	if err != nil || len(archives) != 1 {
+		t.Errorf("the state archives of %s = %q, %v; want one", r.Path, archives, err)
+	}
+	if err := os.Rename(away, main); err != nil {
+		t.Fatal(err)
+	}
+	if list := gitIn(t, main, "worktree", "list", "--porcelain"); !strings.Contains(list, "worktree "+r.Path+"\n") {
+		t.Errorf("git no longer lists %s, which rm could not unregister:\n%s", r.Path, list)
+	}
+}
