@@ -132,7 +132,7 @@ func TestE2EFSKitMountChecksOwnerPermissions(t *testing.T) {
 		}
 		dst := filepath.Join(repo.mountPath, "copied-read-only.txt")
 		// macOS cp's -X skips extended attributes, which the mount rejects
-		// (README). A GNU cp earlier on PATH has no -X.
+		// (docs/artifact-fs.md). A GNU cp earlier on PATH has no -X.
 		if out, err := exec.Command("/bin/cp", "-p", "-X", src, dst).CombinedOutput(); err != nil {
 			t.Fatalf("cp -p -X = %v: %s", err, out)
 		}

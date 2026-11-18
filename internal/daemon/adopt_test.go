@@ -247,7 +247,7 @@ func TestAdoptGitDirWarnsAboutCredentialedOriginOncePerPrepare(t *testing.T) {
 	// object ID cannot hold it.
 	const origin = "gcrypt::rsync://alice:pwqgit//xyz@example.invalid/repository.git"
 	runCmd(t, "git", "-C", source, "remote", "add", "origin", origin)
-	// The README's adoption steps leave the mountpoint empty.
+	// The adoption steps in docs/artifact-fs.md leave the mountpoint empty.
 	runCmd(t, "git", "-C", source, "worktree", "add", "--no-checkout", "-b", "topic", worktree)
 	gitDir := strings.TrimSpace(runCmdOutput(t, "git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-dir"))
 	runCmd(t, "git", "--git-dir", gitDir, "read-tree", "HEAD")
