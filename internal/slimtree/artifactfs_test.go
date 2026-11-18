@@ -51,10 +51,10 @@ func linux(ctx context.Context, args ...string) (code int, stdout, stderr string
 }
 
 // slimtree waits for a daemon's exit after SIGTERM at least as long as the
-// daemon can take, so its SIGKILL never cuts a rollback short.
+// daemon's Close can take, so its SIGKILL never cuts the unmount short.
 func TestDaemonTermWaitOutlastsTheDaemonsExit(t *testing.T) {
-	if defaultDaemonTermWait < daemon.ExitBound {
-		t.Fatalf("defaultDaemonTermWait = %v, want at least daemon.ExitBound %v", defaultDaemonTermWait, daemon.ExitBound)
+	if daemonTermWait < daemon.ExitBound {
+		t.Fatalf("daemonTermWait = %v, want at least daemon.ExitBound %v", daemonTermWait, daemon.ExitBound)
 	}
 }
 

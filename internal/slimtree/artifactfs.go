@@ -48,11 +48,9 @@ const (
 	mountCheckTimeout = 30 * time.Second
 )
 
-// defaultDaemonTermWait is how long a daemon has to exit after SIGTERM.
-const defaultDaemonTermWait = daemon.ExitBound
-
-// daemonTermWait is defaultDaemonTermWait. Tests lower it.
-var daemonTermWait = defaultDaemonTermWait
+// daemonTermWait is how long a daemon has to exit after SIGTERM. Tests
+// lower it.
+var daemonTermWait = daemon.ExitBound
 
 // daemonKillWait bounds the reap of a daemon slimtree started, after SIGKILL.
 const daemonKillWait = time.Minute

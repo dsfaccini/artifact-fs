@@ -45,12 +45,17 @@ const (
 	exitSlack = 5 * time.Second
 )
 
-// ExitBound bounds how long a daemon that serves one repo takes to exit after
+// ExitBound is how long a daemon that serves one repo can take to exit after
 // SIGTERM. Close gives the repo's stop and the runtime's workers
-// stopWaitTimeout, then the preparations' rollbacks gitstore.RollbackBound.
-// Wait at least this long before SIGKILL: a rollback that SIGKILL cuts short
-// leaves the index at one commit and HEAD at another. Close stops repos one
-// at a time, so a daemon that serves more repos can take longer.
+// stopWaitTimeout, then the preparations gitstore.RollbackBound, and
+// exitSlack covers what follows. It leaves out
+// the time Start needs to finish a sync pass that runs when SIGTERM arrives,
+// so it is not strictly an upper bound. Wait at least this long before
+// SIGKILL, so Close finishes its unmount, its drain and its records. A
+// SIGKILL during Close leaves a mount the daemon did not unmount, which no
+// FUSE server answers, and on FSKit unmount(2) of such a volume can hang.
+// Close stops repos one at a time, so a daemon that serves more repos can
+// take longer.
 const ExitBound = stopWaitTimeout + gitstore.RollbackBound + exitSlack
 
 // mountState is where a runtime's FUSE mount stands.
@@ -738,8 +743,9 @@ func (s *Service) unmount(id model.RepoID) error {
 // up. Close ends the daemon, and the process exits after it, so Close ends
 // those workers before it closes the Store, the registry and the daemon lock.
 // A worker that outlived Close would still touch the state root, which a
-// caller may be removing, while every git of the closed Store fails. The FUSE server and the hydrator are not workers:
-// they serve the mount's ops until the process exits.
+// caller may be removing, while every git of the closed Store fails. The
+// FUSE server and the hydrator are not workers: they serve the mount's ops
+// until the process exits.
 func (s *Service) endWorkers(id model.RepoID, deadline time.Time) error {
 	s.mu.Lock()
 	rt := s.running[id]
