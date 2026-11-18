@@ -164,7 +164,7 @@ func finishRemoval(ctx context.Context, home *state.Home, r state.Record, exclud
 		return fmt.Errorf("archiving the state of %s: %w", r.Path, err)
 	}
 	if r.Head != "" {
-		if _, err := apfsclone.Git(ctx, r.CommonDir, "update-ref", a.Ref, r.Head, ""); err != nil {
+		if _, err := gitWrite(ctx, r.CommonDir, "update-ref", a.Ref, r.Head, ""); err != nil {
 			return err
 		}
 		if got, err := refCommit(ctx, r.CommonDir, a.Ref); err != nil {
@@ -187,11 +187,11 @@ func finishRemoval(ctx context.Context, home *state.Home, r state.Record, exclud
 			}
 		}
 		if w.locked {
-			if _, err := apfsclone.Git(ctx, r.CommonDir, "worktree", "unlock", r.Path); err != nil {
+			if _, err := gitWrite(ctx, r.CommonDir, "worktree", "unlock", r.Path); err != nil {
 				return err
 			}
 		}
-		if _, err := apfsclone.Git(ctx, r.CommonDir, "worktree", "remove", "--force", r.Path); err != nil {
+		if _, err := gitWrite(ctx, r.CommonDir, "worktree", "remove", "--force", r.Path); err != nil {
 			return err
 		}
 	case !gone:

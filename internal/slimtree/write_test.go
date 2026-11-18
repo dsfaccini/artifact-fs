@@ -126,47 +126,71 @@ func requireNoGitLock(t *testing.T, gitDir string) {
 	}
 }
 
-// A Ctrl-C that lands while rm writes the recovery ref, or while git worktree
-// remove runs, does not stop the git. Git creates a lock file, such as the
-// ref's lock or the index.lock of the git status that git worktree remove
-// runs, before it installs the handler that removes its lock files on
-// SIGTERM, so a SIGTERM in between would leave the lock in the user's
-// repository.
+// A Ctrl-C that lands while rm writes the recovery ref, while it unlocks an
+// artifactfs worktree, or while git worktree remove runs, does not stop the
+// git. Git creates a lock file, such as the ref's lock or the index.lock of
+// the git status that git worktree remove runs, before it installs the
+// handler that removes its lock files on SIGTERM, so a SIGTERM in between
+// would leave the lock in the user's repository. A recovery ref's lock would
+// stay for good: a rerun writes a ref of another name.
 func TestACanceledRmRunsItsWritesToTheirEnd(t *testing.T) {
+	// apfsclone makes main-feat on feat with new. artifactfs makes the
+	// stopped wt on wt.
+	apfsclone := func(t *testing.T) (string, string, string, func(context.Context) int) {
+		homeAfterFirstRun(t)
+		cloneWith(t, nil)
+		main := newRepo(t)
+		path := filepath.Join(filepath.Dir(main), "main-feat")
+		if code, _, stderr := slimtree(t.Context(), "new", "feat"); code != 0 {
+			t.Fatalf("new feat: exit %d, stderr %q", code, stderr)
+		}
+		return main, path, "feat", func(ctx context.Context) int {
+			code, _, _ := slimtree(ctx, "rm", "main-feat")
+			return code
+		}
+	}
+	artifactfs := func(t *testing.T) (string, string, string, func(context.Context) int) {
+		main, r := stoppedArtifactFS(t, map[string]string{"notes.txt": "kept\n"})
+		return main, r.Path, "wt", func(ctx context.Context) int {
+			code, _, _ := linux(ctx, "rm", "--force", "wt")
+			return code
+		}
+	}
 	for _, tc := range []struct {
 		name, hold string
-		code       int
+		setup      func(t *testing.T) (main, path, branch string, rm func(context.Context) int)
+		// removed is set when the held git is rm's last write.
+		removed bool
 	}{
-		// git worktree remove starts no git once the context ended.
-		{"recovery ref", " update-ref refs/slimtree/", 1},
-		{"worktree remove", " worktree remove ", 0},
+		{"recovery ref", " update-ref refs/slimtree/", apfsclone, false},
+		{"worktree remove", " worktree remove ", apfsclone, true},
+		{"artifactfs recovery ref", " update-ref refs/slimtree/", artifactfs, false},
+		{"artifactfs worktree unlock", " worktree unlock ", artifactfs, false},
+		{"artifactfs worktree remove", " worktree remove ", artifactfs, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			homeAfterFirstRun(t)
-			cloneWith(t, nil)
-			main := newRepo(t)
-			path := filepath.Join(filepath.Dir(main), "main-feat")
-			if code, _, stderr := slimtree(t.Context(), "new", "feat"); code != 0 {
-				t.Fatalf("new feat: exit %d, stderr %q", code, stderr)
-			}
-			head := gitIn(t, path, "rev-parse", "HEAD")
+			main, path, branch, rm := tc.setup(t)
+			head := gitIn(t, main, "rev-parse", "refs/heads/"+branch)
 			h := holdWrite(t, tc.hold)
 
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			returned := make(chan int, 1)
-			go func() {
-				code, _, _ := slimtree(ctx, "rm", "main-feat")
-				returned <- code
-			}()
+			go func() { returned <- rm(ctx) }()
 			h.outlive(t, cancel, returned)
-			if code := <-returned; code != tc.code {
-				t.Fatalf("rm exited %d, want %d", code, tc.code)
+			// rm starts no git once the context ended, and a write that
+			// was its last leaves only the prune to fail.
+			want := 1
+			if tc.removed {
+				want = 0
+			}
+			if code := <-returned; code != want {
+				t.Fatalf("rm exited %d, want %d", code, want)
 			}
 			if got := gitIn(t, main, "for-each-ref", "--format=%(objectname)", "refs/slimtree/"); got != head {
 				t.Fatalf("recovery refs point at %q, want %s", got, head)
 			}
-			if tc.name == "worktree remove" {
+			if tc.removed {
 				requireNoWorktree(t, main, path)
 			}
 			requireNoGitLock(t, filepath.Join(main, ".git"))
@@ -179,31 +203,51 @@ func TestACanceledRmRunsItsWritesToTheirEnd(t *testing.T) {
 // Ctrl-C right after git creates the lock would leave it, so every later git
 // add or checkout in the worktree fails. A file whose stat data the index no
 // longer matches makes such a status write the index. The fake git holds git
-// worktree remove, which runs after the check.
+// worktree remove, which runs after the check. An artifactfs worktree's index
+// lies in its git dir, outside the mount, and checkout-index leaves no stat
+// data in it.
 func TestRmChecksAWorktreeWithoutWritingItsIndex(t *testing.T) {
-	homeAfterFirstRun(t)
-	cloneWith(t, nil)
-	main := newRepo(t)
-	path := filepath.Join(filepath.Dir(main), "main-feat")
-	if code, _, stderr := slimtree(t.Context(), "new", "feat"); code != 0 {
-		t.Fatalf("new feat: exit %d, stderr %q", code, stderr)
-	}
-	past := time.Now().Add(-time.Hour)
-	if err := os.Chtimes(filepath.Join(path, "README.md"), past, past); err != nil {
-		t.Fatal(err)
-	}
-	index := strings.TrimSpace(gitIn(t, path, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+	t.Run("apfsclone", func(t *testing.T) {
+		homeAfterFirstRun(t)
+		cloneWith(t, nil)
+		main := newRepo(t)
+		path := filepath.Join(filepath.Dir(main), "main-feat")
+		if code, _, stderr := slimtree(t.Context(), "new", "feat"); code != 0 {
+			t.Fatalf("new feat: exit %d, stderr %q", code, stderr)
+		}
+		past := time.Now().Add(-time.Hour)
+		if err := os.Chtimes(filepath.Join(path, "README.md"), past, past); err != nil {
+			t.Fatal(err)
+		}
+		index := strings.TrimSpace(gitIn(t, path, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+		requireRmLeavesTheIndex(t, index, func() int {
+			code, _, _ := slimtree(t.Context(), "rm", "main-feat")
+			return code
+		})
+		requireNoWorktree(t, main, path)
+	})
+	t.Run("artifactfs", func(t *testing.T) {
+		main, r := stoppedArtifactFS(t, map[string]string{"notes.txt": "kept\n"})
+		servedArtifactFS(t, &r, "mounted")
+		requireRmLeavesTheIndex(t, filepath.Join(r.GitDir, "index"), func() int {
+			code, _, _ := linux(t.Context(), "rm", "wt")
+			return code
+		})
+		requireNoWorktree(t, main, r.Path)
+	})
+}
+
+// requireRmLeavesTheIndex runs rm, which must exit 0, and fails t when the
+// index changed before rm's git worktree remove started.
+func requireRmLeavesTheIndex(t *testing.T, index string, rm func() int) {
+	t.Helper()
 	before, err := os.ReadFile(index)
 	if err != nil {
 		t.Fatal(err)
 	}
 	h := holdWrite(t, " worktree remove ")
-
 	returned := make(chan int, 1)
-	go func() {
-		code, _, _ := slimtree(t.Context(), "rm", "main-feat")
-		returned <- code
-	}()
+	go func() { returned <- rm() }()
 	h.waitStarted(t, returned)
 	after, err := os.ReadFile(index)
 	if err != nil {
@@ -218,7 +262,6 @@ func TestRmChecksAWorktreeWithoutWritingItsIndex(t *testing.T) {
 	if code := <-returned; code != 0 {
 		t.Fatalf("rm exited %d, want 0", code)
 	}
-	requireNoWorktree(t, main, path)
 }
 
 // A rollback whose deadline passes while it deletes the branch new made, or
