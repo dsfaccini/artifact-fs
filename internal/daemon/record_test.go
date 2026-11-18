@@ -6,11 +6,15 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
@@ -81,6 +85,112 @@ func requireFailure(t *testing.T, ctl *Controller, phase string, wantInError str
 		t.Fatalf("status leaked a credential: %q", st.LastError)
 	}
 	return st
+}
+
+// hookedRegistry runs changeRuntime before each write and each delete of a
+// repo_runtime record, with the state written, or "deleted".
+type hookedRegistry struct {
+	model.Registry
+	changeRuntime func(state string)
+}
+
+func (r *hookedRegistry) PutRuntime(ctx context.Context, rec model.RepoRuntimeRecord) error {
+	r.changeRuntime(rec.State)
+	return r.Registry.PutRuntime(ctx, rec)
+}
+
+func (r *hookedRegistry) DeleteRuntime(ctx context.Context, id model.RepoID) error {
+	r.changeRuntime("deleted")
+	return r.Registry.DeleteRuntime(ctx, id)
+}
+
+// The daemon writes a byte to the notify descriptor after each write and
+// each delete of a repo_runtime record, never before it. A reader that reads
+// status after each byte then sees every change, and so sees the mount, and
+// later the removal, that the last byte follows.
+func TestRuntimeWritesNotifyAfterTheWrite(t *testing.T) {
+	t.Parallel()
+	// Close-on-exec, as os.Pipe makes it, so no git the daemon runs holds an end.
+	var fds [2]int
+	syscall.ForkLock.RLock()
+	err := unix.Pipe(fds[:])
+	if err == nil {
+		unix.CloseOnExec(fds[0])
+		unix.CloseOnExec(fds[1])
+	}
+	syscall.ForkLock.RUnlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The daemon's Close, a cleanup that runs before this one, still writes.
+	t.Cleanup(func() { unix.Close(fds[0]) })
+	if err := unix.SetNonblock(fds[0], true); err != nil {
+		t.Fatal(err)
+	}
+	svc, ctl := newSyncedDaemon(t)
+	// The hook runs on the goroutines that write repo_runtime.
+	var mu sync.Mutex
+	read := 0
+	drain := func() {
+		buf := make([]byte, 64)
+		for {
+			n, err := unix.Read(fds[0], buf)
+			if errors.Is(err, unix.EAGAIN) {
+				return
+			}
+			if err != nil || n == 0 {
+				t.Errorf("reading the notify pipe: %d, %v", n, err)
+				return
+			}
+			read += n
+		}
+	}
+	var states []string
+	svc.registry = &hookedRegistry{Registry: svc.registry, changeRuntime: func(state string) {
+		mu.Lock()
+		defer mu.Unlock()
+		drain()
+		if read != len(states) {
+			t.Errorf("before repo_runtime change %d the daemon had written %d bytes, want one per earlier change", len(states), read)
+		}
+		states = append(states, state)
+	}}
+	if err := svc.NotifyRuntimeWrites(fds[1]); err != nil {
+		t.Fatal(err)
+	}
+	changes := func() ([]string, int) {
+		mu.Lock()
+		defer mu.Unlock()
+		drain()
+		return slices.Clone(states), read
+	}
+
+	syncAndFinishStops(t, svc)
+	got, written := changes()
+	if len(got) == 0 || got[len(got)-1] != repoStateMounted {
+		t.Fatalf("the repo_runtime changes were %q, want the mount last", got)
+	}
+	if written != len(got) {
+		t.Fatalf("after %d repo_runtime changes the daemon had written %d bytes, want one per change", len(got), written)
+	}
+	if st, err := ctl.Status(t.Context(), "repo"); err != nil || st.State != repoStateMounted {
+		t.Fatalf("status = %+v, %v; want mounted", st, err)
+	}
+
+	// The first sync after the removal stops the runtime, and the next
+	// deletes its record.
+	if err := ctl.RemoveRepo(t.Context(), "repo"); err != nil {
+		t.Fatal(err)
+	}
+	syncAndFinishStops(t, svc)
+	syncAndFinishStops(t, svc)
+	got, written = changes()
+	if got[len(got)-1] != "deleted" {
+		t.Fatalf("the repo_runtime changes were %q, want the delete last", got)
+	}
+	if written != len(got) {
+		t.Fatalf("after %d repo_runtime changes the daemon had written %d bytes, want one per change", len(got), written)
+	}
 }
 
 // A store that a newer build migrated fails the mount before the FUSE mount,

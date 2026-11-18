@@ -461,6 +461,104 @@ func TestNewArtifactFSFailsWhenItsDaemonExits(t *testing.T) {
 	gitFindsNothing(t, main, "rev-parse", "--verify", "--quiet", "refs/heads/feat")
 }
 
+// new hands its daemon a pipe as --notify-fd 3, reads the daemon's status
+// when the daemon writes a byte there, and returns once that status reports
+// the worktree mounted and git finds the worktree through the mount. The
+// fake daemon exits without the pipe. Otherwise it waits until the test has
+// recorded the mount, then writes its one byte, as the daemon writes one
+// after each repo_runtime write.
+func TestNewArtifactFSReturnsOnTheDaemonsNotice(t *testing.T) {
+	homeAfterFirstRun(t)
+	main := newRepo(t)
+	dest := filepath.Join(filepath.Dir(main), "main-feat")
+	tmp := t.TempDir()
+	pidFile, release := filepath.Join(tmp, "pid"), filepath.Join(tmp, "release")
+	if err := unix.Mkfifo(release, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeDaemon(t, `[ "$1 $2 $3" = "daemon --notify-fd 3" ] || exit 1
+echo $$ >'`+pidFile+`.tmp' && mv '`+pidFile+`.tmp' '`+pidFile+`'
+read _ <'`+release+`'
+printf x >&3 || exit 1
+exec sleep 60
+`)
+	identifyHook = func(string) (mounts.Identity, error) { return "served", nil }
+	t.Cleanup(func() { identifyHook = nil })
+
+	type result struct {
+		code           int
+		stdout, stderr string
+	}
+	done := make(chan result, 1)
+	go func() {
+		code, stdout, stderr := linux(t.Context(), "--backend", "artifactfs", "new", "feat")
+		done <- result{code, stdout, stderr}
+	}()
+	var pid int
+	for pid == 0 {
+		select {
+		case r := <-done:
+			t.Fatalf("new returned before its daemon took the notify pipe: exit %d, stdout %q, stderr %q", r.code, r.stdout, r.stderr)
+		case <-time.After(10 * time.Millisecond):
+		}
+		if data, err := os.ReadFile(pidFile); err == nil {
+			if pid, err = strconv.Atoi(strings.TrimSpace(string(data))); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
+	// The daemon holds the daemon lock, its registry holds the mount, and the
+	// mount point serves the gitfile, as a mount does.
+	home, err := openHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := home.RecordDir(dest)
+	lock, err := os.OpenFile(filepath.Join(dir, "state", "config", "daemon.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+		lock.Close()
+	})
+	reg, err := registry.New(t.Context(), filepath.Join(dir, "state", "config", "repos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	cfg, err := reg.GetRepo(t.Context(), "main-feat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.PutRuntime(t.Context(), model.RepoRuntimeRecord{RepoID: cfg.ID, State: "mounted"}); err != nil {
+		t.Fatal(err)
+	}
+	gitfile, err := os.ReadFile(filepath.Join(dir, "gitfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, ".git"), gitfile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := <-done
+	if r.code != 0 || r.stdout != dest+"\n" {
+		t.Fatalf("new: exit %d, stdout %q, stderr %q; want exit 0 and %s", r.code, r.stdout, r.stderr, dest)
+	}
+	got := records(t)
+	if len(got) != 1 || got[0].Path != dest || got[0].MountIdentity != "served" || got[0].DaemonPID != pid {
+		t.Fatalf("records = %+v, want %s served by the fake daemon, pid %d", got, dest, pid)
+	}
+}
+
 // new refuses an artifactfs worktree before it starts a daemon or changes
 // anything when a mount check fails, when artifact-fs cannot name the
 // worktree's directory, and when the record directory holds an earlier

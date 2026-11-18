@@ -3,7 +3,10 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -59,6 +62,46 @@ func (s *Service) recordRuntimeLocked(id model.RepoID, update func(*model.RepoRu
 	if err := s.registry.PutRuntime(ctx, written); err != nil {
 		s.logger.Error("repo runtime status write failed", "repo", auth.RedactLogString(string(id)), "error", auth.RedactLogString(err.Error()))
 	}
+	s.notifyRuntimeWrite()
+}
+
+// NotifyRuntimeWrites makes the daemon write a byte to fd after each write
+// and each delete of a repo_runtime record, so the process that started the
+// daemon reads status once it changed instead of polling it. ClearRuntime,
+// which Start runs before it writes any record, writes no byte. The byte
+// only wakes that process: status still reads repo_runtime. The daemon owns fd from here on. It marks
+// fd close-on-exec, so no git it runs holds fd, and writes it without
+// blocking.
+func (s *Service) NotifyRuntimeWrites(fd int) error {
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETFD, unix.FD_CLOEXEC); err != nil {
+		return fmt.Errorf("the notify descriptor %d: %w", fd, err)
+	}
+	if err := unix.SetNonblock(fd, true); err != nil {
+		return fmt.Errorf("the notify descriptor %d: %w", fd, err)
+	}
+	s.recordMu.Lock()
+	defer s.recordMu.Unlock()
+	s.notifyFD, s.notifying = fd, true
+	return nil
+}
+
+// notifyRuntimeWrite writes the byte NotifyRuntimeWrites asks for. A full
+// pipe drops it: the pipe then holds a byte that its reader reads after this
+// write. Once the reader is gone, the daemon closes the descriptor. The
+// caller holds recordMu.
+func (s *Service) notifyRuntimeWrite() {
+	if !s.notifying {
+		return
+	}
+	var err error = unix.EINTR
+	for errors.Is(err, unix.EINTR) {
+		_, err = unix.Write(s.notifyFD, []byte{0})
+	}
+	if err == nil || errors.Is(err, unix.EAGAIN) {
+		return
+	}
+	unix.Close(s.notifyFD)
+	s.notifying = false
 }
 
 // recordRuntimeState writes rt's state with the runtimeState update.
@@ -182,6 +225,7 @@ func (s *Service) forgetRuntime(id model.RepoID) {
 	if err := s.registry.DeleteRuntime(ctx, id); err != nil {
 		s.logger.Error("repo runtime status delete failed", "repo", auth.RedactLogString(string(id)), "error", auth.RedactLogString(err.Error()))
 	}
+	s.notifyRuntimeWrite()
 }
 
 func (s *Service) runningConfigs() []model.RepoConfig {

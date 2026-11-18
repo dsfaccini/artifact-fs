@@ -39,8 +39,9 @@ const (
 	gitfileName = "gitfile"
 	// daemonLogName is the daemon's log in the record directory.
 	daemonLogName = "daemon.log"
-	// mountPoll is how often slimtree looks for a daemon's mount or exit.
-	mountPoll = 100 * time.Millisecond
+	// exitPoll is how often stopDaemon looks for the exit of a daemon that
+	// another slimtree may have started.
+	exitPoll = 100 * time.Millisecond
 	// mountWait bounds the wait for a daemon slimtree started to mount: its
 	// start, its preparation and its mount, which it bounds at 30 s.
 	mountWait = time.Minute
@@ -239,6 +240,7 @@ func serve(ctx context.Context, home *state.Home, ctl *daemon.Controller, r stat
 	if err != nil {
 		return err
 	}
+	defer d.notify.Close()
 	defer func() {
 		if err != nil {
 			if stopErr := d.stop(ctx, r.Path); stopErr != nil {
@@ -268,14 +270,21 @@ type launchedDaemon struct {
 	// done closes once the wait for the daemon returned waitErr.
 	done    chan struct{}
 	waitErr error
+	// notify is the read end of the pipe the daemon writes a byte to after
+	// each repo_runtime write. notified signals each read, until notify
+	// closes.
+	notify   *os.File
+	notified chan struct{}
 }
 
 // startDaemon starts slimtree daemon on r's state root, detached in its own
 // session, in r's record directory and with its log there. The caller's
 // directory can be another worktree's mount, which the daemon would hold.
-// It records the daemon's start token right after the start, from the
-// start time, which fork sets: right after exec, Linux shows the daemon
-// with an empty argv. Only the wait for the daemon tells that it exited.
+// It hands the daemon a pipe's write end as --notify-fd, and the caller
+// closes d.notify. It records the daemon's start token right after the
+// start, from the start time, which fork sets: right after exec, Linux shows
+// the daemon with an empty argv. Only the wait for the daemon tells that it
+// exited.
 func startDaemon(home *state.Home, r state.Record, goos string) (*launchedDaemon, error) {
 	program, err := daemonProgram(home, goos)
 	if err != nil {
@@ -288,26 +297,38 @@ func startDaemon(home *state.Home, r state.Record, goos string) (*launchedDaemon
 		return nil, err
 	}
 	defer log.Close()
-	// Main forwards daemon only as its first argument.
-	cmd := exec.Command(program, "daemon")
+	notify, notifyWrite, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	// slimtree's copy of the write end closes once the daemon holds its own.
+	defer notifyWrite.Close()
+	// Main forwards daemon only as its first argument. The first of
+	// ExtraFiles is descriptor 3.
+	cmd := exec.Command(program, "daemon", "--notify-fd", "3")
 	cmd.Dir = dir
 	cmd.Env = daemonEnv(os.Environ(), r.StateDir, goos)
 	cmd.Stdout, cmd.Stderr = log, log
+	cmd.ExtraFiles = []*os.File{notifyWrite}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
+		notify.Close()
 		return nil, err
 	}
-	d := &launchedDaemon{proc: cmd.Process, program: program, log: logPath, done: make(chan struct{})}
+	d := &launchedDaemon{proc: cmd.Process, program: program, log: logPath, done: make(chan struct{}),
+		notify: notify, notified: make(chan struct{}, 1)}
 	// The child is not reaped before the wait starts, so its PID is its own.
 	token, tokenErr := mounts.StartToken(cmd.Process.Pid)
 	go func() {
 		d.waitErr = cmd.Wait()
 		close(d.done)
 	}()
+	go d.readNotify()
 	if tokenErr == nil && token != "" {
 		d.token = token
 		return d, nil
 	}
+	defer notify.Close()
 	if err := d.end(); err != nil {
 		return nil, errors.Join(tokenErr, fmt.Errorf("%w: %w", errStillServed, err))
 	}
@@ -316,6 +337,22 @@ func startDaemon(home *state.Home, r state.Record, goos string) (*launchedDaemon
 	}
 	// macOS gives an exited child no start token.
 	return nil, fmt.Errorf("the daemon exited (%v); see %s", d.waitErr, logPath)
+}
+
+// readNotify signals notified after each read of notify. One pending signal
+// stands for every byte read before it, because awaitMount reads status
+// after it takes the signal.
+func (d *launchedDaemon) readNotify() {
+	buf := make([]byte, 64)
+	for {
+		if _, err := d.notify.Read(buf); err != nil {
+			return
+		}
+		select {
+		case d.notified <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // end stops the daemon through its own process and reaps it: SIGTERM, then
@@ -351,14 +388,13 @@ func (d *launchedDaemon) stop(ctx context.Context, path string) error {
 }
 
 // awaitMount waits until d mounts r.Path, which status reports mounted and
-// the mount table lists, and git finds r's worktree there. It returns the
-// mount's identity. It fails once d exits, once d reports a mount failure
-// after started, and after mountWait.
+// the mount table lists, and git finds r's worktree there. It reads status
+// each time d notifies a repo_runtime write. It returns the mount's
+// identity. It fails once d exits, once d reports a mount failure after
+// started, and after mountWait.
 func awaitMount(ctx context.Context, ctl *daemon.Controller, r state.Record, d *launchedDaemon, started time.Time) (mounts.Identity, error) {
 	timeout := time.NewTimer(mountWait)
 	defer timeout.Stop()
-	tick := time.NewTicker(mountPoll)
-	defer tick.Stop()
 	for {
 		select {
 		case <-d.done:
@@ -367,7 +403,7 @@ func awaitMount(ctx context.Context, ctl *daemon.Controller, r state.Record, d *
 			return "", ctx.Err()
 		case <-timeout.C:
 			return "", fmt.Errorf("the daemon did not mount %s within %s; see %s", r.Path, mountWait, d.log)
-		case <-tick.C:
+		case <-d.notified:
 		}
 		st, err := ctl.Status(ctx, r.Name())
 		if err != nil {
@@ -613,7 +649,7 @@ func stopDaemon(ctx context.Context, r state.Record) error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(mountPoll):
+			case <-time.After(exitPoll):
 			}
 			if alive, err = daemonAlive(r); err != nil {
 				return err

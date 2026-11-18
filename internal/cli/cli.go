@@ -79,6 +79,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			Flags: []ucli.Flag{
 				&ucli.StringFlag{Name: "root", Value: filepath.Join(root, "mnt"), Usage: "accepted for compatibility; changes no registered repo, which mounts where add-repo --mount-root put it"},
 				&ucli.IntFlag{Name: "hydration-concurrency", Value: daemon.DefaultHydrationConcurrency, Usage: "number of concurrent blob hydration workers"},
+				&ucli.IntFlag{Name: "notify-fd", Value: -1, Usage: "write a byte to this inherited file descriptor after each write of a repo's status, so the process that started the daemon waits without polling"},
 			},
 			Action: func(_ context.Context, c *ucli.Command) error {
 				logger := logging.NewJSONLogger(stderr, slog.LevelInfo)
@@ -88,6 +89,11 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				}
 				defer svc.Close()
 				svc.SetHydrationConcurrency(c.Int("hydration-concurrency"))
+				if fd := c.Int("notify-fd"); fd >= 0 {
+					if err := svc.NotifyRuntimeWrites(fd); err != nil {
+						return err
+					}
+				}
 				err = svc.Start(ctx)
 				if err == context.Canceled {
 					return nil
