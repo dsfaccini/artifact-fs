@@ -356,3 +356,22 @@ func TestStartRunsWithoutTheControlSocket(t *testing.T) {
 		return err == nil && st.State == repoStateMounted
 	})
 }
+
+// Close releases the daemon lock while a child that another goroutine forked
+// holds a copy of the lock file, until it execs, so the CLI sees no daemon and
+// the next daemon starts.
+func TestCloseReleasesTheDaemonLockAForkedChildHolds(t *testing.T) {
+	t.Parallel()
+	root := filepath.Join(shortTempDir(t), "artifact-fs")
+	svc, err := New(t.Context(), root, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gittest.HoldForkedCopies(t, daemonLockPath(root))
+	if err := svc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, running, err := Running(root); err != nil || running {
+		t.Fatalf("Running after Close = %v, %v; want no daemon", running, err)
+	}
+}

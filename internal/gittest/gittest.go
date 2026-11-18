@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/cloudflare/artifact-fs/internal/execfile"
 )
 
@@ -354,4 +356,59 @@ func UnauthorizedRemote(t testing.TB) string {
 	}))
 	t.Cleanup(server.Close)
 	return server.URL + "/repo.git"
+}
+
+// HoldForkedCopies holds a copy of each descriptor this process has open on
+// path until t ends, as a child that another goroutine forked holds them until
+// it execs (golang/go#22315). A flock belongs to the open file, so a copy
+// keeps it after the original descriptor closes, and only LOCK_UN releases
+// it. It fails t when this process has no descriptor open on path.
+func HoldForkedCopies(t testing.TB, path string) {
+	t.Helper()
+	var want unix.Stat_t
+	if err := unix.Stat(path, &want); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir("/dev/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var copies []int
+	for _, e := range entries {
+		fd, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		var st unix.Stat_t
+		if unix.Fstat(fd, &st) != nil || st.Dev != want.Dev || st.Ino != want.Ino {
+			continue
+		}
+		dup, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		copies = append(copies, dup)
+	}
+	if len(copies) == 0 {
+		t.Fatalf("this process holds no descriptor of %s", path)
+	}
+	t.Cleanup(func() {
+		for _, fd := range copies {
+			_ = unix.Close(fd)
+		}
+	})
+}
+
+// RequireFlockFree fails t when another open file holds a flock on path.
+func RequireFlockFree(t testing.TB, path string) {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatalf("flock %s: %v, want it free", path, err)
+	}
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
 }
