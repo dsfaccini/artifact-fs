@@ -29,7 +29,7 @@ func firstRun(stderr io.Writer, probe doctor.Probe, goos, backend string) {
 		}
 	}
 	fmt.Fprintf(stderr, "slimtree's first run: what --backend %s needs here (slimtree doctor checks again)\n", backend)
-	writeChecks(stderr, runDoctor(probe, goos, backend, ""))
+	writeChecks(stderr, doctor.Run(probe, goos, backend, ""))
 	if err == nil {
 		err = writeFirstRunMarker(home)
 	}

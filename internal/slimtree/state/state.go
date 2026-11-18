@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -134,32 +135,57 @@ func (h *Home) Write(r Record) error {
 	return writeFile(dir, recordFile, append(data, '\n'))
 }
 
-// Remove removes the record of the worktree at path, with its directory.
+// Remove removes the record of the worktree at path, with its directory. It
+// removes the record last, so a removal that fails leaves a record that names
+// what is left, such as an artifactfs worktree's state.
 func (h *Home) Remove(path string) error {
-	return os.RemoveAll(h.RecordDir(path))
+	dir := h.RecordDir(path)
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.Name() == recordFile {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			return err
+		}
+	}
+	return os.RemoveAll(dir)
 }
 
 // Archive writes a copy of r to archives/<ID>/<ns>/worktree.json, ns being
-// the time in nanoseconds, and returns the recovery ref that belongs to that
-// archive: refs/slimtree/archive/<ID>/<ns>/HEAD. Write the copy before the
-// ref, so the copy names the repository of every ref a removal leaves. Set
-// r.Head to the commit the ref keeps, so prune deletes the ref only while it
-// points there.
-func (h *Home) Archive(r Record) (string, error) {
+// the time in nanoseconds, and returns that archive, with the recovery ref
+// that belongs to it: refs/slimtree/archive/<ID>/<ns>/HEAD. Write the copy
+// before the ref, so the copy names the repository of every ref a removal
+// leaves. Set r.Head to the commit the ref keeps, so prune deletes the ref
+// only while it points there.
+func (h *Home) Archive(r Record) (Archived, error) {
 	r.Version = recordVersion
 	data, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
-		return "", err
+		return Archived{}, err
 	}
-	id, ns := ID(r.Path), strconv.FormatInt(time.Now().UnixNano(), 10)
-	dir := filepath.Join(h.dir, archivesDir, id, ns)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
+	made := time.Now()
+	id, ns := ID(r.Path), strconv.FormatInt(made.UnixNano(), 10)
+	a := Archived{Dir: filepath.Join(h.dir, archivesDir, id, ns), Ref: "refs/slimtree/archive/" + id + "/" + ns + "/HEAD", Made: made}
+	if err := os.MkdirAll(a.Dir, 0o700); err != nil {
+		return Archived{}, err
 	}
-	if err := writeFile(dir, recordFile, append(data, '\n')); err != nil {
-		return "", err
+	if err := writeFile(a.Dir, recordFile, append(data, '\n')); err != nil {
+		return Archived{}, err
 	}
-	return "refs/slimtree/archive/" + id + "/" + ns + "/HEAD", nil
+	return a, nil
+}
+
+// WriteFile writes what write writes to name in a's directory, as Write
+// writes a record, so a failed write leaves no partial file there.
+func (a Archived) WriteFile(name string, write func(io.Writer) error) error {
+	return writeWith(a.Dir, name, write)
 }
 
 // RecordDirs returns the record directories in w/, with or without a
@@ -319,6 +345,14 @@ var fileCreated func(*os.File)
 // writeFile writes data to name in dir through a temporary file, synced,
 // and a rename, so neither a failed write nor a crash leaves a partial file.
 func writeFile(dir, name string, data []byte) error {
+	return writeWith(dir, name, func(w io.Writer) error {
+		_, err := w.Write(data)
+		return err
+	})
+}
+
+// writeWith writes what write writes to name in dir, as writeFile does.
+func writeWith(dir, name string, write func(io.Writer) error) error {
 	f, err := os.CreateTemp(dir, "."+name+"-*")
 	if err != nil {
 		return err
@@ -326,7 +360,7 @@ func writeFile(dir, name string, data []byte) error {
 	if fileCreated != nil {
 		fileCreated(f)
 	}
-	_, err = f.Write(data)
+	err = write(f)
 	if err == nil {
 		err = f.Sync()
 	}

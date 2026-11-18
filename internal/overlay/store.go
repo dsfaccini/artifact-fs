@@ -1806,6 +1806,39 @@ func ReadChangesSince(ctx context.Context, cfg model.RepoPaths, since int64) (ch
 	return changes, true, nil
 }
 
+// ReadBackingPaths reads an existing overlay database with
+// meta.OpenForReading and without the migrations that New runs, and returns
+// the backing file of each entry that has one, by the entry's path.
+func ReadBackingPaths(ctx context.Context, cfg model.RepoPaths) (map[string]string, error) {
+	if _, err := os.Stat(cfg.OverlayDBPath); err != nil {
+		return nil, err
+	}
+	db, err := meta.OpenForReading(cfg.OverlayDBPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT path, backing_path FROM overlay_entries WHERE backing_path != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	backing := map[string]string{}
+	for rows.Next() {
+		var path, file string
+		if err := rows.Scan(&path, &file); err != nil {
+			return nil, err
+		}
+		backing[path] = file
+	}
+	return backing, rows.Err()
+}
+
 func scanPaths(rows *sql.Rows) ([]string, error) {
 	defer rows.Close()
 	var paths []string

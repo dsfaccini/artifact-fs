@@ -57,17 +57,15 @@ How it was measured:
 | `slimtree new <branch>` | Makes a worktree from APFS clones | Makes a worktree served from an artifact-fs mount |
 | `slimtree stop <worktree>` | Only for `--backend artifactfs` | Unmounts the worktree and stops its daemon; its changes stay |
 | `slimtree resume <worktree>` | Only for `--backend artifactfs` | Mounts the worktree again; `--all` mounts every one, as after a reboot |
-| `slimtree rm <worktree>` | Removes an APFS clone worktree | Coming |
+| `slimtree rm <worktree>` | Removes an APFS clone worktree | Stops the worktree's daemon, archives its files and removes it |
 | `slimtree list` | Lists the worktrees slimtree made | Lists the worktrees slimtree made |
-| `slimtree prune` | Deletes the archives and recovery refs `rm` left that are older than the retention rule | Evicts cached blobs not read within the retention rule, and removes the daemon binary copies no worktree uses |
+| `slimtree prune` | Deletes the archives and recovery refs `rm` left that are older than the retention rule | Deletes the archives and recovery refs `rm` left that are older than the retention rule, evicts cached blobs not read within it, and removes the daemon binary copies no worktree uses |
 | `slimtree retention [<rule>]` | Shows or sets how long archives are kept: `week`, `month` (the default), `forever` or `<N>d` | Shows or sets the rule, which also decides how long a cached blob stays unread before `prune` evicts it |
-| `slimtree doctor` | Checks what slimtree needs | Checks the FUSE setup, and warns that `rm` of artifact-fs worktrees is not supported yet |
+| `slimtree doctor` | Checks what slimtree needs | Checks the FUSE setup |
 
-Release builds are tested on macOS 26, Ubuntu 24.04 and Alpine Linux. Linux
-support is complete in a later release: until then, `slimtree rm` refuses an
-artifact-fs worktree, and `slimtree stop` unmounts one. On macOS,
-`--backend artifactfs` mounts through macFUSE's FSKit backend. It is a beta,
-and release builds do not test it.
+Release builds are tested on macOS 26, Ubuntu 24.04 and Alpine Linux. On
+macOS, `--backend artifactfs` mounts through macFUSE's FSKit backend. It is a
+beta, and release builds do not test it.
 
 ## Install
 
@@ -111,10 +109,16 @@ slimtree resume app-login    # mounts it again
 slimtree resume --all        # after a reboot
 ```
 
-`slimtree rm` takes a worktree by its directory name or its path. It removes
-only APFS clone worktrees in this release. It refuses a worktree with changes
-unless you pass `--force`. It keeps the worktree's `HEAD` in a ref under
-`refs/slimtree/archive/` and never deletes a branch. Each `slimtree rm`, and
+`slimtree rm` takes a worktree by its directory name or its path. It refuses a
+worktree with changes unless you pass `--force`, and `slimtree rm --check` runs
+only its checks. It keeps the worktree's `HEAD` in a ref under
+`refs/slimtree/archive/` and never deletes a branch. For a worktree on an
+artifact-fs mount, Linux's default, it also refuses while another process
+works inside the mount, also with `--force`. It then stops the worktree's
+daemon, and keeps the files your changes made, with the worktree's git dir, in
+`state.tar.gz` in the archive. `--exclude <glob>` leaves out the files at paths
+with a component that the glob matches, such as `--exclude node_modules`. Each
+`slimtree rm`, and
 `slimtree prune`, deletes the archives and recovery refs older than the
 retention rule, a month by default, and evicts artifact-fs's cached blobs not
 read within it; `slimtree retention week|month|forever|<N>d`

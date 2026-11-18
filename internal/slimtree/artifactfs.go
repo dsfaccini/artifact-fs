@@ -513,7 +513,7 @@ func stopWorktree(ctx context.Context, home *state.Home, arg string, stdout io.W
 	if err != nil {
 		return err
 	}
-	if err := healRemount(ctx, home, &r); err != nil {
+	if err := healRemount(ctx, home, &r, true); err != nil {
 		return err
 	}
 	if err := stopDaemon(ctx, r); err != nil {
@@ -527,8 +527,9 @@ func stopWorktree(ctx context.Context, home *state.Home, arg string, stdout io.W
 // daemon runs and reports r mounted, that identity is not the recorded one,
 // and git finds r's worktree and git dir through the mount. After an
 // external unmount, the daemon mounts again, with a new identity. It refuses
-// a mount where git finds another worktree.
-func healRemount(ctx context.Context, home *state.Home, r *state.Record) error {
+// a mount where git finds another worktree. Without write, it sets the
+// identity in r alone, for a command that changes nothing.
+func healRemount(ctx context.Context, home *state.Home, r *state.Record, write bool) error {
 	id, remount, err := remountedBy(ctx, *r)
 	if err != nil || !remount {
 		return err
@@ -537,6 +538,9 @@ func healRemount(ctx context.Context, home *state.Home, r *state.Record) error {
 		return fmt.Errorf("%s holds another mount than the one slimtree recorded, and slimtree left it: %w", r.Path, err)
 	}
 	r.MountIdentity = string(id)
+	if !write {
+		return nil
+	}
 	return home.Write(*r)
 }
 
@@ -620,6 +624,13 @@ func stopDaemon(ctx context.Context, r state.Record) error {
 	if id, err = identify(r.Path); err != nil || id == "" {
 		return err
 	}
+	// Before Linux 6.8 a later mount at r.Path can take the recorded
+	// identity, so the mount can be a daemon's that slimtree did not record.
+	if pid, running, err := daemon.Running(r.StateDir); err != nil {
+		return err
+	} else if running {
+		return fmt.Errorf("pid %d, a daemon slimtree did not record, serves %s, so slimtree left the mount at %s; stop that daemon, then rerun", pid, r.StateDir, r.Path)
+	}
 	if err := unmount(ctx, r.Path, mounts.Identity(r.MountIdentity)); err != nil {
 		key, keyErr := mounts.KeyOf(r.Path)
 		if keyErr != nil {
@@ -634,7 +645,8 @@ func stopDaemon(ctx context.Context, r state.Record) error {
 }
 
 // refuseHolders refuses r's mount while processes other than its daemon and
-// the daemon's children use it.
+// the daemon's children use it. It names each holder that is slimtree or a
+// process slimtree runs under.
 func refuseHolders(ctx context.Context, r state.Record) error {
 	key, err := mounts.KeyOf(r.Path)
 	if err != nil {
@@ -653,11 +665,14 @@ func refuseHolders(ctx context.Context, r state.Record) error {
 			break
 		}
 	}
+	var callers []string
 	for _, h := range holders {
 		if ancestors[h.PID] {
-			msg.WriteString(". slimtree, or a process it runs under, runs inside the worktree; run slimtree from a shell outside it")
-			break
+			callers = append(callers, strconv.Itoa(h.PID))
 		}
+	}
+	if len(callers) > 0 {
+		fmt.Fprintf(&msg, ". %s is slimtree or a process it runs under. A process holds the mount until it exits or leaves the worktree, and a cd in a shell it started does not release it; remove the worktree from a session started outside it", strings.Join(callers, ", "))
 	}
 	return errors.New(msg.String())
 }
@@ -684,7 +699,7 @@ func resumeWorktree(ctx context.Context, home *state.Home, arg, goos string, std
 	if err != nil {
 		return err
 	}
-	if err := healRemount(ctx, home, &r); err != nil {
+	if err := healRemount(ctx, home, &r, true); err != nil {
 		return err
 	}
 	alive, err := daemonAlive(r)

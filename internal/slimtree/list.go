@@ -147,9 +147,11 @@ func artifactFSState(home *state.Home, r state.Record) (string, string) {
 
 // gitWorktree is one worktree that git worktree list reports.
 type gitWorktree struct {
+	// head is the commit HEAD names, or "" on an unborn branch.
 	head     string
 	branch   string
 	prunable bool
+	locked   bool
 }
 
 // worktreeList runs git worktree list in the repository whose common dir is
@@ -205,9 +207,12 @@ func worktreeList(ctx context.Context, commonDir string) (map[string]gitWorktree
 			path = filepath.Clean(value)
 			worktrees[path] = gitWorktree{}
 		case "HEAD":
-			w := worktrees[path]
-			w.head = value
-			worktrees[path] = w
+			// git prints the null object ID for an unborn branch's HEAD.
+			if strings.Trim(value, "0") != "" {
+				w := worktrees[path]
+				w.head = value
+				worktrees[path] = w
+			}
 		case "branch":
 			w := worktrees[path]
 			w.branch = strings.TrimPrefix(value, "refs/heads/")
@@ -215,6 +220,10 @@ func worktreeList(ctx context.Context, commonDir string) (map[string]gitWorktree
 		case "prunable":
 			w := worktrees[path]
 			w.prunable = true
+			worktrees[path] = w
+		case "locked":
+			w := worktrees[path]
+			w.locked = true
 			worktrees[path] = w
 		}
 	}
