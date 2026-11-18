@@ -51,7 +51,10 @@ else at `HEAD`. `--path` puts the worktree elsewhere.
 
 `slimtree rm` refuses a worktree with changes unless you pass `--force`. It
 keeps the worktree's `HEAD` in a ref under `refs/slimtree/archive/` and never
-deletes a branch. Run `slimtree --help` for every flag.
+deletes a branch. Each `slimtree rm`, and `slimtree prune`, deletes the
+archives and recovery refs older than the retention rule, a month by default;
+`slimtree retention week|month|forever|<N>d` changes the rule. Run
+`slimtree --help` for every flag.
 
 ## Source and license
 
