@@ -786,15 +786,19 @@ func TestFirstFileReadPrefetchesItsDirectoryAndListingPrefetchesNothing(t *testi
 }
 
 // A first git status in a clean worktree reads no file but the .gitignore of
-// each directory that holds a directory and the .gitattributes that apply to
-// those.
+// each directory that holds a directory, the .gitattributes that apply to
+// those, and the root's .gitmodules while the index holds a submodule. git
+// log reads the root's .mailmap.
 func TestReadsOfGitRuleFilesPrefetchNothing(t *testing.T) {
 	files := map[string]string{
 		".gitignore":     "*.log\n",
 		".gitattributes": "*.bin binary\n",
+		".gitmodules":    "[submodule \"m\"]\n",
+		".mailmap":       "A <a@example.com>\n",
 		"README.md":      "# readme\n",
 		"top.txt":        "top\n",
 		"src/.gitignore": "*.tmp\n",
+		"src/.mailmap":   "B <b@example.com>\n",
 		"src/a.go":       "package a\n",
 		"src/b.go":       "package b\n",
 	}
@@ -804,20 +808,33 @@ func TestReadsOfGitRuleFilesPrefetchNothing(t *testing.T) {
 	for _, read := range []struct {
 		dir  fuseops.InodeID
 		path string
-	}{{fuseops.RootInodeID, ".gitignore"}, {fuseops.RootInodeID, ".gitattributes"}, {src, "src/.gitignore"}} {
+	}{
+		{fuseops.RootInodeID, ".gitignore"},
+		{fuseops.RootInodeID, ".gitattributes"},
+		{fuseops.RootInodeID, ".gitmodules"},
+		{fuseops.RootInodeID, ".mailmap"},
+		{src, "src/.gitignore"},
+	} {
 		if got := readWholeFile(t, fs, lookUpInode(t, fs, read.dir, filepath.Base(read.path))); got != files[read.path] {
 			t.Fatalf("%s = %q, want %q", read.path, got, files[read.path])
 		}
 	}
 	if got := queue.queued.Load(); got != 0 {
-		t.Fatalf("reads of .gitignore and .gitattributes queued %d prefetch tasks, want 0", got)
+		t.Fatalf("reads of Git's rule files queued %d prefetch tasks, want 0", got)
 	}
 	// A rule file's read leaves its directory to the next read.
 	if got := readWholeFile(t, fs, lookUpInode(t, fs, fuseops.RootInodeID, "README.md")); got != files["README.md"] {
 		t.Fatalf("README.md = %q, want %q", got, files["README.md"])
 	}
-	if got := queue.queued.Load(); got != 4 {
-		t.Fatalf("a read of README.md queued %d prefetch tasks, want the root's 4 files", got)
+	if got := queue.queued.Load(); got != 6 {
+		t.Fatalf("a read of README.md queued %d prefetch tasks, want the root's 6 files", got)
+	}
+	// Git reads only the root's .mailmap.
+	if got := readWholeFile(t, fs, lookUpInode(t, fs, src, ".mailmap")); got != files["src/.mailmap"] {
+		t.Fatalf("src/.mailmap = %q, want %q", got, files["src/.mailmap"])
+	}
+	if got := queue.queued.Load(); got != 10 {
+		t.Fatalf("a read of src/.mailmap queued %d prefetch tasks after the root's 6, want src's 4 files", got-6)
 	}
 }
 
