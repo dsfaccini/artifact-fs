@@ -239,7 +239,6 @@ jobs:
           artifact: planted-fuzz-inputs
 
       - name: Seal the fuzz inputs without a recipient
-        id: unsealed
         uses: ./.github/actions/seal-fuzz-inputs
         with:
           corpus: ${{ runner.temp }}/plant/testdata/fuzz
@@ -255,15 +254,9 @@ jobs:
         env:
           ARTIFACT_ID: ${{ steps.seal.outputs.artifact-id }}
           CIPHERTEXT: ${{ steps.seal.outputs.path }}
-          UNSEALED_ID: ${{ steps.unsealed.outputs.artifact-id }}
-          UNSEALED_PATH: ${{ steps.unsealed.outputs.path }}
         run: |
           if [ -z "$ARTIFACT_ID" ] || [ "$(basename "$CIPHERTEXT")" != planted-fuzz-inputs.tar.age ]; then
             echo "::error::seal-fuzz-inputs uploaded no planted-fuzz-inputs.tar.age."
-            exit 1
-          fi
-          if [ -n "$UNSEALED_ID$UNSEALED_PATH" ]; then
-            echo "::error::The seal without a recipient uploaded the fuzz inputs."
             exit 1
           fi
           planted=plant/testdata/fuzz/FuzzPlanted/planted
@@ -315,6 +308,14 @@ jobs:
           marker=$(echo "planted-$GITHUB_RUN_ID" | sha256sum | cut -c1-32)
           if grep -qF "$marker" log; then
             echo "::error::seal-fuzz-inputs' log shows the planted input."
+            exit 1
+          fi
+          # upload-artifact logs this line for each artifact it uploads, so the
+          # planted seal's upload is the job's only one. That covers the seal
+          # without a recipient.
+          finalized=$(grep -F 'successfully finalized. Artifact ID' log | cut -d' ' -f2-)
+          if [ "$finalized" != "Artifact planted-fuzz-inputs successfully finalized. Artifact ID $ARTIFACT_ID" ]; then
+            echo "::error::seal-fuzz-inputs uploaded another artifact than planted-fuzz-inputs, or none."
             exit 1
           fi
           # The upload, read by its ID with no list or name lookup. Its digest
