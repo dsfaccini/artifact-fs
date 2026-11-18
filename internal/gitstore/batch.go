@@ -306,7 +306,7 @@ func (s *Store) getPool(gitDir string) (*batchPool, error) {
 	if p, ok := s.pools[gitDir]; ok {
 		return p, nil
 	}
-	p := &batchPool{gitDir: gitDir, env: s.lazyFetchEnv, logger: s.logger, maxSize: s.poolMaxSize, all: map[*batchCatFile]struct{}{}, changed: make(chan struct{})}
+	p := &batchPool{gitDir: gitDir, env: s.lazyFetchEnv, logger: s.logger, maxSize: s.poolMaxSize, all: map[*batchCatFile]struct{}{}, changed: make(chan struct{}), testHookStarting: s.testHookBatchStarting}
 	s.pools[gitDir] = p
 	return p, nil
 }
@@ -324,6 +324,8 @@ type batchPool struct {
 	all      map[*batchCatFile]struct{}
 	closed   bool
 	changed  chan struct{}
+	// testHookStarting is the Store's testHookBatchStarting.
+	testHookStarting func()
 }
 
 func (p *batchPool) acquire(ctx context.Context) (*batchCatFile, error) {
@@ -346,6 +348,9 @@ func (p *batchPool) acquire(ctx context.Context) (*batchCatFile, error) {
 		if len(p.all)+p.creating < p.maxSize {
 			p.creating++
 			p.mu.Unlock()
+			if p.testHookStarting != nil {
+				p.testHookStarting()
+			}
 			b, err := newBatchCatFile(p.gitDir, p.env, p.logger)
 			p.mu.Lock()
 			p.creating--
