@@ -296,12 +296,13 @@ func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime i
 	r.switchMu.Lock()
 	defer r.switchMu.Unlock()
 	sw := Switch{Replaced: r.Generation()}
+	var changed model.SwitchedPaths
 	var listings []string
 	// Readers resolved against no generation before the first switch, so
 	// nothing Git saw changes. An async repo's first switch follows the
 	// clean-index bootstrap, whose token a new instance would discard.
 	if sw.Replaced != 0 && sw.Replaced != gen {
-		sw.Changed, listings, sw.DiffErr = switchedPathsFor(ctx, r.Snapshot, r.Overlay, sw.Replaced, gen)
+		changed, listings, sw.DiffErr = switchedPathsFor(ctx, r.Snapshot, r.Overlay, sw.Replaced, gen)
 	}
 	// Readers take gen's times from its nodes once the switch lands.
 	if sw.Replaced != gen {
@@ -309,12 +310,12 @@ func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime i
 			return sw, fmt.Errorf("raise mtimes: %w", err)
 		}
 	}
-	logged, err := r.Overlay.ReconcileChecked(ctx, gen, baseLookup, sw.Changed, &r.transition, func() {
+	var err error
+	sw.Logged, err = r.Overlay.ReconcileChecked(ctx, gen, baseLookup, changed, &r.transition, func() {
 		r.SetCommitTime(commitTime)
 		r.SetGeneration(gen)
-		r.listingsSwitched(listings, sw.Changed.Unknown)
+		r.listingsSwitched(listings, changed.Unknown)
 	})
-	sw.Logged = logged
 	return sw, err
 }
 
@@ -322,11 +323,10 @@ func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime i
 type Switch struct {
 	// Replaced is the generation readers resolved against before the switch.
 	Replaced int64
-	// Changed is what the switch gave the overlay to log.
-	Changed model.SwitchedPaths
 	// Logged is what the switch's ReconcileChecked logged.
 	Logged model.SwitchedPaths
-	// DiffErr is the snapshot read error that made Changed Unknown, if any.
+	// DiffErr is the snapshot read error that made the switch's diff of the
+	// two generations Unknown, if any.
 	DiffErr error
 }
 

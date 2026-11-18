@@ -1426,9 +1426,9 @@ func TestReconcileAfterCommit(t *testing.T) {
 	baseLookup := func(path string) (model.BaseNode, bool) {
 		switch path {
 		case "foo.txt":
-			return model.BaseNode{Path: "foo.txt", ObjectOID: testBlobOID([]byte("modified"))}, true
+			return model.BaseNode{Path: "foo.txt", Type: "file", ObjectOID: testBlobOID([]byte("modified"))}, true
 		case "new.txt":
-			return model.BaseNode{Path: "new.txt", ObjectOID: testBlobOID(nil)}, true
+			return model.BaseNode{Path: "new.txt", Type: "file", ObjectOID: testBlobOID(nil)}, true
 		default:
 			return model.BaseNode{}, false
 		}
@@ -1450,15 +1450,16 @@ func TestReconcileAfterCommit(t *testing.T) {
 }
 
 // The umask of each process that writes through the mount sets or clears the
-// group and other write bits, and Git records neither. A reconcile drops an
-// entry it compares with the base when its content and mode are the base's
-// apart from those two bits, and keeps one that differs in any other bit. A
-// drop that changes the path's mode to the base's logs the path, because Git
-// trusts every index entry the fsmonitor hook does not name.
+// group and other write bits, and Git neither records nor compares them. A
+// reconcile drops an entry it compares with the base when its type, content
+// and mode are the base's apart from those two bits, and keeps one that
+// differs in any other bit or in type. Neither logs the path, because Git
+// sees no change: it takes a path the fsmonitor hook names whose stat data
+// the index does not match as changed until a refresh.
 func TestReconcileIgnoresOnlyGroupAndOtherWrite(t *testing.T) {
 	data := []byte("as committed\n")
 	// Each entry is at file.txt with data and mode, and the reconcile compares
-	// it with a base at file.txt with data.
+	// it with a base at file.txt whose blob holds data.
 	entries := map[string]func(t *testing.T, s *Store, cfg model.RepoPaths, mode uint32){
 		// A file made through the mount over a path the commit adds.
 		"create": func(t *testing.T, s *Store, _ model.RepoPaths, mode uint32) {
@@ -1514,22 +1515,26 @@ func TestReconcileIgnoresOnlyGroupAndOtherWrite(t *testing.T) {
 		name     string
 		entry    string
 		mode     uint32
+		baseType string
 		baseMode uint32
 		kept     bool
-		// logged is whether the reconcile logs file.txt.
-		logged bool
 	}{
-		{name: "umask 022", entry: "create", mode: 0o644, baseMode: 0o100644},
-		{name: "umask 002", entry: "create", mode: 0o664, baseMode: 0o100644, logged: true},
-		{name: "umask 000", entry: "create", mode: 0o666, baseMode: 0o100644, logged: true},
-		{name: "executable under umask 002", entry: "create", mode: 0o775, baseMode: 0o100755, logged: true},
-		{name: "executable bit", entry: "create", mode: 0o755, baseMode: 0o100644, kept: true},
-		{name: "umask 027", entry: "create", mode: 0o640, baseMode: 0o100644, kept: true},
-		{name: "group read", entry: "create", mode: 0o604, baseMode: 0o100644, kept: true},
-		{name: "modify under umask 002", entry: "modify", mode: 0o664, baseMode: 0o100644, logged: true},
-		{name: "modify with the executable bit", entry: "modify", mode: 0o755, baseMode: 0o100644, kept: true},
-		{name: "rename under umask 002", entry: "rename", mode: 0o664, baseMode: 0o100644, logged: true},
-		{name: "rename under umask 027", entry: "rename", mode: 0o640, baseMode: 0o100644, kept: true},
+		{name: "umask 022", entry: "create", mode: 0o644, baseType: "file", baseMode: 0o100644},
+		{name: "umask 002", entry: "create", mode: 0o664, baseType: "file", baseMode: 0o100644},
+		{name: "umask 000", entry: "create", mode: 0o666, baseType: "file", baseMode: 0o100644},
+		{name: "executable under umask 002", entry: "create", mode: 0o775, baseType: "file", baseMode: 0o100755},
+		{name: "executable bit", entry: "create", mode: 0o755, baseType: "file", baseMode: 0o100644, kept: true},
+		{name: "umask 027", entry: "create", mode: 0o640, baseType: "file", baseMode: 0o100644, kept: true},
+		{name: "group read", entry: "create", mode: 0o604, baseType: "file", baseMode: 0o100644, kept: true},
+		{name: "modify under umask 002", entry: "modify", mode: 0o664, baseType: "file", baseMode: 0o100644},
+		{name: "modify with the executable bit", entry: "modify", mode: 0o755, baseType: "file", baseMode: 0o100644, kept: true},
+		{name: "rename under umask 002", entry: "rename", mode: 0o664, baseType: "file", baseMode: 0o100644},
+		{name: "rename under umask 027", entry: "rename", mode: 0o640, baseType: "file", baseMode: 0o100644, kept: true},
+		// A symlink's mode has no permission bits, so these modes differ from
+		// it in ignoredModeBits alone, and its target is the file's content.
+		{name: "create over a symlink", entry: "create", mode: 0o000, baseType: "symlink", baseMode: 0o120000, kept: true},
+		{name: "modify over a symlink", entry: "modify", mode: 0o022, baseType: "symlink", baseMode: 0o120000, kept: true},
+		{name: "rename over a symlink", entry: "rename", mode: 0o002, baseType: "symlink", baseMode: 0o120000, kept: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, cfg := testStore(t)
@@ -1538,7 +1543,7 @@ func TestReconcileIgnoresOnlyGroupAndOtherWrite(t *testing.T) {
 			if e, ok := lookupEntry(t, s, "file.txt"); !ok || e.Mode&0o777 != tt.mode {
 				t.Fatalf("entry before reconcile = %+v, %v; want mode %#o", e, ok, tt.mode)
 			}
-			base := model.BaseNode{Path: "file.txt", Type: "file", Mode: tt.baseMode, ObjectOID: testBlobOID(data)}
+			base := model.BaseNode{Path: "file.txt", Type: tt.baseType, Mode: tt.baseMode, ObjectOID: testBlobOID(data)}
 			before := changesSince(t, cfg, 0).Seq
 			if err := reconcile(ctx, s, func(path string) (model.BaseNode, bool) {
 				return base, path == base.Path
@@ -1552,12 +1557,8 @@ func TestReconcileIgnoresOnlyGroupAndOtherWrite(t *testing.T) {
 			case tt.kept && (!ok || e.Kind != model.OverlayKindModify || e.Mode&0o777 != tt.mode || e.SourceOID != base.ObjectOID || e.SourceMode != tt.baseMode):
 				t.Fatalf("%s entry with mode %#o over a base with mode %#o = %+v, %v; want it kept as a modify of the base with its mode", tt.entry, tt.mode, tt.baseMode, e, ok)
 			}
-			var want []string
-			if tt.logged {
-				want = []string{"file.txt"}
-			}
-			if got := changesSince(t, cfg, before).Paths; !slices.Equal(got, want) {
-				t.Fatalf("changed paths after reconcile = %q, want %q", got, want)
+			if got := changesSince(t, cfg, before).Paths; len(got) != 0 {
+				t.Fatalf("changed paths after reconcile = %q, want none", got)
 			}
 		})
 	}
