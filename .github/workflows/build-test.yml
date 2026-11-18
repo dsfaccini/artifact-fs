@@ -278,12 +278,16 @@ jobs:
           # A calling workflow prefixes the name with the name of its own job.
           job=$(gh api "$run/jobs?filter=latest" --paginate \
             --jq '.jobs[] | select(.name == "seal-fuzz-inputs" or (.name | endswith(" / seal-fuzz-inputs"))) | .id')
-          # The log can trail the job's end.
+          # The log can trail the job's end. It holds the escape sequences of
+          # colored output.
           for _ in 1 2 3 4 5; do
-            gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$job/logs" >log && break
+            gh api --allow-escape-sequences "repos/$GITHUB_REPOSITORY/actions/jobs/$job/logs" >log && break
             sleep 15
           done
-          grep -qF -- '--- FAIL: FuzzPlanted' log
+          if ! grep -qF -- '--- FAIL: FuzzPlanted' log; then
+            echo "::error::Found no log of seal-fuzz-inputs' failing fuzz run."
+            exit 1
+          fi
           grep -qF '##[warning]FUZZ_AGE_RECIPIENT is not set, so no fuzz inputs were uploaded.' log
           marker=$(echo "planted-$GITHUB_RUN_ID" | sha256sum | cut -c1-32)
           if grep -qF "$marker" log; then
