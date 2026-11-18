@@ -63,11 +63,12 @@ How it was measured:
 | Second `git status` | 11 ms | 10 ms |
 | Remove | 0.31 s | 0.12 s |
 
-On Linux slimtree saves disk and time. It checks out no files: the mount reads
-file contents from Git's objects as they are needed, and the worktree's
-FSMonitor hook tells `git status` which files changed. Only remove takes
-longer: `slimtree rm` stops the daemon and archives the worktree's state before
-it removes the worktree.
+On Linux slimtree saves disk, and it makes a worktree and runs the first
+`git status` in less time than git. Its second `git status` is within about
+1 ms of git's. It checks out no files: the mount reads file contents from Git's
+objects as they are needed, and the worktree's FSMonitor hook tells
+`git status` which files changed. Remove takes longer: `slimtree rm` stops the
+daemon and archives the worktree's state before it removes the worktree.
 
 How it was measured:
 
@@ -83,36 +84,54 @@ How it was measured:
 - Each slimtree run had its own `SLIMTREE_HOME`, so its blob cache started
   empty. The blob cache is shared, so a later worktree of the same repository
   reuses the blobs an earlier one hydrated.
-- Disk is what `du` counts right after the create. For slimtree: the
-  worktree's record directory in its home (2.67 MiB, mostly the state root's
-  databases), its admin directory in the base's `.git/worktrees` (0.83 MiB),
-  and the blob cache (0.01 MiB). The mount point is an empty directory. For git:
-  the worktree (347 MiB) and its admin directory (0.84 MiB). ext4 shares no
-  blocks between files, so `du` counts git's checkout in full.
-- The first `git status` hydrated 12 blobs, 2.02 MiB: every regular file at the
-  root of the tree. The slimtree worktree then took 5.57 MiB. The second
-  `git status` hydrated none.
+- Disk is what `du` counts right after the create. It was the same in every
+  round: byte for byte for slimtree, within 4 KiB for git. For slimtree at the
+  base worktree's commit: the worktree's record directory in its home
+  (2.67 MiB, mostly the state root's databases; 2.68 MiB at the pull request's
+  commit), its admin directory in the base's `.git/worktrees` (0.83 MiB), and
+  the blob cache (0.01 MiB). The mount point is an empty directory. For git: the
+  worktree (347 MiB) and its admin directory (0.84 MiB). ext4 shares no blocks
+  between files, so `du` counts git's checkout in full.
+- The first `git status` hydrated 12 blobs, every regular file at the root of
+  the tree. The blobs hold 1.96 MiB; `du` of the blob cache, which also counts
+  its shard directories, grew by 2.02 MiB. The slimtree worktree then took
+  5.57 MiB. The second `git status` hydrated none.
 - `slimtree new` copies its own binary (12.1 MiB) into its home when the home
-  holds no copy of that build, and every worktree's daemon runs that copy. Each
+  holds no copy of that build, and every worktree's daemon runs that copy.
+  `slimtree rm` deletes the copy once no worktree uses it, so after a home's
+  last worktree goes, the next `slimtree new` copies the binary again. Each
   home got the copy before the run, so create's time and disk leave the copy
-  out. Create's time includes the summary that slimtree prints on a home's
-  first run, which takes about 10 ms.
+  out.
+- Create's time includes the summary that slimtree prints on a home's first
+  run: 6.0 ms (5.6 ms to 12.1 ms), the difference between
+  `slimtree --backend artifactfs list` with and without that summary, median
+  of 20 pairs at a load average of 0.9.
 - `slimtree rm` leaves a 0.88 MiB archive of the worktree's state, which
   `slimtree prune` deletes under the retention rule.
 - Times are the wall-clock time of each command, at the base worktree's commit.
   At the pull request's commit they were: create 0.39 s and 0.95 s, first
   `git status` 120 ms and 457 ms, second `git status` 11 ms and 10 ms, remove
   0.30 s and 0.13 s, for slimtree and git.
-- The daemon's log splits slimtree's create at the base worktree's commit:
-  197 ms before the daemon began to mount, 97 ms to mount, and 19 ms more until
-  `slimtree new` returned. At the pull request's commit: 184 ms, 130 ms and
-  80 ms.
+- Create took between 0.30 s and 0.42 s for slimtree and between 0.95 s and
+  1.04 s for git at the base worktree's commit, and between 0.39 s and 0.40 s
+  and between 0.93 s and 0.96 s at the pull request's. slimtree's remove took
+  0.31 s in every round at the base worktree's commit, and between 0.30 s and
+  0.31 s at the pull request's.
+- The daemon's log splits slimtree's create into three phases: until the
+  daemon began to mount, the mount, and the rest until `slimtree new` returned.
+  Each phase's median, so the three need not sum to create's, was 197 ms, 97 ms
+  and 19 ms at the base worktree's commit, and 184 ms, 130 ms and 80 ms at the
+  pull request's. The last phase took 96 ms and 106 ms in rounds 1 and 2 at the
+  base worktree's commit and between 14 ms and 19 ms in rounds 3 to 5, and
+  between 74 ms and 80 ms in every round at the pull request's.
 - git's first `git status` took between 236 ms and 674 ms at the base
   worktree's commit, and between 158 ms and 598 ms at the pull request's. Its
   second `git status` took 10 ms, except in the rounds where its first was the
-  fastest: 214 ms in one round at the base worktree's commit, and 135 ms and
-  139 ms in two at the pull request's. slimtree's first `git status` took
-  between 115 ms and 138 ms, and its second 11 ms in every round.
+  fastest: 214 ms in round 3 at the base worktree's commit, and 139 ms and
+  135 ms in rounds 2 and 5 at the pull request's. git's remove was slow in the
+  same rounds: 0.30 s, and 0.24 s in both, against 0.12 s to 0.13 s in every
+  other round. slimtree's first `git status` took between 115 ms and 138 ms,
+  and its second 11 ms in every round.
 - The tools alternated in order each round. Every run started and ran while the
   5-minute load average was under 20; it stayed between 2.96 and 3.07.
 - AMD Ryzen 7 7700 (8 cores, 16 threads), 62 GiB, Ubuntu 26.04.1, Linux
