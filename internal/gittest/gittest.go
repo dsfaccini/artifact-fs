@@ -369,13 +369,20 @@ func HoldForkedCopies(t testing.TB, path string) {
 	if err := unix.Stat(path, &want); err != nil {
 		t.Fatal(err)
 	}
-	entries, err := os.ReadDir("/dev/fd")
+	// Readdirnames stats no entry. ReadDir stats each one, and on macOS that
+	// fails with EBADF for a descriptor that closed after the listing.
+	dir, err := os.Open("/dev/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names, err := dir.Readdirnames(-1)
+	dir.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
 	var copies []int
-	for _, e := range entries {
-		fd, err := strconv.Atoi(e.Name())
+	for _, name := range names {
+		fd, err := strconv.Atoi(name)
 		if err != nil {
 			continue
 		}
