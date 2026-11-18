@@ -40,30 +40,24 @@ func checkBackend(goos string, b backend) error {
 
 func backendUsage(goos string) string {
 	if goos == "darwin" {
-		return "how to make worktrees: apfsclone (artifactfs worktrees are not supported yet; Linux support is coming)"
+		return "how to make worktrees: apfsclone, or artifactfs (beta on macOS)"
 	}
-	return "how to make worktrees: artifactfs, whose worktrees are not supported yet; Linux support is coming (apfsclone needs macOS)"
+	return "how to make worktrees: artifactfs (apfsclone needs macOS)"
 }
 
-// notInThisRelease refuses cmd on a worktree of backend b, which this release
-// cannot make or remove.
+// notInThisRelease refuses cmd, which removes a worktree of backend b, which
+// this release cannot remove.
 func notInThisRelease(cmd, b string) error {
-	return fmt.Errorf("%s: %s worktrees are not supported yet; Linux support is coming, and until then slimtree makes and removes only apfsclone worktrees, on macOS", cmd, b)
+	return fmt.Errorf("%s: removing %s worktrees is not supported yet; slimtree stop unmounts one", cmd, b)
 }
 
 // runDoctor runs doctor's checks for backend. An artifactfs report also
-// fails a check that says this release makes no artifactfs worktrees, so
-// doctor never reports ready for worktrees new refuses.
+// warns that this release cannot remove artifactfs worktrees.
 func runDoctor(probe doctor.Probe, goos, backend, dir string) doctor.Report {
 	r := doctor.Run(probe, goos, backend, dir)
 	if backend == string(artifactFS) {
-		fix := "upgrade slimtree once a release makes artifactfs worktrees"
-		if goos == "darwin" {
-			fix = "use --backend apfsclone, the default on macOS"
-		}
-		release := doctor.Result{ID: "backend", Status: doctor.StatusFail, Detail: "artifactfs worktrees are not supported yet; Linux support is coming", Fix: fix}
+		release := doctor.Result{ID: "backend", Status: doctor.StatusWarn, Detail: "slimtree rm of artifactfs worktrees is not supported yet", Fix: "upgrade slimtree once a release removes artifactfs worktrees"}
 		r.Checks = append([]doctor.Result{release}, r.Checks...)
-		r.OK = false
 	}
 	return r
 }

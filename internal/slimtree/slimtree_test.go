@@ -27,6 +27,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/doctor"
+	"github.com/cloudflare/artifact-fs/internal/slimtree/mounts"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 )
 
@@ -38,8 +39,8 @@ func TestDefaultBackendByPlatform(t *testing.T) {
 		apfsCloneRuns bool
 		usage         string
 	}{
-		{goos: "darwin", want: apfsClone, apfsCloneRuns: true, usage: "apfsclone (artifactfs worktrees are not supported yet; Linux support is coming)"},
-		{goos: "linux", want: artifactFS, usage: "artifactfs, whose worktrees are not supported yet; Linux support is coming (apfsclone needs macOS)"},
+		{goos: "darwin", want: apfsClone, apfsCloneRuns: true, usage: "apfsclone, or artifactfs (beta on macOS)"},
+		{goos: "linux", want: artifactFS, usage: "artifactfs (apfsclone needs macOS)"},
 	} {
 		t.Run(tc.goos, func(t *testing.T) {
 			if got := defaultBackend(tc.goos); got != tc.want {
@@ -271,36 +272,35 @@ func TestDoctorExitsOneOnAFailedCheck(t *testing.T) {
 	if code := run(t.Context(), "linux", probe, []string{"doctor"}, &stdout, io.Discard); code != 1 || !strings.Contains(stdout.String(), "fail  dev-fuse") || !strings.Contains(stdout.String(), "      fix: sudo chmod 0666 /dev/fuse\n") {
 		t.Fatalf("doctor: exit %d, stdout %q, want the failure and its fix", code, stdout.String())
 	}
-	// This release makes no artifactfs worktrees, so a healthy Linux machine
-	// fails only the backend check.
+	// This release removes no artifactfs worktrees, so a healthy Linux
+	// machine warns about the backend and fails nothing.
 	probe.ReadWrite = func(string) error { return nil }
 	stdout.Reset()
-	if code := run(t.Context(), "linux", probe, []string{"doctor", "--json"}, &stdout, io.Discard); code != 1 {
+	if code := run(t.Context(), "linux", probe, []string{"doctor", "--json"}, &stdout, io.Discard); code != 0 {
 		t.Fatalf("doctor --json on a healthy machine: exit %d, stdout %s", code, stdout.String())
 	}
 	report = doctor.Report{}
 	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
 		t.Fatal(err)
 	}
-	want := doctor.Result{ID: "backend", Status: doctor.StatusFail, Detail: "artifactfs worktrees are not supported yet; Linux support is coming", Fix: "upgrade slimtree once a release makes artifactfs worktrees"}
+	want := doctor.Result{ID: "backend", Status: doctor.StatusWarn, Detail: "slimtree rm of artifactfs worktrees is not supported yet", Fix: "upgrade slimtree once a release removes artifactfs worktrees"}
 	for i, c := range report.Checks {
-		if i == 0 && c != want || i > 0 && c.Status == doctor.StatusFail {
-			t.Fatalf("doctor --json on a healthy machine = %+v, want only %+v to fail", report.Checks, want)
+		if !report.OK || i == 0 && c != want || i > 0 && c.Status == doctor.StatusFail {
+			t.Fatalf("doctor --json on a healthy machine = %+v, want %+v first and no failure", report.Checks, want)
 		}
 	}
 }
 
-// --backend artifactfs doctor on macOS fails the same check, whose fix is
-// the apfsclone backend.
-func TestDoctorSaysArtifactFSIsNotInThisRelease(t *testing.T) {
+// --backend artifactfs doctor on macOS warns the same.
+func TestDoctorSaysArtifactFSRmIsNotInThisRelease(t *testing.T) {
 	homeAfterFirstRun(t)
 	probe := healthyDarwin()
 	probe.OSVersion = func() (string, error) { return "26.0", nil }
 	probe.FSKitAvailable = func() error { return nil }
 	var stdout bytes.Buffer
-	if code := run(t.Context(), "darwin", probe, []string{"--backend", "artifactfs", "doctor"}, &stdout, io.Discard); code != 1 ||
-		!strings.HasPrefix(stdout.String(), "fail  backend        artifactfs worktrees are not supported yet; Linux support is coming\n      fix: use --backend apfsclone, the default on macOS\n") {
-		t.Fatalf("--backend artifactfs doctor on macOS: exit %d, stdout %q; want exit 1 and the backend failure first", code, stdout.String())
+	if code := run(t.Context(), "darwin", probe, []string{"--backend", "artifactfs", "doctor"}, &stdout, io.Discard); code != 0 ||
+		!strings.HasPrefix(stdout.String(), "warn  backend        slimtree rm of artifactfs worktrees is not supported yet\n      fix: upgrade slimtree once a release removes artifactfs worktrees\n") {
+		t.Fatalf("--backend artifactfs doctor on macOS: exit %d, stdout %q; want exit 0 and the backend warning first", code, stdout.String())
 	}
 }
 
@@ -369,8 +369,8 @@ func TestFirstRunSummaryPrintsOnce(t *testing.T) {
 		want  string
 	}{
 		{goos: "linux", probe: healthyLinux(), want: "slimtree's first run: what --backend artifactfs needs here (slimtree doctor checks again)\n" +
-			"fail  backend        artifactfs worktrees are not supported yet; Linux support is coming\n" +
-			"      fix: upgrade slimtree once a release makes artifactfs worktrees\n" +
+			"warn  backend        slimtree rm of artifactfs worktrees is not supported yet\n" +
+			"      fix: upgrade slimtree once a release removes artifactfs worktrees\n" +
 			"ok    fusermount     /usr/bin/fusermount3\n" +
 			"ok    dev-fuse       /dev/fuse\n" +
 			"ok    cap-sys-admin  CapBnd holds CAP_SYS_ADMIN\n" +
@@ -414,14 +414,9 @@ func TestFirstRunSkipsHelpVersionAndDoctor(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("SLIMTREE_HOME", home)
 	for _, args := range [][]string{{"--help"}, {"--version"}, {"help"}, {"h"}, {"doctor", "--help"}, {"doctor", "--json"}} {
-		// This release makes no artifactfs worktrees, so doctor fails on Linux.
-		wantCode, wantErr := 0, ""
-		if args[len(args)-1] == "--json" {
-			wantCode, wantErr = 1, "doctor: a check failed\n"
-		}
 		var stdout, stderr bytes.Buffer
-		if code := run(t.Context(), "linux", healthyLinux(), args, &stdout, &stderr); code != wantCode || stderr.String() != wantErr {
-			t.Errorf("%q: exit %d, stderr %q, want %d, %q and no summary", args, code, stderr.String(), wantCode, wantErr)
+		if code := run(t.Context(), "linux", healthyLinux(), args, &stdout, &stderr); code != 0 || stderr.Len() != 0 {
+			t.Errorf("%q: exit %d, stderr %q, want 0 and no summary", args, code, stderr.String())
 		}
 		if args[len(args)-1] == "--json" {
 			var report doctor.Report
@@ -517,21 +512,43 @@ func TestListReportsEachRecordsState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	repo, paths := repoWithWorktrees(t, "kept", "gone", "served")
+	repo, paths := repoWithWorktrees(t, "kept", "gone", "served", "lost", "running")
 	other, otherPaths := repoWithWorktrees(t, "elsewhere")
 	if err := os.RemoveAll(paths[1]); err != nil {
 		t.Fatal(err)
 	}
 	created := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	// A daemon that runs with no mount at its worktree.
+	sleeper := exec.Command("sleep", "60")
+	if err := sleeper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		sleeper.Process.Kill()
+		sleeper.Wait()
+	})
+	token, err := mounts.StartToken(sleeper.Process.Pid)
+	if err != nil || token == "" {
+		t.Fatalf("StartToken(%d) = %q, %v", sleeper.Process.Pid, token, err)
+	}
 	vanishedRepo := filepath.Join(filepath.Dir(other), "vanished", ".git")
 	for _, r := range []state.Record{
 		{Backend: "apfsclone", Path: paths[0], CommonDir: repo, Branch: "kept", Created: created},
 		{Backend: "apfsclone", Path: paths[1], CommonDir: repo, Branch: "gone", Created: created},
 		{Backend: "artifactfs", Path: paths[2], CommonDir: repo, Branch: "served", Created: created},
+		{Backend: "artifactfs", Path: paths[3], CommonDir: repo, Branch: "lost", Created: created},
+		{Backend: "artifactfs", Path: paths[4], CommonDir: repo, Branch: "running", Created: created, DaemonPID: sleeper.Process.Pid, DaemonToken: token},
 		{Backend: "apfsclone", Path: otherPaths[0], CommonDir: other, Branch: "elsewhere", Created: created},
 		{Backend: "apfsclone", Path: filepath.Join(filepath.Dir(vanishedRepo), "wt"), CommonDir: vanishedRepo, Branch: "wt", Created: created},
 	} {
 		if err := home.Write(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// An artifactfs worktree keeps its gitfile in its record directory; lost
+	// lost it.
+	for _, p := range []string{paths[2], paths[4]} {
+		if err := os.WriteFile(filepath.Join(home.RecordDir(p), "gitfile"), []byte("gitdir: elsewhere\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -559,6 +576,8 @@ func TestListReportsEachRecordsState(t *testing.T) {
 		// git still reads the branch from the worktree's admin directory.
 		{"gone", paths[1], "apfsclone", "missing", "gone", repo},
 		{"served", paths[2], "artifactfs", "stopped", "served", repo},
+		{"lost", paths[3], "artifactfs", "missing", "lost", repo},
+		{"running", paths[4], "artifactfs", "unknown", "running", repo},
 		{"elsewhere", otherPaths[0], "apfsclone", "ok", "elsewhere", other},
 		{"wt", filepath.Join(filepath.Dir(vanishedRepo), "wt"), "apfsclone", "missing", "", vanishedRepo},
 	}
@@ -578,10 +597,12 @@ func TestListReportsEachRecordsState(t *testing.T) {
 	if code := run(t.Context(), "linux", doctor.Probe{}, []string{"list", "--repo"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("list --repo: exit %d, stderr %q", code, stderr.String())
 	}
-	wantText := "NAME    STATE    BACKEND     BRANCH  PATH\n" +
-		"gone    missing  apfsclone   gone    " + paths[1] + "\n" +
-		"kept    ok       apfsclone   moved   " + paths[0] + "\n" +
-		"served  stopped  artifactfs  served  " + paths[2] + "\n"
+	wantText := "NAME     STATE    BACKEND     BRANCH   PATH\n" +
+		"gone     missing  apfsclone   gone     " + paths[1] + "\n" +
+		"kept     ok       apfsclone   moved    " + paths[0] + "\n" +
+		"lost     missing  artifactfs  lost     " + paths[3] + "\n" +
+		"running  unknown  artifactfs  running  " + paths[4] + "\n" +
+		"served   stopped  artifactfs  served   " + paths[2] + "\n"
 	if stdout.String() != wantText {
 		t.Fatalf("list --repo =\n%s\nwant\n%s", stdout.String(), wantText)
 	}

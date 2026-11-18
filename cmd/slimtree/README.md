@@ -4,7 +4,9 @@ slimtree makes git worktrees that take little disk. On macOS it clones the
 files of an existing worktree of the repository with APFS clones, which share
 their blocks with the originals until either side changes a file. Git sees an
 ordinary worktree, so `git status`, commits and branches work as they do after
-`git worktree add`.
+`git worktree add`. On Linux it serves each worktree from an
+[artifact-fs](https://github.com/dsfaccini/artifact-fs) FUSE mount, which reads
+file contents from Git's objects as they are needed.
 
 ## Measured
 
@@ -52,15 +54,18 @@ How it was measured:
 
 | Command | macOS on Apple silicon | Linux on x86_64 or arm64 |
 |---|---|---|
-| `slimtree new <branch>` | Makes a worktree from APFS clones | Coming |
-| `slimtree rm <worktree>` | Removes a worktree slimtree made | Coming |
+| `slimtree new <branch>` | Makes a worktree from APFS clones | Makes a worktree served from an artifact-fs mount |
+| `slimtree stop <worktree>` | Only for `--backend artifactfs` | Unmounts the worktree and stops its daemon; its changes stay |
+| `slimtree resume <worktree>` | Only for `--backend artifactfs` | Mounts the worktree again; `--all` mounts every one, as after a reboot |
+| `slimtree rm <worktree>` | Removes an APFS clone worktree | Coming |
 | `slimtree list` | Lists the worktrees slimtree made | Lists the worktrees slimtree made |
-| `slimtree doctor` | Checks what slimtree needs | Checks the FUSE setup, and reports that Linux support is coming |
+| `slimtree doctor` | Checks what slimtree needs | Checks the FUSE setup, and warns that `rm` of artifact-fs worktrees is not supported yet |
 
 Release builds are tested on macOS 26, Ubuntu 24.04 and Alpine Linux. Linux
-support is coming: there, `slimtree new` will make worktrees served from an
-[artifact-fs](https://github.com/dsfaccini/artifact-fs) FUSE mount. Until then
-`slimtree new` exits with an error on Linux and makes nothing.
+support is complete in a later release: until then, `slimtree rm` refuses an
+artifact-fs worktree, and `slimtree stop` unmounts one. On macOS,
+`--backend artifactfs` mounts through macFUSE's FSKit backend. It is a beta,
+and release builds do not test it.
 
 ## Install
 
@@ -94,10 +99,21 @@ segment of the branch: `<main worktree>-<last segment>`. Two variants:
 It checks out the branch when it exists, and otherwise makes it at `--from`,
 else at `HEAD`.
 
-`slimtree rm` takes a worktree by its directory name or its path. It refuses a
-worktree with changes unless you pass `--force`. It keeps the worktree's `HEAD`
-in a ref under `refs/slimtree/archive/` and never deletes a branch. Run
-`slimtree --help` for every flag.
+On Linux, `slimtree new` mounts the worktree instead, and a daemon of its own
+serves it. Your changes live in the daemon's state under slimtree's home, and
+outlast `slimtree stop` and a reboot:
+
+```bash
+slimtree stop app-login      # unmounts it
+slimtree resume app-login    # mounts it again
+slimtree resume --all        # after a reboot
+```
+
+`slimtree rm` takes a worktree by its directory name or its path. It removes
+only APFS clone worktrees in this release. It refuses a worktree with changes
+unless you pass `--force`. It keeps the worktree's `HEAD` in a ref under
+`refs/slimtree/archive/` and never deletes a branch. Run `slimtree --help` for
+every flag.
 
 ## Source and license
 
