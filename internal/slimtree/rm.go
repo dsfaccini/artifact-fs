@@ -87,6 +87,7 @@ func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, g
 
 	ref := ""
 	if head != "" {
+		r.Head = head
 		if ref, err = home.Archive(r); err != nil {
 			return err
 		}

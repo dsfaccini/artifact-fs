@@ -75,6 +75,9 @@ type Record struct {
 	SlimtreeVersion string    `json:"slimtree_version"`
 	// StateDir is an artifactfs worktree's artifact-fs state root.
 	StateDir string `json:"state_dir,omitempty"`
+	// Head is the commit rm keeps in an archive's recovery ref. Only an
+	// archived record has it, and slimtree 0.1.0's rm wrote none.
+	Head string `json:"head,omitempty"`
 }
 
 // Name is the worktree's directory name, by which commands find it.
@@ -110,7 +113,9 @@ func (h *Home) Remove(path string) error {
 // Archive writes a copy of r to archives/<ID>/<ns>/worktree.json, ns being
 // the time in nanoseconds, and returns the recovery ref that belongs to that
 // archive: refs/slimtree/archive/<ID>/<ns>/HEAD. Write the copy before the
-// ref, so the copy names the repository of every ref a removal leaves.
+// ref, so the copy names the repository of every ref a removal leaves. Set
+// r.Head to the commit the ref keeps, so prune deletes the ref only while it
+// points there.
 func (h *Home) Archive(r Record) (string, error) {
 	r.Version = recordVersion
 	data, err := json.MarshalIndent(r, "", "  ")

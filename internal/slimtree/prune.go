@@ -7,6 +7,8 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/apfsclone"
@@ -50,7 +52,7 @@ func prune(ctx context.Context, home *state.Home, now time.Time) pruning {
 			case err != nil:
 				p.problems = append(p.problems, fmt.Errorf("kept %s: %w", a.Dir, err))
 			case kept != "":
-				p.kept = append(p.kept, fmt.Sprintf("kept %s and %s: its repository %s is gone", a.Dir, a.Ref, kept))
+				p.kept = append(p.kept, fmt.Sprintf("kept %s and %s: its repository %s is gone. Mount it and prune again, or, if it is gone for good, drop the archive with: rm -r %s", a.Dir, a.Ref, kept, shellQuote(a.Dir)))
 			default:
 				p.deleted++
 			}
@@ -62,6 +64,11 @@ func prune(ctx context.Context, home *state.Home, now time.Time) pruning {
 	}
 	return p
 }
+
+// pruneRepoTimeout bounds pruneArchive's stat and git commands in an
+// archive's repository. rm holds the global lock while it prunes, so a
+// repository on a hung mount must not hang it.
+const pruneRepoTimeout = 10 * time.Second
 
 // pruneArchive deletes a and its recovery ref, or returns the repository
 // that holds the ref when that repository is gone.
@@ -76,24 +83,114 @@ func pruneArchive(ctx context.Context, home *state.Home, a state.Archived) (stri
 	case r.CommonDir == "":
 		return "", errors.New("its record names no repository")
 	default:
-		if _, err := os.Stat(r.CommonDir); errors.Is(err, fs.ErrNotExist) {
-			return r.CommonDir, nil
-		} else if err != nil {
+		gone, err := inRepo(ctx, r.CommonDir, func(ctx context.Context) (bool, error) {
+			return deleteRecoveryRef(ctx, r, a)
+		})
+		if err != nil {
 			return "", err
 		}
-		// --no-deref deletes the ref itself, never a ref it names. A ref a
-		// removal never wrote is no error.
-		if _, err := apfsclone.Git(ctx, r.CommonDir, "update-ref", "--no-deref", "-d", a.Ref); err != nil {
-			return "", err
+		if gone {
+			return r.CommonDir, nil
 		}
 	}
 	return "", home.RemoveArchive(a)
 }
 
+// deleteRecoveryRef deletes a's recovery ref while it points at r.Head, or
+// reports that r's repository is gone. --no-deref deletes the ref itself,
+// never a ref it names. A record without Head, which slimtree 0.1.0's rm
+// writes, deletes the ref wherever it points.
+func deleteRecoveryRef(ctx context.Context, r state.Record, a state.Archived) (bool, error) {
+	if _, err := os.Stat(r.CommonDir); errors.Is(err, fs.ErrNotExist) {
+		return true, nil
+	} else if err != nil {
+		return false, err
+	}
+	args := []string{"update-ref", "--no-deref", "-d", a.Ref}
+	if r.Head == "" {
+		// Without an old value, a ref a removal never wrote is no error.
+		_, err := apfsclone.Git(ctx, r.CommonDir, args...)
+		return false, err
+	}
+	_, err := apfsclone.Git(ctx, r.CommonDir, append(args, r.Head)...)
+	if err == nil {
+		return false, nil
+	}
+	out, readErr := apfsclone.Git(ctx, r.CommonDir, "rev-parse", "--verify", "--quiet", a.Ref)
+	var exit *exec.ExitError
+	at := strings.TrimSpace(string(out))
+	switch {
+	// rev-parse --verify --quiet exits 1 for a ref that does not exist: the
+	// removal stopped before it wrote the ref.
+	case errors.As(readErr, &exit) && exit.ExitCode() == 1:
+		return false, nil
+	case readErr == nil && at != r.Head:
+		return false, fmt.Errorf("%s points at %s, not at %s, the commit rm kept; drop both with: git -C %s update-ref -d %s && rm -r %s", a.Ref, at, r.Head, shellQuote(r.CommonDir), a.Ref, shellQuote(a.Dir))
+	}
+	return false, err
+}
+
+// inRepo runs f with ctx bounded by pruneRepoTimeout. When the deadline
+// passes, it returns an error, without waiting past worktreeListGrace for an
+// f stuck in a stat or a git on a hung mount. That f may still delete the
+// ref, which leaves the archive to the next prune.
+func inRepo(ctx context.Context, commonDir string, f func(context.Context) (bool, error)) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, pruneRepoTimeout)
+	defer cancel()
+	type result struct {
+		gone bool
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		gone, err := f(ctx)
+		done <- result{gone, err}
+	}()
+	var r result
+	select {
+	case r = <-done:
+	case <-ctx.Done():
+		select {
+		case r = <-done:
+		case <-time.After(worktreeListGrace):
+		}
+	}
+	switch err := ctx.Err(); {
+	case errors.Is(err, context.DeadlineExceeded):
+		return false, fmt.Errorf("its repository %s did not answer within %s", commonDir, pruneRepoTimeout)
+	case err != nil:
+		return false, err
+	}
+	return r.gone, r.err
+}
+
+// shellQuote quotes s for a POSIX shell.
+func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+
+// diskUse describes used bytes of a disk of disk bytes.
+func diskUse(used, disk uint64) string {
+	var size string
+	switch {
+	case used < 1e3:
+		size = fmt.Sprintf("%d B", used)
+	case used < 1e6:
+		size = fmt.Sprintf("%.1f KB", float64(used)/1e3)
+	case used < 1e9:
+		size = fmt.Sprintf("%.1f MB", float64(used)/1e6)
+	default:
+		size = fmt.Sprintf("%.2f GB", float64(used)/1e9)
+	}
+	share := 100 * float64(used) / float64(disk)
+	if used > 0 && share < 0.001 {
+		return size + ", under 0.001% of the disk"
+	}
+	return fmt.Sprintf("%s, %.3f%% of the disk", size, share)
+}
+
 // write writes what p did, for rm and prune.
 func (p pruning) write(w io.Writer) {
 	if p.disk > 0 {
-		fmt.Fprintf(w, "slimtree: archives use %.1f MB, %.3f%% of the disk\n", float64(p.used)/1e6, 100*float64(p.used)/float64(p.disk))
+		fmt.Fprintf(w, "slimtree: archives use %s\n", diskUse(p.used, p.disk))
 	}
 	switch {
 	case p.ruleErr != nil:

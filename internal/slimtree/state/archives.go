@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -42,6 +43,10 @@ func (h *Home) Archives(skipped func(error)) ([]Archived, error) {
 	}
 	var archives []Archived
 	for _, id := range ids {
+		// A dotfile, such as Finder's .DS_Store, is no archive.
+		if strings.HasPrefix(id.Name(), ".") {
+			continue
+		}
 		dir := filepath.Join(root, id.Name())
 		if !id.IsDir() || !idPattern.MatchString(id.Name()) {
 			notArchive(dir)
@@ -53,6 +58,9 @@ func (h *Home) Archives(skipped func(error)) ([]Archived, error) {
 			continue
 		}
 		for _, t := range times {
+			if strings.HasPrefix(t.Name(), ".") {
+				continue
+			}
 			ns, err := strconv.ParseInt(t.Name(), 10, 64)
 			if !t.IsDir() || err != nil || ns <= 0 || strconv.FormatInt(ns, 10) != t.Name() {
 				notArchive(filepath.Join(dir, t.Name()))
