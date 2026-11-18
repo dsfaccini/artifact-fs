@@ -442,7 +442,7 @@ func TestRmRemovesTheWorktreeAndItsRecord(t *testing.T) {
 func TestArtifactFSWorktreesAreNotInThisReleaseYet(t *testing.T) {
 	homeAfterFirstRun(t)
 	main := newRepo(t)
-	const notYet = ": artifactfs worktrees are not in this release yet; this release makes and removes only apfsclone worktrees, on macOS\n"
+	const notYet = ": artifactfs worktrees are not supported yet; Linux support is coming, and until then slimtree makes and removes only apfsclone worktrees, on macOS\n"
 	for _, tc := range []struct {
 		goos  string
 		probe doctor.Probe

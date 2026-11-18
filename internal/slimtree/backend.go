@@ -40,15 +40,15 @@ func checkBackend(goos string, b backend) error {
 
 func backendUsage(goos string) string {
 	if goos == "darwin" {
-		return "how to make worktrees: apfsclone (artifactfs worktrees are not in this release yet)"
+		return "how to make worktrees: apfsclone (artifactfs worktrees are not supported yet; Linux support is coming)"
 	}
-	return "how to make worktrees: artifactfs, whose worktrees are not in this release yet (apfsclone needs macOS)"
+	return "how to make worktrees: artifactfs, whose worktrees are not supported yet; Linux support is coming (apfsclone needs macOS)"
 }
 
 // notInThisRelease refuses cmd on a worktree of backend b, which this release
 // cannot make or remove.
 func notInThisRelease(cmd, b string) error {
-	return fmt.Errorf("%s: %s worktrees are not in this release yet; this release makes and removes only apfsclone worktrees, on macOS", cmd, b)
+	return fmt.Errorf("%s: %s worktrees are not supported yet; Linux support is coming, and until then slimtree makes and removes only apfsclone worktrees, on macOS", cmd, b)
 }
 
 // runDoctor runs doctor's checks for backend. An artifactfs report also
@@ -61,7 +61,7 @@ func runDoctor(probe doctor.Probe, goos, backend, dir string) doctor.Report {
 		if goos == "darwin" {
 			fix = "use --backend apfsclone, the default on macOS"
 		}
-		release := doctor.Result{ID: "backend", Status: doctor.StatusFail, Detail: "artifactfs worktrees are not in this release yet", Fix: fix}
+		release := doctor.Result{ID: "backend", Status: doctor.StatusFail, Detail: "artifactfs worktrees are not supported yet; Linux support is coming", Fix: fix}
 		r.Checks = append([]doctor.Result{release}, r.Checks...)
 		r.OK = false
 	}

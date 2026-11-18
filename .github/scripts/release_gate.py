@@ -13,7 +13,7 @@ import sys
 
 from build_wheel import release
 
-DEFAULT_DRY_RUN_TAG = "v0.1.0-alpha.1"
+DEFAULT_DRY_RUN_TAG = "v0.1.0"
 
 
 def main(env):

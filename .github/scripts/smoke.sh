@@ -81,20 +81,20 @@ EOF
 	git rev-parse --verify --quiet refs/heads/feat >/dev/null || fail "slimtree rm deleted the branch feat"
 	;;
 Linux)
-	# artifactfs, Linux's default backend, is not in this release.
+	# artifactfs, Linux's default backend, is not supported yet.
 	python3 - "$work/doctor.json" <<'EOF'
 import json, sys
 report = json.load(open(sys.argv[1]))
 backend = report["checks"][0]
 assert not report["ok"] and backend["id"] == "backend" and backend["status"] == "fail", report
-assert backend["detail"] == "artifactfs worktrees are not in this release yet", backend
+assert backend["detail"] == "artifactfs worktrees are not supported yet; Linux support is coming", backend
 EOF
 	for backend in "" artifactfs; do
 		status=0
 		"$slimtree" ${backend:+--backend "$backend"} new feat 2>"$work/new.err" || status=$?
 		cat "$work/new.err"
 		[ "$status" -eq 1 ] || fail "slimtree ${backend:+--backend $backend }new exited $status, want 1"
-		grep -q 'artifactfs worktrees are not in this release yet' "$work/new.err" || fail "slimtree new did not say artifactfs is not in this release"
+		grep -q 'artifactfs worktrees are not supported yet; Linux support is coming' "$work/new.err" || fail "slimtree new did not say Linux support is coming"
 		[ ! -e "$work/src/app-feat" ] || fail "slimtree new made $work/src/app-feat"
 		if git rev-parse --verify --quiet refs/heads/feat; then
 			fail "slimtree new made the branch feat"

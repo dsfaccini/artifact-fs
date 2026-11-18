@@ -6,23 +6,61 @@ their blocks with the originals until either side changes a file. Git sees an
 ordinary worktree, so `git status`, commits and branches work as they do after
 `git worktree add`.
 
-**Alpha.** This is slimtree's first release. Commands, flags and output may
-change in any release before 1.0.
+## Measured
+
+A new worktree of [pydantic-ai](https://github.com/pydantic/pydantic-ai)
+(6,069 tracked paths, 333 MiB), median of 5 rounds:
+
+| | slimtree | `git worktree add` |
+|---|---|---|
+| Disk, at the base worktree's commit | 0.84 MiB | 346 MiB |
+| Disk, at a pull request's commit | 2.08 MiB | 346 MiB |
+| Create | 3.31 s | 1.39 s |
+| First `git status` | 38 ms | 420 ms |
+| Second `git status` | 35 ms | 31 ms |
+
+slimtree saves disk, not time. It takes longer than git to make a worktree,
+because it hashes every file once to check each clone against Git
+(`git update-index --refresh`). Its first `git status` is then as fast as the
+second, but create plus first `git status` still takes 3.36 s against git's
+1.81 s.
+
+How it was measured:
+
+- `slimtree --version`: `slimtree 0.1.0a1 (v0.1.0-alpha.1, f2eed729d076,
+  go1.27.4, darwin/arm64)`, the binary that `uvx slimtree@0.1.0a1` installs.
+  Since 0.1.0a1, `slimtree new` and `slimtree rm` change only in how they
+  release their locks; the cloning and hashing the table times are unchanged.
+- Both tools made a new branch: `slimtree new <branch> --from <commit> --path
+  <path>` and `git worktree add -b <branch> <path> <commit>`, from the same
+  base worktree.
+- Disk is the data only the new worktree and its admin directory hold: the sum
+  of APFS's private size (`ATTR_CMNEXT_PRIVATESIZE`) over their files, read
+  right after the create. `du` counts a clone's shared blocks, so it reports
+  345 MiB for either tool. The pull request's commit differs from the base
+  worktree's in 56 paths.
+- Times are the wall-clock time of each command, at the base worktree's commit.
+  At the pull request's commit they were: create 3.16 s and 1.51 s, first
+  `git status` 33 ms and 477 ms, second `git status` 33 ms and 28 ms, for
+  slimtree and git.
+- The tools alternated in order each round. Every run started and ran while the
+  5-minute load average was under 20; it stayed between 6.7 and 8.9.
+- MacBook Air (Apple M4, 24 GB), macOS 27.2, internal SSD, Git 2.54.0 (Apple
+  Git-157), 2026-11-17.
 
 ## What works in this release
 
 | Command | macOS on Apple silicon | Linux on x86_64 or arm64 |
 |---|---|---|
-| `slimtree new <branch>` | Makes a worktree from APFS clones | Not in this release yet |
-| `slimtree rm <worktree>` | Removes a worktree slimtree made | Not in this release yet |
+| `slimtree new <branch>` | Makes a worktree from APFS clones | Coming |
+| `slimtree rm <worktree>` | Removes a worktree slimtree made | Coming |
 | `slimtree list` | Lists the worktrees slimtree made | Lists the worktrees slimtree made |
-| `slimtree doctor` | Checks what slimtree needs | Checks the FUSE setup, and reports that artifactfs worktrees are not in this release yet |
+| `slimtree doctor` | Checks what slimtree needs | Checks the FUSE setup, and reports that Linux support is coming |
 
-Release builds are tested on macOS 26, Ubuntu 24.04 and Alpine Linux. On Linux,
-`slimtree new` will make worktrees served from an
-[artifact-fs](https://github.com/dsfaccini/artifact-fs) FUSE mount. That
-backend is not in this release, so `slimtree new` exits with an error there and
-makes nothing.
+Release builds are tested on macOS 26, Ubuntu 24.04 and Alpine Linux. Linux
+support is coming: there, `slimtree new` will make worktrees served from an
+[artifact-fs](https://github.com/dsfaccini/artifact-fs) FUSE mount. Until then
+`slimtree new` exits with an error on Linux and makes nothing.
 
 ## Install
 
@@ -40,18 +78,26 @@ In a repository whose main worktree is `~/src/app`:
 
 ```bash
 cd ~/src/app
-slimtree new my-feature    # makes ~/src/app-my-feature on the branch my-feature
+slimtree new fix/login    # makes ~/src/app-login on the branch fix/login
 slimtree list
-slimtree rm app-my-feature
+slimtree rm app-login
 ```
+
+A new worktree goes next to the main worktree, named after it and the last
+segment of the branch: `<main worktree>-<last segment>`. Two variants:
+
+- `slimtree new fix/login --path ~/wt/login` makes `~/wt/login` instead.
+- `slimtree new spike --from origin/main` makes `~/src/app-spike` on a new
+  branch `spike` at `origin/main`.
 
 `slimtree new` clones the main worktree, from any worktree of the repository.
 It checks out the branch when it exists, and otherwise makes it at `--from`,
-else at `HEAD`. `--path` puts the worktree elsewhere.
+else at `HEAD`.
 
-`slimtree rm` refuses a worktree with changes unless you pass `--force`. It
-keeps the worktree's `HEAD` in a ref under `refs/slimtree/archive/` and never
-deletes a branch. Run `slimtree --help` for every flag.
+`slimtree rm` takes a worktree by its directory name or its path. It refuses a
+worktree with changes unless you pass `--force`. It keeps the worktree's `HEAD`
+in a ref under `refs/slimtree/archive/` and never deletes a branch. Run
+`slimtree --help` for every flag.
 
 ## Source and license
 
