@@ -44,7 +44,7 @@ func Main(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer
 func run(ctx context.Context, goos string, probe doctor.Probe, args []string, stdout io.Writer, stderr io.Writer) int {
 	app := &ucli.Command{
 		Name:      "slimtree",
-		Usage:     "disk-light git worktrees from an APFS clone or an artifact-fs mount",
+		Usage:     "disk-light git worktrees from APFS clones",
 		Version:   version.String(),
 		Writer:    stdout,
 		ErrWriter: stderr,
@@ -74,7 +74,7 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 					if err != nil {
 						return err
 					}
-					return printDoctor(stdout, doctor.Run(probe, goos, c.String("backend"), dir), c.Bool("json"))
+					return printDoctor(stdout, runDoctor(probe, goos, c.String("backend"), dir), c.Bool("json"))
 				},
 			},
 			{
@@ -118,7 +118,7 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 						return errors.New("slimtree new takes one branch")
 					}
 					if b := c.String("backend"); b != string(apfsClone) {
-						return fmt.Errorf("slimtree new cannot make %s worktrees yet", b)
+						return notInThisRelease("slimtree new", b)
 					}
 					if err := doctor.Require(probe, goos, string(apfsClone), "new", doctor.Needs{}); err != nil {
 						return err

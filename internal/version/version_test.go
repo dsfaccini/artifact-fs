@@ -15,20 +15,28 @@ import (
 func TestVersionFlagPrintsTheStampedVersion(t *testing.T) {
 	t.Parallel()
 	const pkg = "github.com/cloudflare/artifact-fs/internal/version"
-	bin := filepath.Join(t.TempDir(), "artifact-fs")
-	build := exec.CommandContext(t.Context(), "go", "build", "-buildvcs=false", "-o", bin,
-		"-ldflags", "-s -w -X "+pkg+".Version=0.1.0rc1 -X "+pkg+".Tag=v0.1.0-rc.1 -X "+pkg+".Commit=0123456789abcdef0123456789abcdef01234567",
-		"github.com/cloudflare/artifact-fs/cmd/artifact-fs")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
-	out, err := exec.CommandContext(t.Context(), bin, "--version").Output()
-	if err != nil {
-		t.Fatalf("artifact-fs --version: %v", err)
-	}
-	want := fmt.Sprintf("artifact-fs 0.1.0rc1 (v0.1.0-rc.1, 0123456789ab, %s, %s/%s)\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
-	if string(out) != want {
-		t.Fatalf("artifact-fs --version = %q, want %q", out, want)
+	for _, tc := range []struct{ cmd, version, tag string }{
+		{cmd: "artifact-fs", version: "0.1.0rc1", tag: "v0.1.0-rc.1"},
+		{cmd: "slimtree", version: "0.1.0a1", tag: "v0.1.0-alpha.1"},
+	} {
+		t.Run(tc.cmd, func(t *testing.T) {
+			t.Parallel()
+			bin := filepath.Join(t.TempDir(), tc.cmd)
+			build := exec.CommandContext(t.Context(), "go", "build", "-buildvcs=false", "-o", bin,
+				"-ldflags", "-s -w -X "+pkg+".Version="+tc.version+" -X "+pkg+".Tag="+tc.tag+" -X "+pkg+".Commit=0123456789abcdef0123456789abcdef01234567",
+				"github.com/cloudflare/artifact-fs/cmd/"+tc.cmd)
+			if out, err := build.CombinedOutput(); err != nil {
+				t.Fatalf("go build: %v\n%s", err, out)
+			}
+			out, err := exec.CommandContext(t.Context(), bin, "--version").Output()
+			if err != nil {
+				t.Fatalf("%s --version: %v", tc.cmd, err)
+			}
+			want := fmt.Sprintf("%s %s (%s, 0123456789ab, %s, %s/%s)\n", tc.cmd, tc.version, tc.tag, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+			if string(out) != want {
+				t.Fatalf("%s --version = %q, want %q", tc.cmd, out, want)
+			}
+		})
 	}
 }
 

@@ -4,6 +4,8 @@ on:
   push:
     branches: [main, master]
   workflow_dispatch: {}
+  # release.yml runs this scan on a release's commit.
+  workflow_call: {}
   schedule:
     # Weekly on Saturday. cron fires when either day field matches, so a
     # day-of-month range cannot narrow it to one Saturday a month.
