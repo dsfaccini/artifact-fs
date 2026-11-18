@@ -19,8 +19,15 @@ import (
 )
 
 // rollbackTimeout bounds a rollback. A rollback outlives the command's
-// cancellation, and the canceled command ignores a second Ctrl-C.
+// cancellation, and the canceled command ignores a second Ctrl-C. A write
+// that runs when rollbackTimeout passes outlives it by at most
+// gitstore.WriteGrace, plus up to gitstore.GitCommandWaitDelay for the stop
+// that follows.
 const rollbackTimeout = time.Minute
+
+// rollbackContext, when set, wraps the context of each rollback, so a test
+// ends a rollback at a chosen step. Production code leaves it nil.
+var rollbackContext func(context.Context) (context.Context, context.CancelFunc)
 
 // cloneFile, when set, clones in place of clonefile(2). Tests set it where
 // clonefile(2) does not exist.
@@ -224,10 +231,15 @@ type rollback struct {
 // run removes what a failed new made: the worktree new registered, the
 // directories above it that git worktree add made, and the branch while it
 // still points at rb.start, with the tracking config new wrote. It outlives
-// ctx's cancellation, for at most rollbackTimeout.
+// ctx's cancellation, for at most rollbackTimeout, plus writeGrace for a write
+// that runs then and up to gitstore.GitCommandWaitDelay for its stop.
 func (rb rollback) run(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
 	defer cancel()
+	if rollbackContext != nil {
+		ctx, cancel = rollbackContext(ctx)
+		defer cancel()
+	}
 	// Whether git registered dest decides, not Add's error: a Ctrl-C can land
 	// after git worktree add registered it, before Go reaped git.
 	listed, err := worktreeList(ctx, rb.repo)
@@ -272,11 +284,11 @@ func (rb rollback) run(ctx context.Context) error {
 	default:
 		return fmt.Errorf("slimtree kept the branch %s, which it made at %s and which now points at %s", rb.branch, rb.start, now)
 	}
-	if _, err := apfsclone.Git(ctx, rb.base, "update-ref", "-d", ref, rb.start); err != nil {
+	if _, err := gitWrite(ctx, rb.base, "update-ref", "-d", ref, rb.start); err != nil {
 		return err
 	}
 	for _, k := range rb.unset {
-		_, err := apfsclone.Git(ctx, rb.base, "config", "--unset-all", "branch."+rb.branch+"."+k)
+		_, err := gitWrite(ctx, rb.base, "config", "--unset-all", "branch."+rb.branch+"."+k)
 		// git config exits 5 for a key it does not set.
 		var exit *exec.ExitError
 		if err != nil && !(errors.As(err, &exit) && exit.ExitCode() == 5) {
