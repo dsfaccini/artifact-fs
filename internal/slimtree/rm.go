@@ -98,7 +98,7 @@ func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, g
 		if force {
 			args = []string{"worktree", "remove", "--force", r.Path}
 		}
-		if _, err := apfsclone.Git(ctx, r.CommonDir, args...); err != nil {
+		if _, err := gitWrite(ctx, r.CommonDir, args...); err != nil {
 			return err
 		}
 	}

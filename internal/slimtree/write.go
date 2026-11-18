@@ -15,8 +15,8 @@ var writeGrace = gitstore.WriteGrace
 // ends before the git returns. Production code leaves it nil.
 var writeOutlived func()
 
-// gitWrite runs apfsclone.Git for a git that writes the user's refs or config
-// and contacts no remote, under gitstore.WriteContext. The git starts only
+// gitWrite runs apfsclone.Git for a git that writes the user's refs, config or
+// index and contacts no remote, under gitstore.WriteContext. The git starts only
 // while ctx lives, and runs for at most writeGrace once ctx ends, so its stop
 // finds the handler that removes its lock files installed.
 func gitWrite(ctx context.Context, dir string, args ...string) ([]byte, error) {

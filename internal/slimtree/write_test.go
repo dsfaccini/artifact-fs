@@ -99,37 +99,52 @@ func requireNoGitLock(t *testing.T, gitDir string) {
 	}
 }
 
-// A Ctrl-C that lands while rm writes the recovery ref does not stop the
-// write. Git creates the ref's lock before it installs the handler that
-// removes its lock files on SIGTERM, so a SIGTERM in between would leave the
-// lock in the user's repository.
-func TestACanceledRmWritesItsRecoveryRef(t *testing.T) {
-	homeAfterFirstRun(t)
-	cloneWith(t, nil)
-	main := newRepo(t)
-	path := filepath.Join(filepath.Dir(main), "main-feat")
-	if code, _, stderr := slimtree(t.Context(), "new", "feat"); code != 0 {
-		t.Fatalf("new feat: exit %d, stderr %q", code, stderr)
-	}
-	head := gitIn(t, path, "rev-parse", "HEAD")
-	h := holdWrite(t, " update-ref refs/slimtree/")
+// A Ctrl-C that lands while rm writes the recovery ref, or while git worktree
+// remove runs, does not stop the git. Git creates a lock file, such as the
+// ref's lock or the index.lock of the git status that git worktree remove
+// runs, before it installs the handler that removes its lock files on
+// SIGTERM, so a SIGTERM in between would leave the lock in the user's
+// repository.
+func TestACanceledRmRunsItsWritesToTheirEnd(t *testing.T) {
+	for _, tc := range []struct {
+		name, hold string
+		code       int
+	}{
+		// git worktree remove starts no git once the context ended.
+		{"recovery ref", " update-ref refs/slimtree/", 1},
+		{"worktree remove", " worktree remove ", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			homeAfterFirstRun(t)
+			cloneWith(t, nil)
+			main := newRepo(t)
+			path := filepath.Join(filepath.Dir(main), "main-feat")
+			if code, _, stderr := slimtree(t.Context(), "new", "feat"); code != 0 {
+				t.Fatalf("new feat: exit %d, stderr %q", code, stderr)
+			}
+			head := gitIn(t, path, "rev-parse", "HEAD")
+			h := holdWrite(t, tc.hold)
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	returned := make(chan int, 1)
-	go func() {
-		code, _, _ := slimtree(ctx, "rm", "main-feat")
-		returned <- code
-	}()
-	h.outlive(t, cancel, returned)
-	// git worktree remove starts no git once the context ended.
-	if code := <-returned; code != 1 {
-		t.Fatalf("rm exited %d, want 1", code)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			returned := make(chan int, 1)
+			go func() {
+				code, _, _ := slimtree(ctx, "rm", "main-feat")
+				returned <- code
+			}()
+			h.outlive(t, cancel, returned)
+			if code := <-returned; code != tc.code {
+				t.Fatalf("rm exited %d, want %d", code, tc.code)
+			}
+			if got := gitIn(t, main, "for-each-ref", "--format=%(objectname)", "refs/slimtree/"); got != head {
+				t.Fatalf("recovery refs point at %q, want %s", got, head)
+			}
+			if tc.name == "worktree remove" {
+				requireNoWorktree(t, main, path)
+			}
+			requireNoGitLock(t, filepath.Join(main, ".git"))
+		})
 	}
-	if got := gitIn(t, main, "for-each-ref", "--format=%(objectname)", "refs/slimtree/"); got != head {
-		t.Fatalf("recovery refs point at %q, want %s", got, head)
-	}
-	requireNoGitLock(t, filepath.Join(main, ".git"))
 }
 
 // A rollback whose deadline passes while it deletes the branch new made, or
