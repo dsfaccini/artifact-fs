@@ -392,6 +392,16 @@ func TestRmRefusesAServedArtifactFSWorktreeWithChangesOrHolders(t *testing.T) {
 	holder.Process.Kill()
 	holder.Wait()
 
+	// The refusal names this process, which runs slimtree here, as the
+	// caller.
+	t.Chdir(r.Path)
+	caller := ". " + strconv.Itoa(os.Getpid()) + " is slimtree or a process it runs under. A process holds the mount until it exits or leaves the worktree"
+	if code, _, stderr := linux(t.Context(), "rm", "--force", "wt"); code != 1 || !strings.Contains(stderr, caller) {
+		t.Errorf("rm --force from inside the mount: exit %d, stderr %q; want %q", code, stderr, caller)
+	}
+	t.Chdir(main)
+	alive()
+
 	// Once the recorded daemon is gone, no remount by it explains another
 	// mount.
 	if err := d.Process.Kill(); err != nil {

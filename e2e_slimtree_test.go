@@ -230,7 +230,7 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 	chain.Env = append(os.Environ(), "SLIMTREE_HOME="+home)
 	var chainErr bytes.Buffer
 	chain.Stderr = &chainErr
-	if err := chain.Run(); err != nil || !strings.Contains(chainErr.String(), "or a process it runs under, runs inside the worktree") {
+	if err := chain.Run(); err != nil || !strings.Contains(chainErr.String(), ". "+strconv.Itoa(chain.Process.Pid)+" is slimtree or a process it runs under. ") {
 		t.Fatalf("slimtree stop under a shell in the mount: %v, stderr %q; want the refusal to say so", err, chainErr.String())
 	}
 

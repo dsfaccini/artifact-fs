@@ -645,7 +645,8 @@ func stopDaemon(ctx context.Context, r state.Record) error {
 }
 
 // refuseHolders refuses r's mount while processes other than its daemon and
-// the daemon's children use it.
+// the daemon's children use it. It names each holder that is slimtree or a
+// process slimtree runs under.
 func refuseHolders(ctx context.Context, r state.Record) error {
 	key, err := mounts.KeyOf(r.Path)
 	if err != nil {
@@ -664,11 +665,14 @@ func refuseHolders(ctx context.Context, r state.Record) error {
 			break
 		}
 	}
+	var callers []string
 	for _, h := range holders {
 		if ancestors[h.PID] {
-			msg.WriteString(". slimtree, or a process it runs under, runs inside the worktree; run slimtree from a shell outside it")
-			break
+			callers = append(callers, strconv.Itoa(h.PID))
 		}
+	}
+	if len(callers) > 0 {
+		fmt.Fprintf(&msg, ". %s is slimtree or a process it runs under. A process holds the mount until it exits or leaves the worktree, and a cd in a shell it started does not release it; remove the worktree from a session started outside it", strings.Join(callers, ", "))
 	}
 	return errors.New(msg.String())
 }
