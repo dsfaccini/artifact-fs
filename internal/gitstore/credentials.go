@@ -199,8 +199,12 @@ func isSCPStyleRemote(raw string) bool {
 // runs GIT_SSH only when neither GIT_SSH_COMMAND nor an effective
 // core.sshCommand names an SSH command, so the user's own command, such as the
 // one an adopted worktree, a prepared git dir or a conditional include sets,
-// runs unchanged. A GIT_SSH the user set stays.
+// runs unchanged. A GIT_SSH the user set stays. Once Close has begun, it
+// returns errStoreClosed, so the Store starts no such command.
 func (s *Store) lazyFetchEnv() ([]string, error) {
+	if err := s.checkOpen(); err != nil {
+		return nil, err
+	}
 	env := []string{"GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS=", "SSH_ASKPASS_REQUIRE=never"}
 	if _, ok := os.LookupEnv("GIT_SSH"); ok {
 		return env, nil

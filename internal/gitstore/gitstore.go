@@ -87,6 +87,19 @@ func (s *Store) Close() {
 	}
 }
 
+// checkOpen returns errStoreClosed once Close has begun. Every git the Store
+// starts checks it first: Store.runWithFiles for each git that runs to
+// completion, and lazyFetchEnv for each pooled git cat-file --batch. It holds
+// s.mu only to read closed.
+func (s *Store) checkOpen() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errStoreClosed
+	}
+	return nil
+}
+
 // SetTempDir sets the directory under which the Store makes the SSH wrapper
 // that Git runs, the hooks directory Git reads during the fsmonitor
 // bootstrap, which the Store keeps empty, and the files that hold each git's

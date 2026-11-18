@@ -120,7 +120,10 @@ func (s *Store) runInputCommand(ctx context.Context, cmd *exec.Cmd, gitDir strin
 	// than its length.
 	stderr := &boundedGitError{limit: maxGitErrorBytes}
 	cmd.Stdout, cmd.Stderr = &stdout, stderr
-	if err := RunWithFiles(cmd, s.tempDir, input, nil); err != nil {
+	if err := s.runWithFiles(cmd, input, nil); err != nil {
+		if errors.Is(err, errStoreClosed) {
+			return "", err
+		}
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
@@ -131,6 +134,16 @@ func (s *Store) runInputCommand(ctx context.Context, cmd *exec.Cmd, gitDir strin
 		return "", errors.New(auth.RedactString(msg))
 	}
 	return stdout.String(), nil
+}
+
+// runWithFiles runs cmd through RunWithFiles with the Store's temp
+// directory. Every git of the Store that runs to completion starts here, so
+// once Close has begun it starts none and returns errStoreClosed.
+func (s *Store) runWithFiles(cmd *exec.Cmd, input []byte, readStdout func(io.Reader) error) error {
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+	return RunWithFiles(cmd, s.tempDir, input, readStdout)
 }
 
 // RunWithFiles runs cmd to completion as cmd.Run does, with a file, not a
@@ -287,10 +300,10 @@ func (s *Store) runGitCommand(ctx context.Context, cmd *exec.Cmd, gitDir string,
 	}
 	errBuf := &boundedGitError{limit: maxGitErrorBytes}
 	cmd.Stderr = errBuf
-	runErr := RunWithFiles(cmd, s.tempDir, nil, nil)
+	runErr := s.runWithFiles(cmd, nil, nil)
 	out := strings.TrimSpace(buf.String())
-	if runErr == nil {
-		return out, nil
+	if runErr == nil || errors.Is(runErr, errStoreClosed) {
+		return out, runErr
 	}
 	contextErr := ctx.Err()
 
