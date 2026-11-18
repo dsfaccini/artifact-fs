@@ -1258,11 +1258,25 @@ func (e *Engine) promoteForAttr(ctx context.Context, b *Blobs, path string) erro
 // base file in it is read at the current generation. A read through a handle
 // still at an older generation counts at the current one, so reads at two
 // generations do not prefetch the directory again and again. Listing a
-// directory prefetches nothing, so directory walks stay lazy. It runs after the
-// read's own blob is hydrated, so that read never waits in a speculative batch.
-// The caller holds the transition read lock. Enqueueing only queues and wakes
-// workers, so it hydrates nothing under that lock.
+// directory prefetches nothing, so directory walks stay lazy. Nor does a read
+// of a file Git reads for its own rules: a .gitignore, which Git reads in each
+// directory it walks that holds a directory; a .gitattributes, which it reads
+// on the attribute path of each such .gitignore; the root's .gitmodules, which
+// git status and git diff read while the index holds a submodule; and the
+// root's .mailmap, which git log reads. A first git status in a clean worktree
+// reads no other file. It runs after the read's own blob is hydrated, so that
+// read never waits in a speculative batch. The caller holds the transition
+// read lock. Enqueueing only queues and wakes workers, so it hydrates nothing
+// under that lock.
 func (e *Engine) prefetchSiblings(ctx context.Context, path string) {
+	path = model.CleanPath(path)
+	switch filepath.Base(path) {
+	case ".gitignore", ".gitattributes":
+		return
+	}
+	if path == ".gitmodules" || path == ".mailmap" {
+		return
+	}
 	dir := model.CleanPath(filepath.Dir(path))
 	gen := e.Resolver.Generation()
 	e.prefetchMu.Lock()
