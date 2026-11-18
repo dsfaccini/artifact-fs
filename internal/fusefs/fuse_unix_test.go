@@ -791,16 +791,18 @@ func TestFirstFileReadPrefetchesItsDirectoryAndListingPrefetchesNothing(t *testi
 // log reads the root's .mailmap.
 func TestReadsOfGitRuleFilesPrefetchNothing(t *testing.T) {
 	files := map[string]string{
-		".gitignore":     "*.log\n",
-		".gitattributes": "*.bin binary\n",
-		".gitmodules":    "[submodule \"m\"]\n",
-		".mailmap":       "A <a@example.com>\n",
-		"README.md":      "# readme\n",
-		"top.txt":        "top\n",
-		"src/.gitignore": "*.tmp\n",
-		"src/.mailmap":   "B <b@example.com>\n",
-		"src/a.go":       "package a\n",
-		"src/b.go":       "package b\n",
+		".gitignore":      "*.log\n",
+		".gitattributes":  "*.bin binary\n",
+		".gitmodules":     "[submodule \"m\"]\n",
+		".mailmap":        "A <a@example.com>\n",
+		"README.md":       "# readme\n",
+		"top.txt":         "top\n",
+		"src/.gitignore":  "*.tmp\n",
+		"src/.mailmap":    "B <b@example.com>\n",
+		"src/a.go":        "package a\n",
+		"src/b.go":        "package b\n",
+		"lib/.gitmodules": "[submodule \"n\"]\n",
+		"lib/c.go":        "package c\n",
 	}
 	fs, h, queue, repo, _ := newClonedPrefetchFixture(t, files)
 	h.Start(4, repo)
@@ -829,12 +831,23 @@ func TestReadsOfGitRuleFilesPrefetchNothing(t *testing.T) {
 	if got := queue.queued.Load(); got != 6 {
 		t.Fatalf("a read of README.md queued %d prefetch tasks, want the root's 6 files", got)
 	}
-	// Git reads only the root's .mailmap.
-	if got := readWholeFile(t, fs, lookUpInode(t, fs, src, ".mailmap")); got != files["src/.mailmap"] {
-		t.Fatalf("src/.mailmap = %q, want %q", got, files["src/.mailmap"])
-	}
-	if got := queue.queued.Load(); got != 10 {
-		t.Fatalf("a read of src/.mailmap queued %d prefetch tasks after the root's 6, want src's 4 files", got-6)
+	// Git reads only the root's .gitmodules and .mailmap.
+	queued := queue.queued.Load()
+	for _, nested := range []struct {
+		dir   fuseops.InodeID
+		path  string
+		files int64
+	}{
+		{src, "src/.mailmap", 4},
+		{lookUpInode(t, fs, fuseops.RootInodeID, "lib"), "lib/.gitmodules", 2},
+	} {
+		if got := readWholeFile(t, fs, lookUpInode(t, fs, nested.dir, filepath.Base(nested.path))); got != files[nested.path] {
+			t.Fatalf("%s = %q, want %q", nested.path, got, files[nested.path])
+		}
+		if got := queue.queued.Load() - queued; got != nested.files {
+			t.Fatalf("a read of %s queued %d prefetch tasks, want its directory's %d files", nested.path, got, nested.files)
+		}
+		queued += nested.files
 	}
 }
 
