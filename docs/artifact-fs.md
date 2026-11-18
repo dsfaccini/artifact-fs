@@ -727,7 +727,7 @@ decides which invalidations it gets.
 | `model` | Shared types and canonical interfaces (`Registry`, `GitStore`, `SnapshotStore`, `OverlayStore`, `Hydrator`) |
 | `meta` | Opens the SQLite stores in WAL mode and applies each store's schema migrations once |
 | `auth` | Detects and redacts credentials and remotes in errors and logs |
-| `logging` | The JSON logger, which redacts every string it writes |
+| `logging` | The JSON logger, which redacts every string, error and `fmt.Stringer` value it logs |
 | `execfile` | Writes files that a process may exec |
 | `version` | Describes the running build for `--version` |
 | `slimtree` | The `slimtree` CLI, which makes disk-light git worktrees with an APFS clone or an artifact-fs mount |
@@ -767,7 +767,7 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 | `git show` | Supported | |
 | `git remote -v` | Supported | `add-repo` stores the remote URL without inline credentials; an adopted worktree keeps its own remotes |
 | `git stash` | Supported | Includes push/pop with untracked files |
-| `git status` | Supported | The fsmonitor hook names only the paths that changed. In a 6,069-path slimtree worktree on Linux, the first `git status` took 140 ms and the second 11 ms ([measured](../README.md#linux)) |
+| `git status` | Supported | The fsmonitor hook names only the paths that changed. In a 6,069-path slimtree worktree on Linux, which adopts a linked worktree of a repository that holds every blob, the first `git status` took 140 ms and the second 11 ms ([measured](../README.md#linux)). A blobless clone's first run can hydrate nearly every file; see [Known limitations](#known-limitations) |
 | `git diff` | Supported | Shows correct unified diff for modified files |
 | `git add` | Supported | Stages modified files |
 | `git reset --hard` | Supported | Restores content, modes, and staged creates |
@@ -787,6 +787,7 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 | Git submodules are not initialized | Gitlink paths appear as empty directories so status stays clean |
 | Checkout filters and EOL transforms are not applied to snapshot-only reads | Files use canonical blob bytes until Git writes a transformed overlay |
 | `git status` lists every directory to fill Git's untracked cache, and again on its first run after a mount whose startup marked the baseline; if the cold baseline is skipped because the index, attributes, or overlay are uncertain, Git also scans tracked content normally | Performance |
+| In a blobless clone that `add-repo` made, the clean-index bootstrap skips while a `.gitattributes` blob is not local, as after a fresh clone. The first index refresh, by `git status` or `git reset`, then reads every tracked file, which hydrates nearly all of them. Later runs are fast | Performance |
 
 ## Testing
 
