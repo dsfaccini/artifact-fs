@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -86,24 +87,39 @@ func requireFailure(t *testing.T, ctl *Controller, phase string, wantInError str
 	return st
 }
 
-// hookedRegistry runs putRuntime before each repo_runtime write.
+// hookedRegistry runs changeRuntime before each write and each delete of a
+// repo_runtime record, with the state written, or "deleted".
 type hookedRegistry struct {
 	model.Registry
-	putRuntime func(model.RepoRuntimeRecord)
+	changeRuntime func(state string)
 }
 
 func (r *hookedRegistry) PutRuntime(ctx context.Context, rec model.RepoRuntimeRecord) error {
-	r.putRuntime(rec)
+	r.changeRuntime(rec.State)
 	return r.Registry.PutRuntime(ctx, rec)
 }
 
-// The daemon writes a byte to the notify descriptor after each repo_runtime
-// write, never before it. A reader that reads status after each byte then
-// sees every write, and so sees the mount the last byte follows.
+func (r *hookedRegistry) DeleteRuntime(ctx context.Context, id model.RepoID) error {
+	r.changeRuntime("deleted")
+	return r.Registry.DeleteRuntime(ctx, id)
+}
+
+// The daemon writes a byte to the notify descriptor after each write and
+// each delete of a repo_runtime record, never before it. A reader that reads
+// status after each byte then sees every change, and so sees the mount, and
+// later the removal, that the last byte follows.
 func TestRuntimeWritesNotifyAfterTheWrite(t *testing.T) {
 	t.Parallel()
+	// Close-on-exec, as os.Pipe makes it, so no git the daemon runs holds an end.
 	var fds [2]int
-	if err := unix.Pipe(fds[:]); err != nil {
+	syscall.ForkLock.RLock()
+	err := unix.Pipe(fds[:])
+	if err == nil {
+		unix.CloseOnExec(fds[0])
+		unix.CloseOnExec(fds[1])
+	}
+	syscall.ForkLock.RUnlock()
+	if err != nil {
 		t.Fatal(err)
 	}
 	// The daemon's Close, a cleanup that runs before this one, still writes.
@@ -130,32 +146,50 @@ func TestRuntimeWritesNotifyAfterTheWrite(t *testing.T) {
 		}
 	}
 	var states []string
-	svc.registry = &hookedRegistry{Registry: svc.registry, putRuntime: func(rec model.RepoRuntimeRecord) {
+	svc.registry = &hookedRegistry{Registry: svc.registry, changeRuntime: func(state string) {
 		mu.Lock()
 		defer mu.Unlock()
 		drain()
 		if read != len(states) {
-			t.Errorf("before repo_runtime write %d the daemon had written %d bytes, want one per earlier write", len(states), read)
+			t.Errorf("before repo_runtime change %d the daemon had written %d bytes, want one per earlier change", len(states), read)
 		}
-		states = append(states, rec.State)
+		states = append(states, state)
 	}}
 	if err := svc.NotifyRuntimeWrites(fds[1]); err != nil {
 		t.Fatal(err)
 	}
+	changes := func() ([]string, int) {
+		mu.Lock()
+		defer mu.Unlock()
+		drain()
+		return slices.Clone(states), read
+	}
 
 	syncAndFinishStops(t, svc)
-	mu.Lock()
-	drain()
-	got, written := slices.Clone(states), read
-	mu.Unlock()
+	got, written := changes()
 	if len(got) == 0 || got[len(got)-1] != repoStateMounted {
-		t.Fatalf("the repo_runtime writes recorded states %q, want the mount last", got)
+		t.Fatalf("the repo_runtime changes were %q, want the mount last", got)
 	}
 	if written != len(got) {
-		t.Fatalf("after %d repo_runtime writes the daemon had written %d bytes, want one per write", len(got), written)
+		t.Fatalf("after %d repo_runtime changes the daemon had written %d bytes, want one per change", len(got), written)
 	}
 	if st, err := ctl.Status(t.Context(), "repo"); err != nil || st.State != repoStateMounted {
 		t.Fatalf("status = %+v, %v; want mounted", st, err)
+	}
+
+	// The first sync after the removal stops the runtime, and the next
+	// deletes its record.
+	if err := ctl.RemoveRepo(t.Context(), "repo"); err != nil {
+		t.Fatal(err)
+	}
+	syncAndFinishStops(t, svc)
+	syncAndFinishStops(t, svc)
+	got, written = changes()
+	if got[len(got)-1] != "deleted" {
+		t.Fatalf("the repo_runtime changes were %q, want the delete last", got)
+	}
+	if written != len(got) {
+		t.Fatalf("after %d repo_runtime changes the daemon had written %d bytes, want one per change", len(got), written)
 	}
 }
 

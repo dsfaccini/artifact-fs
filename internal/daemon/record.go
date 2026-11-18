@@ -65,10 +65,11 @@ func (s *Service) recordRuntimeLocked(id model.RepoID, update func(*model.RepoRu
 	s.notifyRuntimeWrite()
 }
 
-// NotifyRuntimeWrites makes the daemon write a byte to fd after each
-// repo_runtime write, so the process that started the daemon reads status
-// once it changed instead of polling it. The byte only wakes that process:
-// status still reads repo_runtime. The daemon owns fd from here on. It marks
+// NotifyRuntimeWrites makes the daemon write a byte to fd after each write
+// and each delete of a repo_runtime record, so the process that started the
+// daemon reads status once it changed instead of polling it. ClearRuntime,
+// which Start runs before it writes any record, writes no byte. The byte
+// only wakes that process: status still reads repo_runtime. The daemon owns fd from here on. It marks
 // fd close-on-exec, so no git it runs holds fd, and writes it without
 // blocking.
 func (s *Service) NotifyRuntimeWrites(fd int) error {
