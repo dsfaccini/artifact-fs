@@ -6,9 +6,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -38,23 +40,25 @@ func slimtreeBinary(t *testing.T) string {
 // slimtreeRecord is the part of an artifactfs worktree's record this test
 // reads.
 type slimtreeRecord struct {
-	DaemonPID   int    `json:"daemon_pid"`
-	DaemonToken string `json:"daemon_start_token"`
+	DaemonPID     int    `json:"daemon_pid"`
+	DaemonToken   string `json:"daemon_start_token"`
+	MountIdentity string `json:"mount_identity"`
 }
 
 // TestE2ESlimtreeLifecycle drives the slimtree binary through an artifactfs
 // worktree's life: new mounts it and runs its post-checkout hook, stop
-// refuses while another process uses the mount and then unmounts it, resume
-// mounts it again with its changes, and resume brings it back after its
-// daemon was killed. Its daemons run in slimtree processes, so this test
-// process serves no mount. Its subject is mounting, so it keeps its own
-// mounts.
+// refuses while another process uses the mount, follows the daemon's new
+// mount after an external unmount, and then unmounts it, resume mounts it
+// again with its changes, and resume brings it back after its daemon was
+// killed. Its daemons run in slimtree processes, so this test process serves
+// no mount. Its subject is mounting, so it keeps its own mounts.
 func TestE2ESlimtreeLifecycle(t *testing.T) {
 	if os.Getenv("AFS_RUN_E2E_TESTS") != "1" {
 		t.Skip("skipping e2e tests (set AFS_RUN_E2E_TESTS=1 to run)")
 	}
 	skipIfNoFUSE(t)
-	skipIfOverMountBudget(t, 3)
+	// On FSKit, new and resume --all mount.
+	skipIfOverMountBudget(t, 2)
 	bin := slimtreeBinary(t)
 
 	base := filepath.Join(t.TempDir(), "base")
@@ -66,6 +70,16 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 	}
 	// The hook is the link only under a home no other user can replace.
 	home := filepath.Join(gittest.PrivateTempDir(t), "home")
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		logs, _ := filepath.Glob(filepath.Join(home, "w", "*", "daemon.log"))
+		for _, log := range logs {
+			data, err := os.ReadFile(log)
+			t.Logf("%s (%v):\n%s", log, err, data)
+		}
+	})
 	mountDir := newE2EMountDir(t)
 	wt := filepath.Join(mountDir, repoName)
 	slimtree := func(args ...string) (string, string, error) {
@@ -171,6 +185,31 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 	holder.Process.Kill()
 	holder.Wait()
 
+	// slimtree names a process it runs under that holds the mount: here a
+	// shell in the worktree that runs slimtree through a subshell outside it.
+	chain := commandIn(wt, "/bin/sh", "-c", `(cd / && "$0" stop "$1"; true); true`, bin, wt)
+	chain.Env = append(os.Environ(), "SLIMTREE_HOME="+home)
+	var chainErr bytes.Buffer
+	chain.Stderr = &chainErr
+	if err := chain.Run(); err != nil || !strings.Contains(chainErr.String(), "or a process it runs under, runs inside the worktree") {
+		t.Fatalf("slimtree stop under a shell in the mount: %v, stderr %q; want the refusal to say so", err, chainErr.String())
+	}
+
+	if runtime.GOOS == "linux" {
+		// After an external unmount, the daemon mounts the worktree again,
+		// with another identity.
+		before := record().MountIdentity
+		run(t, "", "fusermount3", "-u", wt)
+		e2eMountsStarted.Add(1)
+		waitForCondition(t, 30*time.Second, "the daemon's new mount", func() (bool, string) {
+			id, err := mounts.Identify(wt)
+			return err == nil && id != "" && string(id) != before, fmt.Sprintf("identity %q (%v), before %q", id, err, before)
+		})
+		if got := listed(); got != "mounted" {
+			t.Fatalf("slimtree list after the daemon mounted again: %s, want mounted", got)
+		}
+	}
+
 	daemon := record()
 	if got := mustSlimtree("stop", wt); got != "stopped "+wt+"\n" {
 		t.Fatalf("slimtree stop printed %q", got)
@@ -200,6 +239,9 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 		t.Fatalf("slimtree resume of a mounted worktree printed %q", got)
 	}
 
+	if e2eMountsUseFSKit() {
+		t.Skip("skipping the resume over a killed daemon's mount on FSKit: unmount(2) of a dead FSKit volume can hang (AGENTS.md, startUnmount)")
+	}
 	// A killed daemon leaves its mount, which answers nothing.
 	daemon = record()
 	if err := mounts.Signal(daemon.DaemonPID, daemon.DaemonToken, syscall.SIGKILL); err != nil {

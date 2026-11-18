@@ -144,6 +144,11 @@ func makeWorktree(ctx context.Context, home *state.Home, o newOptions, stdout, s
 	if _, ok := listed[dest]; ok {
 		return "", "", fmt.Errorf("git already registers a worktree at %s", dest)
 	}
+	// The directory of an earlier worktree's record can hold its state, which
+	// the new worktree's record and rm would take over.
+	if dir := home.RecordDir(dest); exists(dir) {
+		return "", "", fmt.Errorf("%s holds the state of an earlier worktree at %s; slimtree makes no worktree there while it exists", dir, dest)
+	}
 	// git worktree add makes the directories above dest that are missing.
 	for dir := filepath.Dir(dest); !exists(dir); dir = filepath.Dir(dir) {
 		rb.missing = dir

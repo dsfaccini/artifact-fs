@@ -3,6 +3,7 @@ package slimtree
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,6 +22,8 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/cloudflare/artifact-fs/internal/execfile"
+	"github.com/cloudflare/artifact-fs/internal/model"
+	"github.com/cloudflare/artifact-fs/internal/registry"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/doctor"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/mounts"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
@@ -33,7 +37,7 @@ func fakeDaemon(t *testing.T, body string) {
 	if err := execfile.Write(script, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	daemonProgram = func(*state.Home) (string, error) { return script, nil }
+	daemonProgram = func(*state.Home, string) (string, error) { return script, nil }
 	t.Cleanup(func() { daemonProgram = runtimeCopy })
 }
 
@@ -62,9 +66,9 @@ func TestNewArtifactFSStopsItsDaemonWhenItFailsBeforeTheRecord(t *testing.T) {
 		return &os.LinkError{Op: "rename", Old: src, New: dst, Err: syscall.EXDEV}
 	}
 	t.Cleanup(func() { renameHook = nil })
-	previous := daemonStopWait
-	daemonStopWait = 100 * time.Millisecond
-	t.Cleanup(func() { daemonStopWait = previous })
+	previous := daemonTermWait
+	daemonTermWait = 100 * time.Millisecond
+	t.Cleanup(func() { daemonTermWait = previous })
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -123,6 +127,268 @@ func TestNewArtifactFSStopsItsDaemonWhenItFailsBeforeTheRecord(t *testing.T) {
 	}
 	requireNoWorktree(t, main, dest)
 	gitFindsNothing(t, main, "rev-parse", "--verify", "--quiet", "refs/heads/feat")
+}
+
+// startNew runs new feat with the artifactfs backend until cancel, once the
+// daemon wrote probe, and returns new's exit code and stderr.
+func startNew(t *testing.T, probe string) (int, string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	type result struct {
+		code   int
+		stderr string
+	}
+	done := make(chan result, 1)
+	go func() {
+		code, _, stderr := linux(ctx, "--backend", "artifactfs", "new", "feat")
+		done <- result{code, stderr}
+	}()
+	for {
+		select {
+		case r := <-done:
+			t.Fatalf("new returned before its daemon started: exit %d, stderr %q", r.code, r.stderr)
+		case <-time.After(10 * time.Millisecond):
+		}
+		if _, err := os.Lstat(probe); err == nil {
+			break
+		}
+	}
+	cancel()
+	r := <-done
+	return r.code, r.stderr
+}
+
+// A new whose failure leaves a mount it cannot unmount removes nothing: the
+// gitfile stays in the record directory, and the worktree stays registered,
+// so nothing reaches the mount.
+func TestNewArtifactFSRemovesNothingWhileAMountStays(t *testing.T) {
+	homeAfterFirstRun(t)
+	main := newRepo(t)
+	probe := filepath.Join(t.TempDir(), "probe")
+	fakeDaemon(t, "touch '"+probe+"'\nexec sleep 60\n")
+	identifyHook = func(string) (mounts.Identity, error) { return "stuck", nil }
+	unmountHook = func(context.Context, string, mounts.Identity) error { return errors.New("device busy") }
+	t.Cleanup(func() { identifyHook, unmountHook = nil, nil })
+
+	code, stderr := startNew(t, probe)
+	if code != 1 || !strings.Contains(stderr, "slimtree could not stop what it started") || !strings.Contains(stderr, "device busy") {
+		t.Fatalf("new that cannot unmount: exit %d, stderr %q; want exit 1 and the unmount failure", code, stderr)
+	}
+	home, err := openHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(filepath.Dir(main), "main-feat")
+	if data, err := os.ReadFile(filepath.Join(home.RecordDir(dest), "gitfile")); err != nil || !strings.HasPrefix(string(data), "gitdir: ") {
+		t.Errorf("the record directory's gitfile = %q, %v; want it kept", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(home.RecordDir(dest), "state")); err != nil {
+		t.Errorf("the state root: %v; want it kept", err)
+	}
+	if list := gitIn(t, main, "worktree", "list", "--porcelain"); !strings.Contains(list, "worktree "+dest+"\n") {
+		t.Errorf("git no longer lists %s:\n%s", dest, list)
+	}
+	if got := records(t); len(got) != 0 {
+		t.Errorf("records = %+v, want none", got)
+	}
+}
+
+// A gitfile copy across file systems that fails leaves no partial gitfile in
+// the record directory, so the rollback keeps the worktree's own .git and
+// removes the worktree.
+func TestNewArtifactFSRollsBackAFailedGitfileCopy(t *testing.T) {
+	homeAfterFirstRun(t)
+	main := newRepo(t)
+	marker := filepath.Join(t.TempDir(), "started")
+	fakeDaemon(t, "touch '"+marker+"'\nexec sleep 60\n")
+	renameHook = func(src, dst string) error {
+		return &os.LinkError{Op: "rename", Old: src, New: dst, Err: syscall.EXDEV}
+	}
+	copyOpened = func(f *os.File) {
+		// The first copy fails after its create.
+		f.Close()
+		copyOpened = nil
+	}
+	t.Cleanup(func() { renameHook, copyOpened = nil, nil })
+	if code, stdout, stderr := linux(t.Context(), "--backend", "artifactfs", "new", "feat"); code != 1 || stdout != "" || !strings.Contains(stderr, "file already closed") {
+		t.Fatalf("new with a failed gitfile copy: exit %d, stdout %q, stderr %q; want exit 1 and the copy's failure", code, stdout, stderr)
+	}
+	requireNoWorktree(t, main, filepath.Join(filepath.Dir(main), "main-feat"))
+	gitFindsNothing(t, main, "rev-parse", "--verify", "--quiet", "refs/heads/feat")
+	if _, err := os.Lstat(marker); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("new started a daemon: %v", err)
+	}
+}
+
+// After an external unmount, the recorded daemon mounts the worktree again,
+// with a new identity. While the daemon reports the worktree mounted, list
+// says mounted, and stop records the new identity and stops the daemon.
+// Without that report, stop refuses the other mount.
+func TestStopFollowsARemountByTheRecordedDaemon(t *testing.T) {
+	homeAfterFirstRun(t)
+	parent, err := state.Canonical(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon := exec.Command("sleep", "60")
+	if err := daemon.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		daemon.Process.Kill()
+		daemon.Wait()
+	})
+	token, err := mounts.StartToken(daemon.Process.Pid)
+	if err != nil || token == "" {
+		t.Fatalf("StartToken(%d) = %q, %v", daemon.Process.Pid, token, err)
+	}
+	home, err := openHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := state.Record{Version: 1, Backend: "artifactfs", Path: filepath.Join(parent, "wt"), Branch: "wt",
+		DaemonPID: daemon.Process.Pid, DaemonToken: token, MountIdentity: "before"}
+	r.StateDir = filepath.Join(home.RecordDir(r.Path), "state")
+	gitIn(t, parent, "init", "-q", filepath.Join(parent, "repo"))
+	gitIn(t, filepath.Join(parent, "repo"), "commit", "-q", "--allow-empty", "-m", "base")
+	gitIn(t, filepath.Join(parent, "repo"), "worktree", "add", "-q", "--lock", "-b", "wt", r.Path)
+	r.CommonDir = filepath.Join(parent, "repo", ".git")
+	if err := home.Write(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home.RecordDir(r.Path), "gitfile"), []byte("gitdir: elsewhere\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The daemon's registry, its runtime record, and the daemon lock it holds.
+	if err := os.MkdirAll(filepath.Join(r.StateDir, "config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := registry.New(t.Context(), filepath.Join(r.StateDir, "config", "repos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	if err := reg.AddRepo(t.Context(), model.RepoConfig{RepoPaths: model.RepoPaths{Name: "wt", ID: model.RepoID("wt")}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(r.StateDir, "config", "daemon.lock")
+	if err := os.WriteFile(lockPath, []byte(strconv.Itoa(daemon.Process.Pid)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.Open(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+		lock.Close()
+	})
+	// The daemon's new mount is at the worktree while the daemon runs.
+	identifyHook = func(string) (mounts.Identity, error) {
+		if mounts.Signal(daemon.Process.Pid, token, 0) != nil {
+			return "", nil
+		}
+		return "after", nil
+	}
+	t.Cleanup(func() { identifyHook = nil })
+	listed := func() string {
+		t.Helper()
+		code, stdout, stderr := linux(t.Context(), "list", "--json")
+		var l struct{ Worktrees []struct{ State string } }
+		if err := json.Unmarshal([]byte(stdout), &l); code != 0 || err != nil || len(l.Worktrees) != 1 {
+			t.Fatalf("list --json: exit %d, stdout %q, stderr %q (%v)", code, stdout, stderr, err)
+		}
+		return l.Worktrees[0].State
+	}
+
+	if err := reg.PutRuntime(t.Context(), model.RepoRuntimeRecord{RepoID: model.RepoID("wt"), State: "degraded"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := listed(); got != "unknown" {
+		t.Fatalf("list while the daemon reports no mount: %s, want unknown", got)
+	}
+	if code, _, stderr := linux(t.Context(), "stop", r.Path); code != 1 || !strings.Contains(stderr, "holds another mount than the one slimtree recorded") {
+		t.Fatalf("stop while the daemon reports no mount: exit %d, stderr %q; want the refusal", code, stderr)
+	}
+
+	if err := reg.PutRuntime(t.Context(), model.RepoRuntimeRecord{RepoID: model.RepoID("wt"), State: "mounted"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := listed(); got != "mounted" {
+		t.Fatalf("list after the daemon mounted again: %s, want mounted", got)
+	}
+	if code, stdout, stderr := linux(t.Context(), "stop", r.Path); code != 0 || stdout != "stopped "+r.Path+"\n" {
+		t.Fatalf("stop after the daemon mounted again: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if err := daemon.Wait(); err == nil || err.Error() != "signal: terminated" {
+		t.Fatalf("the daemon's wait = %v, want SIGTERM", err)
+	}
+	r.MountIdentity = "after"
+	if got := records(t); !reflect.DeepEqual(got, []state.Record{r}) {
+		t.Fatalf("records = %+v, want %+v", got, r)
+	}
+}
+
+// The runtime copy is the running binary, under its hash. A copy that does
+// not match its hash, as after a power loss, is written again, and a write
+// that fails leaves no temporary file. On Linux the copy reads the running
+// file through /proc/self/exe, which an upgrade that replaces the file at its
+// path does not change.
+func TestRuntimeCopyIsTheRunningBinary(t *testing.T) {
+	homeAfterFirstRun(t)
+	home, err := openHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := runningBinary("linux"); got != "/proc/self/exe" || err != nil {
+		t.Fatalf(`runningBinary("linux") = %q, %v`, got, err)
+	}
+	self, err := runningBinary(runtime.GOOS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := runtimeCopy(home, runtime.GOOS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("the runtime copy %s holds %d bytes (%v), want the %d of the running binary", path, len(got), err, len(want))
+	}
+	if err := os.Truncate(path, 16); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := runtimeCopy(home, runtime.GOOS); err != nil || again != path {
+		t.Fatalf("runtimeCopy after a truncation = %q, %v; want %s", again, err, path)
+	}
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("the truncated runtime copy holds %d bytes (%v) after runtimeCopy, want %d", len(got), err, len(want))
+	}
+
+	// A directory with a file in it takes the copy's name, so the rename fails.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(path, "x"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtimeCopy(home, runtime.GOOS); err == nil {
+		t.Fatal("runtimeCopy over a directory succeeded")
+	}
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "slimtree" {
+		t.Fatalf("the runtime directory holds %v after a failed write, want slimtree alone", entries)
+	}
 }
 
 // Only the wait for the daemon tells new that it exited, and new then fails

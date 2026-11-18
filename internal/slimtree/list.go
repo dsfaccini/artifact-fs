@@ -16,7 +16,6 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/apfsclone"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
-	"github.com/cloudflare/artifact-fs/internal/slimtree/mounts"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 )
 
@@ -108,7 +107,7 @@ func listWorktrees(ctx context.Context, home *state.Home, repo string, warn func
 		case !ok || gw.prunable:
 			w.State = stateMissing
 		case r.Backend == string(artifactFS):
-			w.State, w.Reason = artifactFSState(home, r)
+			w.State, w.Reason = artifactFSState(ctx, home, r)
 		default:
 			w.State = stateOK
 		}
@@ -121,8 +120,9 @@ func listWorktrees(ctx context.Context, home *state.Home, repo string, warn func
 // artifactFSState returns the state of r, an artifactfs worktree that git
 // lists, and the reason for an unknown state. Without the gitfile in its
 // record directory, git cannot remove the worktree. It is mounted while its
-// recorded daemon runs and its recorded mount is at its path.
-func artifactFSState(home *state.Home, r state.Record) (string, string) {
+// recorded daemon runs and its recorded mount, or a mount the daemon reports
+// it made again, is at its path.
+func artifactFSState(ctx context.Context, home *state.Home, r state.Record) (string, string) {
 	if _, err := os.Lstat(filepath.Join(home.RecordDir(r.Path), gitfileName)); err != nil {
 		return stateMissing, ""
 	}
@@ -133,11 +133,11 @@ func artifactFSState(home *state.Home, r state.Record) (string, string) {
 	if !alive {
 		return stateStopped, ""
 	}
-	id, err := mounts.Identify(r.Path)
+	id, remount, err := remountedBy(ctx, r)
 	switch {
 	case err != nil:
 		return stateUnknown, err.Error()
-	case id == "" || string(id) != r.MountIdentity:
+	case id == "" || string(id) != r.MountIdentity && !remount:
 		return stateUnknown, "its daemon runs, and its mount is not at " + r.Path
 	}
 	return stateMounted, ""

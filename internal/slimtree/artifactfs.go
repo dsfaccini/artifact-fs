@@ -48,9 +48,12 @@ const (
 	mountCheckTimeout = 30 * time.Second
 )
 
-// daemonStopWait bounds the wait for a daemon to exit after SIGTERM, and
-// for a daemon slimtree started again after SIGKILL. Tests lower it.
-var daemonStopWait = time.Minute
+// daemonTermWait is how long a daemon has to exit after SIGTERM. Tests
+// lower it.
+var daemonTermWait = time.Minute
+
+// daemonKillWait bounds the reap of a daemon slimtree started, after SIGKILL.
+const daemonKillWait = time.Minute
 
 // daemonProgram returns the program a daemon of home runs. Tests set it to a
 // fake daemon.
@@ -80,9 +83,6 @@ var localGitEnv = []string{"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GI
 func newArtifactFS(ctx context.Context, home *state.Home, rb *rollback, goos, commit string, addArgs []string, stderr io.Writer) (head string, err error) {
 	dir := home.RecordDir(rb.dest)
 	if err := os.Mkdir(dir, 0o700); err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			return "", fmt.Errorf("%s holds the state of an earlier worktree at %s; slimtree makes no worktree there while it exists", dir, rb.dest)
-		}
 		return "", err
 	}
 	defer func() {
@@ -151,6 +151,27 @@ func undoArtifactFS(ctx context.Context, rb *rollback, dir string, cause error) 
 	return cause
 }
 
+// identifyHook and unmountHook, when set, run in place of mounts.Identify
+// and mounts.Unmount. Tests use them to show a mount where none is.
+var (
+	identifyHook func(path string) (mounts.Identity, error)
+	unmountHook  func(ctx context.Context, path string, id mounts.Identity) error
+)
+
+func identify(path string) (mounts.Identity, error) {
+	if identifyHook != nil {
+		return identifyHook(path)
+	}
+	return mounts.Identify(path)
+}
+
+func unmount(ctx context.Context, path string, id mounts.Identity) error {
+	if unmountHook != nil {
+		return unmountHook(ctx, path, id)
+	}
+	return mounts.Unmount(ctx, path, id)
+}
+
 // renameHook, when set, renames in place of os.Rename in moveFile. Tests use
 // it to fail a rename across file systems.
 var renameHook func(src, dst string) error
@@ -175,10 +196,32 @@ func moveFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(dst, data, fi.Mode().Perm()); err != nil {
+	if err := copyFile(dst, data, fi.Mode().Perm()); err != nil {
+		// A partial copy at dst would stand for src.
+		os.Remove(dst)
 		return err
 	}
 	return os.Remove(src)
+}
+
+// copyOpened, when set, runs on copyFile's file right after its create.
+// Tests use it to fail the write that follows.
+var copyOpened func(*os.File)
+
+// copyFile writes data to the new file dst.
+func copyFile(dst string, data []byte, perm fs.FileMode) error {
+	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return err
+	}
+	if copyOpened != nil {
+		copyOpened(f)
+	}
+	_, err = f.Write(data)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 // serve starts a daemon on r's state root, waits until it mounts r.Path,
@@ -228,7 +271,7 @@ type launchedDaemon struct {
 // start time, which fork sets: right after exec, Linux shows the daemon
 // with an empty argv. Only the wait for the daemon tells that it exited.
 func startDaemon(home *state.Home, r state.Record, goos string) (*launchedDaemon, error) {
-	program, err := daemonProgram(home)
+	program, err := daemonProgram(home, goos)
 	if err != nil {
 		return nil, err
 	}
@@ -270,18 +313,21 @@ func startDaemon(home *state.Home, r state.Record, goos string) (*launchedDaemon
 }
 
 // end stops the daemon through its own process and reaps it: SIGTERM, then
-// SIGKILL, each followed by a wait of daemonStopWait.
+// after daemonTermWait SIGKILL, and a reap bounded by daemonKillWait.
 func (d *launchedDaemon) end() error {
-	for _, sig := range []os.Signal{syscall.SIGTERM, syscall.SIGKILL} {
+	for _, step := range []struct {
+		sig  os.Signal
+		wait time.Duration
+	}{{syscall.SIGTERM, daemonTermWait}, {syscall.SIGKILL, daemonKillWait}} {
 		// A reaped daemon takes no signal.
-		_ = d.proc.Signal(sig)
+		_ = d.proc.Signal(step.sig)
 		select {
 		case <-d.done:
 			return nil
-		case <-time.After(daemonStopWait):
+		case <-time.After(step.wait):
 		}
 	}
-	return fmt.Errorf("the daemon, pid %d, did not exit within %s of SIGKILL", d.proc.Pid, daemonStopWait)
+	return fmt.Errorf("the daemon, pid %d, did not exit within %s of SIGKILL", d.proc.Pid, daemonKillWait)
 }
 
 // stop ends the daemon, then unmounts the mount at path that a killed
@@ -291,11 +337,11 @@ func (d *launchedDaemon) stop(ctx context.Context, path string) error {
 	if err := d.end(); err != nil {
 		return err
 	}
-	id, err := mounts.Identify(path)
+	id, err := identify(path)
 	if err != nil || id == "" {
 		return err
 	}
-	return mounts.Unmount(context.WithoutCancel(ctx), path, id)
+	return unmount(context.WithoutCancel(ctx), path, id)
 }
 
 // awaitMount waits until d mounts r.Path, which status reports mounted and
@@ -328,7 +374,7 @@ func awaitMount(ctx context.Context, ctl *daemon.Controller, r state.Record, d *
 		if st.State != "mounted" {
 			continue
 		}
-		id, err := mounts.Identify(r.Path)
+		id, err := identify(r.Path)
 		if err != nil {
 			return "", err
 		}
@@ -375,39 +421,64 @@ func daemonEnv(environ []string, stateDir, goos string) []string {
 	return env
 }
 
-// runtimeCopy returns the copy of this binary that daemons run,
-// <home>/runtimes/<SHA-256>/slimtree, and writes it when it is missing. A
-// daemon links Git's FSMonitor hook to its own binary, so an upgrade that
-// replaces slimtree never puts another version behind a running daemon's
-// hook.
-func runtimeCopy(home *state.Home) (string, error) {
-	exe, err := os.Executable()
+// runtimeCopy returns the copy of the running binary that daemons run,
+// <home>/runtimes/<SHA-256>/slimtree, and writes it when it is missing or
+// does not match its hash, as after a power loss. A daemon links Git's
+// FSMonitor hook to its own binary, so an upgrade that replaces slimtree
+// never puts another version behind a running daemon's hook.
+func runtimeCopy(home *state.Home, goos string) (string, error) {
+	self, err := runningBinary(goos)
 	if err != nil {
 		return "", err
 	}
-	data, err := os.ReadFile(exe)
+	data, err := os.ReadFile(self)
 	if err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(data)
 	dir := filepath.Join(home.Dir(), "runtimes", hex.EncodeToString(sum[:]))
 	path := filepath.Join(dir, "slimtree")
-	if _, err := os.Lstat(path); err == nil {
+	if copied, err := os.ReadFile(path); err == nil && sha256.Sum256(copied) == sum {
 		return path, nil
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
 	tmp := filepath.Join(dir, ".slimtree-"+strconv.Itoa(os.Getpid()))
-	if err := execfile.Write(tmp, data, 0o700); err != nil {
-		os.Remove(tmp)
-		return "", err
-	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := writeRuntime(tmp, path, data); err != nil {
 		os.Remove(tmp)
 		return "", err
 	}
 	return path, nil
+}
+
+// runningBinary returns a path that reads the running binary on goos. On
+// Linux /proc/self/exe reads the running file even after an upgrade replaced
+// the file at its path. macOS has no such path.
+func runningBinary(goos string) (string, error) {
+	if goos == "linux" {
+		return "/proc/self/exe", nil
+	}
+	return os.Executable()
+}
+
+// writeRuntime writes data to tmp, syncs it, and renames it to path.
+func writeRuntime(tmp, path string, data []byte) error {
+	if err := execfile.Write(tmp, data, 0o700); err != nil {
+		return err
+	}
+	f, err := os.Open(tmp)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // daemonAlive reports whether the daemon r records runs.
@@ -436,11 +507,51 @@ func stopWorktree(ctx context.Context, home *state.Home, arg string, stdout io.W
 	if err != nil {
 		return err
 	}
+	if err := healRemount(ctx, home, &r); err != nil {
+		return err
+	}
 	if err := stopDaemon(ctx, r); err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "stopped %s\n", r.Path)
 	return nil
+}
+
+// healRemount records the identity of the mount at r.Path when r's recorded
+// daemon runs and reports r mounted, and that identity is not the recorded
+// one. After an external unmount, the daemon mounts again, with a new
+// identity.
+func healRemount(ctx context.Context, home *state.Home, r *state.Record) error {
+	id, remount, err := remountedBy(ctx, *r)
+	if err != nil || !remount {
+		return err
+	}
+	r.MountIdentity = string(id)
+	return home.Write(*r)
+}
+
+// remountedBy returns the identity of the mount at r.Path, and whether r's
+// recorded daemon runs and reports r mounted while that identity is not the
+// recorded one.
+func remountedBy(ctx context.Context, r state.Record) (mounts.Identity, bool, error) {
+	alive, err := daemonAlive(r)
+	if err != nil || !alive {
+		return "", false, err
+	}
+	id, err := identify(r.Path)
+	if err != nil || id == "" || string(id) == r.MountIdentity {
+		return id, false, err
+	}
+	ctl, err := daemon.NewController(ctx, r.StateDir, logging.NewJSONLogger(io.Discard, slog.LevelWarn))
+	if err != nil {
+		return id, false, err
+	}
+	defer ctl.Close()
+	st, err := ctl.Status(ctx, r.Name())
+	if err != nil {
+		return id, false, err
+	}
+	return id, st.State == "mounted", nil
 }
 
 // resolveArtifactFS returns the record of the artifactfs worktree arg names.
@@ -462,7 +573,7 @@ func stopDaemon(ctx context.Context, r state.Record) error {
 	if err != nil {
 		return err
 	}
-	id, err := mounts.Identify(r.Path)
+	id, err := identify(r.Path)
 	if err != nil {
 		return err
 	}
@@ -480,10 +591,10 @@ func stopDaemon(ctx context.Context, r state.Record) error {
 		if err := mounts.Signal(r.DaemonPID, r.DaemonToken, syscall.SIGTERM); err != nil && !errors.Is(err, mounts.ErrGone) {
 			return err
 		}
-		deadline := time.Now().Add(daemonStopWait)
+		deadline := time.Now().Add(daemonTermWait)
 		for alive {
 			if time.Now().After(deadline) {
-				return fmt.Errorf("the daemon of %s, pid %d, did not exit within %s of SIGTERM; slimtree left it running", r.Path, r.DaemonPID, daemonStopWait)
+				return fmt.Errorf("the daemon of %s, pid %d, did not exit within %s of SIGTERM; slimtree left it running", r.Path, r.DaemonPID, daemonTermWait)
 			}
 			select {
 			case <-ctx.Done():
@@ -496,10 +607,10 @@ func stopDaemon(ctx context.Context, r state.Record) error {
 		}
 	}
 	// A daemon that exits unmounts its mount, and one that died leaves it.
-	if id, err = mounts.Identify(r.Path); err != nil || id == "" {
+	if id, err = identify(r.Path); err != nil || id == "" {
 		return err
 	}
-	if err := mounts.Unmount(ctx, r.Path, mounts.Identity(r.MountIdentity)); err != nil {
+	if err := unmount(ctx, r.Path, mounts.Identity(r.MountIdentity)); err != nil {
 		key, keyErr := mounts.KeyOf(r.Path)
 		if keyErr != nil {
 			return err
@@ -525,9 +636,16 @@ func refuseHolders(ctx context.Context, r state.Record) error {
 	}
 	var msg strings.Builder
 	msg.WriteString(fmt.Sprintf("processes use %s, so slimtree left it mounted: %s", r.Path, describeHolders(holders)))
+	ancestors := map[int]bool{}
+	for pid := os.Getpid(); pid > 0 && !ancestors[pid]; {
+		ancestors[pid] = true
+		if pid, err = mounts.ParentPID(pid); err != nil {
+			break
+		}
+	}
 	for _, h := range holders {
-		if h.PID == os.Getpid() || h.PID == os.Getppid() {
-			msg.WriteString(". slimtree or its shell runs inside the worktree; run slimtree from a shell outside it")
+		if ancestors[h.PID] {
+			msg.WriteString(". slimtree, or a process it runs under, runs inside the worktree; run slimtree from a shell outside it")
 			break
 		}
 	}
@@ -556,11 +674,14 @@ func resumeWorktree(ctx context.Context, home *state.Home, arg, goos string, std
 	if err != nil {
 		return err
 	}
+	if err := healRemount(ctx, home, &r); err != nil {
+		return err
+	}
 	alive, err := daemonAlive(r)
 	if err != nil {
 		return err
 	}
-	id, err := mounts.Identify(r.Path)
+	id, err := identify(r.Path)
 	if err != nil {
 		return err
 	}

@@ -468,6 +468,37 @@ func TestRmOfArtifactFSWorktreesIsNotInThisReleaseYet(t *testing.T) {
 	}
 }
 
+// new refuses, before git runs, a worktree whose record directory holds an
+// earlier worktree's state, which the new record and rm would take over.
+func TestNewRefusesARetainedRecordDirectory(t *testing.T) {
+	homeAfterFirstRun(t)
+	main := newRepo(t)
+	cloneWith(t, nil)
+	home, err := openHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(filepath.Dir(main), "main-feat")
+	kept := filepath.Join(home.RecordDir(dest), "state", "kept")
+	if err := os.MkdirAll(filepath.Dir(kept), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(kept, []byte("overlay\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, stdout, stderr := slimtree(t.Context(), "new", "feat"); code != 1 || stdout != "" ||
+		!strings.Contains(stderr, "holds the state of an earlier worktree at "+dest) || strings.Contains(stderr, "Preparing worktree") {
+		t.Fatalf("new over a retained record directory: exit %d, stdout %q, stderr %q; want exit 1 and the refusal before git worktree add", code, stdout, stderr)
+	}
+	if data, err := os.ReadFile(kept); err != nil || string(data) != "overlay\n" {
+		t.Errorf("the earlier worktree's state = %q, %v; want it kept", data, err)
+	}
+	if _, err := os.Lstat(dest); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("%s exists: %v", dest, err)
+	}
+	gitFindsNothing(t, main, "rev-parse", "--verify", "--quiet", "refs/heads/feat")
+}
+
 // rm refuses a worktree in which git status lists anything, and changes
 // nothing, unless --force.
 func TestRmRefusesAWorktreeWithChanges(t *testing.T) {
