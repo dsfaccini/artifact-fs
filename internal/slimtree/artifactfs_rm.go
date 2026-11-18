@@ -123,7 +123,20 @@ func removeArtifactFS(ctx context.Context, home *state.Home, probe doctor.Probe,
 	default:
 		return fmt.Errorf("the daemon of %s does not serve it, so git status cannot check it for changes; slimtree resume %s mounts it, or slimtree rm --force removes it unchecked and archives its files", r.Path, r.Path)
 	}
+	// While the recorded daemon runs, it holds the daemon lock.
+	if pid, running, err := daemon.Running(r.StateDir); err != nil {
+		return err
+	} else if running && (!alive || pid != r.DaemonPID) {
+		return fmt.Errorf("pid %d, a daemon slimtree did not record, serves %s; stop it, then rm again", pid, r.StateDir)
+	}
 	if o.check {
+		if id != "" {
+			fmt.Fprintf(stdout, "%s can be removed, unless files lie below its mount, which rm sees only once it unmounted it\n", r.Path)
+			return nil
+		}
+		if _, _, _, err := mountPointState(r.Path, filepath.Join(home.RecordDir(r.Path), gitfileName)); err != nil {
+			return err
+		}
 		fmt.Fprintf(stdout, "%s can be removed\n", r.Path)
 		return nil
 	}
@@ -154,24 +167,11 @@ func removeArtifactFS(ctx context.Context, home *state.Home, probe doctor.Probe,
 // a later run finishes.
 func finishRemoval(ctx context.Context, home *state.Home, r state.Record, excludes []string, stdout, stderr io.Writer) error {
 	gitfile := filepath.Join(home.RecordDir(r.Path), gitfileName)
-	entries, err := os.ReadDir(r.Path)
-	gone := errors.Is(err, fs.ErrNotExist)
-	switch {
-	case gone, len(entries) == 0:
-	case err != nil:
+	entries, gone, copied, err := mountPointState(r.Path, gitfile)
+	if err != nil {
 		return err
-	case len(entries) > 1 || entries[0].Name() != ".git":
-		return fmt.Errorf("%s holds %s, which no mount serves and git worktree remove would delete; move them away", r.Path, entryNames(entries))
-	// An earlier run that put the gitfile back leaves it alone.
-	case !exists(gitfile):
-	default:
-		// A move across file systems that copied the gitfile and then
-		// failed to remove the saved one leaves both.
-		saved, savedErr := os.ReadFile(gitfile)
-		back, backErr := os.ReadFile(filepath.Join(r.Path, ".git"))
-		if savedErr != nil || backErr != nil || !bytes.Equal(saved, back) {
-			return fmt.Errorf("%s holds a .git that is not the gitfile slimtree keeps in %s; no mount serves it, and git worktree remove would delete it; move it away", r.Path, gitfile)
-		}
+	}
+	if copied {
 		if err := os.Remove(gitfile); err != nil {
 			return err
 		}
@@ -248,6 +248,34 @@ func finishRemoval(ctx context.Context, home *state.Home, r state.Record, exclud
 		fmt.Fprintf(stdout, "removed %s; %s keeps its HEAD %s, and %s its files\n", r.Path, a.Ref, r.Head, files)
 	}
 	return nil
+}
+
+// mountPointState reads the mount point path, where nothing is mounted, and
+// returns what it holds, or that it is gone. It refuses a mount point that
+// holds files no mount serves, which git worktree remove would delete. It
+// accepts a .git that an earlier run put back, and reports with copied a
+// .git that is byte for byte the gitfile, which a move across file systems
+// that copied the gitfile and then failed to remove the saved one leaves.
+func mountPointState(path, gitfile string) (entries []fs.DirEntry, gone, copied bool, err error) {
+	entries, err = os.ReadDir(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, true, false, nil
+	case err != nil:
+		return nil, false, false, err
+	case len(entries) == 0:
+		return entries, false, false, nil
+	case len(entries) > 1 || entries[0].Name() != ".git":
+		return nil, false, false, fmt.Errorf("%s holds %s, which no mount serves and git worktree remove would delete; move them away", path, entryNames(entries))
+	case !exists(gitfile):
+		return entries, false, false, nil
+	}
+	saved, savedErr := os.ReadFile(gitfile)
+	back, backErr := os.ReadFile(filepath.Join(path, ".git"))
+	if savedErr != nil || backErr != nil || !bytes.Equal(saved, back) {
+		return nil, false, false, fmt.Errorf("%s holds a .git that is not the gitfile slimtree keeps in %s; no mount serves it, and git worktree remove would delete it; move it away", path, gitfile)
+	}
+	return entries, false, true, nil
 }
 
 // entryNames names entries for a message, at most three of them.

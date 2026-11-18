@@ -177,7 +177,7 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 				ArgsUsage: "<worktree>",
 				Flags: []ucli.Flag{
 					&ucli.BoolFlag{Name: "force", Usage: "discard the changes git status lists, or drop a worktree whose directory is gone or, for artifactfs, that no daemon serves; twice, also drop a worktree whose repository is missing, which keeps git's registration of it"},
-					&ucli.BoolFlag{Name: "check", Usage: "only check whether rm would refuse; changes nothing"},
+					&ucli.BoolFlag{Name: "check", Usage: "only check whether rm would refuse; changes nothing, so it cannot see files below a mounted artifactfs worktree's mount, which rm checks once it unmounted it"},
 					&ucli.StringSliceFlag{Name: "exclude", Usage: "leave out of an artifactfs worktree's archive the files at paths with a component that this glob matches; repeatable", Validator: checkExcludes},
 				},
 				Action: func(ctx context.Context, c *ucli.Command) error {

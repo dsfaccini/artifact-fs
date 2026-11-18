@@ -357,7 +357,7 @@ func TestRmRefusesAServedArtifactFSWorktreeWithChangesOrHolders(t *testing.T) {
 		}
 		requireUnchanged(t, main, r)
 	}
-	if code, stdout, stderr := linux(t.Context(), "rm", "--check", "wt"); code != 0 || stdout != r.Path+" can be removed\n" {
+	if code, stdout, stderr := linux(t.Context(), "rm", "--check", "wt"); code != 0 || stdout != r.Path+" can be removed, unless files lie below its mount, which rm sees only once it unmounted it\n" {
 		t.Fatalf("rm --check of a clean worktree: exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
 	alive()
@@ -700,10 +700,10 @@ func TestRmForceRemovesAnArtifactFSWorktreeInEachStateAStopLeaves(t *testing.T) 
 	}
 }
 
-// Once the daemon is stopped, rm --force refuses a mount point that holds
+// rm --force refuses a mount point where nothing is mounted that holds
 // files, which no mount serves and git worktree remove would delete, and a
-// state root that a daemon slimtree did not record serves. Neither refusal
-// archives anything.
+// state root that a daemon slimtree did not record serves. rm --check
+// refuses both. No refusal archives anything.
 func TestRmForceRefusesWhatWouldLoseFiles(t *testing.T) {
 	main, r := stoppedArtifactFS(t, map[string]string{"notes.txt": "kept\n"})
 	stray := filepath.Join(r.Path, "stray")
@@ -711,8 +711,10 @@ func TestRmForceRefusesWhatWouldLoseFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := r.Path + " holds stray, which no mount serves and git worktree remove would delete; move them away"
-	if code, _, stderr := linux(t.Context(), "rm", "--force", "wt"); code != 1 || !strings.Contains(stderr, want) {
-		t.Fatalf("rm --force over a stray file: exit %d, stderr %q; want %q", code, stderr, want)
+	for _, args := range [][]string{{"rm", "--force", "wt"}, {"rm", "--check", "--force", "wt"}} {
+		if code, _, stderr := linux(t.Context(), args...); code != 1 || !strings.Contains(stderr, want) {
+			t.Fatalf("%q over a stray file: exit %d, stderr %q; want %q", args, code, stderr, want)
+		}
 	}
 	if data, err := os.ReadFile(stray); err != nil || string(data) != "written while unmounted\n" {
 		t.Errorf("the stray file = %q, %v; want it kept", data, err)
@@ -762,8 +764,10 @@ func TestRmForceRefusesWhatWouldLoseFiles(t *testing.T) {
 		lock.Close()
 	})
 	want = "pid 4242, a daemon slimtree did not record, serves " + r.StateDir + "; stop it, then rm again"
-	if code, _, stderr := linux(t.Context(), "rm", "--force", "wt"); code != 1 || !strings.Contains(stderr, want) {
-		t.Fatalf("rm --force while another daemon serves the state root: exit %d, stderr %q; want %q", code, stderr, want)
+	for _, args := range [][]string{{"rm", "--force", "wt"}, {"rm", "--check", "--force", "wt"}} {
+		if code, _, stderr := linux(t.Context(), args...); code != 1 || !strings.Contains(stderr, want) {
+			t.Fatalf("%q while another daemon serves the state root: exit %d, stderr %q; want %q", args, code, stderr, want)
+		}
 	}
 	requireUnchanged(t, main, r)
 }
@@ -849,5 +853,66 @@ func TestRmRefusesAWorktreeWhoseRepositoryIsMissing(t *testing.T) {
 	}
 	if list := gitIn(t, main, "worktree", "list", "--porcelain"); !strings.Contains(list, "worktree "+r.Path+"\n") {
 		t.Errorf("git no longer lists %s, which rm could not unregister:\n%s", r.Path, list)
+	}
+}
+
+// stop, resume and rm leave the mount a dead daemon left while a daemon
+// slimtree did not record holds the state root's daemon lock. Before Linux
+// 6.8 that daemon's mount can carry the recorded identity.
+func TestDeadDaemonsMountStaysWhileAnUnrecordedDaemonServes(t *testing.T) {
+	_, r := stoppedArtifactFS(t, map[string]string{"notes.txt": "kept\n"})
+	dead := exec.Command("sleep", "60")
+	if err := dead.Start(); err != nil {
+		t.Fatal(err)
+	}
+	token, err := mounts.StartToken(dead.Process.Pid)
+	if err != nil || token == "" {
+		t.Fatalf("StartToken(%d) = %q, %v", dead.Process.Pid, token, err)
+	}
+	dead.Process.Kill()
+	dead.Wait()
+	r.DaemonPID, r.DaemonToken, r.MountIdentity = dead.Process.Pid, token, "left"
+	home, err := openHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := home.Write(r); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(r.StateDir, "config", "daemon.lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lockPath, []byte("4242\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.Open(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+		lock.Close()
+	})
+	identifyHook = func(string) (mounts.Identity, error) { return "left", nil }
+	var unmounted []string
+	unmountHook = func(_ context.Context, path string, _ mounts.Identity) error {
+		unmounted = append(unmounted, path)
+		return nil
+	}
+	t.Cleanup(func() { identifyHook, unmountHook = nil, nil })
+	for _, args := range [][]string{{"stop", "wt"}, {"resume", "wt"}, {"rm", "--force", "wt"}} {
+		if code, _, stderr := linux(t.Context(), args...); code != 1 || !strings.Contains(stderr, "pid 4242, a daemon slimtree did not record, serves "+r.StateDir) {
+			t.Errorf("%q while pid 4242 holds the daemon lock: exit %d, stderr %q; want the refusal", args, code, stderr)
+		}
+	}
+	if len(unmounted) != 0 {
+		t.Errorf("unmounted %q while an unrecorded daemon served the state root", unmounted)
+	}
+	if got := records(t); !reflect.DeepEqual(got, []state.Record{r}) {
+		t.Errorf("records = %+v, want %+v", got, r)
 	}
 }

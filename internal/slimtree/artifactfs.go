@@ -624,6 +624,13 @@ func stopDaemon(ctx context.Context, r state.Record) error {
 	if id, err = identify(r.Path); err != nil || id == "" {
 		return err
 	}
+	// Before Linux 6.8 a later mount at r.Path can take the recorded
+	// identity, so the mount can be a daemon's that slimtree did not record.
+	if pid, running, err := daemon.Running(r.StateDir); err != nil {
+		return err
+	} else if running {
+		return fmt.Errorf("pid %d, a daemon slimtree did not record, serves %s, so slimtree left the mount at %s; stop that daemon, then rerun", pid, r.StateDir, r.Path)
+	}
 	if err := unmount(ctx, r.Path, mounts.Identity(r.MountIdentity)); err != nil {
 		key, keyErr := mounts.KeyOf(r.Path)
 		if keyErr != nil {
