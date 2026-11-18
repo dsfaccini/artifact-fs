@@ -718,13 +718,14 @@ func (s *Service) unmount(id model.RepoID) error {
 	}
 }
 
-// endWorkers cancels the context of id's runtime, which a failed stop kept
-// running, and waits for its workers until deadline. keepServing keeps such a
-// runtime serving so that a live daemon's mount stays up. Close ends the
-// daemon, and the process exits after it, so Close ends those workers before
-// it closes the Store, the registry and the daemon lock. A worker that
-// outlived Close would run git in the state root, which a caller may be
-// removing.
+// endWorkers cancels the context of id's runtime, whose stop failed or has
+// not returned, and waits for its workers until deadline. keepServing keeps a
+// runtime whose unmount failed serving, so that a live daemon's mount stays
+// up. Close ends the daemon, and the process exits after it, so Close ends
+// those workers before it closes the Store, the registry and the daemon lock.
+// A worker that outlived Close would run git in the state root, which a
+// caller may be removing. The FUSE server and the hydrator are not workers:
+// they serve the mount's ops until the process exits.
 func (s *Service) endWorkers(id model.RepoID, deadline time.Time) error {
 	s.mu.Lock()
 	rt := s.running[id]

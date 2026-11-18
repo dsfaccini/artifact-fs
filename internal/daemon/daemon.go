@@ -270,11 +270,15 @@ func (s *Service) hydrationWorkers() int {
 	return DefaultHydrationConcurrency
 }
 
-// Close unmounts every repo and releases the registry, the git processes and
-// the daemon lock, also when an unmount fails. It returns the first error. A
-// runtime whose stop failed keeps its mount, and Close ends its workers
-// within the stop's stopWaitTimeout. A runtime whose workers outlive that
-// wait keeps its preparation too, so Close then does not wait for the
+// Close stops every repo and releases the registry, the git processes and the
+// daemon lock, also when a stop fails. It returns the first error. A stop
+// fails when its unmount fails, which keeps the mount, when its drain times
+// out, or when an earlier unmount of the repo has not returned. A stop can
+// also not return within stopWaitTimeout. In each case Close cancels the
+// runtime's context and waits for the runtime's workers, within the same
+// stopWaitTimeout. It leaves the runtime's FUSE server and hydrator to the
+// process exit. When a runtime's workers outlive the wait, a preparation of
+// the runtime can still run, so Close then does not wait for the
 // preparations.
 func (s *Service) Close() error {
 	s.mu.Lock()
