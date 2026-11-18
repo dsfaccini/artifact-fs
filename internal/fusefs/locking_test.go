@@ -1051,7 +1051,7 @@ type lockObserver struct {
 	unlocking func()
 }
 
-func (o *lockObserver) ReconcileChecked(ctx context.Context, gen int64, baseLookup func(string) (model.BaseNode, bool, error), switched model.SwitchedPaths, lock sync.Locker, switchBase func()) error {
+func (o *lockObserver) ReconcileChecked(ctx context.Context, gen int64, baseLookup func(string) (model.BaseNode, bool, error), switched model.SwitchedPaths, lock sync.Locker, switchBase func()) (model.SwitchedPaths, error) {
 	return o.OverlayStore.ReconcileChecked(ctx, gen, baseLookup, switched, observedLock{Locker: lock, locked: o.locked, unlocking: o.unlocking}, switchBase)
 }
 

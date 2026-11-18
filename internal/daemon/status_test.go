@@ -1537,11 +1537,17 @@ func (f *headReconcileFixture) serveThrough(mount fusefs.MountedFS) {
 // switches f's runtime to it.
 func (f *headReconcileFixture) switchToNext() {
 	f.t.Helper()
-	nodes, err := f.svc.git.BuildTreeIndex(f.ctx, f.rt.cfg, f.nextOID)
+	f.switchTo(f.nextOID)
+}
+
+// switchTo publishes the tree of oid and switches f's runtime to it.
+func (f *headReconcileFixture) switchTo(oid string) {
+	f.t.Helper()
+	nodes, err := f.svc.git.BuildTreeIndex(f.ctx, f.rt.cfg, oid)
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	gen, err := f.rt.snapshot.PublishGeneration(f.ctx, f.nextOID, "main", nodes)
+	gen, err := f.rt.snapshot.PublishGeneration(f.ctx, oid, "main", nodes)
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -1600,6 +1606,117 @@ func TestSwitchOnFSKitLogsItsPathsAgainAfterTheKernelCacheExpires(t *testing.T) 
 	}
 	if elapsed := time.Since(start); elapsed < fusefs.CacheTTL {
 		t.Errorf("logged again %v after the switch began, want no sooner than %v", elapsed, fusefs.CacheTTL)
+	}
+}
+
+// A switch's reconcile drops each overlay entry the new base matches, such as
+// a committed file's, and the merged view then changes only the path's times
+// and, under umask 002, its group and other write bits. Git compares neither
+// those bits nor anything else that changed. The reconcile logs no such path,
+// and neither may the logs after the kernel invalidations and, on FSKit,
+// after the kernel cache expires. Git takes a path the hook names whose stat
+// data no longer matches the index as changed until a refresh. So git
+// diff-files reports the committed file, and git stash create, which git
+// merge runs, fails.
+func TestSwitchLogsNoPathWhoseEntryItsReconcileDropped(t *testing.T) {
+	t.Parallel()
+	for _, backend := range []string{fusefs.BackendKernel, fusefs.BackendFSKit} {
+		for _, entry := range []struct {
+			umask string
+			mode  uint32
+		}{{umask: "022", mode: 0o644}, {umask: "002", mode: 0o664}} {
+			t.Run(backend+" under umask "+entry.umask, func(t *testing.T) {
+				t.Parallel()
+				f := newIdleHeadReconcileFixture(t, time.Millisecond)
+				if _, err := f.rt.overlay.CreateFile(f.ctx, "README.md", entry.mode); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.rt.overlay.WriteFile(f.ctx, "README.md", 0, []byte("next\n")); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.rt.overlay.FlushFile(f.ctx, "README.md"); err != nil {
+					t.Fatal(err)
+				}
+				if e, ok, err := f.rt.overlay.Lookup(f.ctx, "README.md"); err != nil || !ok || e.Mode&0o777 != entry.mode {
+					t.Fatalf("overlay entry before the switch: %+v, found %v, error %v; want mode %#o", e, ok, err, entry.mode)
+				}
+				written, _, err := overlay.ReadChangesSince(f.ctx, f.rt.cfg.RepoPaths, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				f.serveThrough(&seqMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, backend: backend, repo: f.rt.cfg.RepoPaths})
+				f.switchToNext()
+				// The log after the kernel cache expires runs on a worker.
+				f.rt.workers.Wait()
+				if _, ok, err := f.rt.overlay.Lookup(f.ctx, "README.md"); err != nil || ok {
+					t.Fatalf("overlay entry after the switch: found %v, error %v; want it dropped", ok, err)
+				}
+				changes, _, err := overlay.ReadChangesSince(f.ctx, f.rt.cfg.RepoPaths, written.Seq)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(changes.Paths) != 0 || changes.Instance != written.Instance {
+					t.Errorf("switch logged %q in instance %s, want nothing in instance %s: Git sees no change in README.md", changes.Paths, changes.Instance, written.Instance)
+				}
+			})
+		}
+	}
+}
+
+// A switch's reconcile drops the delete marker that a rename chain left at an
+// untracked intermediate path, and when the new base has that path, the
+// merged view shows the base there. The reconcile logs the path, and the
+// daemon logs it again after the kernel invalidations, as it logs every path
+// the switch changed.
+func TestSwitchLogsAgainAPathItsReconcileRevealed(t *testing.T) {
+	t.Parallel()
+	f := newIdleHeadReconcileFixture(t, time.Millisecond)
+	// The next base adds B.md and keeps README.md as the served base has it.
+	runCmd(t, "git", "-C", f.workDir, "checkout", "-q", "-f", "--detach", f.oldOID)
+	if err := os.WriteFile(filepath.Join(f.workDir, "B.md"), []byte("b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", f.workDir, "add", "B.md")
+	runCmd(t, "git", "-C", f.workDir, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "add B.md")
+	revealOID := strings.TrimSpace(runCmdOutput(t, "git", "-C", f.workDir, "rev-parse", "HEAD"))
+	readme, ok, err := f.rt.snapshot.LookupNode(f.ctx, f.oldGen, "README.md")
+	if err != nil || !ok {
+		t.Fatalf("README.md in the served base: found %v, error %v", ok, err)
+	}
+	src, err := os.Open(filepath.Join(f.workDir, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	if _, err := f.rt.overlay.EnsureCopyOnWriteFrom(f.ctx, f.rt.cfg.RepoPaths, "README.md", readme, src); err != nil {
+		t.Fatal(err)
+	}
+	// Renaming README.md through B.md, which no base has yet, leaves at B.md
+	// a delete marker that names README.md.
+	if err := f.rt.overlay.Rename(f.ctx, "README.md", "B.md", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.rt.overlay.Rename(f.ctx, "B.md", "C.md", false); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok, err := f.rt.overlay.Lookup(f.ctx, "B.md"); err != nil || !ok || !e.IsDeleted() || e.TargetPath != "README.md" {
+		t.Fatalf("overlay entry at B.md before the switch: %+v, found %v, error %v; want a delete marker naming README.md", e, ok, err)
+	}
+	mount := &seqMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, backend: fusefs.BackendKernel, repo: f.rt.cfg.RepoPaths}
+	f.serveThrough(mount)
+	f.switchTo(revealOID)
+	if _, ok, err := f.rt.overlay.Lookup(f.ctx, "B.md"); err != nil || ok {
+		t.Fatalf("overlay entry at B.md after the switch: found %v, error %v; want it dropped", ok, err)
+	}
+	if len(mount.seqs) != 1 {
+		t.Fatalf("invalidations = %d, want 1", len(mount.seqs))
+	}
+	changes, _, err := overlay.ReadChangesSince(f.ctx, f.rt.cfg.RepoPaths, mount.seqs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"B.md"}; !reflect.DeepEqual(changes.Paths, want) {
+		t.Errorf("paths logged after the invalidations = %q, want %q", changes.Paths, want)
 	}
 }
 
