@@ -20,14 +20,18 @@ on:
       - .github/workflows/release.yml
       - .github/workflows/build-test.yml
       - .github/workflows/redaction-fuzz.yml
+      - .github/workflows/runner-retry.yml
       - .github/actions/seal-fuzz-inputs/**
       - .github/scripts/fuzz.sh
       - .github/scripts/test_redaction_fuzz_workflow.py
       - .github/scripts/build_wheel.py
       - .github/scripts/release_gate.py
+      - .github/scripts/runner_retry.py
       - .github/scripts/test_build_wheel.py
       - .github/scripts/test_release_gate.py
       - .github/scripts/test_release_workflow.py
+      - .github/scripts/test_runner_retry.py
+      - .github/scripts/test_runner_retry_workflow.py
       - .github/scripts/smoke.sh
       - .github/scripts/third_party_licenses.sh
       - cmd/slimtree/**
