@@ -76,7 +76,9 @@ func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, g
 		head = lines[2]
 		// git worktree remove hides what the config hides, such as untracked
 		// files under status.showUntrackedFiles=no, and then deletes them.
-		status, err := apfsclone.Git(ctx, r.Path, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none")
+		// --no-optional-locks keeps git status from refreshing the index
+		// under index.lock, so the check writes nothing and stays cancelable.
+		status, err := apfsclone.Git(ctx, r.Path, "--no-optional-locks", "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none")
 		if err != nil {
 			return err
 		}

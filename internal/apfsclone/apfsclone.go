@@ -447,7 +447,11 @@ func populate(ctx context.Context, clone Clonefile, base, dest, head string, bas
 		return Result{}, err
 	}
 
-	if _, err := git(ctx, dest, nil, "update-index", "-q", "--refresh"); err != nil {
+	err = gitWrite(ctx, func(ctx context.Context) error {
+		_, err := git(ctx, dest, nil, "update-index", "-q", "--refresh")
+		return err
+	})
+	if err != nil {
 		return Result{}, err
 	}
 	mismatched, err := diffFiles(ctx, dest)

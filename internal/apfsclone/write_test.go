@@ -48,14 +48,15 @@ func requireNoGitLock(t *testing.T, gitDir string) {
 	}
 }
 
-// A cancel that lands while Register's git worktree add or read-tree runs
-// does not stop the git. Git creates a lock file, such as a ref's lock or
-// index.lock, before it installs the handler that removes its lock files on
-// SIGTERM, so a SIGTERM in between would leave the lock in the user's
-// repository. The fake git holds the write until its context has ended, and
-// marks a SIGTERM. It is serial: it sets PATH, writeGrace and writeOutlived.
+// A cancel that lands while Register's git worktree add or read-tree runs,
+// or while Add's update-index --refresh runs, does not stop the git. Git
+// creates a lock file, such as a ref's lock or index.lock, before it installs
+// the handler that removes its lock files on SIGTERM, so a SIGTERM in between
+// would leave the lock in the user's repository. The fake git holds the write
+// until its context has ended, and marks a SIGTERM. It is serial: it sets
+// PATH, writeGrace and writeOutlived.
 func TestACanceledRegistrationWriteRunsToItsEnd(t *testing.T) {
-	for _, step := range []string{"worktree add", "read-tree"} {
+	for _, step := range []string{"worktree add", "read-tree", "update-index"} {
 		t.Run(step, func(t *testing.T) {
 			f := newFixture(t, nil, nil)
 			realGit, err := exec.LookPath("git")
@@ -84,8 +85,18 @@ func TestACanceledRegistrationWriteRunsToItsEnd(t *testing.T) {
 			defer cancel()
 			path := filepath.Join(f.worktrees, "held")
 			returned := make(chan error, 1)
+			o := Options{Base: f.base, Path: path, Commit: "upstream/main", AddArgs: []string{"-q", "-b", "feat/held"}, Clone: copyClone}
+			entry := "Register"
+			if step == "update-index" {
+				entry = "Add"
+			}
 			go func() {
-				_, err := Register(ctx, Options{Base: f.base, Path: path, Commit: "upstream/main", AddArgs: []string{"-q", "-b", "feat/held"}})
+				var err error
+				if entry == "Add" {
+					_, err = Add(ctx, o)
+				} else {
+					_, err = Register(ctx, o)
+				}
 				returned <- err
 			}()
 			waitForFile(t, started, returned)
@@ -93,7 +104,7 @@ func TestACanceledRegistrationWriteRunsToItsEnd(t *testing.T) {
 			select {
 			case <-outlived:
 			case err := <-returned:
-				t.Fatalf("Register returned %v while its git %s waited, want the git to outlive the cancel", err, step)
+				t.Fatalf("%s returned %v while its git %s waited, want the git to outlive the cancel", entry, err, step)
 			}
 			if _, err := os.Stat(termed); err == nil {
 				t.Fatalf("the cancel sent the running git %s SIGTERM", step)
@@ -117,6 +128,19 @@ func TestACanceledRegistrationWriteRunsToItsEnd(t *testing.T) {
 				}
 				if got := run(t, path, "ls-files", "README.md"); got != "README.md" {
 					t.Fatalf("the index of %s lists %q, want README.md", path, got)
+				}
+			case "update-index":
+				// The git diff-files after the refresh starts no git once the
+				// context ended.
+				var incomplete *IncompleteError
+				if !errors.As(err, &incomplete) || !errors.Is(err, context.Canceled) {
+					t.Fatalf("Add = %v, want an IncompleteError of the cancel", err)
+				}
+				// The refresh recorded the stat data of every file that
+				// matches its blob. hidden.txt holds the base's edit that git
+				// status misses, so it alone still differs.
+				if got := run(t, path, "diff-files", "--name-only"); got != "hidden.txt" {
+					t.Fatalf("git diff-files in %s lists %q, want only hidden.txt", path, got)
 				}
 			}
 			resolved, err := filepath.EvalSymlinks(path)

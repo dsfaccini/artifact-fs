@@ -19,7 +19,10 @@ import (
 )
 
 // rollbackTimeout bounds a rollback. A rollback outlives the command's
-// cancellation, and the canceled command ignores a second Ctrl-C.
+// cancellation, and the canceled command ignores a second Ctrl-C. A write
+// that runs when rollbackTimeout passes outlives it by at most
+// gitstore.WriteGrace, plus up to gitstore.GitCommandWaitDelay for the stop
+// that follows.
 const rollbackTimeout = time.Minute
 
 // rollbackContext, when set, wraps the context of each rollback, so a test
@@ -229,7 +232,7 @@ type rollback struct {
 // directories above it that git worktree add made, and the branch while it
 // still points at rb.start, with the tracking config new wrote. It outlives
 // ctx's cancellation, for at most rollbackTimeout, plus writeGrace for a write
-// that runs then.
+// that runs then and up to gitstore.GitCommandWaitDelay for its stop.
 func (rb rollback) run(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
 	defer cancel()

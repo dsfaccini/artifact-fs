@@ -1,6 +1,7 @@
 package slimtree
 
 import (
+	"bytes"
 	"context"
 	"io/fs"
 	"os"
@@ -40,8 +41,8 @@ func holdWrite(t *testing.T, hold string) heldWrite {
 	if err := execfile.Write(filepath.Join(dir, "git"), []byte("#!/bin/sh\ncase \" $* \" in *\""+hold+"\"*)\n"+
 		"  trap ': > \"$AFS_TERMED\"; exit 143' TERM\n  : > \"$AFS_STARTED\"\n  i=0\n"+
 		"  while [ ! -e \"$AFS_RELEASED\" ] && [ \"$i\" -lt 6000 ]; do sleep 0.01; i=$((i+1)); done\n"+
-		"  '"+realGit+"' \"$@\"; s=$?; : > \"$AFS_FINISHED\"; exit $s\n  ;;\nesac\n"+
-		"exec '"+realGit+"' \"$@\"\n"), 0o755); err != nil {
+		"  "+shellQuote(realGit)+" \"$@\"; s=$?; : > \"$AFS_FINISHED\"; exit $s\n  ;;\nesac\n"+
+		"exec "+shellQuote(realGit)+" \"$@\"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -56,14 +57,13 @@ func holdWrite(t *testing.T, hold string) heldWrite {
 	return h
 }
 
-// outlive ends the held git's context with end once the git started, checks
-// that the git outlived it, and releases the git. It fails t when returned
+// waitStarted waits until the held git started, and fails t when returned
 // delivers first.
-func (h heldWrite) outlive(t *testing.T, end func(), returned <-chan int) {
+func (h heldWrite) waitStarted(t *testing.T, returned <-chan int) {
 	t.Helper()
 	for {
 		if _, err := os.Stat(h.started); err == nil {
-			break
+			return
 		}
 		select {
 		case code := <-returned:
@@ -71,6 +71,29 @@ func (h heldWrite) outlive(t *testing.T, end func(), returned <-chan int) {
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
+}
+
+// waitFinished waits until the released git finished, and fails t when a
+// SIGTERM stopped it.
+func (h heldWrite) waitFinished(t *testing.T) {
+	t.Helper()
+	for {
+		if _, err := os.Stat(h.finished); err == nil {
+			return
+		}
+		if _, err := os.Stat(h.termed); err == nil {
+			t.Fatal("a SIGTERM stopped the released git before it finished")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// outlive ends the held git's context with end once the git started, checks
+// that the git outlived it, and releases the git. It fails t when returned
+// delivers first.
+func (h heldWrite) outlive(t *testing.T, end func(), returned <-chan int) {
+	t.Helper()
+	h.waitStarted(t, returned)
 	end()
 	select {
 	case <-h.outlived:
@@ -151,6 +174,53 @@ func TestACanceledRmRunsItsWritesToTheirEnd(t *testing.T) {
 	}
 }
 
+// rm checks a worktree for changes with a git status that writes nothing.
+// A git status that may take index.lock refreshes the index under it, and a
+// Ctrl-C right after git creates the lock would leave it, so every later git
+// add or checkout in the worktree fails. A file whose stat data the index no
+// longer matches makes such a status write the index. The fake git holds git
+// worktree remove, which runs after the check.
+func TestRmChecksAWorktreeWithoutWritingItsIndex(t *testing.T) {
+	homeAfterFirstRun(t)
+	cloneWith(t, nil)
+	main := newRepo(t)
+	path := filepath.Join(filepath.Dir(main), "main-feat")
+	if code, _, stderr := slimtree(t.Context(), "new", "feat"); code != 0 {
+		t.Fatalf("new feat: exit %d, stderr %q", code, stderr)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(path, "README.md"), past, past); err != nil {
+		t.Fatal(err)
+	}
+	index := strings.TrimSpace(gitIn(t, path, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+	before, err := os.ReadFile(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := holdWrite(t, " worktree remove ")
+
+	returned := make(chan int, 1)
+	go func() {
+		code, _, _ := slimtree(t.Context(), "rm", "main-feat")
+		returned <- code
+	}()
+	h.waitStarted(t, returned)
+	after, err := os.ReadFile(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Error("rm's check rewrote the worktree's index")
+	}
+	if err := os.WriteFile(h.released, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := <-returned; code != 0 {
+		t.Fatalf("rm exited %d, want 0", code)
+	}
+	requireNoWorktree(t, main, path)
+}
+
 // A rollback whose deadline passes while it deletes the branch new made, or
 // unsets the tracking config new wrote, does not stop the write. The
 // deadline expires once the held write started.
@@ -225,12 +295,7 @@ func TestACanceledPruneDeletesTheRecoveryRef(t *testing.T) {
 		returned <- code
 	}()
 	h.outlive(t, cancel, returned)
-	for {
-		if _, err := os.Stat(h.finished); err == nil {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	h.waitFinished(t)
 	if code := <-returned; code == 0 {
 		t.Fatal("prune exited 0 after the Ctrl-C, want a failure")
 	}
