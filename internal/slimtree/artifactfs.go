@@ -511,7 +511,7 @@ func stopWorktree(ctx context.Context, home *state.Home, arg string, stdout io.W
 	if err != nil {
 		return err
 	}
-	if err := healRemount(ctx, home, &r); err != nil {
+	if err := healRemount(ctx, home, &r, true); err != nil {
 		return err
 	}
 	if err := stopDaemon(ctx, r); err != nil {
@@ -525,8 +525,9 @@ func stopWorktree(ctx context.Context, home *state.Home, arg string, stdout io.W
 // daemon runs and reports r mounted, that identity is not the recorded one,
 // and git finds r's worktree and git dir through the mount. After an
 // external unmount, the daemon mounts again, with a new identity. It refuses
-// a mount where git finds another worktree.
-func healRemount(ctx context.Context, home *state.Home, r *state.Record) error {
+// a mount where git finds another worktree. Without write, it sets the
+// identity in r alone, for a command that changes nothing.
+func healRemount(ctx context.Context, home *state.Home, r *state.Record, write bool) error {
 	id, remount, err := remountedBy(ctx, *r)
 	if err != nil || !remount {
 		return err
@@ -535,6 +536,9 @@ func healRemount(ctx context.Context, home *state.Home, r *state.Record) error {
 		return fmt.Errorf("%s holds another mount than the one slimtree recorded, and slimtree left it: %w", r.Path, err)
 	}
 	r.MountIdentity = string(id)
+	if !write {
+		return nil
+	}
 	return home.Write(*r)
 }
 
@@ -682,7 +686,7 @@ func resumeWorktree(ctx context.Context, home *state.Home, arg, goos string, std
 	if err != nil {
 		return err
 	}
-	if err := healRemount(ctx, home, &r); err != nil {
+	if err := healRemount(ctx, home, &r, true); err != nil {
 		return err
 	}
 	alive, err := daemonAlive(r)

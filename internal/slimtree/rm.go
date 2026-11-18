@@ -19,13 +19,15 @@ import (
 // worktree's repository. Tests use it to cancel the command there.
 var goneListed func()
 
-// removeWorktree removes the apfsclone worktree arg names, with its ignored
-// files, as git worktree remove does, and its record, then prunes. Without force, it
-// refuses a worktree in which git status lists a change or an untracked file,
-// whatever the config hides, and a worktree whose directory is gone, which
-// can be on a volume that is not mounted. It first writes the worktree's HEAD
-// to a recovery ref in the repository, and never deletes a branch.
-func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, goos, arg string, force bool, stdout, stderr io.Writer) error {
+// removeWorktree removes the worktree arg names, with its ignored files, as
+// git worktree remove does, and its record, then prunes. removeArtifactFS
+// removes an artifactfs worktree. Without o.force, it refuses an apfsclone
+// worktree in which git status lists a change or an untracked file, whatever
+// the config hides, and one whose directory is gone, which can be on a volume
+// that is not mounted. With o.check, it stops after the refusals. It first
+// writes the worktree's HEAD to a recovery ref in the repository, and never
+// deletes a branch.
+func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, goos, arg string, o rmOptions, stdout, stderr io.Writer) error {
 	lock, err := home.Lock(ctx, "")
 	if err != nil {
 		return err
@@ -35,8 +37,19 @@ func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, g
 	if err != nil {
 		return err
 	}
-	if r.Backend != string(apfsClone) {
-		return notInThisRelease("slimtree rm "+r.Path, r.Backend)
+	switch r.Backend {
+	case string(artifactFS):
+		if err := removeArtifactFS(ctx, home, probe, goos, r, o, stdout, stderr); err != nil || o.check {
+			return err
+		}
+		prune(ctx, home, time.Now()).write(stderr)
+		return nil
+	case string(apfsClone):
+	default:
+		return fmt.Errorf("slimtree rm %s: unknown backend %q", r.Path, r.Backend)
+	}
+	if len(o.excludes) > 0 {
+		return fmt.Errorf("--exclude leaves files out of an artifactfs worktree's archive, and rm archives no files of the apfsclone worktree %s", r.Path)
 	}
 	if err := doctor.Require(probe, goos, r.Backend, "rm", doctor.Needs{}); err != nil {
 		return err
@@ -45,7 +58,7 @@ func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, g
 	head, registered := "", true
 	switch _, err := os.Lstat(r.Path); {
 	case errors.Is(err, fs.ErrNotExist):
-		if !force {
+		if !o.force {
 			return fmt.Errorf("%s is gone; if its volume is not mounted, mount it and rerun. slimtree rm --force removes git's registration of it and its record", r.Path)
 		}
 		listed, err := worktreeList(ctx, r.CommonDir)
@@ -76,28 +89,34 @@ func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, g
 		head = lines[2]
 		// git worktree remove hides what the config hides, such as untracked
 		// files under status.showUntrackedFiles=no, and then deletes them.
-		status, err := apfsclone.Git(ctx, r.Path, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none")
+		status, err := apfsclone.Git(ctx, r.Path, "--no-optional-locks", "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none")
 		if err != nil {
 			return err
 		}
-		if len(status) > 0 && !force {
+		if len(status) > 0 && !o.force {
 			return fmt.Errorf("git status lists changes in %s; commit them, or discard them with slimtree rm --force", r.Path)
 		}
+	}
+	if o.check {
+		fmt.Fprintf(stdout, "%s can be removed\n", r.Path)
+		return nil
 	}
 
 	ref := ""
 	if head != "" {
 		r.Head = head
-		if ref, err = home.Archive(r); err != nil {
+		a, err := home.Archive(r)
+		if err != nil {
 			return err
 		}
+		ref = a.Ref
 		if _, err := apfsclone.Git(ctx, r.CommonDir, "update-ref", ref, head, ""); err != nil {
 			return err
 		}
 	}
 	if registered {
 		args := []string{"worktree", "remove", r.Path}
-		if force {
+		if o.force {
 			args = []string{"worktree", "remove", "--force", r.Path}
 		}
 		if _, err := apfsclone.Git(ctx, r.CommonDir, args...); err != nil {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs the slimtree wheel for this machine with uv, as a user does, and
 # checks the installed slimtree. It changes nothing outside a temporary
-# directory. On Linux with FUSE it mounts a worktree there, and unmounts it.
+# directory. On Linux with FUSE it mounts a worktree there, and removes it.
 #
 #   smoke.sh <wheel directory> <version> <tag>
 set -euo pipefail
@@ -81,14 +81,6 @@ EOF
 	git rev-parse --verify --quiet refs/heads/feat >/dev/null || fail "slimtree rm deleted the branch feat"
 	;;
 Linux)
-	# slimtree rm of artifactfs worktrees, Linux's default backend, is not supported yet.
-	python3 - "$work/doctor.json" <<'EOF'
-import json, sys
-report = json.load(open(sys.argv[1]))
-backend = report["checks"][0]
-assert backend["id"] == "backend" and backend["status"] == "warn", report
-assert backend["detail"] == "slimtree rm of artifactfs worktrees is not supported yet", backend
-EOF
 	states() {
 		"$slimtree" list --json | python3 -c 'import json, sys; print(" ".join(w["name"] + "=" + w["state"] for w in json.load(sys.stdin)["worktrees"]))'
 	}
@@ -100,11 +92,17 @@ EOF
 		[ "$(states)" = app-feat=mounted ] || fail "slimtree list after new: $(states)"
 		"$slimtree" stop app-feat
 		[ "$(states)" = app-feat=stopped ] || fail "slimtree list after stop: $(states)"
-		status=0
-		"$slimtree" rm app-feat 2>"$work/rm.err" || status=$?
-		cat "$work/rm.err"
-		[ "$status" -eq 1 ] || fail "slimtree rm of an artifactfs worktree exited $status, want 1"
-		grep -q 'removing artifactfs worktrees is not supported yet' "$work/rm.err" || fail "slimtree rm did not say removing artifactfs worktrees is not supported yet"
+		"$slimtree" resume app-feat
+		[ "$(states)" = app-feat=mounted ] || fail "slimtree list after resume: $(states)"
+		"$slimtree" rm --check app-feat
+		"$slimtree" rm app-feat
+		[ ! -e "$path" ] || fail "slimtree rm left $path"
+		if grep -qF " $path " /proc/self/mountinfo; then
+			fail "slimtree rm left a mount at $path"
+		fi
+		[ -z "$(states)" ] || fail "slimtree list after rm: $(states)"
+		git rev-parse --verify --quiet refs/heads/feat >/dev/null || fail "slimtree rm deleted the branch feat"
+		[ "$(git for-each-ref --format='%(objectname)' refs/slimtree/archive/)" = "$(git rev-parse feat)" ] || fail "slimtree rm wrote no recovery ref at feat"
 	else
 		# Without FUSE, new refuses before it changes anything.
 		status=0

@@ -3,13 +3,17 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -50,8 +54,10 @@ type slimtreeRecord struct {
 // refuses while another process uses the mount, records the daemon's new
 // mount after an external unmount and then unmounts it, resume mounts it
 // again with its changes, and resume brings it back after its daemon was
-// killed. Its daemons run in slimtree processes, so this test process serves
-// no mount. Its subject is mounting, so it keeps its own mounts.
+// killed. On Linux, rm then refuses the worktree while it has changes and
+// while another process uses the mount, and rm --force archives its files and
+// removes it. Its daemons run in slimtree processes, so this test process
+// serves no mount. Its subject is mounting, so it keeps its own mounts.
 func TestE2ESlimtreeLifecycle(t *testing.T) {
 	if os.Getenv("AFS_RUN_E2E_TESTS") != "1" {
 		t.Skip("skipping e2e tests (set AFS_RUN_E2E_TESTS=1 to run)")
@@ -138,6 +144,10 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 	// Before any assertion can end the test, so a failure leaves no daemon
 	// and no mount.
 	t.Cleanup(func() {
+		// Once rm removed the worktree, no record is left to stop.
+		if paths, _ := filepath.Glob(filepath.Join(home, "w", "*", "worktree.json")); len(paths) == 0 {
+			return
+		}
 		if _, stderr, err := slimtree("stop", wt); err != nil {
 			t.Errorf("slimtree stop at cleanup: %v: %s", err, stderr)
 			stopRecordedDaemon(t, home)
@@ -276,6 +286,139 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 	assertGitStatus(t, wt, map[string]string{"notes.txt": "??"})
 	if data, err := readMountFile(filepath.Join(wt, "notes.txt")); err != nil || string(data) != "kept across stops\n" {
 		t.Fatalf("notes.txt after resume = %q, %v", data, err)
+	}
+	if runtime.GOOS == "linux" {
+		slimtreeRemovesTheWorktree(t, base, home, wt, slimtree)
+	}
+}
+
+// slimtreeRemovesTheWorktree runs rm on the mounted artifactfs worktree wt,
+// whose untracked notes.txt holds "kept across stops". rm and rm --check
+// refuse it while git status lists that file, and, with --force, while
+// another process uses the mount. rm --force then leaves the overlay files of
+// node_modules out of the archive, keeps notes.txt there, writes the
+// worktree's HEAD to the recovery ref, and leaves no mount, daemon or
+// worktree.
+func slimtreeRemovesTheWorktree(t *testing.T, base, home, wt string, slimtree func(args ...string) (string, string, error)) {
+	t.Helper()
+	for _, args := range [][]string{{"rm", wt}, {"rm", "--check", wt}} {
+		if _, stderr, err := slimtree(args...); err == nil || !strings.Contains(stderr, "git status lists changes in "+wt) {
+			t.Fatalf("slimtree %s with an untracked file: %v, stderr %q; want the refusal", strings.Join(args, " "), err, stderr)
+		}
+	}
+
+	holder := commandIn(wt, "/bin/sh", "-c", "echo ready; exec sleep 60")
+	out, err := holder.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		holder.Process.Kill()
+		holder.Wait()
+	})
+	if _, err := out.Read(make([]byte, 6)); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"rm", "--force", wt}, {"rm", "--check", "--force", wt}} {
+		if _, stderr, err := slimtree(args...); err == nil || !strings.Contains(stderr, "processes use "+wt) || !strings.Contains(stderr, strconv.Itoa(holder.Process.Pid)+" sleep") {
+			t.Fatalf("slimtree %s while pid %d holds the mount: %v, stderr %q; want a refusal that names it", strings.Join(args, " "), holder.Process.Pid, err, stderr)
+		}
+	}
+	holder.Process.Kill()
+	holder.Wait()
+
+	run(t, "", "mkdir", "-p", filepath.Join(wt, "node_modules", "pkg"))
+	if err := writeMountFile(filepath.Join(wt, "node_modules", "pkg", "index.js"), []byte("left out of the archive\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, wt, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "work")
+	head := strings.TrimSpace(gitCmd(t, wt, "rev-parse", "HEAD"))
+	paths, err := filepath.Glob(filepath.Join(home, "w", "*", "worktree.json"))
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("records = %q, %v; want one", paths, err)
+	}
+	data, err := os.ReadFile(paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var daemon slimtreeRecord
+	if err := json.Unmarshal(data, &daemon); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, err := slimtree("rm", "--force", "--exclude", "node_modules", wt)
+	m := regexp.MustCompile(`^removed ` + regexp.QuoteMeta(wt) + `; (refs/slimtree/archive/[0-9a-f]{16}/\d+/HEAD) keeps its HEAD ` + head + `, and (/\S+/state\.tar\.gz) its files\n$`).FindStringSubmatch(stdout)
+	if err != nil || m == nil {
+		t.Fatalf("slimtree rm --force: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+	}
+	if got := strings.TrimSpace(gitCmd(t, base, "rev-parse", m[1])); got != head {
+		t.Errorf("the recovery ref %s points at %s, want %s", m[1], got, head)
+	}
+	if got := strings.TrimSpace(gitCmd(t, base, "rev-parse", "feat")); got != head {
+		t.Errorf("feat points at %s after rm, want %s", got, head)
+	}
+	kept, excluded := false, false
+	for _, content := range archivedFiles(t, m[2]) {
+		kept = kept || content == "kept across stops\n"
+		excluded = excluded || content == "left out of the archive\n"
+	}
+	if !kept || excluded {
+		t.Errorf("%s keeps notes.txt: %t, and node_modules/pkg/index.js: %t; want only notes.txt", m[2], kept, excluded)
+	}
+
+	if id, err := mounts.Identify(wt); err != nil || id != "" {
+		t.Errorf("after rm, the mount table holds %q at %s (%v)", id, wt, err)
+	}
+	if err := mounts.Signal(daemon.DaemonPID, daemon.DaemonToken, 0); !errors.Is(err, mounts.ErrGone) {
+		t.Errorf("after rm, the daemon %d: %v, want it gone", daemon.DaemonPID, err)
+	}
+	if _, err := os.Lstat(wt); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("after rm, %s: %v, want it gone", wt, err)
+	}
+	if list := gitCmd(t, base, "worktree", "list", "--porcelain"); strings.Contains(list, "worktree "+wt+"\n") {
+		t.Errorf("git lists %s after rm:\n%s", wt, list)
+	}
+	var l struct{ Worktrees []struct{ Path string } }
+	stdout, stderr, err = slimtree("list", "--json")
+	if err != nil || json.Unmarshal([]byte(stdout), &l) != nil || len(l.Worktrees) != 0 {
+		t.Errorf("slimtree list after rm: %v, stdout %q, stderr %q; want no worktree", err, stdout, stderr)
+	}
+}
+
+// archivedFiles returns the content of each regular file in the gzipped tar
+// at path.
+func archivedFiles(t *testing.T, path string) []string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(gz)
+	var files []string
+	for {
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return files
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h.Typeflag != tar.TypeReg {
+			continue
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, string(data))
 	}
 }
 

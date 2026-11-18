@@ -150,6 +150,7 @@ type gitWorktree struct {
 	head     string
 	branch   string
 	prunable bool
+	locked   bool
 }
 
 // worktreeList runs git worktree list in the repository whose common dir is
@@ -215,6 +216,10 @@ func worktreeList(ctx context.Context, commonDir string) (map[string]gitWorktree
 		case "prunable":
 			w := worktrees[path]
 			w.prunable = true
+			worktrees[path] = w
+		case "locked":
+			w := worktrees[path]
+			w.locked = true
 			worktrees[path] = w
 		}
 	}

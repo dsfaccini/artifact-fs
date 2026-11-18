@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"runtime"
 	"strings"
@@ -436,38 +435,6 @@ func TestRmRemovesTheWorktreeAndItsRecord(t *testing.T) {
 	}
 }
 
-// This release removes no artifactfs worktree: rm refuses an artifactfs
-// record with exit 1, and changes nothing.
-func TestRmOfArtifactFSWorktreesIsNotInThisReleaseYet(t *testing.T) {
-	homeAfterFirstRun(t)
-	main := newRepo(t)
-	const notYet = ": removing artifactfs worktrees is not supported yet; slimtree stop unmounts one\n"
-	served := filepath.Join(filepath.Dir(main), "served")
-	if err := os.Mkdir(served, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	home, err := openHome()
-	if err != nil {
-		t.Fatal(err)
-	}
-	record := state.Record{Version: 1, Backend: "artifactfs", Path: served, CommonDir: filepath.Join(main, ".git"), Branch: "served"}
-	if err := home.Write(record); err != nil {
-		t.Fatal(err)
-	}
-	for goos, probe := range map[string]doctor.Probe{"linux": healthyLinux(), "darwin": healthyDarwin()} {
-		var stdout, stderr bytes.Buffer
-		if code := run(t.Context(), goos, probe, []string{"rm", "served"}, &stdout, &stderr); code != 1 || stdout.Len() != 0 || stderr.String() != "slimtree rm "+served+notYet {
-			t.Fatalf("rm served on %s: exit %d, stdout %q, stderr %q; want exit 1 and the refusal", goos, code, stdout.String(), stderr.String())
-		}
-		if got := records(t); !reflect.DeepEqual(got, []state.Record{record}) {
-			t.Fatalf("records after rm on %s = %+v, want %+v", goos, got, record)
-		}
-		if _, err := os.Stat(served); err != nil {
-			t.Fatalf("rm on %s removed %s: %v", goos, served, err)
-		}
-	}
-}
-
 // new refuses, before git runs, a worktree whose record directory holds an
 // earlier worktree's state, which the new record and rm would take over.
 func TestNewRefusesARetainedRecordDirectory(t *testing.T) {
@@ -499,8 +466,8 @@ func TestNewRefusesARetainedRecordDirectory(t *testing.T) {
 	gitFindsNothing(t, main, "rev-parse", "--verify", "--quiet", "refs/heads/feat")
 }
 
-// rm refuses a worktree in which git status lists anything, and changes
-// nothing, unless --force.
+// rm and rm --check refuse a worktree in which git status lists anything,
+// and change nothing, unless --force.
 func TestRmRefusesAWorktreeWithChanges(t *testing.T) {
 	homeAfterFirstRun(t)
 	cloneWith(t, nil)
@@ -515,8 +482,14 @@ func TestRmRefusesAWorktreeWithChanges(t *testing.T) {
 	// git worktree remove would hide the file too, then delete it.
 	gitIn(t, main, "config", "status.showUntrackedFiles", "no")
 	want := "git status lists changes in " + path + "; commit them, or discard them with slimtree rm --force\n"
-	if code, stdout, stderr := slimtree(t.Context(), "rm", path); code != 1 || stdout != "" || stderr != want {
-		t.Fatalf("rm of a worktree with changes: exit %d, stdout %q, stderr %q; want 1 and %q", code, stdout, stderr, want)
+	for _, args := range [][]string{{"rm", path}, {"rm", "--check", path}} {
+		if code, stdout, stderr := slimtree(t.Context(), args...); code != 1 || stdout != "" || stderr != want {
+			t.Fatalf("%q of a worktree with changes: exit %d, stdout %q, stderr %q; want 1 and %q", args, code, stdout, stderr, want)
+		}
+	}
+	// rm --check --force refuses nothing, and changes nothing either.
+	if code, stdout, stderr := slimtree(t.Context(), "rm", "--check", "--force", path); code != 0 || stdout != path+" can be removed\n" {
+		t.Fatalf("rm --check --force: exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
 	if _, err := os.Lstat(filepath.Join(path, "notes.txt")); err != nil {
 		t.Fatal(err)
