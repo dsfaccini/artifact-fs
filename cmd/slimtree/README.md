@@ -59,7 +59,7 @@ How it was measured:
 | `slimtree resume <worktree>` | Only for `--backend artifactfs` | Mounts the worktree again; `--all` mounts every one, as after a reboot |
 | `slimtree rm <worktree>` | Removes an APFS clone worktree | Coming |
 | `slimtree list` | Lists the worktrees slimtree made | Lists the worktrees slimtree made |
-| `slimtree prune` | Deletes the archives and recovery refs `rm` left that are older than the retention rule | Has nothing to delete until `rm` removes artifact-fs worktrees |
+| `slimtree prune` | Deletes the archives and recovery refs `rm` left that are older than the retention rule | Evicts cached blobs not read within the retention rule, and removes the daemon binary copies no worktree uses |
 | `slimtree retention [<rule>]` | Shows or sets how long archives are kept: `week`, `month` (the default), `forever` or `<N>d` | Shows or sets the rule |
 | `slimtree doctor` | Checks what slimtree needs | Checks the FUSE setup, and warns that `rm` of artifact-fs worktrees is not supported yet |
 
@@ -116,7 +116,8 @@ only APFS clone worktrees in this release. It refuses a worktree with changes
 unless you pass `--force`. It keeps the worktree's `HEAD` in a ref under
 `refs/slimtree/archive/` and never deletes a branch. Each `slimtree rm`, and
 `slimtree prune`, deletes the archives and recovery refs older than the
-retention rule, a month by default; `slimtree retention week|month|forever|<N>d`
+retention rule, a month by default, and evicts artifact-fs's cached blobs not
+read within it; `slimtree retention week|month|forever|<N>d`
 changes the rule. Run `slimtree --help` for every flag.
 
 ## Source and license
