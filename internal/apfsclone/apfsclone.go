@@ -15,11 +15,17 @@
 //     clone that is not is rewritten from Git. diff-files ignores the
 //     executable bit under core.fileMode=false, which a plain checkout still
 //     writes.
-//   - update-index --refresh then hashes every file, because read-tree records
-//     no stat data. A file that does not match its blob is rewritten from Git,
-//     and diff-files must then be empty. Refresh hashes through Git's clean
-//     filter, which compares raw bytes only because Add refuses every checkout
-//     that converts files.
+//   - Add records each clone's stat data in the index, so Git trusts the clone
+//     and never checks it byte for byte against its blob. It records none for
+//     a clone rewritten from Git, a path that the base's index marks
+//     assume-unchanged or skip-worktree, or a clone whose mtime is not older
+//     than the second in which the base's git status started.
+//   - update-index --refresh then hashes every other file, because read-tree
+//     records no stat data, and every entry that Git treats as racily clean.
+//     A file that does not match its blob is rewritten from Git, and
+//     diff-files must then be empty. Refresh hashes through Git's clean
+//     filter, which compares raw bytes only because Add refuses every
+//     checkout that converts files.
 //
 // Before it creates anything, Add refuses a checkout that converts files: Git
 // would then write other bytes than the blobs', so a clone could not be
@@ -50,6 +56,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -155,7 +162,14 @@ func Add(ctx context.Context, o Options) (Result, error) {
 	if err != nil {
 		return Result{}, refuse(err)
 	}
+	// A file that changes in the base once its git status starts has an mtime
+	// in this second or later.
+	checked := time.Now()
 	dirty, err := dirtyPaths(ctx, base)
+	if err != nil {
+		return Result{}, refuse(err)
+	}
+	hidden, err := hiddenPaths(ctx, base)
 	if err != nil {
 		return Result{}, refuse(err)
 	}
@@ -198,7 +212,7 @@ func Add(ctx context.Context, o Options) (Result, error) {
 			return Result{}, &IncompleteError{dest, err}
 		}
 	}
-	result, err := populate(ctx, clone, base, dest, head, baseHead, dirty, o.afterRewrite)
+	result, err := populate(ctx, clone, base, dest, head, baseState{baseHead, dirty, hidden, checked}, o.afterRewrite)
 	if err != nil {
 		return Result{}, &IncompleteError{dest, err}
 	}
@@ -399,7 +413,7 @@ func preflight(clone Clonefile, base, dest string, baseHead tree) error {
 // from base the paths that baseHead and dirty show to match, and rewrites
 // from Git each clone that does not match its entry. afterRewrite, when not
 // nil, runs after that rewrite.
-func populate(ctx context.Context, clone Clonefile, base, dest, head string, baseHead tree, dirty map[string]bool, afterRewrite func([]string)) (Result, error) {
+func populate(ctx context.Context, clone Clonefile, base, dest, head string, b baseState, afterRewrite func([]string)) (Result, error) {
 	target, err := treeEntries(ctx, dest, head)
 	if err != nil {
 		return Result{}, err
@@ -411,7 +425,7 @@ func populate(ctx context.Context, clone Clonefile, base, dest, head string, bas
 			continue
 		}
 		e := target.entries[p]
-		if b, ok := baseHead.entries[p]; ok && regular(e.mode) && b == e && !dirty[p] {
+		if be, ok := b.head.entries[p]; ok && regular(e.mode) && be == e && !b.dirty[p] {
 			toClone = append(toClone, p)
 		} else {
 			write = append(write, p)
@@ -446,6 +460,19 @@ func populate(ctx context.Context, clone Clonefile, base, dest, head string, bas
 	if err := checkoutIndex(ctx, dest, misshapen); err != nil {
 		return Result{}, err
 	}
+	rewritten := map[string]bool{}
+	for _, p := range misshapen {
+		rewritten[p] = true
+	}
+	var trusted []string
+	for _, p := range cloned {
+		if !rewritten[p] && !b.hidden[p] {
+			trusted = append(trusted, p)
+		}
+	}
+	if err := recordStats(ctx, dest, trusted, b.checked); err != nil {
+		return Result{}, err
+	}
 
 	err = gitWrite(ctx, func(ctx context.Context) error {
 		_, err := git(ctx, dest, nil, "update-index", "-q", "--refresh")
@@ -469,8 +496,7 @@ func populate(ctx context.Context, clone Clonefile, base, dest, head string, bas
 	} else if len(still) > 0 {
 		return Result{}, errors.New("tracked files still differ from the index after rewriting them from Git")
 	}
-	rewritten := map[string]bool{}
-	for _, p := range append(misshapen, mismatched...) {
+	for _, p := range mismatched {
 		rewritten[p] = true
 	}
 	kept := 0
@@ -608,6 +634,31 @@ func treeEntries(ctx context.Context, repo, commit string) (tree, error) {
 		t.paths = append(t.paths, p)
 	}
 	return t, nil
+}
+
+// baseState is what Add read from the base before it registered the new
+// worktree: the base's HEAD, the paths git status lists, the paths whose
+// changes git status skips, and when git status started.
+type baseState struct {
+	head          tree
+	dirty, hidden map[string]bool
+	checked       time.Time
+}
+
+// hiddenPaths returns the paths of repo's index that are marked
+// assume-unchanged or skip-worktree, whose changes git status does not list.
+func hiddenPaths(ctx context.Context, repo string) (map[string]bool, error) {
+	out, err := git(ctx, repo, nil, "ls-files", "-v", "-z")
+	if err != nil {
+		return nil, err
+	}
+	hidden := map[string]bool{}
+	for record := range strings.SplitSeq(string(out), "\x00") {
+		if len(record) > 2 && (record[0] == 'S' || 'a' <= record[0] && record[0] <= 'z') {
+			hidden[record[2:]] = true
+		}
+	}
+	return hidden, nil
 }
 
 // dirtyPaths returns the tracked paths that git status in repo lists.
