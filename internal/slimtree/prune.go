@@ -109,10 +109,10 @@ func deleteRecoveryRef(ctx context.Context, r state.Record, a state.Archived) (b
 	args := []string{"update-ref", "--no-deref", "-d", a.Ref}
 	if r.Head == "" {
 		// Without an old value, a ref a removal never wrote is no error.
-		_, err := apfsclone.Git(ctx, r.CommonDir, args...)
+		_, err := gitWrite(ctx, r.CommonDir, args...)
 		return false, err
 	}
-	_, err := apfsclone.Git(ctx, r.CommonDir, append(args, r.Head)...)
+	_, err := gitWrite(ctx, r.CommonDir, append(args, r.Head)...)
 	if err == nil {
 		return false, nil
 	}

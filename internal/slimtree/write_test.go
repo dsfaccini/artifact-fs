@@ -17,12 +17,13 @@ import (
 )
 
 // heldWrite is a fake git first on PATH that holds each git whose arguments
-// contain hold until released exists, and marks a SIGTERM in termed. Its
-// outlived closes once the context of a git that gitWrite runs ends. Its
-// grace outlasts the test, so a SIGTERM can only come from that end.
+// contain hold until released exists, and marks a SIGTERM in termed. Once
+// released, it runs the real git and marks finished. Its outlived closes once
+// the context of a git that gitWrite runs ends. Its grace outlasts the test,
+// so a SIGTERM can only come from that end.
 type heldWrite struct {
-	started, released, termed string
-	outlived                  chan struct{}
+	started, released, termed, finished string
+	outlived                            chan struct{}
 }
 
 // holdWrite installs a heldWrite. Its test is serial: it sets PATH,
@@ -34,10 +35,12 @@ func holdWrite(t *testing.T, hold string) heldWrite {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	h := heldWrite{started: filepath.Join(dir, "started"), released: filepath.Join(dir, "released"), termed: filepath.Join(dir, "termed"), outlived: make(chan struct{})}
+	h := heldWrite{started: filepath.Join(dir, "started"), released: filepath.Join(dir, "released"), termed: filepath.Join(dir, "termed"),
+		finished: filepath.Join(dir, "finished"), outlived: make(chan struct{})}
 	if err := execfile.Write(filepath.Join(dir, "git"), []byte("#!/bin/sh\ncase \" $* \" in *\""+hold+"\"*)\n"+
 		"  trap ': > \"$AFS_TERMED\"; exit 143' TERM\n  : > \"$AFS_STARTED\"\n  i=0\n"+
-		"  while [ ! -e \"$AFS_RELEASED\" ] && [ \"$i\" -lt 6000 ]; do sleep 0.01; i=$((i+1)); done\n  ;;\nesac\n"+
+		"  while [ ! -e \"$AFS_RELEASED\" ] && [ \"$i\" -lt 6000 ]; do sleep 0.01; i=$((i+1)); done\n"+
+		"  '"+realGit+"' \"$@\"; s=$?; : > \"$AFS_FINISHED\"; exit $s\n  ;;\nesac\n"+
 		"exec '"+realGit+"' \"$@\"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -45,6 +48,7 @@ func holdWrite(t *testing.T, hold string) heldWrite {
 	t.Setenv("AFS_STARTED", h.started)
 	t.Setenv("AFS_RELEASED", h.released)
 	t.Setenv("AFS_TERMED", h.termed)
+	t.Setenv("AFS_FINISHED", h.finished)
 	var once sync.Once
 	grace, hook := writeGrace, writeOutlived
 	writeGrace, writeOutlived = time.Hour, func() { once.Do(func() { close(h.outlived) }) }
@@ -197,4 +201,44 @@ func TestARollbackPastItsDeadlineEndsItsWrite(t *testing.T) {
 			requireNoGitLock(t, filepath.Join(main, ".git"))
 		})
 	}
+}
+
+// A Ctrl-C that lands while prune deletes a recovery ref does not stop the
+// delete. prune's wait for its repository ends at the Ctrl-C after at most
+// worktreeListGrace, so the test waits for the fake's finished mark, not for
+// prune.
+func TestACanceledPruneDeletesTheRecoveryRef(t *testing.T) {
+	homeDir := pruneHome(t)
+	commonDir, commit := commitRepo(t)
+	work := filepath.Join(filepath.Dir(filepath.Dir(commonDir)), "repo-feat")
+	old, oldRef := archiveAt(t, homeDir, work, commonDir, time.Now().Add(-31*24*time.Hour), commit, commit)
+	if got := recoveryRefs(t, commonDir); got != oldRef+"\n" {
+		t.Fatalf("recovery refs before prune = %q, want %s", got, oldRef)
+	}
+	h := holdWrite(t, " update-ref --no-deref -d "+oldRef+" ")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	returned := make(chan int, 1)
+	go func() {
+		code, _, _ := slimtree(ctx, "prune")
+		returned <- code
+	}()
+	h.outlive(t, cancel, returned)
+	for {
+		if _, err := os.Stat(h.finished); err == nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if code := <-returned; code == 0 {
+		t.Fatal("prune exited 0 after the Ctrl-C, want a failure")
+	}
+	if got := recoveryRefs(t, commonDir); got != "" {
+		t.Fatalf("recovery refs after prune = %q, want none", got)
+	}
+	// The Ctrl-C ended prune before it deleted the archive, which the next
+	// prune deletes.
+	requireExists(t, old)
+	requireNoGitLock(t, commonDir)
 }
