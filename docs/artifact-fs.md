@@ -1,5 +1,6 @@
 > [!NOTE]
 > This repository is a fork of [cloudflare/artifact-fs](https://github.com/cloudflare/artifact-fs).
+> Its [README](../README.md) presents slimtree, the worktree CLI this fork builds on artifact-fs.
 
 **Pass [this link](https://github.com/dsfaccini/davids-ai-toolset/tree/main/skills/disk-light-worktrees) to your agent, and each fresh worktree takes about 88% less disk.**
 
@@ -11,7 +12,7 @@
 
 # ArtifactFS
 
-[![Build & Test](https://github.com/cloudflare/artifact-fs/actions/workflows/build-test.yml/badge.svg)](https://github.com/cloudflare/artifact-fs/actions/workflows/build-test.yml)
+[![Build & Test](https://github.com/dsfaccini/artifact-fs/actions/workflows/build-test.yml/badge.svg?branch=main)](https://github.com/dsfaccini/artifact-fs/actions/workflows/build-test.yml?query=branch%3Amain)
 
 > This is a beta release of ArtifactFS. Your mileage may vary.
 
@@ -52,6 +53,9 @@ upstream module path, so `go install` cannot fetch it. Build it from a checkout:
 ```bash
 GOWORK=off go build -o artifact-fs ./cmd/artifact-fs
 ```
+
+The fork also builds `slimtree` from `./cmd/slimtree`; the
+[README](../README.md) shows how to install and use it.
 
 ### Native macOS FSKit backend in this fork
 
@@ -167,6 +171,25 @@ directory when it starts. Other CLI commands keep theirs in `config/tmp`, and
 each removes its own when it exits. A process that stops without that cleanup
 leaves its directory behind. Remove other entries in `config/tmp` only while no
 artifact-fs process runs on that state root.
+
+## Commands
+
+| Command | What it does |
+|---------|--------------|
+| `add-repo` | Registers a repository and prepares it for the daemon to mount; with `--async`, only registers it |
+| `daemon` | Mounts the registered repos and serves them until killed |
+| `status --name <repo>` | Shows the repo's state; see [Monitoring hydration and repo status](#monitoring-hydration-and-repo-status) |
+| `list-repos` | Lists the registered repos |
+| `prepare --name <repo>` | Prepares a repository again without unmounting it; see [Async repo preparation](#async-repo-preparation) |
+| `fetch --name <repo>` | Fetches what the remote refresh fetches, once: the fetch ref, or a `--require-commit` repo's `--ref` |
+| `unmount --name <repo>` / `remount --name <repo>` | Asks the running daemon to unmount the repo until `remount`, or to mount it again; see [Unmounting and remounting a repo](#unmounting-and-remounting-a-repo) |
+| `set-refresh --name <repo> --interval <d>` | Changes the remote refresh interval, or `never` |
+| `set-warn-kept-generations --name <repo> --count <n>` | Changes the kept-generations warning threshold; see [Generations that open files keep](#generations-that-open-files-keep) |
+| `evict-cache --name <repo>` | Evicts blobs from the blob cache; see [Evicting the blob cache](#evicting-the-blob-cache) |
+| `remove-repo --name <repo>` | Unregisters the repo; the running daemon unmounts it at its next registry poll |
+| `gc`, `doctor`, `prefetch` | Stubs that print `not implemented yet` |
+
+`artifact-fs --help` and `artifact-fs <command> --help` list every flag.
 
 ## Monitoring hydration and repo status
 
@@ -691,6 +714,7 @@ decides which invalidations it gets.
 
 | Package | Role |
 |---------|------|
+| `cli` | The `artifact-fs` command line. It runs `daemon` on `daemon.Service`, `fsmonitor-hook` on `daemon.FSMonitorHook`, and every other command but the stubs on `daemon.Controller` |
 | `daemon` | Repo lifecycle. `Controller` runs every CLI command except `daemon`, `fsmonitor-hook` and the `gc`, `doctor` and `prefetch` stubs. `FSMonitorHook` and `FSMonitorHookByID` answer Git's fsmonitor hook without a `Controller`. `Service` holds the daemon lock, syncs the registry, prepares, mounts and unmounts each repo, reconciles HEAD, runs the refresh loop, and writes `repo_runtime` |
 | `fusefs` | FUSE adapter (inode management, op dispatch), Resolver (merged view), Engine (the adapter's only API: one method per operation) |
 | `gitstore` | Git CLI wrapper: clone, fetch, ls-tree, batch pool for `cat-file --batch` |
@@ -701,6 +725,13 @@ decides which invalidations it gets.
 | `watcher` | Polls the contents of `HEAD` and of the ref it names, loose or packed, at 500ms intervals |
 | `registry` | SQLite store of repo configs, prepare and mount requests, acquisition receipts, and the `repo_runtime` records the daemon writes and `status` reads |
 | `model` | Shared types and canonical interfaces (`Registry`, `GitStore`, `SnapshotStore`, `OverlayStore`, `Hydrator`) |
+| `meta` | Opens the SQLite stores in WAL mode and applies each store's schema migrations once |
+| `auth` | Detects and redacts credentials and remotes in errors and logs |
+| `logging` | The JSON logger, which redacts every string it writes |
+| `execfile` | Writes files that a process may exec |
+| `version` | Describes the running build for `--version` |
+| `slimtree` | The `slimtree` CLI, which makes disk-light git worktrees with an APFS clone or an artifact-fs mount |
+| `apfsclone` | Makes a git worktree whose files are APFS clones of a base worktree's files, for `slimtree` on macOS |
 
 ## Supported git operations
 
@@ -736,7 +767,7 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 | `git show` | Supported | |
 | `git remote -v` | Supported | `add-repo` stores the remote URL without inline credentials; an adopted worktree keeps its own remotes |
 | `git stash` | Supported | Includes push/pop with untracked files |
-| `git status` | Supported | ~7s on 5800-entry repo |
+| `git status` | Supported | The fsmonitor hook names only the paths that changed. In a 6,069-path slimtree worktree on Linux, the first `git status` took 140 ms and the second 11 ms ([measured](../README.md#linux)) |
 | `git diff` | Supported | Shows correct unified diff for modified files |
 | `git add` | Supported | Stages modified files |
 | `git reset --hard` | Supported | Restores content, modes, and staged creates |
@@ -756,7 +787,6 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 | Git submodules are not initialized | Gitlink paths appear as empty directories so status stays clean |
 | Checkout filters and EOL transforms are not applied to snapshot-only reads | Files use canonical blob bytes until Git writes a transformed overlay |
 | `git status` lists every directory to fill Git's untracked cache, and again on its first run after a mount whose startup marked the baseline; if the cold baseline is skipped because the index, attributes, or overlay are uncertain, Git also scans tracked content normally | Performance |
-| `git reset` takes ~6.5s for index refresh | Performance -- same root cause as `git status` |
 
 ## Testing
 
@@ -786,6 +816,8 @@ AFS_RUN_E2E_TESTS=1 \
 |----------|---------|-------------|
 | `AFS_RUN_E2E_TESTS` | `0` | Set to `1` to enable end-to-end tests |
 | `AFS_E2E_REPO` | local bare repo | Git remote URL for e2e tests. Use an ambient Git credential helper for authenticated HTTPS remotes. |
+| `AFS_E2E_SLIMTREE` | a `go build` of `./cmd/slimtree` | The slimtree binary that `TestE2ESlimtreeLifecycle` drives |
+| `ARTIFACT_FS_FUSE_BACKEND` | `auto` | The macOS transport; see [Native macOS FSKit backend in this fork](#native-macos-fskit-backend-in-this-fork) |
 | `ARTIFACT_FS_ROOT` | `~/.local/share/artifact-fs` (macOS) or `/var/lib/artifact-fs` (Linux) | Runtime data root for the daemon and CLI |
 
 ## Contributing
