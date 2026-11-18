@@ -89,6 +89,10 @@ type preparation struct {
 	fetch bool
 	// mountPoint creates cfg's mount point first.
 	mountPoint bool
+	// attributes fetches the .gitattributes blobs of the source's commit
+	// that the object store lacks, which the clean-index bootstrap reads.
+	// mountRepo leaves it off, so the sync loop never waits on a remote.
+	attributes bool
 	// noWait makes the pipeline return errPrepareLockHeld, and record no
 	// failure, when another step holds the repo's prepare lock. Otherwise it
 	// waits for the lock.
@@ -166,6 +170,9 @@ func (s *core) prepare(ctx context.Context, cfg model.RepoConfig, p preparation)
 		if err := s.publishPrepared(prepareCtx, &res); err != nil {
 			return err
 		}
+		if p.attributes {
+			s.fetchAttributes(prepareCtx, cfg, res.source.Commit)
+		}
 		if err := s.recordAcquisition(prepareCtx, cfg, res.source); err != nil {
 			return withPreparationPhase(preparePhasePersistReady, err)
 		}
@@ -190,6 +197,15 @@ func (s *core) prepare(ctx context.Context, cfg model.RepoConfig, p preparation)
 		return p.fail(ctx, cfg, err)
 	}
 	return err
+}
+
+// fetchAttributes fetches the .gitattributes blobs of commit that cfg's
+// object store lacks. A failed fetch leaves only the clean-index bootstrap to
+// skip, so it logs and the preparation goes on.
+func (s *core) fetchAttributes(ctx context.Context, cfg model.RepoConfig, commit string) {
+	if err := s.git.FetchGitAttributes(ctx, cfg, commit); err != nil && ctx.Err() == nil {
+		s.logger.Warn("gitattributes fetch failed; the first git status after the mount reads every file", "repo", cfg.Name, "error", auth.RedactLogString(err.Error(), cfg.RemoteURL))
+	}
 }
 
 // prepareSourceOf is the source field of cfg's preparation logs.
@@ -374,6 +390,7 @@ func (s *core) prepareSync(ctx context.Context, cfg model.RepoConfig) error {
 		attempt:    1,
 		fetch:      true,
 		mountPoint: true,
+		attributes: true,
 		complete: func(ctx context.Context, res *prepared) error {
 			stateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prepareStateWriteTimeout)
 			defer cancel()
@@ -411,13 +428,14 @@ func (s *core) persistSyncFailure(ctx context.Context, cfg model.RepoConfig, pre
 // persists it ready and activates the runtime that waits behind its gate.
 func (s *Service) prepareAsync(ctx context.Context, cfg model.RepoConfig, attempt int64) error {
 	return s.prepare(ctx, cfg, preparation{
-		mode:     prepareModeAsync,
-		attempt:  attempt,
-		ambient:  true,
-		fetch:    true,
-		snapshot: s.snapshotForPrepare,
-		complete: s.activatePrepared,
-		fail:     s.persistAsyncFailure,
+		mode:       prepareModeAsync,
+		attempt:    attempt,
+		ambient:    true,
+		fetch:      true,
+		attributes: true,
+		snapshot:   s.snapshotForPrepare,
+		complete:   s.activatePrepared,
+		fail:       s.persistAsyncFailure,
 	})
 }
 

@@ -114,7 +114,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				&ucli.StringFlag{Name: "refresh", Value: "30s", Usage: "remote refresh interval or never"},
 				&ucli.StringFlag{Name: "mount-root", Usage: "override mount root"},
 				&ucli.BoolFlag{Name: "async", Usage: "return after registration and prepare the repo in the daemon"},
-				&ucli.BoolFlag{Name: "adopt-gitdir", Usage: "adopt an initialized linked worktree without fetching or resetting its index"},
+				&ucli.BoolFlag{Name: "adopt-gitdir", Usage: "adopt an initialized linked worktree without fetching its refs or resetting its index"},
 				&ucli.BoolFlag{Name: "prepared-gitdir", Usage: "use an existing git dir for async preparation"},
 				&ucli.StringFlag{Name: "git-dir", Usage: "explicit git dir path"},
 				&ucli.StringFlag{Name: "blob-cache-dir", Usage: "directory for hydrated blobs; may be shared between repositories"},
