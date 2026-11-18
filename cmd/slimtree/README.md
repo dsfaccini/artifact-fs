@@ -24,15 +24,30 @@ A new worktree of [pydantic-ai](https://github.com/pydantic/pydantic-ai)
 | Second `git status` | 33 ms | 29 ms |
 | Remove | 0.39 s | 0.33 s |
 
-slimtree saves disk and makes a worktree faster than git. It clones the base
-worktree's files instead of writing them, and records each clone's stat data in
-the new worktree's index, so its first `git status` hashes no clone and is as
-fast as its second. Create plus first `git status` takes 1.16 s against git's
-1.85 s. slimtree checks no clone byte for byte against its blob: it trusts a
-clone when the base's `git status` does not list the file, the clone has its
-blob's size, and the file is older than the create. Remove takes longer:
+slimtree saves disk and, by median, makes a worktree faster than git. It
+clones the base worktree's files instead of writing them, and records each
+clone's stat data in the new worktree's index, so its first `git status` hashes
+no clone: it took 35 ms against its second's 33 ms at the base worktree's
+commit, and 38 ms against 31 ms at the pull request's. Create plus first
+`git status` takes 1.16 s against git's 1.85 s at the base worktree's commit,
+and 1.17 s against 1.42 s at the pull request's. Remove takes longer:
 `slimtree rm` archives the worktree's record and keeps a recovery ref of its
 HEAD before it removes the worktree.
+
+slimtree checks no clone byte for byte against its blob. It trusts a clone
+only when all of these hold:
+
+- the base's `git status` does not list the file, and the base's HEAD has the
+  same mode and blob there as the new worktree's commit;
+- slimtree did not rewrite the clone from Git;
+- the base's index does not mark the path assume-unchanged or skip-worktree;
+- the base's attributes convert nothing for the path;
+- the clone is a regular file of its blob's size;
+- its mtime is older than the second in which slimtree read the base's HEAD;
+- the base's HEAD is the same commit when slimtree registers the worktree.
+
+So the trust is only as good as the base's own `git status`: its index's stat
+data, `core.checkStat`, `core.trustctime` and its fsmonitor.
 
 How it was measured:
 
@@ -61,9 +76,22 @@ How it was measured:
   At the pull request's commit they were: create 1.14 s and 1.21 s, first
   `git status` 38 ms and 196 ms, second `git status` 31 ms and 28 ms, remove
   0.40 s and 0.35 s, for slimtree and git.
+- Create took between 1.04 s and 1.32 s for slimtree and between 1.17 s and
+  2.75 s for git at the base worktree's commit, and between 1.03 s and 4.73 s
+  and between 1.12 s and 1.48 s at the pull request's. There, two of
+  slimtree's five creates, 1.78 s and 4.73 s, took longer than git's slowest.
+- Traces of 10 more slimtree creates at the pull request's commit show that
+  refresh hashed no file in any of them. The slow ones spent their time in
+  slimtree's clone and `lstat` passes and in git's own commands. Memory
+  pressure on the machine is a likely cause, but the runs recorded no memory
+  data.
 - git's first `git status` took between 154 ms and 960 ms at the base
   worktree's commit, and between 79 ms and 506 ms at the pull request's.
-  slimtree's took between 32 ms and 57 ms, and between 34 ms and 47 ms.
+  slimtree's took between 32 ms and 57 ms, and between 34 ms and 47 ms, and its
+  second between 28 ms and 37 ms, and between 29 ms and 34 ms.
+- Remove took between 0.36 s and 0.50 s for slimtree and between 0.31 s and
+  0.39 s for git at the base worktree's commit, and between 0.36 s and 0.52 s
+  and between 0.33 s and 0.52 s at the pull request's.
 - The tools alternated in order each round. Every run started and ran while the
   5-minute load average was under 20; it stayed between 5.9 and 7.0.
 - MacBook Air (Apple M4, 24 GB), macOS 27.2, internal SSD, Git 2.54.0 (Apple
