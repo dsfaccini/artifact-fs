@@ -748,6 +748,47 @@ func testE2EGitCommitModifyTrackedFile(t *testing.T, repo *mountedE2ERepo) {
 	}
 }
 
+// Once the daemon serves a commit, each file it committed from the overlay
+// shows the commit's time, not its write time, and the base's mode, which
+// differs from a file written under umask 002 in group write alone. Git
+// compares neither that bit nor anything else that changed, so the fsmonitor
+// hook must not name the files. Git would find stat data the index does not
+// match, and take the files as changed until a refresh. git merge runs git
+// stash create, which then fails.
+func testE2EGitCommitLeavesCommittedFilesClean(t *testing.T, repo *mountedE2ERepo) {
+	writeMountTestFile(t, repo.mountPath, "COMMITTED.md", "committed\n")
+	writeMountTestFile(t, repo.mountPath, "COMMITTED664.md", "committed under umask 002\n")
+	run(t, repo.mountPath, "chmod", "0664", "COMMITTED664.md")
+	if st, err := os.Stat(filepath.Join(repo.mountPath, "COMMITTED664.md")); err != nil || st.Mode().Perm() != 0o664 {
+		t.Fatalf("COMMITTED664.md before the commit: %v, %v; want mode 0664", st, err)
+	}
+	written := time.Now().Unix()
+	// A commit in a later second gives the files a time other than their write time.
+	waitForCondition(t, 5*time.Second, "a second past the writes", func() (bool, string) {
+		return time.Now().Unix() > written, ""
+	})
+	gitCmd(t, repo.mountPath, "add", "COMMITTED.md", "COMMITTED664.md")
+	gitCmd(t, repo.mountPath,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit", "-m", "add files written a second earlier",
+	)
+	head := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+	waitForCondition(t, 10*time.Second, "the daemon serves "+head, func() (bool, string) {
+		st, err := repo.ctl.Status(context.Background(), repoName)
+		if err != nil {
+			return false, err.Error()
+		}
+		return st.ServedHEADOID == head, "served " + st.ServedHEADOID
+	})
+	if stdout, stderr, err := gitCmdResult(repo.mountPath, "diff-files", "--name-status"); err != nil || stdout != "" {
+		t.Errorf("git diff-files = %q, %v, stderr %q; want no output", stdout, err, stderr)
+	}
+	if stdout, stderr, err := gitCmdResult(repo.mountPath, "stash", "create"); err != nil || stdout != "" || stderr != "" {
+		t.Errorf("git stash create = %q, %v, stderr %q; want no output", stdout, err, stderr)
+	}
+}
+
 func testE2EGitCommitPreservesUnstagedAfterStagedCommit(t *testing.T, repo *mountedE2ERepo) {
 	readmePath := filepath.Join(repo.mountPath, "README.md")
 	base := readFileEventually(t, readmePath)

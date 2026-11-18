@@ -84,7 +84,10 @@ func probeLock(lock string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	defer f.Close()
+	defer func() {
+		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+		_ = f.Close()
+	}()
 	switch err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); {
 	case errors.Is(err, unix.EWOULDBLOCK):
 		fmt.Println("lock held")

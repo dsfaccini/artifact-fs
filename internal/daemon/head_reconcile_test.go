@@ -430,7 +430,7 @@ func TestStatusReportsPublishedAndServedGenerationsAfterOverlayFailure(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lock.Close()
+	defer releaseDaemonLock(lock)
 	// The daemon records a runtime once it mounts.
 	f.svc.recordRuntimeState(f.rt, "")
 	f.updateMain(f.nextOID)
@@ -525,7 +525,7 @@ func TestStatusReadsDeletesAgainstTheServedGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lock.Close()
+	defer releaseDaemonLock(lock)
 	f.svc.recordRuntimeState(f.rt, "")
 	f.unlink(f.engine(), "README.md")
 	runCmd(t, "git", "-C", f.workDir, "rm", "-q", "-f", "README.md")

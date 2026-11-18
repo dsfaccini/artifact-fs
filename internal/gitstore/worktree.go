@@ -17,7 +17,7 @@ import (
 // ReadTreeHEAD initializes the index during controlled clone or preparation.
 // Do not call it from delayed HEAD watchers: it can discard newer staged work.
 func (s *Store) ReadTreeHEAD(ctx context.Context, repo model.RepoConfig) error {
-	_, err := s.runNetworkGit(ctx, repo.GitDir, nil, "read-tree", "HEAD")
+	_, err := s.runNetworkGitWrite(ctx, repo.GitDir, "read-tree", "HEAD")
 	return err
 }
 
@@ -188,7 +188,7 @@ func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoCon
 			if !errors.As(readErr, &exitErr) || exitErr.exitCode != 1 {
 				return readErr
 			}
-			if _, err := s.runGit(ctx, repo.GitDir, "config", "--file", mainConfig, key, value); err != nil {
+			if _, err := s.runGitWrite(ctx, repo.GitDir, "config", "--file", mainConfig, key, value); err != nil {
 				return err
 			}
 		}
@@ -207,14 +207,14 @@ func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoCon
 				continue
 			}
 		}
-		if _, err := s.runGit(ctx, repo.GitDir, "config", "--file", commonConfig, "--unset-all", key); err != nil {
+		if _, err := s.runGitWrite(ctx, repo.GitDir, "config", "--file", commonConfig, "--unset-all", key); err != nil {
 			var exitErr *gitCommandError
 			if !errors.As(err, &exitErr) || exitErr.exitCode != 5 {
 				return err
 			}
 		}
 	}
-	if _, err := s.runGit(ctx, repo.GitDir, "config", "--file", commonConfig, "extensions.worktreeConfig", "true"); err != nil {
+	if _, err := s.runGitWrite(ctx, repo.GitDir, "config", "--file", commonConfig, "extensions.worktreeConfig", "true"); err != nil {
 		return err
 	}
 	for _, setting := range [][2]string{
@@ -224,7 +224,7 @@ func (s *Store) ConfigureAdoptedWorktree(ctx context.Context, repo model.RepoCon
 		{"core.ignorecase", "false"},
 		{"core.symlinks", "true"},
 	} {
-		if _, err := s.runGit(ctx, repo.GitDir, "config", "--worktree", setting[0], setting[1]); err != nil {
+		if _, err := s.runGitWrite(ctx, repo.GitDir, "config", "--worktree", setting[0], setting[1]); err != nil {
 			return err
 		}
 	}
@@ -241,7 +241,7 @@ func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.Repo
 		}
 		// Verified acquisitions use a standalone Git directory. Pin it only
 		// after FUSE mounts so index refreshes cannot infer the caller's cwd.
-		if _, err := s.runGit(ctx, repo.GitDir, "config", "core.worktree", repo.MountPath); err != nil {
+		if _, err := s.runGitWrite(ctx, repo.GitDir, "config", "core.worktree", repo.MountPath); err != nil {
 			return err
 		}
 	}
@@ -284,13 +284,13 @@ func (s *Store) ConfigureFSMonitorHook(ctx context.Context, repo model.RepoConfi
 	} else if err := s.replaceLink(hookPath, exe); err != nil {
 		return err
 	}
-	if _, err := s.runGit(ctx, repo.GitDir, append(configArgs, "core.fsmonitor", hookPath)...); err != nil {
+	if _, err := s.runGitWrite(ctx, repo.GitDir, append(configArgs, "core.fsmonitor", hookPath)...); err != nil {
 		return err
 	}
-	if _, err := s.runGit(ctx, repo.GitDir, append(configArgs, "fsmonitor.allowRemote", "true")...); err != nil {
+	if _, err := s.runGitWrite(ctx, repo.GitDir, append(configArgs, "fsmonitor.allowRemote", "true")...); err != nil {
 		return err
 	}
-	if _, err := s.runGit(ctx, repo.GitDir, append(configArgs, "core.untrackedCache", "true")...); err != nil {
+	if _, err := s.runGitWrite(ctx, repo.GitDir, append(configArgs, "core.untrackedCache", "true")...); err != nil {
 		return err
 	}
 	// Git adds the fsmonitor extension on the next porcelain index read. The
@@ -408,7 +408,7 @@ func (s *Store) ReleaseAdoptedWorktree(ctx context.Context, repo model.RepoConfi
 		// Git matches a value pattern in its locale. Under a UTF-8 locale "."
 		// matches no byte that is not valid UTF-8, which a path can hold, and
 		// the C locale matches each byte.
-		if _, err := s.runGitWithEnv(ctx, repo.GitDir, []string{"LC_ALL=C"}, "config", "--file", worktreeConfig, "--unset-all", pin[0], pin[1]); err != nil {
+		if _, err := s.runGitWriteWithEnv(ctx, repo.GitDir, []string{"LC_ALL=C"}, "config", "--file", worktreeConfig, "--unset-all", pin[0], pin[1]); err != nil {
 			var exitErr *gitCommandError
 			if !errors.As(err, &exitErr) || exitErr.exitCode != 5 {
 				return err
@@ -590,7 +590,7 @@ func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.
 	// remove-repo unsets core.untrackedCache, native Git keeps such a cache
 	// and warns on every status that it cannot use it, so this Git drops the
 	// cache. The mount's next status builds it again.
-	if _, err := s.runGitInput(ctx, repo.GitDir, updateEnv, validInput, "-c", "core.hooksPath="+privateHooks, "-c", "core.untrackedCache=false", "update-index", "--fsmonitor", "--fsmonitor-valid", "-z", "--stdin"); err != nil {
+	if _, err := s.runGitWriteInput(ctx, repo.GitDir, updateEnv, validInput, "-c", "core.hooksPath="+privateHooks, "-c", "core.untrackedCache=false", "update-index", "--fsmonitor", "--fsmonitor-valid", "-z", "--stdin"); err != nil {
 		return skip()
 	}
 	if err := ctx.Err(); err != nil {

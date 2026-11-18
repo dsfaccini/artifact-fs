@@ -208,7 +208,7 @@ func TestPrepareFetchedBranchRollbackRestoresTheIndexFirst(t *testing.T) {
 	t.Setenv("AFS_FAILED", filepath.Join(tmp, "symbolic-ref-failed"))
 	t.Setenv("AFS_REF_RESTORE", refRestore)
 
-	store := New(nil)
+	store := newShortGraceStore(nil)
 	store.rollbackContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
 		return gittest.ExpireOnFile(context.WithoutCancel(ctx), refRestore)
 	}
@@ -250,7 +250,7 @@ func TestPrepareFetchedBranchKeepsARefUpdateThatLanded(t *testing.T) {
 			ctx, cancel := gittest.ExpireOnFile(context.Background(), landed)
 			defer cancel()
 			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}}
-			if err := New(nil).PrepareFetchedBranch(ctx, cfg, tt.fetchRef); !errors.Is(err, context.DeadlineExceeded) {
+			if err := newShortGraceStore(nil).PrepareFetchedBranch(ctx, cfg, tt.fetchRef); !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("PrepareFetchedBranch error = %v, want deadline exceeded", err)
 			}
 			head, err := exec.Command(realGit, "--git-dir", gitDir, "rev-parse", "--verify", "HEAD^{commit}").Output()
@@ -301,7 +301,7 @@ func TestPrepareFetchedBranchUndoesAReadTreeThatLanded(t *testing.T) {
 			ctx, cancel := gittest.ExpireOnFile(context.Background(), landed)
 			defer cancel()
 			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}}
-			if err := New(nil).PrepareFetchedBranch(ctx, cfg, tt.fetchRef); !errors.Is(err, context.DeadlineExceeded) {
+			if err := newShortGraceStore(nil).PrepareFetchedBranch(ctx, cfg, tt.fetchRef); !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("PrepareFetchedBranch error = %v, want deadline exceeded", err)
 			}
 			if head := strings.TrimSpace(runOutput(t, realGit, "--git-dir", gitDir, "rev-parse", "HEAD")); head != baseOID {
@@ -346,7 +346,7 @@ func TestPrepareFetchedBranchKeepsAStagedChangeAFailedReadTreeLeft(t *testing.T)
 				defer cancel()
 			}
 			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}}
-			if err := New(nil).PrepareFetchedBranch(ctx, cfg, "main"); err == nil {
+			if err := newShortGraceStore(nil).PrepareFetchedBranch(ctx, cfg, "main"); err == nil {
 				t.Fatal("PrepareFetchedBranch succeeded although read-tree failed")
 			}
 			if head := strings.TrimSpace(runOutput(t, realGit, "--git-dir", gitDir, "rev-parse", "HEAD")); head != baseOID {
@@ -388,7 +388,7 @@ func TestPrepareFetchedBranchUndoesALandedReadTreeOfAnIgnoredGitlink(t *testing.
 	ctx, cancel := gittest.ExpireOnFile(context.Background(), landed)
 	defer cancel()
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "x", GitDir: gitDir}}
-	if err := New(nil).PrepareFetchedBranch(ctx, cfg, "main"); !errors.Is(err, context.DeadlineExceeded) {
+	if err := newShortGraceStore(nil).PrepareFetchedBranch(ctx, cfg, "main"); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("PrepareFetchedBranch error = %v, want deadline exceeded", err)
 	}
 	if head := strings.TrimSpace(runOutput(t, realGit, "--git-dir", gitDir, "rev-parse", "HEAD")); head != baseOID {
@@ -1796,7 +1796,7 @@ func TestPrepareFetchedBranchFailsWhenTheTrackingRetryIsCanceled(t *testing.T) {
 	defer cancel()
 	var logs bytes.Buffer
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "repo", Name: "repo", GitDir: gitDir}}
-	err := New(slog.New(slog.NewJSONHandler(&logs, nil))).PrepareFetchedBranch(ctx, cfg, "feature")
+	err := newShortGraceStore(slog.New(slog.NewJSONHandler(&logs, nil))).PrepareFetchedBranch(ctx, cfg, "feature")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("PrepareFetchedBranch error = %v, want the deadline", err)
 	}
