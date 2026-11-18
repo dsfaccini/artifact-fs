@@ -2,6 +2,7 @@ package slimtree
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -526,6 +527,42 @@ func TestRmForceFinishesAnArtifactFSRemovalThatFailed(t *testing.T) {
 			requireStopped(t, main, r)
 		},
 	}, {
+		name: "gitfile copy",
+		fail: func(t *testing.T, _ string, r state.Record) func() {
+			// The move across file systems copies the gitfile, then cannot
+			// remove the saved one from the record directory.
+			renameHook = func(src, dst string) error {
+				return &os.LinkError{Op: "rename", Old: src, New: dst, Err: syscall.EXDEV}
+			}
+			home, err := openHome()
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := home.RecordDir(r.Path)
+			if err := os.Chmod(dir, 0o500); err != nil {
+				t.Fatal(err)
+			}
+			restore := func() {
+				renameHook = nil
+				os.Chmod(dir, 0o700)
+			}
+			t.Cleanup(restore)
+			return restore
+		},
+		failed: func(t *testing.T, _ string, r state.Record, _ []string) {
+			home, err := openHome()
+			if err != nil {
+				t.Fatal(err)
+			}
+			saved, err := os.ReadFile(filepath.Join(home.RecordDir(r.Path), gitfileName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if back, err := os.ReadFile(filepath.Join(r.Path, ".git")); err != nil || !bytes.Equal(back, saved) {
+				t.Errorf("the copied .git = %q, %v; want the saved gitfile %q", back, err, saved)
+			}
+		},
+	}, {
 		name: "worktree remove",
 		fail: func(t *testing.T, main string, _ state.Record) func() {
 			// git cannot remove the worktree's directory, and then removes
@@ -673,7 +710,7 @@ func TestRmForceRefusesWhatWouldLoseFiles(t *testing.T) {
 	if err := os.WriteFile(stray, []byte("written while unmounted\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	want := r.Path + " holds files that no mount serves, which git worktree remove would delete; move them away"
+	want := r.Path + " holds stray, which no mount serves and git worktree remove would delete; move them away"
 	if code, _, stderr := linux(t.Context(), "rm", "--force", "wt"); code != 1 || !strings.Contains(stderr, want) {
 		t.Fatalf("rm --force over a stray file: exit %d, stderr %q; want %q", code, stderr, want)
 	}
@@ -681,6 +718,27 @@ func TestRmForceRefusesWhatWouldLoseFiles(t *testing.T) {
 		t.Errorf("the stray file = %q, %v; want it kept", data, err)
 	}
 	if err := os.Remove(stray); err != nil {
+		t.Fatal(err)
+	}
+	requireUnchanged(t, main, r)
+
+	// A .git that is not the saved gitfile, while the gitfile is saved.
+	home, err := openHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	strayGit := filepath.Join(r.Path, ".git")
+	if err := os.WriteFile(strayGit, []byte("gitdir: elsewhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want = r.Path + " holds a .git that is not the gitfile slimtree keeps in " + filepath.Join(home.RecordDir(r.Path), gitfileName)
+	if code, _, stderr := linux(t.Context(), "rm", "--force", "wt"); code != 1 || !strings.Contains(stderr, want) {
+		t.Fatalf("rm --force over a stray .git: exit %d, stderr %q; want %q", code, stderr, want)
+	}
+	if data, err := os.ReadFile(strayGit); err != nil || string(data) != "gitdir: elsewhere\n" {
+		t.Errorf("the stray .git = %q, %v; want it kept", data, err)
+	}
+	if err := os.Remove(strayGit); err != nil {
 		t.Fatal(err)
 	}
 	requireUnchanged(t, main, r)

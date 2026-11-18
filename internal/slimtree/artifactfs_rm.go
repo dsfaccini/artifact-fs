@@ -2,6 +2,7 @@ package slimtree
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"errors"
@@ -156,12 +157,24 @@ func finishRemoval(ctx context.Context, home *state.Home, r state.Record, exclud
 	entries, err := os.ReadDir(r.Path)
 	gone := errors.Is(err, fs.ErrNotExist)
 	switch {
-	case gone:
+	case gone, len(entries) == 0:
 	case err != nil:
 		return err
+	case len(entries) > 1 || entries[0].Name() != ".git":
+		return fmt.Errorf("%s holds %s, which no mount serves and git worktree remove would delete; move them away", r.Path, entryNames(entries))
 	// An earlier run that put the gitfile back leaves it alone.
-	case len(entries) > 1 || len(entries) == 1 && (entries[0].Name() != ".git" || exists(gitfile)):
-		return fmt.Errorf("%s holds files that no mount serves, which git worktree remove would delete; move them away", r.Path)
+	case !exists(gitfile):
+	default:
+		// A move across file systems that copied the gitfile and then
+		// failed to remove the saved one leaves both.
+		saved, savedErr := os.ReadFile(gitfile)
+		back, backErr := os.ReadFile(filepath.Join(r.Path, ".git"))
+		if savedErr != nil || backErr != nil || !bytes.Equal(saved, back) {
+			return fmt.Errorf("%s holds a .git that is not the gitfile slimtree keeps in %s; no mount serves it, and git worktree remove would delete it; move it away", r.Path, gitfile)
+		}
+		if err := os.Remove(gitfile); err != nil {
+			return err
+		}
 	}
 	listed, err := worktreeList(ctx, r.CommonDir)
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -235,6 +248,18 @@ func finishRemoval(ctx context.Context, home *state.Home, r state.Record, exclud
 		fmt.Fprintf(stdout, "removed %s; %s keeps its HEAD %s, and %s its files\n", r.Path, a.Ref, r.Head, files)
 	}
 	return nil
+}
+
+// entryNames names entries for a message, at most three of them.
+func entryNames(entries []fs.DirEntry) string {
+	names := make([]string, 0, 3)
+	for _, e := range entries[:min(len(entries), 3)] {
+		names = append(names, e.Name())
+	}
+	if len(entries) > 3 {
+		return fmt.Sprintf("%s and %d more", strings.Join(names, ", "), len(entries)-3)
+	}
+	return strings.Join(names, ", ")
 }
 
 // writeStateArchive writes to w a gzipped tar of r's state root, below
