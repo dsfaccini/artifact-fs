@@ -35,6 +35,10 @@ runs:
           echo "::warning::FUZZ_AGE_RECIPIENT is not set, so no fuzz inputs were uploaded."
           exit 0
         fi
+        if [ "$RUNNER_OS" != Linux ] || [ "$RUNNER_ARCH" != X64 ]; then
+          echo "::error::seal-fuzz-inputs installs age for Linux X64 only, and this runner is $RUNNER_OS $RUNNER_ARCH."
+          exit 1
+        fi
         bin="$RUNNER_TEMP/age-$AGE_VERSION"
         if [ ! -x "$bin/age" ]; then
           mkdir -p "$bin"

@@ -288,14 +288,20 @@ jobs:
             echo "::error::Found no log of seal-fuzz-inputs' failing fuzz run."
             exit 1
           fi
-          grep -qF '##[warning]FUZZ_AGE_RECIPIENT is not set, so no fuzz inputs were uploaded.' log
+          if ! grep -qF '##[warning]FUZZ_AGE_RECIPIENT is not set, so no fuzz inputs were uploaded.' log; then
+            echo "::error::seal-fuzz-inputs' log lacks the warning of the seal without a recipient."
+            exit 1
+          fi
           marker=$(echo "planted-$GITHUB_RUN_ID" | sha256sum | cut -c1-32)
           if grep -qF "$marker" log; then
             echo "::error::seal-fuzz-inputs' log shows the planted input."
             exit 1
           fi
           uploads=$(gh api "$run/artifacts" --paginate --jq '.artifacts[].name')
-          grep -qx planted-fuzz-inputs <<<"$uploads"
+          if ! grep -qx planted-fuzz-inputs <<<"$uploads"; then
+            echo "::error::seal-fuzz-inputs uploaded no planted-fuzz-inputs artifact."
+            exit 1
+          fi
           if grep -qx unsealed-fuzz-inputs <<<"$uploads"; then
             echo "::error::The seal without a recipient uploaded the fuzz inputs."
             exit 1
