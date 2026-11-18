@@ -748,6 +748,40 @@ func testE2EGitCommitModifyTrackedFile(t *testing.T, repo *mountedE2ERepo) {
 	}
 }
 
+// Once the daemon serves a commit, the file it committed from the overlay
+// shows the commit's time, not its write time, and nothing else changed. The
+// fsmonitor hook must not name it: Git would then find stat data the index
+// does not match, and take the file as changed until a refresh. git merge
+// runs git stash create, which then fails.
+func testE2EGitCommitLeavesCommittedFilesClean(t *testing.T, repo *mountedE2ERepo) {
+	writeMountTestFile(t, repo.mountPath, "COMMITTED.md", "committed\n")
+	written := time.Now().Unix()
+	// A commit in a later second gives the file a time other than its write time.
+	waitForCondition(t, 5*time.Second, "a second past the write", func() (bool, string) {
+		return time.Now().Unix() > written, ""
+	})
+	gitCmd(t, repo.mountPath, "add", "COMMITTED.md")
+	gitCmd(t, repo.mountPath,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit", "-m", "add a file written a second earlier",
+	)
+	head := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+	waitForCondition(t, 10*time.Second, "the daemon serves "+head, func() (bool, string) {
+		st, err := repo.ctl.Status(context.Background(), repoName)
+		if err != nil {
+			return false, err.Error()
+		}
+		return st.ServedHEADOID == head, "served " + st.ServedHEADOID
+	})
+	if stdout, stderr, err := gitCmdResult(repo.mountPath, "diff-files", "--name-status"); err != nil || stdout != "" {
+		t.Errorf("git diff-files = %q, %v, stderr %q; want no output", stdout, err, stderr)
+	}
+	if stdout, stderr, err := gitCmdResult(repo.mountPath, "stash", "create"); err != nil || stdout != "" || stderr != "" {
+		t.Errorf("git stash create = %q, %v, stderr %q; want no output", stdout, err, stderr)
+	}
+}
+
 func testE2EGitCommitPreservesUnstagedAfterStagedCommit(t *testing.T, repo *mountedE2ERepo) {
 	readmePath := filepath.Join(repo.mountPath, "README.md")
 	base := readFileEventually(t, readmePath)

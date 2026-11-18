@@ -2384,7 +2384,7 @@ func TestReconcileLogsAtMostMaxSwitchedPaths(t *testing.T) {
 			}
 			before := changesSince(t, cfg, 0)
 			noBase := func(string) (model.BaseNode, bool, error) { return model.BaseNode{}, false, nil }
-			if err := s.ReconcileChecked(ctx, 1, noBase, model.SwitchedPaths{Paths: paths}, nil, nil); err != nil {
+			if _, err := s.ReconcileChecked(ctx, 1, noBase, model.SwitchedPaths{Paths: paths}, nil, nil); err != nil {
 				t.Fatal(err)
 			}
 			after := changesSince(t, cfg, before.Seq)
@@ -2426,7 +2426,7 @@ func TestReconcileAndMarkServedRecordTheServedGeneration(t *testing.T) {
 		t.Fatalf("served generation of a new overlay = %d, want 0", got)
 	}
 	noBase := func(string) (model.BaseNode, bool, error) { return model.BaseNode{}, false, nil }
-	if err := s.ReconcileChecked(ctx, 3, noBase, model.SwitchedPaths{}, nil, nil); err != nil {
+	if _, err := s.ReconcileChecked(ctx, 3, noBase, model.SwitchedPaths{}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := served(); got != 3 {
@@ -2443,8 +2443,9 @@ func TestReconcileAndMarkServedRecordTheServedGeneration(t *testing.T) {
 // reconcile reconciles s with the base lookup reads, with no readers to
 // exclude.
 func reconcile(ctx context.Context, s *Store, lookup func(string) (model.BaseNode, bool)) error {
-	return s.ReconcileChecked(ctx, 0, func(path string) (model.BaseNode, bool, error) {
+	_, err := s.ReconcileChecked(ctx, 0, func(path string) (model.BaseNode, bool, error) {
 		n, ok := lookup(path)
 		return n, ok, nil
 	}, model.SwitchedPaths{}, nil, nil)
+	return err
 }

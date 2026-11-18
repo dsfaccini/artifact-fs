@@ -1192,7 +1192,12 @@ func (s *Store) SetMode(ctx context.Context, path string, mode uint32) error {
 // new instance instead, so the fsmonitor hook answers every earlier token
 // with a rescan. In the same transaction it records gen, the generation
 // baseLookup reads, as the generation the change log is current with.
-func (s *Store) ReconcileChecked(ctx context.Context, gen int64, baseLookup func(path string) (model.BaseNode, bool, error), switched model.SwitchedPaths, lock sync.Locker, switchBase func()) error {
+//
+// It returns what the apply phase logged: those paths and each path whose
+// entry's removal changed the merged view, or Unknown when it gave the
+// database a new instance. Removing an entry the new base matches, such as a
+// committed file's, logs nothing, though the path's times change.
+func (s *Store) ReconcileChecked(ctx context.Context, gen int64, baseLookup func(path string) (model.BaseNode, bool, error), switched model.SwitchedPaths, lock sync.Locker, switchBase func()) (model.SwitchedPaths, error) {
 	// A reconcile's own changes reach the change log only in part, so one
 	// reconcile must not plan while another applies.
 	s.reconcileMu.Lock()
@@ -1204,26 +1209,26 @@ func (s *Store) ReconcileChecked(ctx context.Context, gen int64, baseLookup func
 	err := s.flushAllLocked(ctx)
 	s.mu.Unlock()
 	if err != nil {
-		return err
+		return model.SwitchedPaths{}, err
 	}
 	// Read the sequence before the entries: a write between the two reads
 	// is then classified again in the apply phase.
 	var seq int64
 	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM overlay_changes`).Scan(&seq); err != nil {
-		return fmt.Errorf("reconcile change log: %w", err)
+		return model.SwitchedPaths{}, fmt.Errorf("reconcile change log: %w", err)
 	}
 	entries, err := s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries ORDER BY path`)
 	if err != nil {
-		return fmt.Errorf("reconcile list: %w", err)
+		return model.SwitchedPaths{}, fmt.Errorf("reconcile list: %w", err)
 	}
 	plan, err := r.classify(entries, false)
 	if err != nil {
-		return err
+		return model.SwitchedPaths{}, err
 	}
 	if lock != nil {
 		lock.Lock()
 	}
-	removed, err := s.applyReconcile(ctx, r, seq, entries, plan, gen, switched)
+	removed, logged, err := s.applyReconcile(ctx, r, seq, entries, plan, gen, switched)
 	if err == nil && switchBase != nil {
 		switchBase()
 	}
@@ -1240,20 +1245,20 @@ func (s *Store) ReconcileChecked(ctx context.Context, gen int64, baseLookup func
 			_ = os.Remove(v.BackingPath)
 		}
 	}
-	return err
+	return logged, err
 }
 
 // applyReconcile applies plan, logs switched, records gen as the served
-// generation, and returns the entries it removed.
-func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, entries []model.OverlayEntry, plan reconcilePlan, gen int64, switched model.SwitchedPaths) ([]model.OverlayEntry, error) {
+// generation, and returns the entries it removed and what it logged.
+func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, entries []model.OverlayEntry, plan reconcilePlan, gen int64, switched model.SwitchedPaths) ([]model.OverlayEntry, model.SwitchedPaths, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.flushAllLocked(ctx); err != nil {
-		return nil, err
+		return nil, model.SwitchedPaths{}, err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, model.SwitchedPaths{}, err
 	}
 	defer tx.Rollback()
 	// Rebasing an entry, removing a delete marker for a path the new base
@@ -1264,27 +1269,27 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 	// The transaction holds the write lock from BEGIN, so no write lands
 	// between reading the log and applying the result.
 	if err := suspendChangeLog(ctx, tx); err != nil {
-		return nil, err
+		return nil, model.SwitchedPaths{}, err
 	}
 	rows, err := tx.QueryContext(ctx, changesSinceQuery, seq)
 	if err != nil {
-		return nil, err
+		return nil, model.SwitchedPaths{}, err
 	}
 	changed, err := scanPaths(rows)
 	if err != nil {
-		return nil, err
+		return nil, model.SwitchedPaths{}, err
 	}
 	if len(changed) > 0 || plan.incomplete {
 		if entries, err = s.rereadChanged(ctx, tx, entries, changed); err != nil {
-			return nil, err
+			return nil, model.SwitchedPaths{}, err
 		}
 		if plan, err = r.classify(entries, true); err != nil {
-			return nil, err
+			return nil, model.SwitchedPaths{}, err
 		}
 	}
 	if len(plan.remove) == 0 && len(plan.update) == 0 && len(switched.Paths) == 0 && !switched.Unknown {
 		if served, err := servedGeneration(ctx, tx); err != nil || served == gen {
-			return nil, err
+			return nil, model.SwitchedPaths{}, err
 		}
 	}
 	var logged []string
@@ -1292,14 +1297,14 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 	// another Store's reconcile, is not lost.
 	stmt, err := tx.PrepareContext(ctx, `DELETE FROM overlay_entries WHERE path=? AND kind=? AND source_oid=? AND source_mode=? AND mode=? AND mtime_unix_ns=? AND ctime_unix_ns=?`)
 	if err != nil {
-		return nil, err
+		return nil, model.SwitchedPaths{}, err
 	}
 	defer stmt.Close()
 	deleted := make([]model.OverlayEntry, 0, len(plan.remove))
 	for _, e := range plan.remove {
 		res, err := stmt.ExecContext(ctx, e.Path, e.Kind, e.SourceOID, e.SourceMode, e.Mode, e.MtimeUnixNs, e.CtimeUnixNs)
 		if err != nil {
-			return nil, err
+			return nil, model.SwitchedPaths{}, err
 		}
 		if n, err := res.RowsAffected(); err == nil && n > 0 {
 			deleted = append(deleted, e)
@@ -1317,12 +1322,12 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 	}
 	updateStmt, err := tx.PrepareContext(ctx, `UPDATE overlay_entries SET kind=?, source_oid=?, source_mode=?, target_path=? WHERE path=? AND kind=? AND source_oid=? AND source_mode=? AND mode=? AND mtime_unix_ns=? AND ctime_unix_ns=?`)
 	if err != nil {
-		return nil, err
+		return nil, model.SwitchedPaths{}, err
 	}
 	defer updateStmt.Close()
 	for _, update := range plan.update {
 		if _, err := updateStmt.ExecContext(ctx, update.after.Kind, update.after.SourceOID, update.after.SourceMode, update.after.TargetPath, update.before.Path, update.before.Kind, update.before.SourceOID, update.before.SourceMode, update.before.Mode, update.before.MtimeUnixNs, update.before.CtimeUnixNs); err != nil {
-			return nil, err
+			return nil, model.SwitchedPaths{}, err
 		}
 	}
 	// An entry shows the same content before and after the switch, unless the
@@ -1332,18 +1337,22 @@ func (s *Store) applyReconcile(ctx context.Context, r *reconciler, seq int64, en
 		return found
 	}
 	if err := resumeChangeLog(ctx, tx, logged...); err != nil {
-		return nil, err
+		return nil, model.SwitchedPaths{}, err
 	}
-	if err := logSwitched(ctx, tx, switched, covered, s.MaxSwitchedPaths); err != nil {
-		return nil, err
+	loggedSwitched, err := logSwitched(ctx, tx, switched, covered, s.MaxSwitchedPaths)
+	if err != nil {
+		return nil, model.SwitchedPaths{}, err
+	}
+	if !loggedSwitched.Unknown {
+		loggedSwitched.Paths = append(loggedSwitched.Paths, logged...)
 	}
 	if err := setServedGeneration(ctx, tx, gen); err != nil {
-		return nil, err
+		return nil, model.SwitchedPaths{}, err
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return nil, model.SwitchedPaths{}, err
 	}
-	return deleted, nil
+	return deleted, loggedSwitched, nil
 }
 
 // rereadChanged replaces the entries at each changed path and at every path
@@ -1627,8 +1636,8 @@ func resumeChangeLog(ctx context.Context, tx *sql.Tx, paths ...string) error {
 // logSwitched logs each of switched's paths that covered rejects, in tx. When
 // switched is Unknown, or more than maxPaths paths remain to log, it gives the
 // database a new instance instead, so the fsmonitor hook answers every earlier
-// token with a rescan.
-func logSwitched(ctx context.Context, tx *sql.Tx, switched model.SwitchedPaths, covered func(path string) bool, maxPaths int) error {
+// token with a rescan. It returns what it logged.
+func logSwitched(ctx context.Context, tx *sql.Tx, switched model.SwitchedPaths, covered func(path string) bool, maxPaths int) (model.SwitchedPaths, error) {
 	var paths []string
 	if !switched.Unknown {
 		for _, path := range switched.Paths {
@@ -1639,9 +1648,9 @@ func logSwitched(ctx context.Context, tx *sql.Tx, switched model.SwitchedPaths, 
 	}
 	if switched.Unknown || len(paths) > maxPaths {
 		_, err := tx.ExecContext(ctx, `UPDATE overlay_instance SET id = lower(hex(randomblob(16)))`)
-		return err
+		return model.SwitchedPaths{Unknown: true}, err
 	}
-	return logChanges(ctx, tx, paths...)
+	return model.SwitchedPaths{Paths: paths}, logChanges(ctx, tx, paths...)
 }
 
 // servedGeneration returns the generation the change log is current with, or
@@ -1677,11 +1686,12 @@ func (s *Store) MarkServed(ctx context.Context, gen int64, switched model.Switch
 }
 
 // LogSwitched logs switched again, as ReconcileChecked does: each of its paths
-// that no overlay entry covers, or a new instance. The daemon calls it after
-// the kernel invalidations that follow a switch, so a token issued before
-// them, whose query may have read attributes the kernel cached from the old
-// generation, gets the paths again. On FSKit, which sends the kernel no
-// invalidations, it calls it once more after the kernel's cache expires.
+// that no overlay entry covers, or a new instance. The daemon calls it with
+// what a switch's ReconcileChecked logged, after the kernel invalidations
+// that follow the switch, so a token issued before them, whose query may have
+// read attributes the kernel cached from the old generation, gets the paths
+// again. On FSKit, which sends the kernel no invalidations, it calls it once
+// more after the kernel's cache expires.
 func (s *Store) LogSwitched(ctx context.Context, switched model.SwitchedPaths) error {
 	if len(switched.Paths) == 0 && !switched.Unknown {
 		return nil
@@ -1711,7 +1721,7 @@ func (s *Store) logSwitchedIn(ctx context.Context, switched model.SwitchedPaths,
 		_, found := slices.BinarySearch(entries, path)
 		return found
 	}
-	if err := logSwitched(ctx, tx, switched, covered, s.MaxSwitchedPaths); err != nil {
+	if _, err := logSwitched(ctx, tx, switched, covered, s.MaxSwitchedPaths); err != nil {
 		return err
 	}
 	if then != nil {

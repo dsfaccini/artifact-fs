@@ -1603,6 +1603,53 @@ func TestSwitchOnFSKitLogsItsPathsAgainAfterTheKernelCacheExpires(t *testing.T) 
 	}
 }
 
+// A switch's reconcile drops each overlay entry the new base matches, such as
+// a committed file's, and the merged view then changes only the path's times.
+// The reconcile logs no such path, and neither may the logs after the kernel
+// invalidations and, on FSKit, after the kernel cache expires. Git takes a
+// path the hook names whose stat data no longer matches the index as changed,
+// so git diff-files reports the committed file, and git stash create, which
+// git merge runs, fails.
+func TestSwitchLogsNoPathWhoseEntryItsReconcileDropped(t *testing.T) {
+	t.Parallel()
+	for _, backend := range []string{fusefs.BackendKernel, fusefs.BackendFSKit} {
+		t.Run(backend, func(t *testing.T) {
+			t.Parallel()
+			f := newIdleHeadReconcileFixture(t, time.Millisecond)
+			if _, err := f.rt.overlay.CreateFile(f.ctx, "README.md", 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.rt.overlay.WriteFile(f.ctx, "README.md", 0, []byte("next\n")); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.rt.overlay.FlushFile(f.ctx, "README.md"); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok, err := f.rt.overlay.Lookup(f.ctx, "README.md"); err != nil || !ok {
+				t.Fatalf("overlay entry before the switch: found %v, error %v", ok, err)
+			}
+			written, _, err := overlay.ReadChangesSince(f.ctx, f.rt.cfg.RepoPaths, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.serveThrough(&seqMount{fakeMountedFS: &fakeMountedFS{unmounted: make(chan struct{})}, backend: backend, repo: f.rt.cfg.RepoPaths})
+			f.switchToNext()
+			// The log after the kernel cache expires runs on a worker.
+			f.rt.workers.Wait()
+			if _, ok, err := f.rt.overlay.Lookup(f.ctx, "README.md"); err != nil || ok {
+				t.Fatalf("overlay entry after the switch: found %v, error %v; want it dropped", ok, err)
+			}
+			changes, _, err := overlay.ReadChangesSince(f.ctx, f.rt.cfg.RepoPaths, written.Seq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(changes.Paths) != 0 || changes.Instance != written.Instance {
+				t.Errorf("switch logged %q in instance %s, want nothing in instance %s: README.md's content did not change", changes.Paths, changes.Instance, written.Instance)
+			}
+		})
+	}
+}
+
 // pausingListing pauses the first listing of generation gen until resume
 // closes.
 type pausingListing struct {

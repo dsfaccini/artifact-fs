@@ -146,8 +146,8 @@ func (s *Service) switchGeneration(ctx context.Context, rt *repoRuntime, gen, co
 	return err
 }
 
-// sendSwitch sends the kernel the invalidations sw needs, then logs sw's
-// paths for the fsmonitor hook.
+// sendSwitch sends the kernel the invalidations sw needs, then logs again
+// what sw's reconcile logged for the fsmonitor hook.
 func (s *Service) sendSwitch(ctx context.Context, rt *repoRuntime, sw fusefs.Switch) {
 	s.mu.Lock()
 	mfs := rt.mfs
@@ -162,13 +162,13 @@ func (s *Service) sendSwitch(ctx context.Context, rt *repoRuntime, sw fusefs.Swi
 			s.logger.Warn("kernel cache invalidation failed", "repo", name, "error", err)
 		}
 	}
-	if err := rt.overlay.LogSwitched(ctx, sw.Changed); err != nil {
+	if err := rt.overlay.LogSwitched(ctx, sw.Logged); err != nil {
 		s.logger.Warn("change log after the kernel invalidations failed", "repo", name, "error", err)
 	}
 	// FSKit sends the kernel no invalidations, so the kernel can answer with
 	// attributes it cached from the old generation until they expire.
 	if serving && mfs.Backend() == fusefs.BackendFSKit {
-		s.logSwitchedAfterCacheTTL(rt, name, sw.Changed)
+		s.logSwitchedAfterCacheTTL(rt, name, sw.Logged)
 	}
 }
 

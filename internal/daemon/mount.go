@@ -131,7 +131,7 @@ func (s *Service) startPreparedRuntime(ctx, prepareCtx context.Context, res *pre
 	baseLookup := func(path string) (model.BaseNode, bool, error) {
 		return snap.LookupNode(prepareCtx, gen, path)
 	}
-	if err := ov.ReconcileChecked(prepareCtx, gen, baseLookup, switched, nil, nil); err != nil {
+	if _, err := ov.ReconcileChecked(prepareCtx, gen, baseLookup, switched, nil, nil); err != nil {
 		return err
 	}
 	// Prune only once the reconcile recorded gen as served. A start that

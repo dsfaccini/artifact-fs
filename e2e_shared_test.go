@@ -44,6 +44,7 @@ func TestE2ESharedMount(t *testing.T) {
 	shared.run(t, "GitCheckoutRestorePath", testE2EGitCheckoutRestorePath)
 	shared.run(t, "GitMergeAndRebase", testE2EGitMergeAndRebase)
 	shared.run(t, "GitCommitModifyTrackedFile", testE2EGitCommitModifyTrackedFile)
+	shared.run(t, "GitCommitLeavesCommittedFilesClean", testE2EGitCommitLeavesCommittedFilesClean)
 	shared.run(t, "GitCommitPreservesUnstagedAfterStagedCommit", testE2EGitCommitPreservesUnstagedAfterStagedCommit)
 	shared.run(t, "GitCommitTrackedRename", testE2EGitCommitTrackedRename)
 	shared.run(t, "GitCommitTrackedDelete", testE2EGitCommitTrackedDelete)

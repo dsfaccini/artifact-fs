@@ -309,11 +309,13 @@ func (r *Resolver) SwitchGeneration(ctx context.Context, gen int64, commitTime i
 			return sw, fmt.Errorf("raise mtimes: %w", err)
 		}
 	}
-	return sw, r.Overlay.ReconcileChecked(ctx, gen, baseLookup, sw.Changed, &r.transition, func() {
+	logged, err := r.Overlay.ReconcileChecked(ctx, gen, baseLookup, sw.Changed, &r.transition, func() {
 		r.SetCommitTime(commitTime)
 		r.SetGeneration(gen)
 		r.listingsSwitched(listings, sw.Changed.Unknown)
 	})
+	sw.Logged = logged
+	return sw, err
 }
 
 // Switch is what one SwitchGeneration did.
@@ -322,6 +324,8 @@ type Switch struct {
 	Replaced int64
 	// Changed is what the switch gave the overlay to log.
 	Changed model.SwitchedPaths
+	// Logged is what the switch's ReconcileChecked logged.
+	Logged model.SwitchedPaths
 	// DiffErr is the snapshot read error that made Changed Unknown, if any.
 	DiffErr error
 }
