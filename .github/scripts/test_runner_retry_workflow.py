@@ -20,6 +20,11 @@ def lines(text):
     return {line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")}
 
 
+def job_permissions(job):
+    m = re.search(r"^    permissions:(.*)\n((?:      .*\n)*)", job + "\n", re.M)
+    return m and lines(m.group(1) + "\n" + m.group(2))
+
+
 class RunnerRetryWorkflowTest(unittest.TestCase):
     def setUp(self):
         self.text = WORKFLOW.read_text()
@@ -36,43 +41,36 @@ class RunnerRetryWorkflowTest(unittest.TestCase):
 
     def test_only_its_job_can_write_actions(self):
         self.assertIn("\npermissions: {}\n", self.text)
-        permissions = re.search(r"^    permissions:\n((?:      .*\n)+)", self.job, re.M).group(1)
-        self.assertEqual(lines(permissions), {"actions: write", "checks: read", "contents: read"})
-        for workflow in WORKFLOWS.glob("*.yml"):
-            if workflow != WORKFLOW:
-                self.assertNotRegex(workflow.read_text(), r"actions: write|write-all", workflow.name)
+        self.assertEqual(job_permissions(self.job), {"actions: write", "checks: read", "contents: read"})
+        others = [w for w in [*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")] if w != WORKFLOW]
+        self.assertGreater(len(others), 0)
+        for workflow in others:
+            text = workflow.read_text()
+            self.assertNotRegex(text, r"actions:\s*['\"]?write|write-all", workflow.name)
+            # A job without permissions of its own or of its workflow gets the
+            # repository's default, which can write actions.
+            if not re.search(r"^permissions:", text, re.M):
+                for name, job in jobs(text).items():
+                    self.assertTrue(job_permissions(job), f"{workflow.name}: {name} declares no permissions")
 
-    def test_the_script_decides_from_the_run_that_completed(self):
-        env = lines(re.search(r"^    env:\n((?:      .*\n)+)", self.job, re.M).group(1))
-        self.assertLessEqual(
-            {
-                "RUN_ID: ${{ github.event.workflow_run.id }}",
-                "ATTEMPT: ${{ github.event.workflow_run.run_attempt }}",
-                "HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}",
-            },
-            env,
-        )
-        (step,) = [step for step in steps(self.job) if "runner_retry.py" in step]
-        self.assertIn('"repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$ATTEMPT/jobs?per_page=100"', step)
-        call = re.search(r"python3 -B \.github/scripts/runner_retry\.py ([^|]*)\|", step).group(1)
-        self.assertEqual(
-            re.findall(r"--[a-z-]+ \S+", call),
-            ['--run "$RUN_URL"', '--repository "$GITHUB_REPOSITORY"',
-             '--head-repository "$HEAD_REPOSITORY"', '--attempt "$ATTEMPT"'],
-        )
-        # A step's run script reads the event's fields from env, never from an
-        # expression the runner pastes into the script.
-        self.assertNotIn("${{", step)
+    def test_the_script_alone_decides(self):
+        (decide,) = [step for step in steps(self.job) if "runner_retry.py" in step]
+        self.assertEqual(lines(decide), {
+            "name: Decide whether no runner took the failed jobs",
+            "id: decide",
+            "run: python3 -B .github/scripts/runner_retry.py",
+        })
 
     def test_only_a_retry_decision_reruns_the_failed_jobs(self):
         self.assertEqual(len(re.findall(r"/rerun", self.text)), 1)
-        self.assertRegex(
-            self.text,
-            r"\n( +)if tail -n 1 \"\$RUNNER_TEMP/decision\" \| grep -q '\^retry:'; then\n"
-            r"\1  gh api -X POST \"repos/\$GITHUB_REPOSITORY/actions/runs/\$RUN_ID/rerun-failed-jobs\"\n"
-            r"\1fi\n",
-        )
-        self.assertIn('| tee "$RUNNER_TEMP/decision"\n', self.text)
+        (rerun,) = [step for step in steps(self.job) if "/rerun" in step]
+        self.assertEqual(lines(rerun), {
+            "name: Re-run the failed jobs",
+            "if: steps.decide.outputs.retry == 'true'",
+            "env:",
+            "RUN_ID: ${{ github.event.workflow_run.id }}",
+            'run: gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/rerun-failed-jobs"',
+        })
 
 
 if __name__ == "__main__":

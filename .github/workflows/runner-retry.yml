@@ -4,7 +4,7 @@ name: Runner retry
 # as when macOS runners run short, and the job runs no step. This workflow
 # re-runs such a run's failed jobs and their dependents once, as a manual
 # re-run of the failed jobs does. runner_retry.py decides: a run with any other
-# failure or cancellation stays as it is.
+# failure or cancellation, or whose ref has moved on, stays as it is.
 on:
   workflow_run:
     workflows: ["Build & Test", "Release"]
@@ -26,30 +26,22 @@ jobs:
       actions: write
       # Reads each job's annotations.
       checks: read
+      # Checks out the script and reads the run's ref.
       contents: read
     env:
       GH_TOKEN: ${{ github.token }}
-      RUN_ID: ${{ github.event.workflow_run.id }}
-      RUN_URL: ${{ github.event.workflow_run.html_url }}
-      ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-      HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
     steps:
       # The default branch, which holds this workflow, not the run's head.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Re-run the jobs that no runner took
-        run: |
-          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$ATTEMPT/jobs?per_page=100" \
-            --jq '.jobs[]' >"$RUNNER_TEMP/jobs"
-          for id in $(jq -r 'select(.conclusion != "success") | .id' "$RUNNER_TEMP/jobs"); do
-            gh api --paginate "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations?per_page=100" \
-              --jq ".[] | {job: $id, message}"
-          done >"$RUNNER_TEMP/annotations"
-          jq -n --slurpfile jobs "$RUNNER_TEMP/jobs" --slurpfile annotations "$RUNNER_TEMP/annotations" '{$jobs, $annotations}' |
-            python3 -B .github/scripts/runner_retry.py --run "$RUN_URL" --repository "$GITHUB_REPOSITORY" \
-              --head-repository "$HEAD_REPOSITORY" --attempt "$ATTEMPT" | tee "$RUNNER_TEMP/decision"
-          if tail -n 1 "$RUNNER_TEMP/decision" | grep -q '^retry:'; then
-            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/rerun-failed-jobs"
-          fi
+      - name: Decide whether no runner took the failed jobs
+        id: decide
+        run: python3 -B .github/scripts/runner_retry.py
+
+      - name: Re-run the failed jobs
+        if: steps.decide.outputs.retry == 'true'
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/rerun-failed-jobs"
