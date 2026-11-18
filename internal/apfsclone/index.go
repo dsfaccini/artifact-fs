@@ -19,8 +19,8 @@ import (
 
 // recordStats records in the index of worktree the stat data of each of
 // paths, as Git records the stat data of a file it checks out, so that Git
-// does not hash the file. It records none for a file whose mtime is not older
-// than the second of before. Git still hashes an entry whose mtime is not
+// does not hash the file. It records none for a path that is not a regular
+// file, or whose mtime is not older than the second of before. Git still hashes an entry whose mtime is not
 // older than the index file's, which it treats as racily clean. recordStats
 // leaves the index unchanged when the index is not a regular file, when its
 // version is not 2, 3 or 4, when its object format is unknown, and when it
@@ -77,11 +77,10 @@ func recordStats(ctx context.Context, worktree string, paths []string, before ti
 		if !want[name] {
 			return nil, nil
 		}
+		// Refresh handles a file that is gone or no longer regular.
 		var st unix.Stat_t
-		if err := unix.Lstat(filepath.Join(worktree, filepath.FromSlash(name)), &st); err != nil {
-			return nil, &os.PathError{Op: "lstat", Path: name, Err: err}
-		}
-		if st.Mtim.Sec >= before.Unix() {
+		if unix.Lstat(filepath.Join(worktree, filepath.FromSlash(name)), &st) != nil ||
+			st.Mode&unix.S_IFMT != unix.S_IFREG || st.Mtim.Sec >= before.Unix() {
 			return nil, nil
 		}
 		return &st, nil
