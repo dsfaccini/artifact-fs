@@ -1,6 +1,10 @@
 package slimtree
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/cloudflare/artifact-fs/internal/slimtree/doctor"
+)
 
 // backend names how slimtree makes a worktree.
 type backend string
@@ -39,4 +43,21 @@ func backendUsage(goos string) string {
 		return "how to make worktrees: apfsclone, or artifactfs (beta on macOS)"
 	}
 	return "how to make worktrees: artifactfs (apfsclone needs macOS)"
+}
+
+// notInThisRelease refuses cmd, which removes a worktree of backend b, which
+// this release cannot remove.
+func notInThisRelease(cmd, b string) error {
+	return fmt.Errorf("%s: removing %s worktrees is not in this release yet; slimtree stop unmounts one", cmd, b)
+}
+
+// runDoctor runs doctor's checks for backend. An artifactfs report also
+// warns that this release cannot remove artifactfs worktrees.
+func runDoctor(probe doctor.Probe, goos, backend, dir string) doctor.Report {
+	r := doctor.Run(probe, goos, backend, dir)
+	if backend == string(artifactFS) {
+		release := doctor.Result{ID: "backend", Status: doctor.StatusWarn, Detail: "slimtree rm of artifactfs worktrees is not in this release yet", Fix: "upgrade slimtree once a release removes artifactfs worktrees"}
+		r.Checks = append([]doctor.Result{release}, r.Checks...)
+	}
+	return r
 }

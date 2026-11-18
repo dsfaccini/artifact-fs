@@ -74,7 +74,7 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 					if err != nil {
 						return err
 					}
-					return printDoctor(stdout, doctor.Run(probe, goos, c.String("backend"), dir), c.Bool("json"))
+					return printDoctor(stdout, runDoctor(probe, goos, c.String("backend"), dir), c.Bool("json"))
 				},
 			},
 			{

@@ -1,0 +1,374 @@
+name: Release
+
+# A tag push releases slimtree:
+#   vX.Y.Z-alpha.N  -> TestPyPI, then PyPI after the pypi environment's review
+#   vX.Y.Z-rc.N     -> TestPyPI only
+#   vX.Y.Z          -> PyPI after the pypi environment's review
+# Each tag also gets a draft GitHub release. A branch push that changes the
+# release files, or a manual run, is a dry run: it runs the checks, builds and
+# smoke-tests the wheels, and publishes nothing.
+on:
+  push:
+    tags: ["v*"]
+    branches: ["**"]
+    # GitHub skips path filters for tag pushes. The smoke tests check
+    # slimtree's commands, so a change to slimtree runs a dry run too.
+    paths:
+      - .github/workflows/release.yml
+      - .github/scripts/build_wheel.py
+      - .github/scripts/release_gate.py
+      - .github/scripts/test_build_wheel.py
+      - .github/scripts/test_release_gate.py
+      - .github/scripts/test_release_workflow.py
+      - .github/scripts/smoke.sh
+      - .github/scripts/third_party_licenses.sh
+      - cmd/slimtree/**
+      - internal/slimtree/**
+      - internal/version/**
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag a dry run builds as. A manual run publishes nothing.
+        required: true
+        default: v0.1.0-alpha.1
+
+permissions: {}
+
+# An explicit bash runs with -o pipefail, so a failed command in a pipe fails
+# its step. The default shell runs bash -e alone.
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  # A called workflow's github.workflow is this one's name, and the checks name
+  # their groups after it, so this group must not start with "Release-".
+  group: slimtree-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      stage: ${{ steps.tag.outputs.stage }}
+      publish: ${{ steps.tag.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check that a failed pipe fails its step
+        run: shopt -qo pipefail
+
+      - name: Test the release scripts and this workflow
+        run: python3 -B -m unittest discover -s .github/scripts -v
+
+      - name: Check the tag
+        id: tag
+        env:
+          DRY_RUN_TAG: ${{ inputs.tag }}
+        run: python3 -B .github/scripts/release_gate.py
+
+  # The checks run on the tagged commit itself: a commit that changes only
+  # docs has no build-test run of its own.
+  build-test:
+    needs: gate
+    uses: ./.github/workflows/build-test.yml
+    permissions:
+      contents: read
+
+  semgrep:
+    needs: gate
+    uses: ./.github/workflows/semgrep.yml
+    permissions:
+      contents: read
+
+  examples:
+    needs: gate
+    uses: ./.github/workflows/examples.yml
+    permissions:
+      contents: read
+
+  redaction-fuzz:
+    needs: gate
+    uses: ./.github/workflows/redaction-fuzz.yml
+    permissions:
+      contents: read
+
+  build:
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No cache: a release builds only from the module proxy and the source.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.x
+          check-latest: true
+          cache: false
+
+      # Each build writes outside the checkout, so Go stamps every binary with
+      # vcs.modified=false: a file in the checkout that git does not track
+      # makes the next build's tree differ from the commit.
+      - name: Build
+        run: |
+          pkg=github.com/cloudflare/artifact-fs/internal/version
+          for target in linux-amd64 linux-arm64 darwin-arm64; do
+            GOOS=${target%-*} GOARCH=${target#*-} CGO_ENABLED=0 go build -trimpath \
+              -ldflags "-s -w -X $pkg.Version=$VERSION -X $pkg.Tag=$TAG -X $pkg.Commit=$GITHUB_SHA" \
+              -o "$RUNNER_TEMP/bin/$target/slimtree" ./cmd/slimtree
+          done
+          "$RUNNER_TEMP/bin/linux-amd64/slimtree" --version
+
+      - name: Check that each binary names the commit, unmodified
+        run: |
+          for binary in "$RUNNER_TEMP"/bin/*/slimtree; do
+            info=$(go version -m "$binary")
+            if ! grep -q "vcs.revision=$GITHUB_SHA\$" <<<"$info" || ! grep -q 'vcs.modified=false$' <<<"$info"; then
+              echo "$info"
+              echo "::error::$binary does not record $GITHUB_SHA unmodified."
+              exit 1
+            fi
+          done
+
+      - name: Check for known vulnerabilities
+        run: |
+          for binary in "$RUNNER_TEMP"/bin/*/slimtree; do
+            go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 -mode=binary "$binary"
+          done
+
+      - name: Collect third-party licenses
+        run: .github/scripts/third_party_licenses.sh linux/amd64 linux/arm64 darwin/arm64 >THIRD_PARTY_LICENSES
+
+      - name: Build wheels and archives
+        run: |
+          mkdir -p dist/wheels dist/archives
+          epoch=$(git log -1 --format=%ct)
+          for target in linux-amd64 linux-arm64 darwin-arm64; do
+            python3 -B .github/scripts/build_wheel.py wheel --binary "$RUNNER_TEMP/bin/$target/slimtree" --target "$target" \
+              --version "$VERSION" --license LICENSE --license THIRD_PARTY_LICENSES \
+              --readme cmd/slimtree/README.md --out dist/wheels
+            dir="slimtree-$VERSION-$target"
+            mkdir -p "$RUNNER_TEMP/archive/$dir"
+            cp "$RUNNER_TEMP/bin/$target/slimtree" LICENSE THIRD_PARTY_LICENSES cmd/slimtree/README.md "$RUNNER_TEMP/archive/$dir/"
+            tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" -C "$RUNNER_TEMP/archive" -cf - "$dir" | gzip -n >"dist/archives/$dir.tar.gz"
+          done
+          (cd dist/wheels && sha256sum -- *.whl && cd ../archives && sha256sum -- *.tar.gz) >SHA256SUMS
+          mv SHA256SUMS dist/archives/
+          cat dist/archives/SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels
+          path: dist/wheels/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: archives
+          path: dist/archives/
+          if-no-files-found: error
+
+  smoke:
+    name: smoke (${{ matrix.name }})
+    needs: [gate, build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: ubuntu-24.04, runner: ubuntu-24.04 }
+          - { name: ubuntu-24.04-arm, runner: ubuntu-24.04-arm }
+          - { name: macos-26, runner: macos-26 }
+          - { name: alpine, runner: ubuntu-24.04, image: "alpine:3.24" }
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+      VERSION: ${{ needs.gate.outputs.version }}
+      IMAGE: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheels
+          path: dist
+
+      - if: matrix.image == ''
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: 0.13.6
+          enable-cache: false
+
+      - name: Install and check slimtree
+        if: matrix.image == ''
+        run: .github/scripts/smoke.sh dist "$VERSION" "$TAG"
+
+      # musl: the Linux wheel's musllinux tag must install and run there too.
+      - name: Install and check slimtree on Alpine
+        if: matrix.image != ''
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work -e TAG -e VERSION "$IMAGE" \
+            sh -c 'apk add --no-cache bash git python3 uv && bash .github/scripts/smoke.sh dist "$VERSION" "$TAG"'
+
+  # twine's dependencies resolve fresh from PyPI, so twine runs apart from the
+  # job that writes the wheels.
+  twine-check:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheels
+          path: dist
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: 0.13.6
+          enable-cache: false
+
+      - name: Check the wheels
+        run: uvx twine@7.0.0 check --strict dist/*.whl
+
+  # A tag whose checks fail gets no public provenance record.
+  attest:
+    needs: [gate, build-test, semgrep, examples, redaction-fuzz, build, smoke, twine-check]
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+      attestations: write
+    steps:
+      # By name: a called workflow's job could upload another artifact.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheels
+          path: dist
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: archives
+          path: dist
+
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+
+  github-release:
+    needs: [gate, build-test, semgrep, examples, redaction-fuzz, build, smoke, twine-check, attest]
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+      VERSION: ${{ needs.gate.outputs.version }}
+      STAGE: ${{ needs.gate.outputs.stage }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheels
+          path: dist
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: archives
+          path: dist
+
+      # The notes list the titles of the PRs since the previous release tag: a
+      # final release's previous final, or any release's previous tag. Before
+      # the first, they start at 1.0.0-rc.10, the last upstream tag this fork
+      # carries, because upstream's PR numbers name other PRs here.
+      - name: Create a draft release
+        run: |
+          exclude=()
+          if [ "$STAGE" = final ]; then
+            exclude=(--exclude 'v*-*')
+          fi
+          start=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${exclude[@]}" "$TAG^" 2>/dev/null) || start=1.0.0-rc.10
+          prerelease=()
+          if [ "$STAGE" != final ]; then
+            prerelease=(--prerelease)
+          fi
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "slimtree $VERSION" --generate-notes --notes-start-tag "$start" "${prerelease[@]}"
+
+  publish-testpypi:
+    needs: [gate, github-release]
+    if: >-
+      needs.gate.outputs.publish == 'true'
+      && (needs.gate.outputs.stage == 'alpha' || needs.gate.outputs.stage == 'rc')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/slimtree/${{ needs.gate.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheels
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist/
+
+  publish-pypi:
+    needs: [gate, github-release, publish-testpypi]
+    # A final tag skips TestPyPI; an alpha tag reaches PyPI only through it.
+    if: >-
+      !cancelled()
+      && needs.gate.outputs.publish == 'true'
+      && needs.github-release.result == 'success'
+      && (needs.gate.outputs.stage == 'final'
+        || needs.gate.outputs.stage == 'alpha' && needs.publish-testpypi.result == 'success')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/slimtree/${{ needs.gate.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheels
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist/

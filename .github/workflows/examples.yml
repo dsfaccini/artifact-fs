@@ -21,8 +21,9 @@ permissions:
 
 concurrency:
   # Each main run gets a group of its own, so a later merge cancels neither a
-  # running nor a pending main run.
-  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  # running nor a pending main run. In a workflow that calls this one,
+  # github.workflow is the caller's name, so the group names this workflow too.
+  group: ${{ github.workflow }}-examples-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 jobs:

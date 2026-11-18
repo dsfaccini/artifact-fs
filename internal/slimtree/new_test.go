@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"strings"
@@ -432,6 +433,38 @@ func TestRmRemovesTheWorktreeAndItsRecord(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(homeDir, "archives", id, m[2], "worktree.json"))
 	if err != nil || !strings.Contains(string(data), `"common_dir": "`+filepath.Join(main, ".git")+`"`) {
 		t.Fatalf("archived record = %s, %v; want one that names the repository", data, err)
+	}
+}
+
+// This release removes no artifactfs worktree: rm refuses an artifactfs
+// record with exit 1, and changes nothing.
+func TestRmOfArtifactFSWorktreesIsNotInThisReleaseYet(t *testing.T) {
+	homeAfterFirstRun(t)
+	main := newRepo(t)
+	const notYet = ": removing artifactfs worktrees is not in this release yet; slimtree stop unmounts one\n"
+	served := filepath.Join(filepath.Dir(main), "served")
+	if err := os.Mkdir(served, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	home, err := openHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := state.Record{Version: 1, Backend: "artifactfs", Path: served, CommonDir: filepath.Join(main, ".git"), Branch: "served"}
+	if err := home.Write(record); err != nil {
+		t.Fatal(err)
+	}
+	for goos, probe := range map[string]doctor.Probe{"linux": healthyLinux(), "darwin": healthyDarwin()} {
+		var stdout, stderr bytes.Buffer
+		if code := run(t.Context(), goos, probe, []string{"rm", "served"}, &stdout, &stderr); code != 1 || stdout.Len() != 0 || stderr.String() != "slimtree rm "+served+notYet {
+			t.Fatalf("rm served on %s: exit %d, stdout %q, stderr %q; want exit 1 and the refusal", goos, code, stdout.String(), stderr.String())
+		}
+		if got := records(t); !reflect.DeepEqual(got, []state.Record{record}) {
+			t.Fatalf("records after rm on %s = %+v, want %+v", goos, got, record)
+		}
+		if _, err := os.Stat(served); err != nil {
+			t.Fatalf("rm on %s removed %s: %v", goos, served, err)
+		}
 	}
 }
 

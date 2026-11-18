@@ -39,8 +39,8 @@ func TestDefaultBackendByPlatform(t *testing.T) {
 		apfsCloneRuns bool
 		usage         string
 	}{
-		{goos: "darwin", want: apfsClone, apfsCloneRuns: true, usage: "artifactfs (beta on macOS)"},
-		{goos: "linux", want: artifactFS, usage: "apfsclone needs macOS"},
+		{goos: "darwin", want: apfsClone, apfsCloneRuns: true, usage: "apfsclone, or artifactfs (beta on macOS)"},
+		{goos: "linux", want: artifactFS, usage: "artifactfs (apfsclone needs macOS)"},
 	} {
 		t.Run(tc.goos, func(t *testing.T) {
 			if got := defaultBackend(tc.goos); got != tc.want {
@@ -265,17 +265,42 @@ func TestDoctorExitsOneOnAFailedCheck(t *testing.T) {
 		t.Fatalf("doctor --json with an unwritable /dev/fuse: exit %d, stderr %q, want 1", code, stderr.String())
 	}
 	var report doctor.Report
-	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || report.OK || len(report.Checks) != 6 || report.Checks[1].Fix != "sudo chmod 0666 /dev/fuse" {
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || report.OK || len(report.Checks) != 7 || report.Checks[2].Fix != "sudo chmod 0666 /dev/fuse" {
 		t.Fatalf("doctor --json = %s (%v), want a failed report with the chmod fix", stdout.String(), err)
 	}
 	stdout.Reset()
 	if code := run(t.Context(), "linux", probe, []string{"doctor"}, &stdout, io.Discard); code != 1 || !strings.Contains(stdout.String(), "fail  dev-fuse") || !strings.Contains(stdout.String(), "      fix: sudo chmod 0666 /dev/fuse\n") {
 		t.Fatalf("doctor: exit %d, stdout %q, want the failure and its fix", code, stdout.String())
 	}
+	// This release removes no artifactfs worktrees, so a healthy Linux
+	// machine warns about the backend and fails nothing.
 	probe.ReadWrite = func(string) error { return nil }
 	stdout.Reset()
 	if code := run(t.Context(), "linux", probe, []string{"doctor", "--json"}, &stdout, io.Discard); code != 0 {
 		t.Fatalf("doctor --json on a healthy machine: exit %d, stdout %s", code, stdout.String())
+	}
+	report = doctor.Report{}
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	want := doctor.Result{ID: "backend", Status: doctor.StatusWarn, Detail: "slimtree rm of artifactfs worktrees is not in this release yet", Fix: "upgrade slimtree once a release removes artifactfs worktrees"}
+	for i, c := range report.Checks {
+		if !report.OK || i == 0 && c != want || i > 0 && c.Status == doctor.StatusFail {
+			t.Fatalf("doctor --json on a healthy machine = %+v, want %+v first and no failure", report.Checks, want)
+		}
+	}
+}
+
+// --backend artifactfs doctor on macOS warns the same.
+func TestDoctorSaysArtifactFSRmIsNotInThisRelease(t *testing.T) {
+	homeAfterFirstRun(t)
+	probe := healthyDarwin()
+	probe.OSVersion = func() (string, error) { return "26.0", nil }
+	probe.FSKitAvailable = func() error { return nil }
+	var stdout bytes.Buffer
+	if code := run(t.Context(), "darwin", probe, []string{"--backend", "artifactfs", "doctor"}, &stdout, io.Discard); code != 0 ||
+		!strings.HasPrefix(stdout.String(), "warn  backend        slimtree rm of artifactfs worktrees is not in this release yet\n      fix: upgrade slimtree once a release removes artifactfs worktrees\n") {
+		t.Fatalf("--backend artifactfs doctor on macOS: exit %d, stdout %q; want exit 0 and the backend warning first", code, stdout.String())
 	}
 }
 
@@ -344,6 +369,8 @@ func TestFirstRunSummaryPrintsOnce(t *testing.T) {
 		want  string
 	}{
 		{goos: "linux", probe: healthyLinux(), want: "slimtree's first run: what --backend artifactfs needs here (slimtree doctor checks again)\n" +
+			"warn  backend        slimtree rm of artifactfs worktrees is not in this release yet\n" +
+			"      fix: upgrade slimtree once a release removes artifactfs worktrees\n" +
 			"ok    fusermount     /usr/bin/fusermount3\n" +
 			"ok    dev-fuse       /dev/fuse\n" +
 			"ok    cap-sys-admin  CapBnd holds CAP_SYS_ADMIN\n" +
@@ -393,8 +420,8 @@ func TestFirstRunSkipsHelpVersionAndDoctor(t *testing.T) {
 		}
 		if args[len(args)-1] == "--json" {
 			var report doctor.Report
-			if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || !report.OK {
-				t.Errorf("doctor --json stdout = %s (%v), want a passing report", stdout.String(), err)
+			if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || len(report.Checks) != 7 {
+				t.Errorf("doctor --json stdout = %s (%v), want one report", stdout.String(), err)
 			}
 		}
 	}
