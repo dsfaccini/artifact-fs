@@ -718,6 +718,38 @@ func (s *Service) unmount(id model.RepoID) error {
 	}
 }
 
+// endWorkers cancels the context of id's runtime, which a failed stop kept
+// running, and waits for its workers until deadline. keepServing keeps such a
+// runtime serving so that a live daemon's mount stays up. Close ends the
+// daemon, and the process exits after it, so Close ends those workers before
+// it closes the Store, the registry and the daemon lock. A worker that
+// outlived Close would run git in the state root, which a caller may be
+// removing.
+func (s *Service) endWorkers(id model.RepoID, deadline time.Time) error {
+	s.mu.Lock()
+	rt := s.running[id]
+	s.mu.Unlock()
+	if rt == nil {
+		return nil
+	}
+	if rt.cancel != nil {
+		rt.cancel()
+	}
+	ended := make(chan struct{})
+	go func() {
+		rt.workers.Wait()
+		close(ended)
+	}()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-ended:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("the workers of %s have not ended after its failed stop", id)
+	}
+}
+
 // stopRuntime unmounts rt, then cancels its context, which cancels its FUSE
 // ops in flight, waits for its workers and its server, and closes its stores
 // and its git cat-file processes. It runs as the repo's unmount, so ctx ends

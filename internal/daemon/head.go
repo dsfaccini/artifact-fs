@@ -402,6 +402,7 @@ func (s *Service) headReconcileLoop(rt *repoRuntime) {
 		}
 
 		for {
+			runHook(s.headReconcileStarting)
 			err := s.reconcileHEAD(rt.ctx, rt)
 			if err == nil {
 				retry.succeed()
