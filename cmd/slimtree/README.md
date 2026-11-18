@@ -82,9 +82,10 @@ How it was measured:
   slimtree's five creates, 1.78 s and 4.73 s, took longer than git's slowest.
 - Traces of 10 more slimtree creates at the pull request's commit show that
   refresh hashed no file in any of them. The slow ones spent their time in
-  slimtree's clone and `lstat` passes and in git's own commands. Memory
-  pressure on the machine is a likely cause, but the runs recorded no memory
-  data.
+  slimtree's clone and `lstat` passes and in git's own commands. The slowest
+  traced create ran at a 1-minute load of 20.5 to 29.5, and every one of its
+  steps slowed. Memory pressure on the machine is a likely cause, but the runs
+  recorded no memory data, and the 4.73 s round itself has no trace.
 - git's first `git status` took between 154 ms and 960 ms at the base
   worktree's commit, and between 79 ms and 506 ms at the pull request's.
   slimtree's took between 32 ms and 57 ms, and between 34 ms and 47 ms, and its
