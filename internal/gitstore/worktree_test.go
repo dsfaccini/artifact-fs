@@ -813,12 +813,83 @@ func TestBootstrapCleanIndexForFSMonitorSkipsMissingAttributesBlob(t *testing.T)
 		t.Fatal(err)
 	}
 	cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: filepath.Join(repo, ".git"), MountPath: repo}}
-	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); err != nil || bootstrapped {
-		t.Fatalf("missing attributes blob bootstrap = %v, %v; want false, nil", bootstrapped, err)
+	// The error tells the daemon's log why the bootstrap skipped. Git's
+	// message follows the prefix, and differs between Git versions.
+	const want = "the blob of .gitattributes is not in the object store: "
+	if bootstrapped, err := New(nil).BootstrapCleanIndexForFSMonitor(context.Background(), cfg, head, nil); bootstrapped || err == nil || !strings.HasPrefix(err.Error(), want) {
+		t.Fatalf("missing attributes blob bootstrap = %v, %v; want false, %s...", bootstrapped, err, want)
 	}
 	if after, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(after, before) {
 		t.Fatalf("missing attributes blob changed index: err=%v", err)
 	}
+}
+
+// A blobless clone holds no blob of its HEAD, and the clean-index bootstrap
+// reads .gitattributes without lazy fetch. FetchGitAttributes fetches the
+// .gitattributes blobs, and no other, unless the bootstrap would skip
+// whatever the attributes hold.
+func TestFetchGitAttributesFetchesOnlyTheAttributesBlobs(t *testing.T) {
+	t.Parallel()
+	files := map[string]string{
+		".gitattributes":      "*.png binary\n",
+		"docs/.gitattributes": "*.md text\n",
+		"docs/readme.md":      "readme\n",
+		"tracked.txt":         "base\n",
+	}
+	remote := gittest.PartialCloneRemote(t, files)
+	for _, tc := range []struct {
+		name   string
+		config [][2]string
+		// otherCommit asks for another commit than HEAD's.
+		otherCommit bool
+		fetch       bool
+	}{
+		{name: "fetches", fetch: true},
+		{name: "HEAD is another commit", otherCommit: true},
+		{name: "core.autocrlf true", config: [][2]string{{"core.autocrlf", "true"}}},
+		{name: "core.autocrlf input", config: [][2]string{{"core.autocrlf", "input"}}},
+		{name: "core.attributesFile", config: [][2]string{{"core.attributesFile", "/dev/null"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gitDir := filepath.Join(t.TempDir(), "repo.git")
+			cfg := model.RepoConfig{RepoPaths: model.RepoPaths{ID: "x", Name: "repo", GitDir: gitDir}, RepoSpec: model.RepoSpec{RemoteURL: remote, Branch: "main"}}
+			store := New(nil)
+			defer store.Close()
+			if err := store.CloneBlobless(t.Context(), cfg); err != nil {
+				t.Fatal(err)
+			}
+			for _, kv := range tc.config {
+				run(t, "git", "--git-dir", gitDir, "config", kv[0], kv[1])
+			}
+			for path := range files {
+				if gitBlobLocal(gitDir, path) {
+					t.Fatalf("blobless clone holds the blob of %s", path)
+				}
+			}
+			commit := strings.TrimSpace(runOutput(t, "git", "--git-dir", gitDir, "rev-parse", "HEAD"))
+			if tc.otherCommit {
+				commit = strings.Repeat("1", len(commit))
+			}
+			if err := store.FetchGitAttributes(t.Context(), cfg, commit); err != nil {
+				t.Fatal(err)
+			}
+			for path := range files {
+				want := tc.fetch && filepath.Base(path) == ".gitattributes"
+				if got := gitBlobLocal(gitDir, path); got != want {
+					t.Fatalf("after FetchGitAttributes, the blob of %s is local = %v, want %v", path, got, want)
+				}
+			}
+		})
+	}
+}
+
+// gitBlobLocal reports whether the object store of gitDir holds the blob of
+// path at HEAD, without fetching it.
+func gitBlobLocal(gitDir, path string) bool {
+	cmd := exec.Command("git", "--git-dir", gitDir, "cat-file", "-e", "HEAD:"+path)
+	cmd.Env = append(os.Environ(), "GIT_NO_LAZY_FETCH=1")
+	return cmd.Run() == nil
 }
 
 func TestEnsureIndexInitializedPreservesAlternateIndex(t *testing.T) {

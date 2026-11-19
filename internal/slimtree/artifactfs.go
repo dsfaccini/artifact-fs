@@ -43,7 +43,9 @@ const (
 	// another slimtree may have started.
 	exitPoll = 100 * time.Millisecond
 	// mountWait bounds the wait for a daemon slimtree started to mount: its
-	// start, its preparation and its mount, which it bounds at 30 s.
+	// start, its mount check, which contacts no remote, and its mount, which
+	// it bounds at 30 s. add-repo's preparation, which can fetch, runs before
+	// the daemon starts.
 	mountWait = time.Minute
 	// mountCheckTimeout bounds the git command that reads a new mount.
 	mountCheckTimeout = 30 * time.Second

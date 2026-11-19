@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -69,11 +70,11 @@ func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfi
 // add-repo never persists inline credentials: a sync clone uses them once
 // and stores the URL without them, and async and prepared repos reject them,
 // because the daemon would store the URL and fetch with it on its own
-// schedule. Adoption only warns. It stores no URL and never clones, fetches or
+// schedule. Adoption only warns. It stores no URL and never clones or
 // refreshes. The remotes stay the user's existing Git config. Git's lazy
-// fetches and the hydrator's batch fetches of missing blobs and trees use the
-// promisor remotes, as any Git command in the worktree would. ArtifactFS
-// redacts all Git output it logs.
+// fetches, the hydrator's batch fetches of missing blobs and trees, and each
+// preparation's FetchGitAttributes use the promisor remotes, as any Git
+// command in the worktree would. ArtifactFS redacts all Git output it logs.
 func (s *Store) WarnAdoptedRemoteCredentials(ctx context.Context, repo model.RepoConfig) {
 	names := []string{"origin"}
 	if promisors, err := s.promisorRemotes(ctx, repo.GitDir); err == nil {
@@ -425,8 +426,11 @@ const FSMonitorBootstrapEnv = "ARTIFACT_FS_FSMONITOR_BOOTSTRAP"
 
 // BootstrapCleanIndexForFSMonitor marks snapshot paths valid only while the
 // real index is locked and proven to match the immutable snapshot commit.
-// Once Close has begun, it returns errStoreClosed before it takes index.lock
-// or makes a file.
+// The daemon runs it on its sync loop when it mounts a repo, so it contacts
+// no remote. A preparation fetches the .gitattributes blobs it reads with
+// FetchGitAttributes, and a blob still missing makes it skip with an error
+// that names the blob's path. Once Close has begun, it returns errStoreClosed
+// before it takes index.lock or makes a file.
 func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.RepoConfig, snapshotOID string, validate func() (bool, error)) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -535,18 +539,8 @@ func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.
 	if len(paths) == 0 {
 		return false, nil
 	}
-	if out, err := run("config", "--type=bool", "--default=false", "--get", "core.autocrlf"); err != nil || strings.EqualFold(strings.TrimSpace(out), "true") {
+	if s.bootstrapConfigSkips(ctx, repo.GitDir, env) {
 		return skip()
-	}
-	configs, err := run("config", "--null", "--list")
-	if err != nil {
-		return skip()
-	}
-	for entry := range strings.SplitSeq(configs, "\x00") {
-		key, _, ok := strings.Cut(entry, "\n")
-		if ok && strings.EqualFold(key, "core.attributesfile") {
-			return false, nil
-		}
 	}
 	pathInput := []byte(strings.Join(paths, "\x00") + "\x00")
 	attrs, err := s.runGitInput(ctx, repo.GitDir, env, pathInput, "-c", "core.fsmonitor=false", "check-attr", "--cached", "--all", "-z", "--stdin")
@@ -587,7 +581,10 @@ func (s *Store) BootstrapCleanIndexForFSMonitor(ctx context.Context, repo model.
 		return false, nil
 	}
 	if err := s.verifyGitAttributesPresent(ctx, repo, env); err != nil {
-		return skip()
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, err
 	}
 	validInput := []byte(strings.Join(validPaths, "\x00") + "\x00")
 	updateEnv := append([]string{FSMonitorBootstrapEnv + "=1"}, env...)
@@ -672,8 +669,73 @@ func (s *Store) verifyGitAttributesPresent(ctx context.Context, repo model.RepoC
 			return errors.New("unmerged .gitattributes entry")
 		}
 		if err := s.runGitDiscardOutputWithEnv(ctx, repo.GitDir, env, "cat-file", "-e", parts[1]+"^{blob}"); err != nil {
-			return err
+			return fmt.Errorf("the blob of %s is not in the object store: %w", path, err)
 		}
+	}
+	return nil
+}
+
+// bootstrapConfigSkips reports whether gitDir's config makes the clean-index
+// bootstrap skip: core.autocrlf set to anything but false, a configured
+// core.attributesFile, or a config git cannot read.
+func (s *Store) bootstrapConfigSkips(ctx context.Context, gitDir string, env []string) bool {
+	if out, err := s.runGitWithEnv(ctx, gitDir, env, "config", "--type=bool", "--default=false", "--get", "core.autocrlf"); err != nil || strings.EqualFold(strings.TrimSpace(out), "true") {
+		return true
+	}
+	configs, err := s.runGitWithEnv(ctx, gitDir, env, "config", "--null", "--list")
+	if err != nil {
+		return true
+	}
+	for entry := range strings.SplitSeq(configs, "\x00") {
+		key, _, ok := strings.Cut(entry, "\n")
+		if ok && strings.EqualFold(key, "core.attributesfile") {
+			return true
+		}
+	}
+	return false
+}
+
+// attributesFetchTimeout bounds FetchGitAttributes's fetch, which runs under
+// the repo's prepare lock.
+const attributesFetchTimeout = 30 * time.Second
+
+// FetchGitAttributes fetches, in one fetch, the blobs of commit's
+// .gitattributes files that the object store lacks. The clean-index
+// bootstrap reads them without lazy fetch, and a blobless clone lacks the
+// blob of every commit it never checked out. Without them the bootstrap
+// skips, and the first git status reads every file. It fetches nothing for a
+// repo whose bootstrap skips whatever its attributes: one whose HEAD is not
+// commit, or whose config converts files.
+func (s *Store) FetchGitAttributes(ctx context.Context, repo model.RepoConfig, commit string) error {
+	if head, err := s.runGit(ctx, repo.GitDir, "rev-parse", "--verify", "HEAD"); err != nil || strings.TrimSpace(head) != commit {
+		return err
+	}
+	if s.bootstrapConfigSkips(ctx, repo.GitDir, nil) {
+		return nil
+	}
+	tree, err := s.runGitWithEnv(ctx, repo.GitDir, []string{"GIT_NO_LAZY_FETCH=1"}, "ls-tree", "-r", "-z", "--full-tree", commit)
+	if err != nil {
+		return err
+	}
+	var oids []string
+	for entry := range strings.SplitSeq(tree, "\x00") {
+		meta, path, ok := strings.Cut(entry, "\t")
+		parts := strings.Fields(meta)
+		if ok && len(parts) == 3 && parts[1] == "blob" && filepath.Base(path) == ".gitattributes" {
+			oids = append(oids, parts[2])
+		}
+	}
+	if len(oids) == 0 {
+		return nil
+	}
+	missing, err := s.missingObjects(ctx, repo.GitDir, oids)
+	if err != nil || len(missing) == 0 {
+		return err
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, attributesFetchTimeout)
+	defer cancel()
+	if err := s.fetchObjects(fetchCtx, repo.GitDir, missing); err != nil {
+		return fmt.Errorf("fetch %d .gitattributes blobs: %w", len(missing), err)
 	}
 	return nil
 }

@@ -99,23 +99,31 @@ func (s *Store) FetchMissingBlobs(ctx context.Context, repo model.RepoPaths, obj
 	if err != nil || len(missing) == 0 {
 		return err
 	}
-	// A filtered fetch from a remote that is not a promisor records it as one
-	// in the repo config, so the fetch goes only to a promisor.
-	remote, err := s.promisorRemote(ctx, repo.GitDir)
-	if err == nil && remote == "" {
-		err = errors.New("no promisor remote")
-	}
-	if err == nil {
-		// The fetch downloads every wanted object again, present or not, so
-		// it asks only for the missing ones.
-		_, err = s.runLazyFetchGitInput(ctx, repo.GitDir, []byte(strings.Join(missing, "\n")+"\n"),
-			"-c", "fetch.negotiationAlgorithm=noop", "fetch", "--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--filter=blob:none", "--stdin", "--", remote)
-	}
+	err = s.fetchObjects(ctx, repo.GitDir, missing)
 	// The hydrator cancels a batch fetch only when it stops, which is not a
 	// fetch failure. A timeout still logs.
 	if err != nil && !errors.Is(ctx.Err(), context.Canceled) {
 		s.logger.Warn("batch blob fetch failed, blobs will fetch one at a time", "repo", repo.Name, "blobs", len(missing), "error", auth.RedactLogString(err.Error()))
 	}
+	return err
+}
+
+// fetchObjects fetches missing, which the object store lacks, in one fetch
+// from the promisor remote.
+func (s *Store) fetchObjects(ctx context.Context, gitDir string, missing []string) error {
+	// A filtered fetch from a remote that is not a promisor records it as one
+	// in the repo config, so the fetch goes only to a promisor.
+	remote, err := s.promisorRemote(ctx, gitDir)
+	if err == nil && remote == "" {
+		err = errors.New("no promisor remote")
+	}
+	if err != nil {
+		return err
+	}
+	// The fetch downloads every wanted object again, present or not, so it
+	// asks only for the missing ones.
+	_, err = s.runLazyFetchGitInput(ctx, gitDir, []byte(strings.Join(missing, "\n")+"\n"),
+		"-c", "fetch.negotiationAlgorithm=noop", "fetch", "--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--filter=blob:none", "--stdin", "--", remote)
 	return err
 }
 

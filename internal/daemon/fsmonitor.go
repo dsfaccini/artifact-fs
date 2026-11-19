@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
@@ -56,7 +57,7 @@ func (s *Service) bootstrapCleanStatusIndex(ctx context.Context, cfg model.RepoC
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		s.logger.Warn("git status clean baseline bootstrap skipped", "repo", cfg.Name, "error", err)
+		s.logger.Warn("git status clean baseline bootstrap skipped", "repo", cfg.Name, "error", auth.RedactLogString(err.Error(), cfg.RemoteURL))
 		return nil
 	}
 	if bootstrapped {

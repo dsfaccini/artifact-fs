@@ -338,6 +338,7 @@ type GitStore interface {
 	ConfigureStatusOptimization(ctx context.Context, repo RepoConfig, stateRoot string) error
 	ConfigureFSMonitorHook(ctx context.Context, repo RepoConfig, stateRoot string) error
 	BootstrapCleanIndexForFSMonitor(ctx context.Context, repo RepoConfig, snapshotOID string, validate func() (bool, error)) (bool, error)
+	FetchGitAttributes(ctx context.Context, repo RepoConfig, commit string) error
 	ResolveHEAD(ctx context.Context, repo RepoConfig) (oid string, ref string, err error)
 	CommitTimestamp(ctx context.Context, repo RepoConfig, oid string) (int64, error)
 	ComputeAheadBehind(ctx context.Context, repo RepoConfig) (ahead int, behind int, diverged bool, err error)
