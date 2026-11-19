@@ -12,6 +12,17 @@ ordinary worktree, so `git status`, commits and branches work as they do after
 [artifact-fs](https://github.com/dsfaccini/artifact-fs/blob/main/docs/artifact-fs.md)
 FUSE mount, which reads file contents from Git's objects as they are needed.
 
+## Quick start
+
+```bash
+uv tool install slimtree
+cd ~/src/app              # the repository's main worktree
+slimtree doctor           # checks what slimtree needs; installs nothing
+slimtree new fix/login    # makes ~/src/app-login on the branch fix/login
+slimtree list
+slimtree rm app-login
+```
+
 ## Measured
 
 A new worktree of [pydantic-ai](https://github.com/pydantic/pydantic-ai)
@@ -38,8 +49,14 @@ and 1.17 s against 1.42 s at the pull request's. Remove takes longer:
 `slimtree rm` archives the worktree's record and keeps a recovery ref of its
 HEAD before it removes the worktree.
 
-slimtree checks no clone byte for byte against its blob. It trusts a clone
-only when all of these hold:
+slimtree checks no clone byte for byte against its blob. Its trust is only as
+good as the base's own `git status`: its index's stat data, `core.checkStat`,
+`core.trustctime` and its fsmonitor.
+
+<details>
+<summary>When slimtree trusts a clone</summary>
+
+slimtree trusts a clone only when all of these hold:
 
 - the base's `git status` does not list the file, and the base's HEAD has the
   same mode and blob there as the new worktree's commit;
@@ -50,10 +67,10 @@ only when all of these hold:
 - its mtime is older than the second in which slimtree read the base's HEAD;
 - the base's HEAD is the same commit when slimtree registers the worktree.
 
-So the trust is only as good as the base's own `git status`: its index's stat
-data, `core.checkStat`, `core.trustctime` and its fsmonitor.
+</details>
 
-How it was measured:
+<details>
+<summary>How it was measured</summary>
 
 - `slimtree --version`: `slimtree dev (untagged, e5fed326a40c, go1.27.4,
   darwin/arm64)`, built from main e5fed32 as the release workflow builds it
@@ -102,6 +119,8 @@ How it was measured:
 - MacBook Air (Apple M4, 24 GB), macOS 27.2, internal SSD, Git 2.54.0 (Apple
   Git-157), 2026-11-18.
 
+</details>
+
 ### Linux
 
 | | slimtree | `git worktree add` |
@@ -122,7 +141,8 @@ FSMonitor hook tells `git status` which files changed. Remove takes longer:
 `slimtree rm` stops the daemon and archives the worktree's state before it
 removes the worktree.
 
-How it was measured:
+<details>
+<summary>How it was measured</summary>
 
 - `slimtree --version`: `slimtree dev (untagged, 9888021600a7, go1.27.4,
   linux/amd64)`, built from 9888021 (#129) as the release workflow builds it
@@ -210,6 +230,8 @@ How it was measured:
   7.0.0-43, ext4 on RAID 1 over two NVMe SSDs, fuse3 3.18.2, Git 2.53.0,
   2026-11-18.
 
+</details>
+
 ## What works in this release
 
 | Command | macOS on Apple silicon | Linux on x86_64 or arm64 |
@@ -227,26 +249,10 @@ Release builds are tested on macOS 26, Ubuntu 24.04 and Alpine Linux. On
 macOS, `--backend artifactfs` mounts through macFUSE's FSKit backend. It is a
 beta, and release builds do not test it.
 
-## Install
-
-```bash
-uv tool install slimtree
-slimtree doctor
-```
+## Use
 
 `slimtree doctor` checks what slimtree needs on this machine and in the current
 directory. It installs nothing, and prints the fix for each check that fails.
-
-## Use
-
-In a repository whose main worktree is `~/src/app`:
-
-```bash
-cd ~/src/app
-slimtree new fix/login    # makes ~/src/app-login on the branch fix/login
-slimtree list
-slimtree rm app-login
-```
 
 A new worktree goes next to the main worktree, named after it and the last
 segment of the branch: `<main worktree>-<last segment>`. Two variants:
@@ -272,9 +278,14 @@ slimtree resume --all        # after a reboot
 `slimtree rm` takes a worktree by its directory name or its path. It refuses a
 worktree with changes unless you pass `--force`, and `slimtree rm --check` runs
 only its checks. It keeps the worktree's `HEAD` in a ref under
-`refs/slimtree/archive/` and never deletes a branch. For a worktree on an
-artifact-fs mount, Linux's default, it also refuses while another process
-works inside the mount, also with `--force`. It then stops the worktree's
+`refs/slimtree/archive/` and never deletes a branch. Run `slimtree --help` for
+every flag.
+
+<details>
+<summary>What <code>slimtree rm</code> keeps, and for how long</summary>
+
+For a worktree on an artifact-fs mount, Linux's default, `slimtree rm` also
+refuses while another process works inside the mount, also with `--force`. It then stops the worktree's
 daemon, and keeps the files your changes made, with the worktree's git dir, in
 `state.tar.gz` in the archive. `--exclude <glob>` leaves out the files at paths
 with a component that the glob matches, such as `--exclude node_modules`. Each
@@ -282,7 +293,9 @@ with a component that the glob matches, such as `--exclude node_modules`. Each
 `slimtree prune`, deletes the archives and recovery refs older than the
 retention rule, a month by default, and evicts artifact-fs's cached blobs not
 read within it; `slimtree retention week|month|forever|<N>d`
-changes the rule. Run `slimtree --help` for every flag.
+changes the rule.
+
+</details>
 
 ## Source and license
 
