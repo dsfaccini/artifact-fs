@@ -24,6 +24,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/execfile"
 	"github.com/cloudflare/artifact-fs/internal/gittest"
 	"github.com/cloudflare/artifact-fs/internal/slimtree/mounts"
+	"github.com/cloudflare/artifact-fs/internal/slimtree/state"
 )
 
 // slimtreeBinary returns the slimtree binary e2e tests drive:
@@ -54,9 +55,10 @@ type slimtreeRecord struct {
 // refuses while another process uses the mount, records the daemon's new
 // mount after an external unmount and then unmounts it, resume mounts it
 // again with its changes, and resume brings it back after its daemon was
-// killed. On Linux, rm then refuses the worktree while it has changes and
-// while another process uses the mount, and rm --force archives its files and
-// removes it. Its daemons run in slimtree processes, so this test process
+// killed. On Linux, new --detach first makes a second worktree from inside
+// the first, and rm --force --no-archive removes it. rm then refuses the
+// first worktree while it has changes and while another process uses the
+// mount, and rm --force archives its files and removes it. Its daemons run in slimtree processes, so this test process
 // serves no mount. Its subject is mounting, so it keeps its own mounts.
 func TestE2ESlimtreeLifecycle(t *testing.T) {
 	if os.Getenv("AFS_RUN_E2E_TESTS") != "1" {
@@ -197,6 +199,9 @@ func TestE2ESlimtreeLifecycle(t *testing.T) {
 	}
 	if _, err := os.Lstat(unused); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("prune kept %s, which no worktree uses: %v", unused, err)
+	}
+	if runtime.GOOS == "linux" {
+		slimtreeDetachesFromAnArtifactFSBase(t, base, home, wt, bin)
 	}
 	if err := writeMountFile(filepath.Join(wt, "notes.txt"), []byte("kept across stops\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -400,6 +405,86 @@ func slimtreeRemovesTheWorktree(t *testing.T, base, home, wt string, slimtree fu
 	stdout, stderr, err = slimtree("list", "--json")
 	if err != nil || json.Unmarshal([]byte(stdout), &l) != nil || len(l.Worktrees) != 0 {
 		t.Errorf("slimtree list after rm: %v, stdout %q, stderr %q; want no worktree", err, stdout, stderr)
+	}
+}
+
+// slimtreeDetachesFromAnArtifactFSBase runs new --detach from inside the
+// mounted artifactfs worktree wt, with slimtree.base set to wt, as a pre-push
+// review makes its policy base from the worktree under review. git worktree
+// add copies wt's config.worktree, whose core.fsmonitor names wt's hook. That
+// hook answers with wt's changes, so a git status that ran it would miss the
+// new worktree's own. The new worktree's daemon sets the worktree's own hook,
+// and git status lists its changes and leaves wt clean. rm --force
+// --no-archive then leaves no worktree, record, state root, archive, recovery
+// ref or branch.
+func slimtreeDetachesFromAnArtifactFSBase(t *testing.T, base, home, wt, bin string) {
+	t.Helper()
+	pb := filepath.Join(filepath.Dir(wt), "policy-base")
+	recordDir := filepath.Join(home, "w", state.ID(pb))
+	slimtreeIn := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := commandIn(dir, bin, args...)
+		cmd.Env = append(os.Environ(), "SLIMTREE_HOME="+home)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("slimtree %s in %s: %v\nstdout: %s\nstderr: %s", strings.Join(args, " "), dir, err, stdout.String(), stderr.String())
+		}
+		return stdout.String()
+	}
+	head := strings.TrimSpace(gitCmd(t, wt, "rev-parse", "HEAD"))
+	branches := gitCmd(t, base, "for-each-ref", "refs/heads/")
+	ownHook := strings.TrimSpace(gitCmd(t, wt, "config", "--get", "core.fsmonitor"))
+	gitCmd(t, base, "config", "slimtree.base", wt)
+	t.Cleanup(func() {
+		if _, err := os.Stat(filepath.Join(recordDir, "worktree.json")); err == nil {
+			cmd := commandIn(base, bin, "stop", pb)
+			cmd.Env = append(os.Environ(), "SLIMTREE_HOME="+home)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Errorf("slimtree stop %s at cleanup: %v: %s", pb, err, out)
+			}
+		}
+	})
+	e2eMountsStarted.Add(1)
+	got := slimtreeIn(wt, "new", "--detach", "HEAD", "--path", pb)
+	gitCmd(t, base, "config", "--unset", "slimtree.base")
+	if got != pb+"\n" {
+		t.Fatalf("slimtree new --detach printed %q, want %s", got, pb)
+	}
+	if got := strings.TrimSpace(gitCmd(t, pb, "rev-parse", "HEAD")); got != head {
+		t.Fatalf("the detached worktree's HEAD is %s, want %s", got, head)
+	}
+	if ref, _, err := gitCmdResult(pb, "symbolic-ref", "-q", "HEAD"); err == nil {
+		t.Fatalf("the detached worktree's HEAD names %q, want no branch", ref)
+	}
+	if hook := strings.TrimSpace(gitCmd(t, pb, "config", "--get", "core.fsmonitor")); hook == ownHook || !strings.HasPrefix(hook, recordDir+"/") {
+		t.Fatalf("the detached worktree's core.fsmonitor is %s, want its own hook below %s, not %s's %s", hook, recordDir, wt, ownHook)
+	}
+	if err := writeMountFile(filepath.Join(pb, "README.md"), []byte("edited in the policy base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeMountFile(filepath.Join(pb, "review.txt"), []byte("new in the policy base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	assertGitStatus(t, pb, map[string]string{"README.md": " M", "review.txt": "??"})
+	assertGitStatus(t, wt, map[string]string{})
+
+	if got := slimtreeIn(base, "rm", "--force", "--no-archive", pb); got != "removed "+pb+"\n" {
+		t.Fatalf("slimtree rm --force --no-archive printed %q", got)
+	}
+	for _, gone := range []string{pb, recordDir, filepath.Join(home, "archives", state.ID(pb))} {
+		if _, err := os.Lstat(gone); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("after rm --no-archive, %s: %v, want it gone", gone, err)
+		}
+	}
+	if list := gitCmd(t, base, "worktree", "list", "--porcelain"); strings.Contains(list, "worktree "+pb+"\n") {
+		t.Errorf("git lists %s after rm:\n%s", pb, list)
+	}
+	if refs := gitCmd(t, base, "for-each-ref", "refs/slimtree/"); refs != "" {
+		t.Errorf("recovery refs after rm --no-archive: %q, want none", refs)
+	}
+	if got := gitCmd(t, base, "for-each-ref", "refs/heads/"); got != branches {
+		t.Errorf("branches after rm --no-archive = %q, want %q", got, branches)
 	}
 }
 

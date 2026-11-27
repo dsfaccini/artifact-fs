@@ -821,3 +821,154 @@ func TestRmRefusesASymlinkToAnotherWorktree(t *testing.T) {
 		t.Fatalf("git no longer registers %s:\n%s", other, list)
 	}
 }
+
+// new --detach makes a worktree whose files match a plain git worktree add
+// --detach's, at the commit-ish, with HEAD detached and no branch, by default
+// at <base>-<the commit's first 12 hex digits>. It refuses --from and --track,
+// and a commit-ish that names no commit, before git registers anything.
+func TestNewDetachesAtACommit(t *testing.T) {
+	homeAfterFirstRun(t)
+	cloneWith(t, nil)
+	main := newRepo(t)
+	topic := strings.TrimSpace(gitIn(t, main, "rev-parse", "topic"))
+	branches := gitIn(t, main, "for-each-ref", "refs/heads/")
+	path := filepath.Join(filepath.Dir(main), "main-"+topic[:12])
+	noBranch := "--detach checks out the commit-ish it takes in place of a branch, and makes no branch for --from or --track\n"
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"new", "--detach", "--from", "main", "topic"}, noBranch},
+		{[]string{"new", "--detach", "--track", "topic"}, noBranch},
+		{[]string{"new", "--detach", "nothing"}, "nothing names no commit\n"},
+	} {
+		if code, stdout, stderr := slimtree(t.Context(), tc.args...); code != 1 || stdout != "" || stderr != tc.want {
+			t.Errorf("%s: exit %d, stdout %q, stderr %q; want 1 and %q", strings.Join(tc.args, " "), code, stdout, stderr, tc.want)
+		}
+	}
+	requireNoWorktree(t, main, path)
+
+	code, stdout, stderr := slimtree(t.Context(), "new", "--detach", "topic")
+	if code != 0 || stdout != path+"\n" {
+		t.Fatalf("new --detach topic: exit %d, stdout %q, stderr %q; want 0 and %s", code, stdout, stderr, path)
+	}
+	plain := filepath.Join(filepath.Dir(main), "plain")
+	gitIn(t, main, "worktree", "add", "-q", "--detach", plain, "topic")
+	if got, want := trackedTree(t, path), trackedTree(t, plain); !maps.Equal(got, want) {
+		t.Fatalf("new's tree = %q\nplain tree = %q", got, want)
+	}
+	if got := gitIn(t, path, "status", "--porcelain"); got != "" {
+		t.Fatalf("git status in the new worktree lists %q", got)
+	}
+	if got := strings.TrimSpace(gitIn(t, path, "rev-parse", "HEAD")); got != topic {
+		t.Fatalf("HEAD = %s, want topic's %s", got, topic)
+	}
+	gitFindsNothing(t, path, "symbolic-ref", "-q", "HEAD")
+	if got := gitIn(t, main, "for-each-ref", "refs/heads/"); got != branches {
+		t.Fatalf("branches after new --detach = %q, want %q", got, branches)
+	}
+	got := records(t)
+	if len(got) != 1 || got[0].Created.IsZero() {
+		t.Fatalf("records = %+v, want one, with its creation time", got)
+	}
+	got[0].Created = got[0].Created.UTC().Truncate(0)
+	want := state.Record{Version: 1, Backend: "apfsclone", Path: path, CommonDir: filepath.Join(main, ".git"),
+		Created: got[0].Created, SlimtreeVersion: version.String()}
+	if got[0] != want {
+		t.Fatalf("record = %+v, want %+v", got[0], want)
+	}
+}
+
+// A detached new that fails removes the worktree it registered. It keeps a
+// detached worktree that another process registered at its path, since git
+// refused to fill that path for new.
+func TestNewDetachedRollsBackOnlyWhatItMade(t *testing.T) {
+	homeAfterFirstRun(t)
+	main := newRepo(t)
+	path := filepath.Join(filepath.Dir(main), "pb")
+	branches := gitIn(t, main, "for-each-ref", "refs/heads/")
+
+	// Ctrl-C while new fills the worktree, after git worktree add registered
+	// it.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	cloneWith(t, func(src, dst string) error {
+		if strings.HasPrefix(dst, path+string(filepath.Separator)) {
+			cancel()
+		}
+		return copyClone(src, dst)
+	})
+	if code, stdout, stderr := slimtree(ctx, "new", "--detach", "topic", "--path", path); code != 1 || stdout != "" || !strings.Contains(stderr, "context canceled") {
+		t.Fatalf("an interrupted new --detach: exit %d, stdout %q, stderr %q; want 1 and context canceled", code, stdout, stderr)
+	}
+	requireNoWorktree(t, main, path)
+
+	// Preflight's probe is the first clone, before new's git worktree add.
+	registered := false
+	cloneWith(t, func(src, dst string) error {
+		if !registered {
+			registered = true
+			gitIn(t, main, "worktree", "add", "-q", "--detach", path, "topic")
+			if err := os.WriteFile(filepath.Join(path, "precious.txt"), []byte("precious\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return copyClone(src, dst)
+	})
+	want := "slimtree kept the worktree " + path + ", which another process can have made"
+	if code, stdout, stderr := slimtree(t.Context(), "new", "--detach", "topic", "--path", path); code != 1 || stdout != "" || !strings.Contains(stderr, want) {
+		t.Fatalf("new --detach over another process's worktree: exit %d, stdout %q, stderr %q; want 1 and %q", code, stdout, stderr, want)
+	}
+	if got, err := os.ReadFile(filepath.Join(path, "precious.txt")); err != nil || string(got) != "precious\n" {
+		t.Fatalf("precious.txt = %q, %v", got, err)
+	}
+	if list := gitIn(t, main, "worktree", "list", "--porcelain"); !strings.Contains(list, "worktree "+path+"\n") {
+		t.Fatalf("git no longer registers %s:\n%s", path, list)
+	}
+	if got := gitIn(t, main, "for-each-ref", "refs/heads/"); got != branches {
+		t.Fatalf("branches = %q, want %q", got, branches)
+	}
+	if got := records(t); len(got) != 0 {
+		t.Fatalf("records = %+v, want none", got)
+	}
+}
+
+// rm --no-archive removes a worktree, its registration and its record, and
+// leaves no recovery ref and no archive. It keeps the branch. It refuses
+// --exclude, which only an archive uses, and then changes nothing.
+func TestRmNoArchiveKeepsNoArchive(t *testing.T) {
+	homeDir := homeAfterFirstRun(t)
+	cloneWith(t, nil)
+	main := newRepo(t)
+	feat := filepath.Join(filepath.Dir(main), "main-feat")
+	detached := filepath.Join(filepath.Dir(main), "pb")
+	for _, args := range [][]string{{"new", "feat"}, {"new", "--detach", "topic", "--path", detached}} {
+		if code, _, stderr := slimtree(t.Context(), args...); code != 0 {
+			t.Fatalf("%s: exit %d, stderr %q", strings.Join(args, " "), code, stderr)
+		}
+	}
+	gitIn(t, feat, "commit", "-q", "--allow-empty", "-m", "work")
+	head := gitIn(t, feat, "rev-parse", "HEAD")
+
+	want := "--exclude leaves files out of an artifactfs worktree's archive, and --no-archive keeps no archive\n"
+	if code, stdout, stderr := slimtree(t.Context(), "rm", "--no-archive", "--exclude", "node_modules", "pb"); code != 1 || stdout != "" || stderr != want {
+		t.Fatalf("rm --no-archive --exclude: exit %d, stdout %q, stderr %q; want 1 and %q", code, stdout, stderr, want)
+	}
+	if got := records(t); len(got) != 2 {
+		t.Fatalf("records after a refused rm = %+v, want both", got)
+	}
+
+	for _, path := range []string{detached, feat} {
+		if code, stdout, stderr := slimtree(t.Context(), "rm", "--no-archive", path); code != 0 || stdout != "removed "+path+"\n" {
+			t.Fatalf("rm --no-archive %s: exit %d, stdout %q, stderr %q", path, code, stdout, stderr)
+		}
+		requireNoWorktree(t, main, path)
+	}
+	if got := gitIn(t, main, "rev-parse", "feat"); got != head {
+		t.Fatalf("feat points at %s, want %s", got, head)
+	}
+	if refs := recoveryRefs(t, filepath.Join(main, ".git")); refs != "" {
+		t.Fatalf("recovery refs = %q, want none", refs)
+	}
+	requireGone(t, filepath.Join(homeDir, "archives"))
+}
