@@ -110,9 +110,10 @@ func (s *Service) configureCurrentStatusOptimization(rt *repoRuntime, cfg model.
 // overlay, which records changes made through the mount. Its token carries the
 // overlay database's id and change sequence, so Git receives only the paths
 // changed since its last query. It trusts only tokens issued for this
-// registration and this database while the worktree is mounted. Otherwise
-// native edits may have bypassed the overlay, and "/" makes Git rescan the
-// worktree.
+// registration and this database while the worktree is mounted, and only for
+// a git that works in the registration's git dir. Otherwise native edits may
+// have bypassed the overlay, or the caller is another worktree, and "/" makes
+// Git rescan the worktree.
 //
 // Git runs the hook on every command that reads the index, so it opens no
 // Controller: it reads the registry with registry.ReadRepo and builds no git
@@ -152,7 +153,8 @@ func answerFSMonitorHook(ctx context.Context, cfg model.RepoConfig, since string
 	// The mount table check sends no request to the mount, which stays gated
 	// while the daemon runs Git during preparation.
 	mounted := isMounted(cfg.MountPath)
-	trusted = trusted && ok && err == nil && sinceSeq >= 0 && mounted
+	own := callerUsesGitDir(cfg.GitDir)
+	trusted = trusted && ok && err == nil && sinceSeq >= 0 && mounted && own
 	if !trusted {
 		sinceSeq = math.MaxInt64
 	}
@@ -168,7 +170,7 @@ func answerFSMonitorHook(ctx context.Context, cfg model.RepoConfig, since string
 	// mount's later answers would not correct. The bootstrap marks entries from
 	// the snapshot instead, so its token may carry into the mount.
 	token := prefix + "rescan"
-	if logged && (mounted || os.Getenv(gitstore.FSMonitorBootstrapEnv) != "") {
+	if own && logged && (mounted || os.Getenv(gitstore.FSMonitorBootstrapEnv) != "") {
 		token = fmt.Sprintf("%s%s:%d", prefix, changes.Instance, changes.Seq)
 	}
 	if err := writeHookField(w, token); err != nil {
@@ -180,6 +182,27 @@ func answerFSMonitorHook(ctx context.Context, cfg model.RepoConfig, since string
 		}
 	}
 	return nil
+}
+
+// callerUsesGitDir reports whether the git that runs the hook works in
+// gitDir. Every worktree reads the repo's config, and git worktree add copies
+// the config.worktree of the worktree it runs in, so another worktree's git
+// can run the hook. Git exports GIT_DIR for a linked worktree, for --git-dir
+// and for a gitfile, such as the mount's .git, and leaves it unset in a main
+// worktree it found by its .git directory. A main worktree runs the hook only
+// as the registered worktree, so an unset GIT_DIR counts as gitDir. The check
+// stats only git dirs, never the mount.
+func callerUsesGitDir(gitDir string) bool {
+	caller := os.Getenv("GIT_DIR")
+	if caller == "" {
+		return true
+	}
+	a, err := os.Stat(caller)
+	if err != nil {
+		return false
+	}
+	b, err := os.Stat(gitDir)
+	return err == nil && os.SameFile(a, b)
 }
 
 func writeHookField(w io.Writer, value string) error {
