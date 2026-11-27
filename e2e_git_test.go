@@ -258,6 +258,67 @@ func testE2EGitCleanState(t *testing.T, repo *mountedE2ERepo) {
 	}
 }
 
+// A worktree that git worktree add makes from the mount runs the mount's
+// FSMonitor hook: every worktree reads the repo's config, and git worktree add
+// copies the config.worktree of the worktree it runs in, where an adopted
+// worktree keeps the hook. Git runs the hook there with the added worktree's
+// git dir as GIT_DIR. The hook answers that git with a rescan, so git status
+// lists the added worktree's own changes, and it keeps answering the mount
+// from its change log.
+func testE2EGitStatusInAWorktreeAddedFromTheMount(t *testing.T, repo *mountedE2ERepo) {
+	added := filepath.Join(t.TempDir(), "added")
+	gitCmd(t, repo.mountPath, "worktree", "add", "-q", "--detach", added)
+	removed := false
+	t.Cleanup(func() {
+		if !removed {
+			gitCmdResult(repo.mountPath, "worktree", "remove", "--force", added)
+		}
+	})
+	hook := strings.TrimSpace(gitCmd(t, repo.mountPath, "config", "--get", "core.fsmonitor"))
+	if got := strings.TrimSpace(gitCmd(t, added, "config", "--get", "core.fsmonitor")); got != hook {
+		t.Fatalf("the added worktree's core.fsmonitor = %q, want the mount's %q", got, hook)
+	}
+	// The first status stores the hook's token in the added worktree's index,
+	// and the second sends it.
+	if got := addedWorktreeStatus(t, added); got != "" {
+		t.Fatalf("first git status in the added worktree = %q, want clean", got)
+	}
+	if err := os.WriteFile(filepath.Join(added, "README.md"), []byte("edited in the added worktree\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(added, "added.txt"), []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := addedWorktreeStatus(t, added); got != " M README.md\n?? added.txt\n" {
+		t.Fatalf("git status in the added worktree after its edits = %q, want both edits", got)
+	}
+	assertGitStatus(t, repo.mountPath, map[string]string{})
+	gitCmd(t, repo.mountPath, "worktree", "remove", "--force", added)
+	removed = true
+}
+
+// addedWorktreeStatus runs git status in worktree, which is not on a mount,
+// and returns its porcelain output. It fails t unless the FSMonitor hook
+// answered.
+func addedWorktreeStatus(t *testing.T, worktree string) string {
+	t.Helper()
+	trace := filepath.Join(t.TempDir(), "trace2.json")
+	cmd := exec.Command("git", "-C", worktree, "status", "--porcelain")
+	cmd.Env = append(os.Environ(), "GIT_TRACE2_EVENT="+trace)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git status in %s: %v", worktree, err)
+	}
+	events, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(events, []byte(`"category":"fsm_hook","key":"query/response-length"`)) || bytes.Contains(events, []byte(`"category":"fsm_hook","key":"query/failed"`)) {
+		t.Fatalf("the FSMonitor hook did not answer git status in %s", worktree)
+	}
+	return string(out)
+}
+
 // Git's untracked cache trusts a directory whose stat data has not changed
 // since Git listed it. git update-index --test-untracked-cache checks that a
 // directory's stat data changes when an entry is added to it or removed from
