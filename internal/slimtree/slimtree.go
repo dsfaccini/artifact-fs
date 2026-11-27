@@ -108,26 +108,30 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 			},
 			{
 				Name:      "new",
-				Usage:     "make a worktree on a branch: the branch that exists, or a new one at --from, else at HEAD",
-				ArgsUsage: "<branch>",
+				Usage:     "make a worktree on a branch: the branch that exists, or a new one at --from, else at HEAD; with --detach, at a commit, on no branch",
+				ArgsUsage: "<branch> | --detach <commit-ish>",
 				Flags: []ucli.Flag{
 					&ucli.StringFlag{Name: "from", Usage: "make the new branch at this commit-ish, resolved in the current directory"},
 					&ucli.BoolFlag{Name: "track", Usage: "make the new branch track --from, which must name a branch"},
+					&ucli.BoolFlag{Name: "detach", Usage: "check out the commit-ish given in place of the branch, resolved in the current directory, with HEAD detached and no branch, as git worktree add --detach does"},
 					&ucli.StringFlag{Name: "path", Usage: "the worktree's path (default: <base>-<the branch's last segment>, next to the base worktree)"},
 				},
 				Action: func(ctx context.Context, c *ucli.Command) error {
 					if c.Args().Len() != 1 {
-						return errors.New("slimtree new takes one branch")
+						return errors.New("slimtree new takes one branch, or with --detach one commit-ish")
 					}
-					b := backend(c.String("backend"))
-					if err := doctor.Require(probe, goos, string(b), "new", doctor.Needs{Mount: b == artifactFS}); err != nil {
+					o := newOptions{branch: c.Args().First(), from: c.String("from"), track: c.Bool("track"), path: c.String("path"), backend: backend(c.String("backend")), goos: goos}
+					if c.Bool("detach") {
+						o.branch, o.detach = "", c.Args().First()
+					}
+					if err := doctor.Require(probe, goos, string(o.backend), "new", doctor.Needs{Mount: o.backend == artifactFS}); err != nil {
 						return err
 					}
 					home, err := openHome()
 					if err != nil {
 						return err
 					}
-					return newWorktree(ctx, home, newOptions{branch: c.Args().First(), from: c.String("from"), track: c.Bool("track"), path: c.String("path"), backend: b, goos: goos}, stdout, stderr)
+					return newWorktree(ctx, home, o, stdout, stderr)
 				},
 			},
 			{
@@ -173,12 +177,13 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 			},
 			{
 				Name:      "rm",
-				Usage:     "remove a worktree slimtree made, with its ignored files, as git worktree remove does; a recovery ref keeps its HEAD, an archive keeps an artifactfs worktree's files, and its branch stays",
+				Usage:     "remove a worktree slimtree made, with its ignored files, as git worktree remove does; a recovery ref keeps its HEAD, an archive keeps an artifactfs worktree's files, unless --no-archive, and its branch stays",
 				ArgsUsage: "<worktree>",
 				Flags: []ucli.Flag{
 					&ucli.BoolFlag{Name: "force", Usage: "discard the changes git status lists, or drop a worktree whose directory is gone or, for artifactfs, that no daemon serves; twice, also drop a worktree whose repository is missing, which keeps git's registration of it"},
 					&ucli.BoolFlag{Name: "check", Usage: "only check whether rm would refuse; changes nothing, so it cannot see files below a mounted artifactfs worktree's mount, which rm checks once it unmounted it"},
 					&ucli.StringSliceFlag{Name: "exclude", Usage: "leave out of an artifactfs worktree's archive the files at paths with a component that this glob matches; repeatable", Validator: checkExcludes},
+					&ucli.BoolFlag{Name: "no-archive", Usage: "keep no archive: no recovery ref of its HEAD, no copy of its record, and none of an artifactfs worktree's files"},
 				},
 				Action: func(ctx context.Context, c *ucli.Command) error {
 					if c.Args().Len() != 1 {
@@ -188,7 +193,7 @@ func run(ctx context.Context, goos string, probe doctor.Probe, args []string, st
 					if err != nil {
 						return err
 					}
-					return removeWorktree(ctx, home, probe, goos, c.Args().First(), rmOptions{force: c.Count("force") > 0, forceTwice: c.Count("force") > 1, check: c.Bool("check"), excludes: c.StringSlice("exclude")}, stdout, stderr)
+					return removeWorktree(ctx, home, probe, goos, c.Args().First(), rmOptions{force: c.Count("force") > 0, forceTwice: c.Count("force") > 1, check: c.Bool("check"), excludes: c.StringSlice("exclude"), noArchive: c.Bool("no-archive")}, stdout, stderr)
 				},
 			},
 			{

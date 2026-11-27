@@ -24,10 +24,13 @@ var goneListed func()
 // removes an artifactfs worktree. Without o.force, it refuses an apfsclone
 // worktree in which git status lists a change or an untracked file, whatever
 // the config hides, and one whose directory is gone, which can be on a volume
-// that is not mounted. With o.check, it stops after the refusals. It first
-// writes the worktree's HEAD to a recovery ref in the repository, and never
-// deletes a branch.
+// that is not mounted. With o.check, it stops after the refusals. Unless
+// o.noArchive, it first writes the worktree's HEAD to a recovery ref in the
+// repository. It never deletes a branch.
 func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, goos, arg string, o rmOptions, stdout, stderr io.Writer) error {
+	if o.noArchive && len(o.excludes) > 0 {
+		return errors.New("--exclude leaves files out of an artifactfs worktree's archive, and --no-archive keeps no archive")
+	}
 	lock, err := home.Lock(ctx, "")
 	if err != nil {
 		return err
@@ -109,7 +112,7 @@ func removeWorktree(ctx context.Context, home *state.Home, probe doctor.Probe, g
 	}
 
 	ref := ""
-	if head != "" {
+	if head != "" && !o.noArchive {
 		r.Head = head
 		a, err := home.Archive(r)
 		if err != nil {

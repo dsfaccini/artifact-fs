@@ -40,6 +40,9 @@ type rmOptions struct {
 	// excludes are globs. An artifactfs worktree's archive leaves out the
 	// overlay file of each path with a component that one of them matches.
 	excludes []string
+	// noArchive keeps no archive: no archived record, no recovery ref and no
+	// state archive.
+	noArchive bool
 }
 
 // checkExcludes refuses a pattern that path.Match cannot match against one
@@ -151,21 +154,21 @@ func removeArtifactFS(ctx context.Context, home *state.Home, probe doctor.Probe,
 	} else if running {
 		return fmt.Errorf("pid %d, a daemon slimtree did not record, serves %s; stop it, then rm again", pid, r.StateDir)
 	}
-	if err := finishRemoval(ctx, home, r, o.excludes, stdout, stderr); err != nil {
+	if err := finishRemoval(ctx, home, r, o, stdout, stderr); err != nil {
 		return fmt.Errorf("%w; slimtree stopped %s, and slimtree rm --force %s removes it", err, r.Path, r.Path)
 	}
 	return nil
 }
 
 // finishRemoval removes r, an artifactfs worktree that no daemon serves and
-// nothing is mounted at. It archives r's record and, in stateArchiveName, its
-// state root and git dir, writes its HEAD to the recovery ref, and puts its
-// gitfile back. git worktree remove --force then removes the worktree and
-// its git dir. Last, it removes r's record and prunes. It refuses a mount
-// point that holds files: no mount serves them and no archive keeps them,
-// and git worktree remove would delete them. Each step leaves a state that
-// a later run finishes.
-func finishRemoval(ctx context.Context, home *state.Home, r state.Record, excludes []string, stdout, stderr io.Writer) error {
+// nothing is mounted at. Unless o.noArchive, it archives r's record and, in
+// stateArchiveName, its state root and git dir, and writes its HEAD to the
+// recovery ref. It puts r's gitfile back. git worktree remove --force then
+// removes the worktree and its git dir. Last, it removes r's record and
+// prunes. It refuses a mount point that holds files: no mount serves them and
+// no archive keeps them, and git worktree remove would delete them. Each step
+// leaves a state that a later run finishes.
+func finishRemoval(ctx context.Context, home *state.Home, r state.Record, o rmOptions, stdout, stderr io.Writer) error {
 	gitfile := filepath.Join(home.RecordDir(r.Path), gitfileName)
 	entries, gone, copied, err := mountPointState(r.Path, gitfile)
 	if err != nil {
@@ -189,14 +192,16 @@ func finishRemoval(ctx context.Context, home *state.Home, r state.Record, exclud
 	}
 	w, registered := listed[r.Path]
 	r.Head = w.head
-	a, err := home.Archive(r)
-	if err != nil {
-		return err
+	var a state.Archived
+	if !o.noArchive {
+		if a, err = home.Archive(r); err != nil {
+			return err
+		}
+		if err := a.WriteFile(stateArchiveName, func(out io.Writer) error { return writeStateArchive(ctx, out, r, o.excludes, stderr) }); err != nil {
+			return fmt.Errorf("archiving the state of %s: %w", r.Path, err)
+		}
 	}
-	if err := a.WriteFile(stateArchiveName, func(out io.Writer) error { return writeStateArchive(ctx, out, r, excludes, stderr) }); err != nil {
-		return fmt.Errorf("archiving the state of %s: %w", r.Path, err)
-	}
-	if r.Head != "" {
+	if a.Ref != "" && r.Head != "" {
 		if _, err := gitWrite(ctx, r.CommonDir, "update-ref", a.Ref, r.Head, ""); err != nil {
 			return err
 		}
@@ -242,9 +247,12 @@ func finishRemoval(ctx context.Context, home *state.Home, r state.Record, exclud
 		return fmt.Errorf("removed %s, but not its record: %w", r.Path, err)
 	}
 	files := filepath.Join(a.Dir, stateArchiveName)
-	if r.Head == "" {
+	switch {
+	case o.noArchive:
+		fmt.Fprintf(stdout, "removed %s\n", r.Path)
+	case r.Head == "":
 		fmt.Fprintf(stdout, "removed %s; %s keeps its files\n", r.Path, files)
-	} else {
+	default:
 		fmt.Fprintf(stdout, "removed %s; %s keeps its HEAD %s, and %s its files\n", r.Path, a.Ref, r.Head, files)
 	}
 	return nil

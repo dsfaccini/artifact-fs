@@ -926,3 +926,30 @@ func TestDeadDaemonsMountStaysWhileAnUnrecordedDaemonServes(t *testing.T) {
 		t.Errorf("records = %+v, want %+v", got, r)
 	}
 }
+
+// rm --force --no-archive of an artifactfs worktree that no daemon serves
+// removes the worktree, its registration, its record and its state root, and
+// leaves no recovery ref and no archive. The branch stays.
+func TestRmNoArchiveLeavesNoArtifactFSArchive(t *testing.T) {
+	main, r := stoppedArtifactFS(t, map[string]string{"notes.txt": "discarded\n"})
+	head := strings.TrimSpace(gitIn(t, main, "rev-parse", "wt"))
+	home, err := openHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireExists(t, filepath.Join(r.StateDir, "overlays", "wt", "meta.sqlite"))
+
+	code, stdout, stderr := linux(t.Context(), "rm", "--force", "--no-archive", "wt")
+	if code != 0 || stdout != "removed "+r.Path+"\n" {
+		t.Fatalf("rm --force --no-archive wt: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	requireNoWorktree(t, main, r.Path)
+	requireGone(t, r.StateDir)
+	if got := strings.TrimSpace(gitIn(t, main, "rev-parse", "wt")); got != head {
+		t.Errorf("wt points at %s, want %s", got, head)
+	}
+	if refs := recoveryRefs(t, r.CommonDir); refs != "" {
+		t.Errorf("recovery refs = %q, want none", refs)
+	}
+	requireGone(t, filepath.Join(home.Dir(), "archives"))
+}
